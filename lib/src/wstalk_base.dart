@@ -2,6 +2,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'wstalk_message.dart';
 import 'wstalk_impl.dart';
@@ -83,12 +84,16 @@ class TalkSocket {
       }
     } catch (ex) {
       _listening = false;
-      _webSocket.close(1011);
+      _webSocket.close(1011).catchError((ex) {
+        throw ex;
+      });
       _closeAndClear();
       throw ex;
     }
     _listening = false;
-    _webSocket.close(1000);
+    _webSocket.close(1000).catchError((ex) {
+      throw ex;
+    });
     _closeAndClear();
   }
 
@@ -183,9 +188,12 @@ class TalkSocket {
   /// Encode a name into it's integer representation
   /// Names both starting and ending with underscore are reserved for now for internal implementation
   static int encode(String name) {
-    List<int> idstr = new List<int>.from(utf8.encode(name));
-    idstr.length = 9;
-    idstr[8] = 0;
+    Uint8List idstr = new List<int>.from(utf8.encode(name));
+    int i = idstr.length;
+    idstr.length = 8;
+    for (; i < 8; ++i) {
+      idstr[i] = 0;
+    }
     return idstr[0] | (idstr[1] << 8) | (idstr[2] << 16) | (idstr[3] << 24)
       | (idstr[4] << 32) | (idstr[5] << 40) | (idstr[6] << 48) | (idstr[7] << 56);
   }
@@ -287,7 +295,9 @@ class TalkSocket {
   // Closes the connection
   void close() {
     if (_listening) {
-      _webSocket.close(1000);
+      _webSocket.close(1000).catchError((ex) {
+        throw ex;
+      });
     }
   }
 
