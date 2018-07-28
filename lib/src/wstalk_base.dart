@@ -16,7 +16,12 @@ class TalkException implements Exception {
 }
 
 class TalkSocket {
-  static const int _timeOutMs = 10000;
+  /// We give the remote host 10 seconds to reply to a message
+  static const int _receiveTimeOutMs = 10000;
+
+  /// We give ourselves 5 seconds to reply to a message
+  static const int _sendTimeOutMs = 5000;
+
   static int _idExcept = encode("_EXCEPT_");
   static int _idPing = encode("__PING__");
   static int _idPong = encode("__PONG__");
@@ -163,7 +168,7 @@ class TalkSocket {
     _incrementNextRequestId();
 
     Completer<TalkMessage> completer = new Completer<TalkMessage>();
-    Timer timer = new Timer(new Duration(milliseconds: _timeOutMs), () {
+    Timer timer = new Timer(new Duration(milliseconds: _receiveTimeOutMs), () {
       // Check if it's not already been removed, may happen due to race condition
       if (_localReplyTimers.containsKey(request)) {
         print("Message was not replied to by the remote server in time '${decode(id)}', throw exception");
@@ -246,7 +251,7 @@ class TalkSocket {
       if (_localReplyTimers.length >= 4096) {
         throw new TalkException("Too many requests received, potential out-of-memory attack");
       }
-      Timer timer = new Timer(new Duration(milliseconds: _timeOutMs), () {
+      Timer timer = new Timer(new Duration(milliseconds: _sendTimeOutMs), () {
         // Check if it's not already been removed, may happen due to race condition
         if (_localReplyTimers.containsKey(message.request)) {
           print("Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
