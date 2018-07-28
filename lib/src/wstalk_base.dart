@@ -188,9 +188,12 @@ class TalkSocket {
   /// Encode a name into it's integer representation
   /// Names both starting and ending with underscore are reserved for now for internal implementation
   static int encode(String name) {
-    Uint8List idstr = new List<int>.from(utf8.encode(name));
-    int i = idstr.length;
-    idstr.length = 8;
+    Uint8List nameenc = utf8.encode(name);
+    Uint8List idstr = new Uint8List(8);
+    int i = 0;
+    for (; i < nameenc.length && i < 8; ++i) {
+      idstr[i] = nameenc[i];
+    }
     for (; i < 8; ++i) {
       idstr[i] = 0;
     }
