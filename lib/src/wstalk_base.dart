@@ -16,11 +16,11 @@ class TalkException implements Exception {
 }
 
 class TalkSocket {
-  /// We give the remote host 10 seconds to reply to a message
-  static const int _receiveTimeOutMs = 10000;
+  /// We give the remote host 15 seconds to reply to a message
+  static const int _receiveTimeOutMs = 15000;
 
-  /// We give ourselves 5 seconds to reply to a message
-  static const int _sendTimeOutMs = 5000;
+  /// We give ourselves 10 seconds to reply to a message
+  static const int _sendTimeOutMs = 10000;
 
   static int _idExcept = encode("_EXCEPT_");
   static int _idPing = encode("__PING__");
