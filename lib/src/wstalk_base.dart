@@ -130,6 +130,10 @@ class TalkSocket {
     data.setRange(16, message.data.length + 16, message.data);
     _webSocket.add(data);
   }
+  
+  void sendException(String message, { TalkMessage reply }) {
+    sendMessage(_idExcept, utf8.encode(message), reply: reply);
+  }
 
   void sendMessage(int id, List<int> data, { TalkMessage reply }) {
     if (!_listening) {
