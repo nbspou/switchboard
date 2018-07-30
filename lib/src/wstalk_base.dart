@@ -136,6 +136,7 @@ class TalkSocket {
   void sendExtend(TalkMessage reply) {
     if (_localReplyTimers.containsKey(reply.request)) {
       _localReplyTimers[reply.request].cancel();
+      _localReplyTimers.remove(reply.request);
       _setLocalReplyTimer(reply);
       sendMessage(_idExtend, new Uint8List(0), reply: reply);
     } else {
@@ -153,7 +154,7 @@ class TalkSocket {
       throw new TalkException("Not sending to this talk socket, connection was already lost");
     }
 
-    if (reply != null) {
+    if (reply != null && id != _idExtend) {
       if (!_localReplyTimers.containsKey(reply.request)) {
         throw new TalkException("Request was already replied to, or request timed out");
       }
