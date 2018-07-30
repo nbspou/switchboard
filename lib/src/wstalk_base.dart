@@ -22,6 +22,7 @@ class TalkSocket {
   /// We give ourselves 10 seconds to reply to a message
   static const int _sendTimeOutMs = 10000;
 
+  static int _idExtend = encode("_EXTEND_");
   static int _idExcept = encode("_EXCEPT_");
   static int _idPing = encode("__PING__");
   static int _idPong = encode("__PONG__");
@@ -130,8 +131,20 @@ class TalkSocket {
     data.setRange(16, message.data.length + 16, message.data);
     _webSocket.add(data);
   }
+
+  /// Extend timeouts (or fail)
+  void sendExtend(TalkMessage reply) {
+    if (_localReplyTimers.containsKey(reply.request)) {
+      _localReplyTimers[reply.request].cancel();
+      _setLocalReplyTimer(reply);
+      sendMessage(_idExtend, new Uint8List(0), reply: reply);
+    } else {
+      throw new TalkException("Failed to extend time, already replied or timed out");
+    }
+  }
   
-  void sendException(String message, { TalkMessage reply }) {
+  /// Throw an exception as message reply
+  void sendException(String message, TalkMessage reply) {
     sendMessage(_idExcept, utf8.encode(message), reply: reply);
   }
 
@@ -149,6 +162,18 @@ class TalkSocket {
     }
 
     _send(new TalkMessage(id, 0, reply != null ? reply.request : 0, data));
+  }
+
+  void _setRemoteResponseTimer(Completer<TalkMessage> completer, int request, int id) {
+    Timer timer = new Timer(new Duration(milliseconds: _receiveTimeOutMs), () {
+      // Check if it's not already been removed, may happen due to race condition
+      if (_remoteResponseStates.containsKey(request)) {
+        print("Message was not replied to by the remote server in time '${decode(id)}', throw exception");
+        completer.completeError(new TalkException("No reply received in time from the remote server"));
+        _remoteResponseStates.remove(request);
+      }
+    });
+    _remoteResponseStates[request] = new RemoteResponseState(id, completer, timer);
   }
 
   Future<TalkMessage> sendRequest(int id, List<int> data, { TalkMessage reply }) {
@@ -172,16 +197,7 @@ class TalkSocket {
     _incrementNextRequestId();
 
     Completer<TalkMessage> completer = new Completer<TalkMessage>();
-    Timer timer = new Timer(new Duration(milliseconds: _receiveTimeOutMs), () {
-      // Check if it's not already been removed, may happen due to race condition
-      if (_localReplyTimers.containsKey(request)) {
-        print("Message was not replied to by the remote server in time '${decode(id)}', throw exception");
-        completer.completeError(new TalkException("No reply received in time from the remote server"));
-        _remoteResponseStates.remove(request);
-      }
-    });
-
-    _remoteResponseStates[request] = new RemoteResponseState(completer, timer);
+    _setRemoteResponseTimer(completer, request, id);
     
     _send(new TalkMessage(id, request, reply != null ? reply.request : 0, data));
     return completer.future;
@@ -246,6 +262,18 @@ class TalkSocket {
     return _streamController(id).stream;
   }
 
+  void _setLocalReplyTimer(TalkMessage message) {
+    Timer timer = new Timer(new Duration(milliseconds: _sendTimeOutMs), () {
+      // Check if it's not already been removed, may happen due to race condition
+      if (_localReplyTimers.containsKey(message.request)) {
+        print("Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
+        sendMessage(_idExcept, utf8.encode("No Reply Sent"), reply: message);
+        _localReplyTimers.remove(message.request);
+      }
+    });
+    _localReplyTimers[message.request] = timer;
+  }
+
   /// Processes a received message
   void _received(TalkMessage message) {
     // print("Received message with name '${decode(message.id)}'");
@@ -255,15 +283,7 @@ class TalkSocket {
       if (_localReplyTimers.length >= 4096) {
         throw new TalkException("Too many requests received, potential out-of-memory attack");
       }
-      Timer timer = new Timer(new Duration(milliseconds: _sendTimeOutMs), () {
-        // Check if it's not already been removed, may happen due to race condition
-        if (_localReplyTimers.containsKey(message.request)) {
-          print("Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
-          sendMessage(_idExcept, utf8.encode("No Reply Sent"), reply: message);
-          _localReplyTimers.remove(message.request);
-        }
-      });
-      _localReplyTimers[message.request] = timer;
+      _setLocalReplyTimer(message);
     }
     if (message.response != 0) {
       // Responding messages are handled specially,
@@ -276,7 +296,9 @@ class TalkSocket {
         RemoteResponseState state = _remoteResponseStates[message.response];
         _remoteResponseStates.remove(message.response);
         state.timer.cancel();
-        if (message.id ==  _idExcept) {
+        if (message.id == _idExtend) {
+          _setRemoteResponseTimer(state.completer, message.response, state.id);
+        } else if (message.id == _idExcept) {
           state.completer.completeError(new TalkException(utf8.decode(message.data)));
         } else {
           state.completer.complete(message);
