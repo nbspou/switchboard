@@ -55,7 +55,7 @@ class TalkSocket {
       throw new TalkException("Received '_EXCEPT_' with no response identifier. Invalid message");
     });
     stream(_idPing).listen((TalkMessage message) {
-      sendMessage(_idPong, new List<int>(), reply: message);
+      sendMessage(_idPong, new List<int>(), replying: message);
     });
   }
 
@@ -133,36 +133,36 @@ class TalkSocket {
   }
 
   /// Extend timeouts (or fail)
-  void sendExtend(TalkMessage reply) {
-    if (_localReplyTimers.containsKey(reply.request)) {
-      _localReplyTimers[reply.request].cancel();
-      _localReplyTimers.remove(reply.request);
-      _setLocalReplyTimer(reply);
-      sendMessage(_idExtend, new Uint8List(0), reply: reply);
+  void sendExtend(TalkMessage replying) {
+    if (_localReplyTimers.containsKey(replying.request)) {
+      _localReplyTimers[replying.request].cancel();
+      _localReplyTimers.remove(replying.request);
+      _setLocalReplyTimer(replying);
+      sendMessage(_idExtend, new Uint8List(0), replying: replying);
     } else {
       throw new TalkException("Failed to extend time, already replied or timed out");
     }
   }
   
   /// Throw an exception as message reply
-  void sendException(String message, TalkMessage reply) {
-    sendMessage(_idExcept, utf8.encode(message), reply: reply);
+  void sendException(String message, TalkMessage replying) {
+    sendMessage(_idExcept, utf8.encode(message), replying: replying);
   }
 
-  void sendMessage(int id, List<int> data, { TalkMessage reply }) {
+  void sendMessage(int id, List<int> data, { TalkMessage replying }) {
     if (!_listening) {
       throw new TalkException("Not sending to this talk socket, connection was already lost");
     }
 
-    if (reply != null && id != _idExtend) {
-      if (!_localReplyTimers.containsKey(reply.request)) {
+    if (replying != null && id != _idExtend) {
+      if (!_localReplyTimers.containsKey(replying.request)) {
         throw new TalkException("Request was already replied to, or request timed out");
       }
-      _localReplyTimers[reply.request].cancel();
-      _localReplyTimers.remove(reply.request);
+      _localReplyTimers[replying.request].cancel();
+      _localReplyTimers.remove(replying.request);
     }
 
-    _send(new TalkMessage(id, 0, reply != null ? reply.request : 0, data));
+    _send(new TalkMessage(id, 0, replying != null ? replying.request : 0, data));
   }
 
   void _setRemoteResponseTimer(Completer<TalkMessage> completer, int request, int id) {
@@ -177,7 +177,7 @@ class TalkSocket {
     _remoteResponseStates[request] = new RemoteResponseState(id, completer, timer);
   }
 
-  Future<TalkMessage> sendRequest(int id, List<int> data, { TalkMessage reply }) {
+  Future<TalkMessage> sendRequest(int id, List<int> data, { TalkMessage replying }) {
     if (!_listening) {
       throw new TalkException("Not sending to this talk socket, connection was already lost");
     }
@@ -186,12 +186,12 @@ class TalkSocket {
       throw new TalkException("Too many requests sent, potential out-of-memory attack");
     }
 
-    if (reply != null) {
-      if (!_localReplyTimers.containsKey(reply.request)) {
+    if (replying != null) {
+      if (!_localReplyTimers.containsKey(replying.request)) {
         throw new TalkException("Request was already replied to, or request timed out");
       }
-      _localReplyTimers[reply.request].cancel();
-      _localReplyTimers.remove(reply.request);
+      _localReplyTimers[replying.request].cancel();
+      _localReplyTimers.remove(replying.request);
     }
 
     int request = _nextRequestId;
@@ -200,7 +200,7 @@ class TalkSocket {
     Completer<TalkMessage> completer = new Completer<TalkMessage>();
     _setRemoteResponseTimer(completer, request, id);
     
-    _send(new TalkMessage(id, request, reply != null ? reply.request : 0, data));
+    _send(new TalkMessage(id, request, replying != null ? replying.request : 0, data));
     return completer.future;
   }
 
@@ -268,7 +268,7 @@ class TalkSocket {
       // Check if it's not already been removed, may happen due to race condition
       if (_localReplyTimers.containsKey(message.request)) {
         print("Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
-        sendMessage(_idExcept, utf8.encode("No Reply Sent"), reply: message);
+        sendMessage(_idExcept, utf8.encode("No Reply Sent"), replying: message);
         _localReplyTimers.remove(message.request);
       }
     });
