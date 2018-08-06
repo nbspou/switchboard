@@ -63,11 +63,11 @@ class TalkSocket {
   /// Disconnection exceptions and so on will come from here.
   /// When this returns, the connection is guaranteed dead.
   /// Can only be called once.
-  Future listen() async {
+  Future<Null> listen() async {
     return await _listen(_webSocket);
   }
 
-  void _listen(Stream<dynamic> s) async {
+  Future<Null> _listen(Stream<dynamic> s) async {
     if (!_listening) {
       throw new TalkException("Not listening to this talk socket, connection was already lost");
     }
