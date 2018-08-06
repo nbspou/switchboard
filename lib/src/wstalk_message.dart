@@ -1,4 +1,3 @@
-
 class TalkMessage {
   final int id;
   final int request;
