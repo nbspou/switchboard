@@ -308,7 +308,7 @@ class TalkSocket {
       if (_localReplyTimers.containsKey(message.request)) {
         print(
             "Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
-        sendMessage(_idExcept, utf8.encode("No Reply Sent"), replying: message);
+        sendException("No Reply Sent", message);
         _localReplyTimers.remove(message.request);
       }
     });
@@ -332,8 +332,9 @@ class TalkSocket {
       // they are passed directly to the requesting function
       if (!_remoteResponseStates.containsKey(message.response)) {
         // Response received but no longer expected
-        sendMessage(
-            _idExcept, utf8.encode("No Request Sent / Response Timeout"));
+        if (message.request != 0) {
+          sendException("No Request Sent / Response Timeout", message);
+        }
         print(
             "Message was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
       } else {
