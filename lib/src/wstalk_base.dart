@@ -57,7 +57,11 @@ class TalkSocket {
           "Received '_EXCEPT_' with no response identifier. Invalid message");
     });
     stream(_idPing).listen((TalkMessage message) {
-      sendMessage(_idPong, new List<int>(), replying: message);
+      try {
+        sendMessage(_idPong, new List<int>(), replying: message);
+      } catch (error, stack) {
+        // Can silently discard any failure here, it's not important
+      }
     });
   }
 
