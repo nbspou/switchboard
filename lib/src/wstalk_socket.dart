@@ -113,7 +113,7 @@ class TalkSocket {
           List<int> bytes = e;
           int reserved =
               bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
-          if (reserved != 1 || reserved != 3)
+          if (reserved != 1 && reserved != 3)
             throw new TalkException(
                 "Unexpected reserved value (${reserved}), expect 1 or 3");
           int id = bytes[4] |
