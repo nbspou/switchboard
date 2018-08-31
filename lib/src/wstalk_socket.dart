@@ -77,7 +77,17 @@ class TalkSocket {
     });
     stream(_idPing).listen((TalkMessage message) {
       try {
-        sendMessage(_idPong, new List<int>(), replying: message);
+        sendMessage(_idPong, new Uint8List(0), replying: message);
+      } catch (error, stack) {
+        // Can silently discard any failure here, it's not important
+      }
+    });
+    stream(_idMultiPing).listen((TalkMessage message) {
+      try {
+        for (int i = 0; i < 4; ++i) {
+          sendMessage(_idMultiPong, new Uint8List(0), replying: message);
+        }
+        sendEndOfStream(message);
       } catch (error, stack) {
         // Can silently discard any failure here, it's not important
       }
@@ -103,9 +113,9 @@ class TalkSocket {
           List<int> bytes = e;
           int reserved =
               bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
-          if (reserved != 1 || reserved != 2)
+          if (reserved != 1 || reserved != 3)
             throw new TalkException(
-                "Unexpected reserved value (${reserved}), expect 1 or 2");
+                "Unexpected reserved value (${reserved}), expect 1 or 3");
           int id = bytes[4] |
               (bytes[5] << 8) |
               (bytes[6] << 16) |
@@ -117,7 +127,7 @@ class TalkSocket {
           int request = bytes[12] | (bytes[13] << 8);
           int response = bytes[14] | (bytes[15] << 8);
           List<int> data = bytes.sublist(16);
-          bool streamRequest = reserved == 2;
+          bool streamRequest = reserved == 3;
           TalkMessage message = new TalkMessage(id, request, response, data, streamRequest);
           _received(message);
         } else {
@@ -142,16 +152,25 @@ class TalkSocket {
 
   Future<int> ping() async {
     DateTime now = new DateTime.now();
-    TalkMessage pong = await sendRequest(_idPing, new List<int>());
+    TalkMessage pong = await sendRequest(_idPing, new Uint8List(0));
     assert(pong.id == _idPong);
     return new DateTime.now().millisecondsSinceEpoch -
         now.millisecondsSinceEpoch;
   }
 
+  Stream<int> multiPing() async* {
+    DateTime now = new DateTime.now();
+    await for (TalkMessage pong in sendStreamRequest(_idMultiPing, new Uint8List(0))) {
+      assert(pong.id == _idMultiPong);
+      yield new DateTime.now().millisecondsSinceEpoch -
+          now.millisecondsSinceEpoch;
+    }
+  }
+
   // stream responses and completions can be requests as well!
   void _send(TalkMessage message) async {
     Uint8List data = new Uint8List(message.data.length + 16);
-    data[0] = message.streamRequest ? 2 : 1;
+    data[0] = message.streamRequest ? 3 : 1;
     data[1] = 0;
     data[2] = 0;
     data[3] = 0;
@@ -425,6 +444,24 @@ class TalkSocket {
               "Message was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
         } else {
           // TODO: Received response to stream request, depending on the message mode the request will be closed
+          _RemoteStreamResponseState state = _remoteStreamResponseStates[message.response];
+          _remoteStreamResponseStates.remove(message.response);
+          state.timer.cancel();
+          if (message.id == _idExtend) {
+            // Extend. Don't further process the message
+            _setRemoteStreamResponseTimer(state.controller, message.response, state.id);
+          } else if (message.id == _idEndOfStream) {
+            // End of stream. Don't further process the message
+            state.controller.close();
+          } else if (message.id == _idExcept) {
+            // Exception. Also end of stream
+            state.controller.addError(new TalkException(utf8.decode(message.data)));
+            state.controller.close();
+          } else {
+            // Received stream response. Keep waiting for more
+            _setRemoteStreamResponseTimer(state.controller, message.response, state.id);
+            state.controller.add(message);
+          }
         }
       } else {
         // Received response to a regular request
