@@ -43,6 +43,13 @@ testClient(TalkSocket ts) async {
   for (int i = 0; i < 3; ++i) {
     print(await ts.ping());
   }
+  // Multi-ping three times
+  for (int i = 0; i < 3; ++i) {
+    // Receive four responses for each
+    await for (int dt in ts.multiPing()) {
+      print(dt);
+    }
+  }
   // Tell the server to close
   ts.sendMessage(42, new List<int>());
 }
