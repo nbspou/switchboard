@@ -4,7 +4,20 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'wstalk_message.dart';
-import 'wstalk_impl.dart';
+
+class _RemoteResponseState {
+  final int id;
+  final Completer<TalkMessage> completer;
+  final Timer timer;
+  const _RemoteResponseState(this.id, this.completer, this.timer);
+}
+
+class _RemoteStreamResponseState {
+  final int id;
+  final StreamController<TalkMessage> controller;
+  final Timer timer;
+  const _RemoteStreamResponseState(this.id, this.controller, this.timer);
+}
 
 class TalkException implements Exception {
   final String message;
@@ -26,6 +39,10 @@ class TalkSocket {
   static int _idPing = encode("__PING__");
   static int _idPong = encode("__PONG__");
 
+  static int _idEndOfStream = encode("__EOFS__");
+  static int _idMultiPing = encode("_M_PING_");
+  static int _idMultiPong = encode("_M_PONG_");
+
   final WebSocket _webSocket;
 
   Map<int, StreamController<TalkMessage>> _streams =
@@ -33,8 +50,10 @@ class TalkSocket {
   bool _listening;
 
   Map<int, Timer> _localReplyTimers = new Map<int, Timer>();
-  Map<int, RemoteResponseState> _remoteResponseStates =
-      new Map<int, RemoteResponseState>();
+  Map<int, _RemoteResponseState> _remoteResponseStates =
+      new Map<int, _RemoteResponseState>();
+  Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
+      new Map<int, _RemoteStreamResponseState>();
 
   int _nextRequestId = 1;
 
@@ -84,9 +103,9 @@ class TalkSocket {
           List<int> bytes = e;
           int reserved =
               bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24);
-          if (reserved != 1)
+          if (reserved != 1 || reserved != 2)
             throw new TalkException(
-                "Unexpected reserved value (${reserved}), expect 1");
+                "Unexpected reserved value (${reserved}), expect 1 or 2");
           int id = bytes[4] |
               (bytes[5] << 8) |
               (bytes[6] << 16) |
@@ -98,7 +117,8 @@ class TalkSocket {
           int request = bytes[12] | (bytes[13] << 8);
           int response = bytes[14] | (bytes[15] << 8);
           List<int> data = bytes.sublist(16);
-          TalkMessage message = new TalkMessage(id, request, response, data);
+          bool streamRequest = reserved == 2;
+          TalkMessage message = new TalkMessage(id, request, response, data, streamRequest);
           _received(message);
         } else {
           throw new TalkException(
@@ -128,9 +148,10 @@ class TalkSocket {
         now.millisecondsSinceEpoch;
   }
 
+  // stream responses and completions can be requests as well!
   void _send(TalkMessage message) async {
-    List<int> data = new List<int>(message.data.length + 16);
-    data[0] = 1;
+    Uint8List data = new Uint8List(message.data.length + 16);
+    data[0] = message.streamRequest ? 2 : 1;
     data[1] = 0;
     data[2] = 0;
     data[3] = 0;
@@ -156,6 +177,7 @@ class TalkSocket {
       _localReplyTimers[replying.request].cancel();
       _localReplyTimers.remove(replying.request);
       _setLocalReplyTimer(replying);
+      // Note this isn't using 'more', specially handled
       sendMessage(_idExtend, new Uint8List(0), replying: replying);
     } else {
       throw new TalkException(
@@ -163,12 +185,16 @@ class TalkSocket {
     }
   }
 
+  void sendEndOfStream(TalkMessage replying) {
+    sendMessage(_idEndOfStream, new Uint8List(0), replying: replying);
+  }
+
   /// Throw an exception as message reply
   void sendException(String message, TalkMessage replying) {
     sendMessage(_idExcept, utf8.encode(message), replying: replying);
   }
 
-  void sendMessage(int id, List<int> data, {TalkMessage replying}) {
+  void sendMessage(int id, List<int> data, {TalkMessage replying,}) {
     if (!_listening) {
       throw new TalkException(
           "Not sending to this talk socket, connection was already lost");
@@ -181,6 +207,9 @@ class TalkSocket {
       }
       _localReplyTimers[replying.request].cancel();
       _localReplyTimers.remove(replying.request);
+      // Keep restoring timer until end of stream
+      if (replying.streamRequest && id != _idEndOfStream)
+        _setLocalReplyTimer(replying);
     }
 
     _send(
@@ -200,20 +229,43 @@ class TalkSocket {
       }
     });
     _remoteResponseStates[request] =
-        new RemoteResponseState(id, completer, timer);
+        new _RemoteResponseState(id, completer, timer);
   }
 
-  Future<TalkMessage> sendRequest(int id, List<int> data,
-      {TalkMessage replying}) {
+  void _setRemoteStreamResponseTimer(
+      StreamController<TalkMessage> controller, int request, int id) {
+    Timer timer = new Timer(new Duration(milliseconds: _receiveTimeOutMs), () {
+      // Check if it's not already been removed, may happen due to race condition
+      if (_remoteStreamResponseStates.containsKey(request)) {
+        print(
+            "Message was not replied to further by the remote server in time '${decode(id)}', throw exception");
+        controller.addError(new TalkException(
+            "No additional streaming replies received in time from the remote server"));
+        controller.close();
+        _remoteStreamResponseStates.remove(request);
+      }
+    });
+    _remoteStreamResponseStates[request] =
+        new _RemoteStreamResponseState(id, controller, timer);
+  }
+
+  void _preValidateRequest() {
     if (!_listening) {
       throw new TalkException(
           "Not sending to this talk socket, connection was already lost");
     }
 
-    if (_remoteResponseStates.length >= 4096) {
+    if (_remoteResponseStates.length + _remoteStreamResponseStates.length >=
+        4096) {
       throw new TalkException(
           "Too many requests sent, potential out-of-memory attack");
     }
+  }
+
+  /// Sends a request, expecting a message in reply
+  Future<TalkMessage> sendRequest(int id, List<int> data,
+      {TalkMessage replying,}) {
+    _preValidateRequest();
 
     if (replying != null) {
       if (!_localReplyTimers.containsKey(replying.request)) {
@@ -222,6 +274,9 @@ class TalkSocket {
       }
       _localReplyTimers[replying.request].cancel();
       _localReplyTimers.remove(replying.request);
+      // Keep restoring timer until end of stream
+      if (replying.streamRequest && id != _idEndOfStream)
+        _setLocalReplyTimer(replying);
     }
 
     int request = _nextRequestId;
@@ -230,9 +285,39 @@ class TalkSocket {
     Completer<TalkMessage> completer = new Completer<TalkMessage>();
     _setRemoteResponseTimer(completer, request, id);
 
-    _send(new TalkMessage(
-        id, request, replying != null ? replying.request : 0, data));
+    _send(
+        new TalkMessage(
+            id, request, replying != null ? replying.request : 0, data));
     return completer.future;
+  }
+
+  Stream<TalkMessage> sendStreamRequest(int id, List<int> data,
+      {TalkMessage replying,}) {
+    _preValidateRequest();
+
+    if (replying != null) {
+      if (!_localReplyTimers.containsKey(replying.request)) {
+        throw new TalkException(
+            "Request was already replied to, or request timed out");
+      }
+      _localReplyTimers[replying.request].cancel();
+      _localReplyTimers.remove(replying.request);
+      // Keep restoring timer until end of stream
+      if (replying.streamRequest && id != _idEndOfStream)
+        _setLocalReplyTimer(replying);
+    }
+
+    int request = _nextRequestId;
+    _incrementNextRequestId();
+
+    StreamController<TalkMessage> controller =
+        new StreamController<TalkMessage>();
+    _setRemoteStreamResponseTimer(controller, request, id);
+
+    _send(
+        new TalkMessage(
+            id, request, replying != null ? replying.request : 0, data, true));
+    return controller.stream;
   }
 
   void _incrementNextRequestId() {
@@ -331,14 +416,19 @@ class TalkSocket {
       // Responding messages are handled specially,
       // they are passed directly to the requesting function
       if (!_remoteResponseStates.containsKey(message.response)) {
-        // Response received but no longer expected
-        if (message.request != 0) {
-          sendException("No Request Sent / Response Timeout", message);
+        if (!_remoteStreamResponseStates.containsKey(message.response)) {
+          // Response received but no longer expected
+          if (message.request != 0) {
+            sendException("No Request Sent / Response Timeout", message);
+          }
+          print(
+              "Message was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
+        } else {
+          // TODO: Received response to stream request, depending on the message mode the request will be closed
         }
-        print(
-            "Message was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
       } else {
-        RemoteResponseState state = _remoteResponseStates[message.response];
+        // Received response to a regular request
+        _RemoteResponseState state = _remoteResponseStates[message.response];
         _remoteResponseStates.remove(message.response);
         state.timer.cancel();
         if (message.id == _idExtend) {
@@ -365,12 +455,20 @@ class TalkSocket {
       timer.cancel();
     }
     _localReplyTimers.clear();
-    for (RemoteResponseState state in _remoteResponseStates.values) {
+    for (_RemoteResponseState state in _remoteResponseStates.values) {
       state.timer.cancel();
       state.completer.completeError(
           new TalkException("Talk socket closing, reply cannot be received"));
     }
     _remoteResponseStates.clear();
+    for (_RemoteStreamResponseState state
+        in _remoteStreamResponseStates.values) {
+      state.timer.cancel();
+      state.controller.addError(
+          new TalkException("Talk socket closing, replies cannot be received"));
+      state.controller.close();
+    }
+    _remoteStreamResponseStates.clear();
   }
 
   // Closes the connection
