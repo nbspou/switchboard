@@ -52,7 +52,7 @@ abstract class Channel {
       Uint8List subFrame = buffer.asUint8List(offset + o);
       String procedureId = utf8.decode(procedureIdRaw.takeWhile((c) => c != 0));
       // This message expects a stream response (if not set, can only send timeout extend stream response)
-      bool expectStreamResponse = (flags & 0x08) != 0;
+      // bool expectStreamResponse = (flags & 0x08) != 0; // not necessary
       // This message is a stream response (a non-stream-response signals end-of-stream)
       bool isStreamResponse = (flags & 0x30) == 0x10;
       // Timeout extend message (must be a stream response) (an extend message with a request id extends the timeout)
@@ -68,5 +68,41 @@ abstract class Channel {
 
   void _listen() {
     _raw.listen(_onFrame);
+  }
+
+  void sendMessage() {
+
+  }
+
+  void sendStreamRequest() {
+
+  }
+
+  void sendRequest() {
+
+  }
+
+  void replyMessageStream() {
+
+  }
+
+  void replyRequestStream() {
+    
+  }
+
+  void replyStreamRequestStream() {
+
+  }
+
+  void replyMessage() {
+
+  }
+
+  void replyRequest() {
+    
+  }
+
+  void replyStreamRequest() {
+
   }
 }
