@@ -331,3 +331,8 @@ abstract class Channel {
   }
   */
 }
+
+// when creating a channel through switchboard, can specify an existing channel to receive the 'openChannel' callback
+// this permits to inherit state and other stuff
+
+// switchboard essentially handles the openChannel payload format
