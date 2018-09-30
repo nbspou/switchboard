@@ -23,6 +23,9 @@ abstract class Connection {
 
   Future<void> close();
 
+  // channels are immediately valid until closed -----------------------
+  RawChannel openChannel();
+
 /*
   Future<Channel> openChannel() {
 
