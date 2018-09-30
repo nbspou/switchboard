@@ -51,6 +51,10 @@ abstract class Channel {
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
       new Map<int, _RemoteStreamResponseState>(); // TODO -------------
 
+  RawChannel get channel {
+    return _raw;
+  }
+
   RawChannel _raw;
   Channel(RawChannel raw) {
     _raw = raw;
