@@ -47,9 +47,9 @@ abstract class Channel {
   Map<int, _LocalAnyResponseState> _localAnyResponseStates =
       new Map<int, _LocalAnyResponseState>();
   Map<int, _RemoteResponseState> _remoteResponseStates =
-      new Map<int, _RemoteResponseState>();
+      new Map<int, _RemoteResponseState>(); // TODO -------------
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
-      new Map<int, _RemoteStreamResponseState>();
+      new Map<int, _RemoteStreamResponseState>(); // TODO -------------
 
   RawChannel _raw;
   Channel(RawChannel raw) {
@@ -126,7 +126,8 @@ abstract class Channel {
       bool isTimeoutExtend = (flags & 0x30) == 0x30;
       // Abort message (must be non-stream response) (an abort message with a request id is a request cancellation)
       bool isAbort = (flags & 0x30) == 0x20;
-      Message message = new Message(procedureId, requestId, responseId, subFrame);
+      Message message =
+          new Message(procedureId, requestId, responseId, subFrame);
 
       // Process message
       if (requestId != 0) {
@@ -138,11 +139,12 @@ abstract class Channel {
           return;
         }
         // Set the timer
-        RewindableTimer timer = new RewindableTimer(new Duration(milliseconds: _sendTimeOutMs), () {
+        RewindableTimer timer =
+            new RewindableTimer(new Duration(milliseconds: _sendTimeOutMs), () {
           // Check if it's not already been removed, may happen due to race condition
           if (_localAnyResponseStates.containsKey(requestId)) {
             print(
-                "Message was not replied to by the local program in time '$procedureId', abort");
+                "Message '$procedureId' was not replied to by the local program in time, abort");
             _replyAbort(requestId, "Reply not sent in time");
             _localAnyResponseStates.remove(requestId);
           }
@@ -173,7 +175,9 @@ abstract class Channel {
     ++_lastRequestId;
     _lastRequestId &= 0xFFFFFF;
     if (_lastRequestId == 0) ++_lastRequestId;
-    while ((_remoteResponseStates[_lastRequestId] ?? _remoteStreamResponseStates[_lastRequestId]) != null) {
+    while ((_remoteResponseStates[_lastRequestId] ??
+            _remoteStreamResponseStates[_lastRequestId]) !=
+        null) {
       ++_lastRequestId;
       _lastRequestId &= 0xFFFFFF;
       if (_lastRequestId == 0) ++_lastRequestId;
@@ -234,8 +238,7 @@ abstract class Channel {
   }
 
   void _replyAbort(int responseId, String reason) {
-    _sendMessage(
-        "", utf8.encode(reason), responseId, false, 0, false, true);
+    _sendMessage("", utf8.encode(reason), responseId, false, 0, false, true);
   }
 
   void _sendingResponse(int responseId, bool isStreamResponse) {
@@ -262,7 +265,7 @@ abstract class Channel {
     int requestId = _makeRequestId();
     _sendingResponse(responseId, isStreamResponse);
     _sendMessage(procedureId, data, responseId, isStreamResponse, requestId);
-    // TODO: Handle stuff
+    // TODO: Handle stuff // TODO -------------
   }
 
   Stream<Message> sendStreamRequest(String procedureId, Uint8List data,
@@ -271,7 +274,7 @@ abstract class Channel {
     _sendingResponse(responseId, isStreamResponse);
     _sendMessage(
         procedureId, data, responseId, isStreamResponse, requestId, true);
-    // TODO: Handle stuff
+    // TODO: Handle stuff // TODO -------------
   }
 
   void replyMessage(Message replying, String procedureId, Uint8List data) {
