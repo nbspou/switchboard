@@ -1,11 +1,11 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/connection_impl.dart';
+import 'package:wstalk/src/mux_connection_impl.dart';
 import 'package:wstalk/src/raw_channel.dart';
 
 class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
-  final ConnectionImpl connection;
+  final MuxConnectionImpl connection;
   final int channelId;
   RawChannelImpl(this.connection, this.channelId);
 
@@ -53,13 +53,14 @@ class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
     if (!_streamController.isClosed && !_closing) {
       _closing = true;
       try {
-        await connection.closeChannel(channelId);
+        connection.closeChannel(channelId);
       } catch (error, stack) {
         rethrow;
       } finally {
         _closing = false;
       }
     }
+    await _streamController.done;
   }
 
   @override
@@ -68,7 +69,7 @@ class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
   @override
   StreamSubscription<Uint8List> listen(void Function(Uint8List event) onData,
       {Function onError, void Function() onDone, bool cancelOnError}) {
-    _streamController.stream.listen(onData,
+    return _streamController.stream.listen(onData,
         onError: onError, onDone: onDone, cancelOnError: cancelOnError);
   }
 }

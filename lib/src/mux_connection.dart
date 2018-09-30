@@ -10,29 +10,19 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/channel.dart';
 import 'package:wstalk/src/raw_channel.dart';
 import 'package:wstalk/src/raw_channel_impl.dart';
 
-abstract class Connection {
-  bool get channelsAvailable;
+const int kMaxConnectionFrameHeaderSize = 7;
 
-  Connection(WebSocket webSocket, Function() onClose, {bool client = true});
+abstract class MuxConnection {
+  Connection(WebSocket webSocket, {Function(RawChannel channel, Uint8List payLoad) onChannel, Function() onClose, bool client = true});
 
   bool get isOpen;
+  bool get channelsAvailable;
+  RawChannel openChannel(Uint8List payLoad);
 
   Future<void> close();
-
-  // channels are immediately valid until closed -----------------------
-  RawChannel openChannel();
-
-/*
-  Future<Channel> openChannel() {
-
-  }*/
-
-  // & openRawChannel()
-  // etc
 }
 
 /* end of file */
