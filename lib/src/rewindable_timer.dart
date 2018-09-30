@@ -12,7 +12,7 @@ class RewindableTimer {
   Duration _duration;
   Function() _callback;
 
-  ExtendableTimer(Duration duration, Function() callback) {
+  RewindableTimer(Duration duration, Function() callback) {
     _duration = duration;
     _callback = callback;
     _timer = new Timer(duration, callback);
