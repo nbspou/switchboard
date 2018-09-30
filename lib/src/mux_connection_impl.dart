@@ -233,4 +233,6 @@ class MuxConnectionImpl implements MuxConnection {
   }
 }
 
+// TODO: On close channel and 0 active channels remaining, close() after 10 seconds of no activity (cancel timeout on open channel)
+
 /* end of file */
