@@ -32,6 +32,7 @@ class MuxConnectionImpl implements MuxConnection {
   static const int _keepAliveIntervalMs = 10000;
 
   Timer _closeTimeoutTimer;
+  bool _autoCloseEmptyConnection;
   bool _keepActiveAlivePing;
 
   bool get channelsAvailable {
@@ -47,6 +48,7 @@ class MuxConnectionImpl implements MuxConnection {
     bool autoCloseEmptyConnection = false,
     bool keepActiveAlivePing = true,
   }) {
+    _autoCloseEmptyConnection = autoCloseEmptyConnection;
     _keepActiveAlivePing = keepActiveAlivePing;
     _webSocket = webSocket;
     _nextChannelId = client ? 2 : 3;
@@ -58,6 +60,13 @@ class MuxConnectionImpl implements MuxConnection {
     if (keepActiveAlivePing) {
       _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
     }
+    if (autoCloseEmptyConnection) {
+      _closeTimeoutTimer = new Timer(new Duration(milliseconds: _closeTimeoutMs), () {
+        // Empty connection timeout
+        _closeTimeoutTimer = null;
+        close();
+      });
+    }
   }
 
   bool isLocalChannel(RawChannelImpl channel) {
@@ -65,6 +74,10 @@ class MuxConnectionImpl implements MuxConnection {
   }
 
   void _onCloseDo(Function() onClose) {
+    if (_closeTimeoutTimer != null) {
+      _closeTimeoutTimer.cancel();
+      _closeTimeoutTimer = null;
+    }
     if (onClose != null) {
       try {
         onClose();
@@ -188,6 +201,10 @@ class MuxConnectionImpl implements MuxConnection {
             if (_keepActiveAlivePing) {
               _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
             }
+            if (_closeTimeoutTimer != null) {
+              _closeTimeoutTimer.cancel();
+              _closeTimeoutTimer = null;
+            }
             _onChannel(channel, subFrame);
           } else {
             // TODO: LOG: Error. Remote attempts to open a channel which is already open or closing.
@@ -208,8 +225,17 @@ class MuxConnectionImpl implements MuxConnection {
               // Reply confirmation
               _closeChannel(channelId);
             }
-            if (_keepActiveAlivePing && _channels.isEmpty && _closingChannels.isEmpty) {
-              _webSocket.pingInterval = null;
+            if (_channels.isEmpty && _closingChannels.isEmpty) {
+              if (_keepActiveAlivePing) {
+                _webSocket.pingInterval = null;
+              }
+              if (_autoCloseEmptyConnection && _closeTimeoutTimer == null) {
+                _closeTimeoutTimer = new Timer(new Duration(milliseconds: _closeTimeoutMs), () {
+                  // Empty connection timeout
+                  _closeTimeoutTimer = null;
+                  close();
+                });
+              }
             }
           } else {
             // TODO: LOG: Error. Invalid channel specified by remote.
@@ -284,6 +310,10 @@ class MuxConnectionImpl implements MuxConnection {
     sendFrame(channelId, frame, command: 1);
     if (_keepActiveAlivePing) {
       _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
+    }
+    if (_closeTimeoutTimer != null) {
+      _closeTimeoutTimer.cancel();
+      _closeTimeoutTimer = null;
     }
     return channel;
   }
