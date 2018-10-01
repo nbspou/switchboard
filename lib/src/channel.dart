@@ -204,10 +204,10 @@ abstract class Channel {
     if (hasResponseId) headerSize += 3;
 
     // Expand data frame with channel header plus mux header capacity
-    int fullHeaderSize = headerSize + kMaxConnectionFrameHeaderSize;
+    int fullHeaderSize = headerSize + kReserveMuxConnectionHeaderSiwe;
     Uint8List fullFrame = Uint8List(fullHeaderSize) + data;
     Uint8List frame =
-        fullFrame.buffer.asUint8List(kMaxConnectionFrameHeaderSize);
+        fullFrame.buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
     int flags = 0;
     if (hasProcedureId) flags |= 0x01;
     if (hasRequestId) flags |= 0x02;

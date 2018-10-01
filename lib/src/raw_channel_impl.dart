@@ -19,7 +19,7 @@ class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
     _streamController.add(frame);
   }
 
-  void channelClosed() {
+  void channelRemoteClosed() {
     // Channel has been closed
     try {
       if (!_streamController.isClosed) {
@@ -53,7 +53,7 @@ class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
     if (!_streamController.isClosed && !_closing) {
       _closing = true;
       try {
-        connection.closeChannel(channelId);
+        connection.closeChannel(this);
       } catch (error, stack) {
         rethrow;
       } finally {

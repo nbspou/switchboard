@@ -1,5 +1,5 @@
 /*
-WSTalk
+Switchboard
 Microservice Network Architecture
 Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
@@ -19,7 +19,10 @@ class MuxConnectionImpl implements MuxConnection {
   Function(RawChannel channel, Uint8List payLoad) _onChannel;
   Function() _onClose;
 
+  /// Open channels
   final Map<int, RawChannelImpl> _channels = new Map<int, RawChannelImpl>();
+
+  /// Channels to which the close command has been sent, which have not yet received close confirmation
   final Map<int, RawChannelImpl> _closingChannels = new Map<int, RawChannelImpl>();
 
   int _nextChannelId;
@@ -56,7 +59,7 @@ class MuxConnectionImpl implements MuxConnection {
     _closingChannels.clear();
     for (RawChannelImpl channel in channels) {
       try {
-        channel.channelClosed();
+        channel.channelRemoteClosed();
       } catch (error, stack) {
         // TODO: LOG: Error closing channels.
       }
@@ -146,13 +149,15 @@ class MuxConnectionImpl implements MuxConnection {
             (frame[6] << 40);
         subFrame = buffer.asUint8List(offset + 7);
       }
+       // Can still receive frames when close was sent to the remote
       RawChannelImpl channel = _channels[channelId] ?? _closingChannels[channelId];
       switch (systemCommand) {
         case 0: // data
           if (channel != null) {
             channel.receivedFrame(subFrame);
           } else {
-            // TODO: LOG: Error. Invalid channel specified by remote.
+            // TODO: LOG: Error. Remote attempts to communicate on a closed channel.
+            close();
           }
           break;
         case 1: // open channel
@@ -161,25 +166,32 @@ class MuxConnectionImpl implements MuxConnection {
             _channels[channelId] = channel;
             _onChannel(channel, subFrame);
           } else {
-            // TODO: LOG: Error. Invalid channel specified by remote. Already in use.
+            // TODO: LOG: Error. Remote attempts to open a channel which is already open or closing.
+            close();
           }
           break;
         case 2: // close channel
           if (channel != null) {
-            channel.channelClosed();
+            // Remote closes the channel
+            channel.channelRemoteClosed();
             if (_channels.remove(channelId) == null) {
               // This is the confirmation
-              _closingChannels.remove(channelId);
+              if (_closingChannels.remove(channelId) == null) {
+                // TODO: LOG: Attempt to close channel twice. Protocol violation, close connection.
+                close();
+              }
             } else {
               // Reply confirmation
-              closeChannel(channelId);
+              _closeChannel(channelId);
             }
           } else {
             // TODO: LOG: Error. Invalid channel specified by remote.
+            close();
           }
           break;
         case 3:
           // TODO: LOG: Error. Invalid system command.
+          close();
           break;
       }
     } catch (error, stack) {
@@ -215,8 +227,16 @@ class MuxConnectionImpl implements MuxConnection {
   }
 
   // RawChannel.close();
-  void closeChannel(int channelId) {
-    Uint8List frame = new Uint8List(kMaxConnectionFrameHeaderSize).buffer.asUint8List(kMaxConnectionFrameHeaderSize);
+  void closeChannel(RawChannelImpl channel) {
+    if (_channels.remove(channel.channelId) != null) {
+      _closingChannels[channel.channelId] = channel;
+      _closeChannel(channel.channelId);
+    }
+  }
+  
+  // RawChannel.close();
+  void _closeChannel(int channelId) {
+    Uint8List frame = new Uint8List(kReserveMuxConnectionHeaderSiwe).buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
     sendFrame(channelId, frame, command: 2);
   }
 
@@ -227,7 +247,7 @@ class MuxConnectionImpl implements MuxConnection {
     int channelId = _nextChannelId++;
     RawChannelImpl channel = new RawChannelImpl(this, channelId);
     _channels[channelId] = channel;
-    Uint8List frame = payLoad ?? new Uint8List(kMaxConnectionFrameHeaderSize).buffer.asUint8List(kMaxConnectionFrameHeaderSize);
+    Uint8List frame = payLoad ?? new Uint8List(kReserveMuxConnectionHeaderSiwe).buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
     sendFrame(channelId, frame, command: 1);
     return channel;
   }
