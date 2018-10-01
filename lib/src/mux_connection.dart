@@ -38,10 +38,16 @@ import 'package:wstalk/src/raw_channel_impl.dart';
 const int kReserveMuxConnectionHeaderSiwe = 7;
 
 abstract class MuxConnection {
-  Connection(WebSocket webSocket,
-      {Function(RawChannel channel, Uint8List payLoad) onChannel,
-      Function() onClose,
-      bool client = true});
+  Connection(
+    WebSocket webSocket, {
+    Function(RawChannel channel, Uint8List payLoad) onChannel,
+    Function() onClose,
+    bool client = true,
+    // Close the connection after 10 seconds if there are no open channels
+    bool autoCloseEmptyConnection = false,
+    // Send a keep-alive ping over the connection every 10 seconds, as long as there are open channels
+    bool keepActiveAlivePing = true,
+  });
 
   bool get isOpen;
   bool get channelsAvailable;

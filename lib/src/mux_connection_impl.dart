@@ -23,16 +23,31 @@ class MuxConnectionImpl implements MuxConnection {
   final Map<int, RawChannelImpl> _channels = new Map<int, RawChannelImpl>();
 
   /// Channels to which the close command has been sent, which have not yet received close confirmation
-  final Map<int, RawChannelImpl> _closingChannels = new Map<int, RawChannelImpl>();
+  final Map<int, RawChannelImpl> _closingChannels =
+      new Map<int, RawChannelImpl>();
 
   int _nextChannelId;
+
+  static const int _closeTimeoutMs = 10000;
+  static const int _keepAliveIntervalMs = 10000;
+
+  Timer _closeTimeoutTimer;
+  bool _keepActiveAlivePing;
 
   bool get channelsAvailable {
     return _nextChannelId < 0x1000000000000;
   }
 
   // Function onChannel fires anytime a channel is added by the remote host. Function onClose fires when the connection closed.
-  Connection(WebSocket webSocket, {Function(RawChannel channel, Uint8List payLoad) onChannel, Function() onClose, bool client = true}) {
+  Connection(
+    WebSocket webSocket, {
+    Function(RawChannel channel, Uint8List payLoad) onChannel,
+    Function() onClose,
+    bool client = true,
+    bool autoCloseEmptyConnection = false,
+    bool keepActiveAlivePing = true,
+  }) {
+    _keepActiveAlivePing = keepActiveAlivePing;
     _webSocket = webSocket;
     _nextChannelId = client ? 2 : 3;
     _onChannel = onChannel;
@@ -40,6 +55,9 @@ class MuxConnectionImpl implements MuxConnection {
       _onCloseDo(onClose);
     };
     _listen();
+    if (keepActiveAlivePing) {
+      _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
+    }
   }
 
   bool isLocalChannel(RawChannelImpl channel) {
@@ -47,14 +65,15 @@ class MuxConnectionImpl implements MuxConnection {
   }
 
   void _onCloseDo(Function() onClose) {
-    if (onClose != null) { 
+    if (onClose != null) {
       try {
         onClose();
       } catch (error, stack) {
         // TODO: LOG: Error in close callback.
       }
     }
-    List<RawChannelImpl> channels = (_channels.values.toList()..addAll(_closingChannels.values));
+    List<RawChannelImpl> channels =
+        (_channels.values.toList()..addAll(_closingChannels.values));
     _channels.clear();
     _closingChannels.clear();
     for (RawChannelImpl channel in channels) {
@@ -137,7 +156,8 @@ class MuxConnectionImpl implements MuxConnection {
       if (unknownFlags) {
         // TODO: LOG: Warning: Remote is using an unknown extension.
       }
-      int systemCommand = (flags & 0x30) >> 4; // 0: data, 1: open channel, 2: close channel, 3: reserved.
+      int systemCommand = (flags & 0x30) >>
+          4; // 0: data, 1: open channel, 2: close channel, 3: reserved.
       int channelId = (frame[1]) | (frame[2] << 8);
       Uint8List subFrame;
       if (shortChannelId) {
@@ -149,8 +169,9 @@ class MuxConnectionImpl implements MuxConnection {
             (frame[6] << 40);
         subFrame = buffer.asUint8List(offset + 7);
       }
-       // Can still receive frames when close was sent to the remote
-      RawChannelImpl channel = _channels[channelId] ?? _closingChannels[channelId];
+      // Can still receive frames when close was sent to the remote
+      RawChannelImpl channel =
+          _channels[channelId] ?? _closingChannels[channelId];
       switch (systemCommand) {
         case 0: // data
           if (channel != null) {
@@ -164,6 +185,9 @@ class MuxConnectionImpl implements MuxConnection {
           if (channel == null) {
             channel = new RawChannelImpl(this, channelId);
             _channels[channelId] = channel;
+            if (_keepActiveAlivePing) {
+              _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
+            }
             _onChannel(channel, subFrame);
           } else {
             // TODO: LOG: Error. Remote attempts to open a channel which is already open or closing.
@@ -184,6 +208,9 @@ class MuxConnectionImpl implements MuxConnection {
               // Reply confirmation
               _closeChannel(channelId);
             }
+            if (_keepActiveAlivePing && _channels.isEmpty && _closingChannels.isEmpty) {
+              _webSocket.pingInterval = null;
+            }
           } else {
             // TODO: LOG: Error. Invalid channel specified by remote.
             close();
@@ -201,7 +228,7 @@ class MuxConnectionImpl implements MuxConnection {
   }
 
   /// Send a frame from a channel.
-  void sendFrame(int channelId, Uint8List frame, { int command }) {
+  void sendFrame(int channelId, Uint8List frame, {int command}) {
     int offset = frame.offsetInBytes;
     bool shortChannelId = (channelId < 0x10000);
     int headerSize = shortChannelId ? 3 : 7;
@@ -209,7 +236,8 @@ class MuxConnectionImpl implements MuxConnection {
     if (offset < headerSize) {
       expandedFrame = new Uint8List(headerSize) + frame;
     } else {
-      expandedFrame = frame.buffer.asUint8List(offset - headerSize, headerSize + frame.lengthInBytes);
+      expandedFrame = frame.buffer
+          .asUint8List(offset - headerSize, headerSize + frame.lengthInBytes);
     }
     int flags = 0;
     if (shortChannelId) flags |= 0x02;
@@ -233,10 +261,12 @@ class MuxConnectionImpl implements MuxConnection {
       _closeChannel(channel.channelId);
     }
   }
-  
+
   // RawChannel.close();
   void _closeChannel(int channelId) {
-    Uint8List frame = new Uint8List(kReserveMuxConnectionHeaderSiwe).buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
+    Uint8List frame = new Uint8List(kReserveMuxConnectionHeaderSiwe)
+        .buffer
+        .asUint8List(kReserveMuxConnectionHeaderSiwe);
     sendFrame(channelId, frame, command: 2);
   }
 
@@ -247,8 +277,14 @@ class MuxConnectionImpl implements MuxConnection {
     int channelId = _nextChannelId++;
     RawChannelImpl channel = new RawChannelImpl(this, channelId);
     _channels[channelId] = channel;
-    Uint8List frame = payLoad ?? new Uint8List(kReserveMuxConnectionHeaderSiwe).buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
+    Uint8List frame = payLoad ??
+        new Uint8List(kReserveMuxConnectionHeaderSiwe)
+            .buffer
+            .asUint8List(kReserveMuxConnectionHeaderSiwe);
     sendFrame(channelId, frame, command: 1);
+    if (_keepActiveAlivePing) {
+      _webSocket.pingInterval = new Duration(milliseconds: _keepAliveIntervalMs);
+    }
     return channel;
   }
 }
