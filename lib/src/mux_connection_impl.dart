@@ -14,6 +14,26 @@ import 'package:wstalk/src/mux_connection.dart';
 import 'package:wstalk/src/raw_channel.dart';
 import 'package:wstalk/src/raw_channel_impl.dart';
 
+/*
+abstract class RootClass {
+  bool iHaveWine;
+  void _really();
+}
+
+abstract class DoStuff implements RootClass {
+  void drinkWine() {
+    iHaveWine = false;
+    _really();
+  }
+}
+
+class Magic extends RootClass with DoStuff {
+  void _really() {
+    drinkWine();
+  }
+}
+*/
+
 class MuxConnectionImpl implements MuxConnection {
   WebSocket _webSocket;
   Function(RawChannel channel, Uint8List payLoad) _onChannel;
