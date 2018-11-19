@@ -155,8 +155,12 @@ abstract class Channel {
         });
         _localAnyResponseStates[requestId] = new _LocalAnyResponseState(timer);
       }
-      if (responseId == 0) {
-        onMessage(message); // TODO -------------
+      if (responseId != 0) {
+        // TODO -------------
+        // This message is a response to a request we've sent
+      } else {
+        // New message, or new request chain
+        onMessage(message);
       }
     } catch (error, stack) {
       // TODO: Error while handling channel frame, channel closed.
