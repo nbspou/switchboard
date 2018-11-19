@@ -8,15 +8,6 @@ Checklist
 - Can send messages over raw channels
 - Exception when sending messages over closed channels
 - (Not tested) Exception when receiving message over remotely closed channel
-- Can open and close a messaging channel
-- Can send basic messages over the messaging channel both ways
-- Can send basic messages requiring response over the messaging channel both ways
-- Can send a chain of three messages over the messaging channel both ways
-- Can send a message requiring a stream response over the messaging channel both ways
-- Exception occurs locally on both sides when a response times out
-- Exception occurs locally on both sides when a the stream response times out
-- First exception to occur is sent accross as an exception message
-- Time extension messages extend the time for exception
 
 */
 
