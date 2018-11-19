@@ -365,7 +365,7 @@ class TalkChannel extends Stream<TalkMessage> {
 
   void replyEndOfStream(TalkMessage replying,
       [String procedureId, Uint8List data]) {
-    // Data is not part of the stream, but post-stream. TODO: Not supported in Dart implementation.
+    // Data is not part of the stream, but post-stream. In the Dart implementation, this is thrown as a TalkEndOfStream error to the message stream.
     replyMessage(replying, procedureId, data ?? new Uint8List(0));
   }
 
@@ -402,7 +402,7 @@ class TalkChannel extends Stream<TalkMessage> {
           sender.replyAbort(message, abort.message);
         } else {
           // TODO: Log error
-          sender.replyAbort(message, "Remote Error");
+          sender.replyAbort(message, "Forward Error");
         }
       });
     } else {
@@ -423,7 +423,7 @@ class TalkChannel extends Stream<TalkMessage> {
           sender.replyAbort(message, abort.message);
         } else {
           // TODO: Log error
-          sender.replyAbort(message, "Remote Error");
+          sender.replyAbort(message, "Forward Error");
         }
       });
     } else {
