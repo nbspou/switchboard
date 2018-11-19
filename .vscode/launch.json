@@ -9,6 +9,12 @@
             "program": "example/wstalk_example.dart",
             "request": "launch",
             "type": "dart"
+        },
+        {
+            "name": "WSTalk2 Mux Test",
+            "program": "test/test_mux.dart",
+            "request": "launch",
+            "type": "dart",
         }
     ]
 }

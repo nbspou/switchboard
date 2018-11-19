@@ -6,7 +6,7 @@ Author: Jan Boon <kaetemi@no-break.space>
 */
 
 /*
-MuxConnection along with the RawChannel class
+MuxConnection along with the MuxChannel class
 implement a multiplexing layer on top of a standard WebSocket.
 
 The frame header consists of
@@ -32,26 +32,45 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/raw_channel.dart';
-import 'package:wstalk/src/raw_channel_impl.dart';
+import 'package:wstalk/src/mux_channel.dart';
+import 'package:wstalk/src/mux_channel_impl.dart';
 
-const int kReserveMuxConnectionHeaderSiwe = 7;
+import 'package:wstalk/src/mux_connection_impl.dart';
+
+const int kReserveMuxConnectionHeaderSize = 7;
+
+class MuxException implements Exception {
+  final String message;
+  const MuxException(this.message);
+  String toString() {
+    return message;
+  }
+}
 
 abstract class MuxConnection {
-  Connection(
+  factory MuxConnection(
     WebSocket webSocket, {
-    Function(RawChannel channel, Uint8List payLoad) onChannel,
+    Function(MuxChannel channel, Uint8List payLoad) onChannel,
     Function() onClose,
     bool client = true,
     // Close the connection after 10 seconds if there are no open channels
     bool autoCloseEmptyConnection = false,
     // Send a keep-alive ping over the connection every 10 seconds, as long as there are open channels
     bool keepActiveAlivePing = true,
-  });
+  }) {
+    return MuxConnectionImpl(
+      webSocket,
+      onChannel: onChannel,
+      onClose: onClose,
+      client: client,
+      autoCloseEmptyConnection: autoCloseEmptyConnection,
+      keepActiveAlivePing: keepActiveAlivePing,
+    );
+  }
 
   bool get isOpen;
   bool get channelsAvailable;
-  RawChannel openChannel(Uint8List payLoad);
+  MuxChannel openChannel(Uint8List payLoad);
 
   Future<void> close();
 }
