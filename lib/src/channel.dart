@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import 'package:wstalk/src/message.dart';
 import 'package:wstalk/src/mux_connection.dart';
-import 'package:wstalk/src/raw_channel.dart';
+import 'package:wstalk/src/mux_channel.dart';
 import 'package:wstalk/src/rewindable_timer.dart';
 
 class _LocalAnyResponseState {
@@ -51,12 +51,12 @@ abstract class Channel {
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
       new Map<int, _RemoteStreamResponseState>(); // TODO -------------
 
-  RawChannel get channel {
+  MuxChannel get channel {
     return _raw;
   }
 
-  RawChannel _raw;
-  Channel(RawChannel raw) {
+  MuxChannel _raw;
+  Channel(MuxChannel raw) {
     _raw = raw;
     _listen();
   }
@@ -204,10 +204,10 @@ abstract class Channel {
     if (hasResponseId) headerSize += 3;
 
     // Expand data frame with channel header plus mux header capacity
-    int fullHeaderSize = headerSize + kReserveMuxConnectionHeaderSiwe;
+    int fullHeaderSize = headerSize + kReserveMuxConnectionHeaderSize;
     Uint8List fullFrame = Uint8List(fullHeaderSize) + data;
     Uint8List frame =
-        fullFrame.buffer.asUint8List(kReserveMuxConnectionHeaderSiwe);
+        fullFrame.buffer.asUint8List(kReserveMuxConnectionHeaderSize);
     int flags = 0;
     if (hasProcedureId) flags |= 0x01;
     if (hasRequestId) flags |= 0x02;

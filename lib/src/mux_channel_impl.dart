@@ -2,17 +2,17 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:wstalk/src/mux_connection_impl.dart';
-import 'package:wstalk/src/raw_channel.dart';
+import 'package:wstalk/src/mux_channel.dart';
 
-class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
+class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
   final MuxConnectionImpl connection;
   final int channelId;
-  RawChannelImpl(this.connection, this.channelId);
+  MuxChannelImpl(this.connection, this.channelId);
 
   StreamController<Uint8List> _streamController =
       new StreamController<Uint8List>();
 
-  bool _closing;
+  bool _closing = false;
 
   void receivedFrame(Uint8List frame) {
     // Remote to local
@@ -55,12 +55,12 @@ class RawChannelImpl extends Stream<Uint8List> implements RawChannel {
       try {
         connection.closeChannel(this);
       } catch (error, stack) {
-        rethrow;
-      } finally {
         _closing = false;
+        rethrow;
       }
     }
     await _streamController.done;
+    _closing = false;
   }
 
   @override
