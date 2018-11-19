@@ -34,6 +34,14 @@ class TalkAbort implements Exception {
   }
 }
 
+class TalkEndOfStream implements Exception {
+  final TalkMessage message;
+  const TalkEndOfStream(this.message);
+  String toString() {
+    return "TalkEndOfStream has message payload";
+  }
+}
+
 class TalkException implements Exception {
   final String message;
   const TalkException(this.message);
@@ -91,8 +99,8 @@ class TalkChannel extends Stream<TalkMessage> {
     _localAnyResponseStates.clear();
     for (_RemoteResponseState state in _remoteResponseStates.values) {
       state.timer.cancel();
-      state.completer.completeError(new TalkException(
-          "Talk channel closing, reply cannot be received"));
+      state.completer.completeError(
+          new TalkException("Talk channel closing, reply cannot be received"));
     }
     _remoteResponseStates.clear();
     for (_RemoteStreamResponseState state
@@ -181,7 +189,8 @@ class TalkChannel extends Stream<TalkMessage> {
         _onAbort(utf8.decode(subFrame));
       } else if (isStreamResponse || isTimeoutExtend) {
         // Invalid message state
-        throw new TalkException("Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
+        throw new TalkException(
+            "Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
       } else {
         // New message, or new request chain
         _onMessage(message);
@@ -354,8 +363,9 @@ class TalkChannel extends Stream<TalkMessage> {
         responseId: replying.requestId, isStreamResponse: true);
   }
 
-  void replyEndOfStream(TalkMessage replying, String procedureId,
-      [Uint8List data]) {
+  void replyEndOfStream(TalkMessage replying,
+      [String procedureId, Uint8List data]) {
+    // Data is not part of the stream, but post-stream. TODO: Not supported in Dart implementation.
     replyMessage(replying, procedureId, data ?? new Uint8List(0));
   }
 
@@ -375,14 +385,51 @@ class TalkChannel extends Stream<TalkMessage> {
     if (replying.requestId != 0) {
       _sendingResponse(replying.requestId, false);
     }
-    _replyAbort(replying.requestId, "Procedure Unknown: ${replying.procedureId}");
+    _replyAbort(
+        replying.requestId, "Procedure Unknown: ${replying.procedureId}");
   }
 
-  /*
-  void requestAbort(TalkMessage request) {
-    // Stream.cancel
+  void _forwardReply(TalkChannel sender, TalkMessage replying, TalkMessage message, bool stream) {
+    if (message.requestId != 0) {
+      replyStreamRequest(replying, message.procedureId, message.data).listen((TalkMessage reply) {
+        sender._forwardReply(sender, message, reply, true);
+      }, onError: (error, stack) {
+        if (error is TalkEndOfStream) {
+          TalkEndOfStream eos = error;
+          sender._forwardReply(sender, message, eos.message, false);
+        } else if (error is TalkAbort) {
+          TalkAbort abort = error;
+          sender.replyAbort(message, abort.message);
+        } else {
+          // TODO: Log error
+          sender.replyAbort(message, "Remote Error");
+        }
+      });
+    } else {
+      replyMessage(replying, message.procedureId, message.data);
+    }
   }
-  */
+
+  void forward(TalkChannel sender, TalkMessage message) {
+    if (message.requestId != 0) {
+      sendStreamRequest(message.procedureId, message.data).listen((TalkMessage reply) {
+        sender._forwardReply(sender, message, reply, true);
+      }, onError: (error, stack) {
+        if (error is TalkEndOfStream) {
+          TalkEndOfStream eos = error;
+          sender._forwardReply(sender, message, eos.message, false);
+        } else if (error is TalkAbort) {
+          TalkAbort abort = error;
+          sender.replyAbort(message, abort.message);
+        } else {
+          // TODO: Log error
+          sender.replyAbort(message, "Remote Error");
+        }
+      });
+    } else {
+      sendMessage(message.procedureId, message.data);
+    }
+  }
 }
 
 // when creating a channel through switchboard, can specify an existing channel to receive the 'openChannel' callback
