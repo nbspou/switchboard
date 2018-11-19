@@ -15,6 +15,12 @@
             "program": "test/test_mux.dart",
             "request": "launch",
             "type": "dart",
+        },
+        {
+            "name": "WSTalk2 Talk Test",
+            "program": "test/test_talk.dart",
+            "request": "launch",
+            "type": "dart",
         }
     ]
 }

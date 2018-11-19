@@ -123,6 +123,8 @@ class TalkChannel extends Stream<TalkMessage> {
     _listenController.addError(new TalkAbort(reason));
   }
 
+  static Uint8List _emptyProcedureId = new Uint8List(8);
+
   void _onFrame(Uint8List frame) {
     try {
       // Parse general header of the message
@@ -133,7 +135,7 @@ class TalkChannel extends Stream<TalkMessage> {
       bool hasRequestId = (flags & 0x02) != 0;
       bool hasResponseId = (flags & 0x04) != 0;
       int o = 1;
-      Uint8List procedureIdRaw = Uint8List(8);
+      Uint8List procedureIdRaw = _emptyProcedureId;
       int requestId = 0;
       int responseId = 0;
       if (hasProcedureId) {
@@ -147,7 +149,7 @@ class TalkChannel extends Stream<TalkMessage> {
         responseId = (frame[o++]) | (frame[o++] << 8) | (frame[o++] << 16);
       }
       Uint8List subFrame = buffer.asUint8List(offset + o);
-      String procedureId = utf8.decode(procedureIdRaw.takeWhile((c) => c != 0));
+      String procedureId = utf8.decode(procedureIdRaw.takeWhile((c) => c != 0).toList());
       // This message expects a stream response (if not set, can only send timeout extend stream response)
       // bool expectStreamResponse = (flags & 0x08) != 0; // not necessary?
       // This message is a stream response (a non-stream-response signals end-of-stream)
@@ -197,6 +199,7 @@ class TalkChannel extends Stream<TalkMessage> {
       }
     } catch (error, stack) {
       // TODO: Error while handling channel frame, channel closed.
+      print("$error\n$stack");
       close();
     }
   }
@@ -245,7 +248,7 @@ class TalkChannel extends Stream<TalkMessage> {
       bool expectStreamResponse = false,
       bool isAbortOrExtend = false]) {
     // Check options
-    bool hasProcedureId = procedureId?.isEmpty ?? false;
+    bool hasProcedureId = procedureId?.isNotEmpty ?? false;
     bool hasRequestId = requestId != 0 && requestId != null;
     bool hasResponseId = responseId != 0 && responseId != null;
     int headerSize = 1;
@@ -255,7 +258,7 @@ class TalkChannel extends Stream<TalkMessage> {
 
     // Expand data frame with channel header plus mux header capacity
     int fullHeaderSize = headerSize + kReserveMuxConnectionHeaderSize;
-    Uint8List fullFrame = Uint8List(fullHeaderSize) + data;
+    Uint8List fullFrame = new Uint8List.fromList(Uint8List(fullHeaderSize) + data);
     Uint8List frame =
         fullFrame.buffer.asUint8List(kReserveMuxConnectionHeaderSize);
     int flags = 0;
@@ -270,7 +273,7 @@ class TalkChannel extends Stream<TalkMessage> {
     frame[0] = flags;
     int o = 1;
     if (hasProcedureId) {
-      Uint8List procedureIdRaw = utf8.encode(procedureId).take(8).toList();
+      List<int> procedureIdRaw = utf8.encode(procedureId).take(8).toList();
       for (int i = 0; i < procedureIdRaw.length; ++i) {
         frame[o + i] = procedureIdRaw[i];
       }
