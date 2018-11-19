@@ -11,11 +11,11 @@ implement a multiplexing layer on top of a standard WebSocket.
 
 The frame header consists of
 - Flags: 1 byte
-- Channel Id: 2 or 6 bytes
+- TalkChannel Id: 2 or 6 bytes
 
 Using the flags allows the user to set the size format of the channel id.
 The flags also allow to tag a message as either DATA, OPEN, or CLOSE.
-Channel state is controlled by the open and close commands.
+TalkChannel state is controlled by the open and close commands.
 Data can be sent to any open channel.
 
 Channels are immediately open upon sending an open command,
@@ -43,7 +43,7 @@ class MuxException implements Exception {
   final String message;
   const MuxException(this.message);
   String toString() {
-    return message;
+    return "MuxException: $message";
   }
 }
 

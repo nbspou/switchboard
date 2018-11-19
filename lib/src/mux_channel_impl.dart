@@ -20,7 +20,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
   }
 
   void channelRemoteClosed() {
-    // Channel has been closed
+    // TalkChannel has been closed
     try {
       if (!_streamController.isClosed) {
         _streamController.close();

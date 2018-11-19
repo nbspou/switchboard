@@ -2,7 +2,7 @@
 
 Library providing a natural interface to asynchronous network messaging by implementing a back-and-forth binary messaging protocol on top of WebSocket.
 
-Message responses themselves can also be requests, which differs from plain RPC protocols, in that it allows back-and-forth trampolining between server and client without having to manually track conversation states. Additionally, requests can also be made for streams, which allows for efficient list queries to be easily implemented. Stream responses can recursively be requests in themselves, and so forth.
+TalkMessage responses themselves can also be requests, which differs from plain RPC protocols, in that it allows back-and-forth trampolining between server and client without having to manually track conversation states. Additionally, requests can also be made for streams, which allows for efficient list queries to be easily implemented. Stream responses can recursively be requests in themselves, and so forth.
 
 ## Usage
 

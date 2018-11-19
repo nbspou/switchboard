@@ -241,7 +241,7 @@ class TalkSocket {
       // Check if it's not already been removed, may happen due to race condition
       if (_remoteResponseStates.containsKey(request)) {
         print(
-            "Message was not replied to by the remote server in time '${decode(id)}', throw exception");
+            "TalkMessage was not replied to by the remote server in time '${decode(id)}', throw exception");
         completer.completeError(new TalkException(
             "No reply received in time from the remote server"));
         _remoteResponseStates.remove(request);
@@ -257,7 +257,7 @@ class TalkSocket {
       // Check if it's not already been removed, may happen due to race condition
       if (_remoteStreamResponseStates.containsKey(request)) {
         print(
-            "Message was not replied to further by the remote server in time '${decode(id)}', throw exception");
+            "TalkMessage was not replied to further by the remote server in time '${decode(id)}', throw exception");
         controller.addError(new TalkException(
             "No additional streaming replies received in time from the remote server"));
         controller.close();
@@ -411,7 +411,7 @@ class TalkSocket {
       // Check if it's not already been removed, may happen due to race condition
       if (_localReplyTimers.containsKey(message.request)) {
         print(
-            "Message was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
+            "TalkMessage was not replied to by the local program in time '${decode(message.id)}', reply with '_EXCEPT_'");
         sendException("No Reply Sent", message);
         _localReplyTimers.remove(message.request);
       }
@@ -441,7 +441,7 @@ class TalkSocket {
             sendException("No Request Sent / Response Timeout", message);
           }
           print(
-              "Message was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
+              "TalkMessage was not replied to by the remote server in time, ignoring late response '${decode(message.id)}'");
         } else {
           // TODO: Received response to stream request, depending on the message mode the request will be closed
           _RemoteStreamResponseState state = _remoteStreamResponseStates[message.response];

@@ -1,7 +1,7 @@
 
 import 'dart:io';
 import 'package:wstalk/wstalk.dart';
-
+/*
 runServer() async {
   try {
     HttpServer server = await HttpServer.bind('127.0.0.1', 9090);
@@ -70,8 +70,10 @@ testClient(TalkSocket ts) async {
   // Tell the server to close
   ts.sendMessage(42, new List<int>());
 }
-
+*/
 main() {
+  /*
   runServer();
   runClient();
+  */
 }
