@@ -320,7 +320,7 @@ class TalkChannel extends Stream<TalkMessage> {
   Future<TalkMessage> sendRequest(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
     int requestId = _makeRequestId();
-    _sendingResponse(responseId, isStreamResponse);
+    // _sendingResponse(responseId, isStreamResponse);
     _sendMessage(procedureId, data, responseId, isStreamResponse, requestId);
     // TODO: Handle stuff // TODO -------------
   }
@@ -328,40 +328,46 @@ class TalkChannel extends Stream<TalkMessage> {
   Stream<TalkMessage> sendStreamRequest(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
     int requestId = _makeRequestId();
-    _sendingResponse(responseId, isStreamResponse);
+    // _sendingResponse(responseId, isStreamResponse);
     _sendMessage(
         procedureId, data, responseId, isStreamResponse, requestId, true);
     // TODO: Handle stuff // TODO -------------
   }
 
   void replyMessage(TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, false);
     sendMessage(procedureId, data, responseId: replying.requestId);
   }
 
   Future<TalkMessage> replyRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, false);
     return sendRequest(procedureId, data, responseId: replying.requestId);
   }
 
   Stream<TalkMessage> replyStreamRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, false);
     return sendStreamRequest(procedureId, data, responseId: replying.requestId);
   }
 
   void replyMessageStream(
       TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, true);
     sendMessage(procedureId, data,
         responseId: replying.requestId, isStreamResponse: true);
   }
 
   Future<TalkMessage> replyRequestStream(
       TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, true);
     return sendRequest(procedureId, data,
         responseId: replying.requestId, isStreamResponse: true);
   }
 
   Stream<TalkMessage> replyStreamRequestStream(
       TalkMessage replying, String procedureId, Uint8List data) {
+    _sendingResponse(replying.requestId, true);
     return sendStreamRequest(procedureId, data,
         responseId: replying.requestId, isStreamResponse: true);
   }

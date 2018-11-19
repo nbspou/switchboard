@@ -114,14 +114,27 @@ void main() {
       random.nextInt(256),
       random.nextInt(256),
     ]);
-    expect(serverChannel, emitsInOrder([new TalkMessage("HELLO", 0, 0, sentPayload), emitsDone]));
-    expect(clientChannel, emitsInOrder([new TalkMessage("WORLD", 0, 0, sentPayload), emitsDone]));
+    expect(serverChannel,
+        emitsInOrder([new TalkMessage("HELLO", 0, 0, sentPayload), emitsDone]));
+    expect(clientChannel,
+        emitsInOrder([new TalkMessage("WORLD", 0, 0, sentPayload), emitsDone]));
     clientChannel.sendMessage("HELLO", sentPayload);
     serverChannel.sendMessage("WORLD", sentPayload);
     await serverChannel.close();
   });
 
-  test("Can send basic messages requiring response over the messaging channel both ways",
+  test("Reply to bad message should except", () async {
+    expect(() async {
+      serverChannel.replyMessage(
+          new TalkMessage("ABC", 5, 0, new Uint8List(0)), "XYZ", new Uint8List(0));
+    }(), throwsA(isInstanceOf<TalkException>()));
+    expect(serverChannel, emitsInOrder([emitsDone]));
+    expect(clientChannel, emitsInOrder([emitsDone]));
+    await clientChannel.close();
+  });
+
+  test(
+      "Can send basic messages requiring response over the messaging channel both ways",
       () async {
     Uint8List sentPayload = Uint8List.fromList([
       random.nextInt(256),
@@ -131,14 +144,18 @@ void main() {
       random.nextInt(256),
       random.nextInt(256),
     ]);
+    Completer<void> c = new Completer<void>();
     serverChannel.listen((TalkMessage message) {
       serverChannel.replyMessage(message, "WORLD", message.data);
+      c.complete();
     }, onError: (error, stack) {
       fail("$error\n$stack");
     });
-    expect(clientChannel, emitsInOrder([new TalkMessage("WORLD", 0, 1, sentPayload), emitsDone]));
+    expect(clientChannel,
+        emitsInOrder([new TalkMessage("WORLD", 0, 1, sentPayload), emitsDone]));
     clientChannel.sendRequest("HELLO", sentPayload);
-    await serverChannel.close();
+    await c.future;
+    await clientChannel.close();
   });
 }
 
