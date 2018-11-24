@@ -43,7 +43,7 @@ class MuxConnectionImpl implements MuxConnection {
   MuxConnectionImpl(
     WebSocket webSocket, {
     Function(MuxChannel channel, Uint8List payLoad) onChannel,
-    Function() onClose,
+    Function(MuxConnection connection) onClose,
     bool client = true,
     bool autoCloseEmptyConnection = false,
     bool keepActiveAlivePing = true,
@@ -73,14 +73,14 @@ class MuxConnectionImpl implements MuxConnection {
     return (channel.channelId & 1) == (_nextChannelId & 1);
   }
 
-  void _onCloseDo(Function() onClose) {
+  void _onCloseDo(Function(MuxConnection connection) onClose) {
     if (_closeTimeoutTimer != null) {
       _closeTimeoutTimer.cancel();
       _closeTimeoutTimer = null;
     }
     if (onClose != null) {
       try {
-        onClose();
+        onClose(this);
       } catch (error, stack) {
         // TODO: LOG: Error in close callback.
       }
@@ -155,7 +155,7 @@ class MuxConnectionImpl implements MuxConnection {
   void _onFrame(dynamic f) {
     try {
       Uint8List frame = f;
-      int offset = frame.offsetInBytes;
+      final int offset = frame.offsetInBytes;
       ByteBuffer buffer = frame.buffer;
       int flags = frame[0];
       // 2-byte channel id instead of 6-byte, more useful for client-server
@@ -177,13 +177,13 @@ class MuxConnectionImpl implements MuxConnection {
       int channelId = (frame[1]) | (frame[2] << 8);
       Uint8List subFrame;
       if (shortChannelId) {
-        subFrame = buffer.asUint8List(offset + 3);
+        subFrame = buffer.asUint8List(offset + 3, frame.length -3);
       } else {
         channelId |= (frame[3] << 16) |
             (frame[4] << 24) |
             (frame[5] << 32) |
             (frame[6] << 40);
-        subFrame = buffer.asUint8List(offset + 7);
+        subFrame = buffer.asUint8List(offset + 7, frame.length -3);
       }
       // Can still receive frames when close was sent to the remote
       MuxChannelImpl channel =

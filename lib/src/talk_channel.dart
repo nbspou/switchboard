@@ -147,7 +147,7 @@ class TalkChannel extends Stream<TalkMessage> {
   void _onFrame(Uint8List frame) {
     try {
       // Parse general header of the message
-      int offset = frame.offsetInBytes;
+      final int offset = frame.offsetInBytes;
       ByteBuffer buffer = frame.buffer;
       int flags = frame[0];
       bool hasProcedureId = (flags & 0x01) != 0;
@@ -167,7 +167,7 @@ class TalkChannel extends Stream<TalkMessage> {
       if (hasResponseId) {
         responseId = (frame[o++]) | (frame[o++] << 8) | (frame[o++] << 16);
       }
-      Uint8List subFrame = buffer.asUint8List(offset + o);
+      Uint8List subFrame = buffer.asUint8List(offset + o, frame.length - o);
       String procedureId =
           utf8.decode(procedureIdRaw.takeWhile((c) => c != 0).toList());
       // This message expects a stream response (if not set, can only send timeout extend stream response)

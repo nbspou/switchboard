@@ -5,6 +5,8 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
+// TODO: This should just be a stream of MuxChannels
+
 /*
 MuxConnection along with the MuxChannel class
 implement a multiplexing layer on top of a standard WebSocket.
@@ -51,7 +53,7 @@ abstract class MuxConnection {
   factory MuxConnection(
     WebSocket webSocket, {
     Function(MuxChannel channel, Uint8List payLoad) onChannel,
-    Function() onClose,
+    Function(MuxConnection connection) onClose,
     bool client = true,
     // Close the connection after 10 seconds if there are no open channels
     bool autoCloseEmptyConnection = false,
