@@ -125,11 +125,11 @@ void main() {
     expect(
         serverChannel,
         emitsInOrder(
-            [new TalkMessage("HELLO", 0, 0, false, sentPayload), emitsDone]));
+            [new TalkMessage(serverChannel, "HELLO", 0, 0, false, sentPayload), emitsDone]));
     expect(
         clientChannel,
         emitsInOrder(
-            [new TalkMessage("WORLD", 0, 0, false, sentPayload), emitsDone]));
+            [new TalkMessage(clientChannel, "WORLD", 0, 0, false, sentPayload), emitsDone]));
     clientChannel.sendMessage("HELLO", sentPayload);
     serverChannel.sendMessage("WORLD", sentPayload);
     await serverChannel.close();
@@ -139,7 +139,7 @@ void main() {
     expect(() async {
       serverChannel.replyMessage(
           new TalkMessage(
-              "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
+              serverChannel, "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
           "XYZ",
           new Uint8List(0));
     }(), throwsA(isInstanceOf<TalkException>()));
@@ -152,7 +152,7 @@ void main() {
     serverChannel.outgoingSafety = false;
     serverChannel.replyMessage(
         new TalkMessage(
-            "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
+            serverChannel, "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
         "XYZ",
         new Uint8List(0));
     expect(serverChannel,
@@ -178,7 +178,7 @@ void main() {
       fail("$error\n$stack");
     });
     expect(await clientChannel.sendRequest("HELLO", sentPayload),
-        equals(new TalkMessage("WORLD", 0, 1, false, sentPayload)));
+        equals(new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
   });
 
   test("Can reply to stream", () async {
@@ -206,12 +206,12 @@ void main() {
       clientChannel.sendStreamRequest("HELLO", sentPayload),
       emitsInOrder(
         [
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
           emitsDone
         ],
       ),
@@ -269,12 +269,12 @@ void main() {
       clientChannel.sendStreamRequest("HELLO", sentPayload),
       emitsInOrder(
         [
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
-          new TalkMessage("WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
           emitsDone
         ],
       ),
@@ -305,7 +305,7 @@ void main() {
       fail("$error\n$stack");
     });
     expect(await clientChannel.sendRequest("HELLO", sentPayload),
-        equals(new TalkMessage("WORLD", 0, 1, false, sentPayload)));
+        equals(new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
   });
 }
 

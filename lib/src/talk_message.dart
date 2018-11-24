@@ -7,19 +7,23 @@ Author: Jan Boon <kaetemi@no-break.space>
 
 import 'dart:typed_data';
 
+import 'package:switchboard/src/talk_channel.dart';
+
 class TalkMessage {
+  final TalkChannel channel;
   final String procedureId;
   final int requestId;
   final int responseId;
   final bool expectStreamResponse;
   final Uint8List data;
-  const TalkMessage(this.procedureId, this.requestId, this.responseId,
-      this.expectStreamResponse, this.data);
+  const TalkMessage(this.channel, this.procedureId, this.requestId,
+      this.responseId, this.expectStreamResponse, this.data);
   bool operator ==(dynamic message) {
     if (!(message is TalkMessage)) {
       return false;
     }
-    if (message.procedureId != procedureId ||
+    if (message.channel != channel ||
+        message.procedureId != procedureId ||
         message.requestId != requestId ||
         message.responseId != responseId ||
         message.expectStreamResponse != expectStreamResponse) {
@@ -41,7 +45,8 @@ class TalkMessage {
   }
 
   int get hashCode {
-    return procedureId.hashCode ^
+    return channel.hashCode ^
+        procedureId.hashCode ^
         requestId.hashCode ^
         responseId.hashCode ^
         expectStreamResponse.hashCode ^
