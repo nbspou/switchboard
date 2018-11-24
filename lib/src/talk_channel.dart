@@ -7,6 +7,11 @@ import 'package:wstalk/src/mux_connection.dart';
 import 'package:wstalk/src/mux_channel.dart';
 import 'package:wstalk/src/rewindable_timer.dart';
 
+/*
+Message, no request id, no response id
+Simply sent, no requirements
+*/
+
 class _LocalAnyResponseState {
   final RewindableTimer timer;
   const _LocalAnyResponseState(this.timer);
@@ -14,15 +19,15 @@ class _LocalAnyResponseState {
 
 class _RemoteResponseState {
   // final int id;
-  final Completer<TalkMessage> completer;
   final RewindableTimer timer;
+  final Completer<TalkMessage> completer;
   const _RemoteResponseState(/*this.id, */ this.completer, this.timer);
 }
 
 class _RemoteStreamResponseState {
   // final int id;
-  final StreamController<TalkMessage> controller;
   final RewindableTimer timer;
+  final StreamController<TalkMessage> controller;
   const _RemoteStreamResponseState(/*this.id, */ this.controller, this.timer);
 }
 
@@ -34,6 +39,8 @@ class TalkAbort implements Exception {
   }
 }
 
+/// Payload on end of stream.
+/// Not supported by Dart.
 class TalkEndOfStream implements Exception {
   final TalkMessage message;
   const TalkEndOfStream(this.message);
@@ -63,10 +70,15 @@ class TalkChannel extends Stream<TalkMessage> {
   StreamController<TalkMessage> _listenController =
       new StreamController<TalkMessage>();
 
+  /// Waiting for the local application to send a reply
   Map<int, _LocalAnyResponseState> _localAnyResponseStates =
       new Map<int, _LocalAnyResponseState>();
+
+  /// Waiting for a reply from the remote host
   Map<int, _RemoteResponseState> _remoteResponseStates =
       new Map<int, _RemoteResponseState>(); // TODO -------------
+
+  /// Waiting for a reply from the remote host
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
       new Map<int, _RemoteStreamResponseState>(); // TODO -------------
 
@@ -149,17 +161,18 @@ class TalkChannel extends Stream<TalkMessage> {
         responseId = (frame[o++]) | (frame[o++] << 8) | (frame[o++] << 16);
       }
       Uint8List subFrame = buffer.asUint8List(offset + o);
-      String procedureId = utf8.decode(procedureIdRaw.takeWhile((c) => c != 0).toList());
+      String procedureId =
+          utf8.decode(procedureIdRaw.takeWhile((c) => c != 0).toList());
       // This message expects a stream response (if not set, can only send timeout extend stream response)
-      // bool expectStreamResponse = (flags & 0x08) != 0; // not necessary?
+      bool expectStreamResponse = (flags & 0x08) != 0; // not necessary?
       // This message is a stream response (a non-stream-response signals end-of-stream)
       bool isStreamResponse = (flags & 0x30) == 0x10;
       // Timeout extend message (must be a stream response) (an extend message with a request id extends the timeout)
       bool isTimeoutExtend = (flags & 0x30) == 0x30;
       // Abort message (must be non-stream response) (an abort message with a request id is a request cancellation)
       bool isAbort = (flags & 0x30) == 0x20;
-      TalkMessage message =
-          new TalkMessage(procedureId, requestId, responseId, subFrame);
+      TalkMessage message = new TalkMessage(
+          procedureId, requestId, responseId, expectStreamResponse, subFrame);
 
       // Process message
       if (requestId != 0) {
@@ -167,25 +180,77 @@ class TalkChannel extends Stream<TalkMessage> {
         // Ensure we're not past the concurrency limit
         int concurrentRequests = _localAnyResponseStates.length;
         if (concurrentRequests >= _maxConcurrentRequests) {
-          _replyAbort(requestId, "Too many incoming concurrent requests");
+          if (outgoingSafety) {
+            _replyAbort(requestId, "Too many incoming concurrent requests");
+          }
           return;
         }
         // Set the timer
         RewindableTimer timer =
             new RewindableTimer(new Duration(milliseconds: _sendTimeOutMs), () {
-          // Check if it's not already been removed, may happen due to race condition
-          if (_localAnyResponseStates.containsKey(requestId)) {
+          _LocalAnyResponseState state =
+              _localAnyResponseStates.remove(requestId);
+          if (state != null) {
             print(
                 "TalkMessage '$procedureId' was not replied to by the local program in time, abort");
-            _replyAbort(requestId, "Reply not sent in time");
-            _localAnyResponseStates.remove(requestId);
+            if (outgoingSafety) {
+              _replyAbort(requestId, "Reply not sent in time");
+            }
           }
         });
         _localAnyResponseStates[requestId] = new _LocalAnyResponseState(timer);
       }
       if (responseId != 0) {
-        // TODO -------------
         // This message is a response to a request we've sent
+        _RemoteResponseState state = _remoteResponseStates[responseId];
+        if (state != null) {
+          // Received a message in response to a request
+          if (isTimeoutExtend) {
+            state.timer.rewind();
+          } else if (isAbort) {
+            state.timer.cancel();
+            state.completer.completeError(new TalkAbort(utf8.decode(subFrame)));
+            _abortRequiresReply(message);
+            _remoteResponseStates.remove(responseId);
+          } else if (isStreamResponse) {
+            state.timer.cancel();
+            state.completer
+                .completeError(new TalkAbort("Received stream response."));
+            _invalidResponseType(message);
+            _remoteResponseStates.remove(responseId);
+          } else {
+            state.timer.cancel();
+            state.completer.complete(message);
+            _remoteResponseStates.remove(responseId);
+          }
+        } else {
+          _RemoteStreamResponseState state =
+              _remoteStreamResponseStates[responseId];
+          if (state != null) {
+            // Received a message in response to a stream request
+            if (isTimeoutExtend) {
+              state.timer.rewind();
+            } else if (isAbort) {
+              state.timer.cancel();
+              state.controller.addError(new TalkAbort(utf8.decode(subFrame)));
+              state.controller.close();
+              _abortRequiresReply(message);
+              _remoteStreamResponseStates.remove(responseId);
+            } else if (isStreamResponse) {
+              state.timer.rewind();
+              state.controller.add(message);
+            } else {
+              state.timer.cancel();
+              if (message.data.length > 0 || message.requestId != 0) {
+                state.controller.addError(new TalkEndOfStream(message));
+              }
+              state.controller.close();
+              _remoteStreamResponseStates.remove(responseId);
+            }
+          } else {
+            _unknownResponseIdentifier(message);
+          }
+        }
       } else if (isAbort) {
         // New abort, unusual, but okay
         _onAbort(utf8.decode(subFrame));
@@ -258,14 +323,15 @@ class TalkChannel extends Stream<TalkMessage> {
 
     // Expand data frame with channel header plus mux header capacity
     int fullHeaderSize = headerSize + kReserveMuxConnectionHeaderSize;
-    Uint8List fullFrame = new Uint8List.fromList(Uint8List(fullHeaderSize) + data);
+    Uint8List fullFrame =
+        new Uint8List.fromList(Uint8List(fullHeaderSize) + data);
     Uint8List frame =
         fullFrame.buffer.asUint8List(kReserveMuxConnectionHeaderSize);
     int flags = 0;
     if (hasProcedureId) flags |= 0x01;
     if (hasRequestId) flags |= 0x02;
     if (hasResponseId) flags |= 0x04;
-    // if (expectStreamResponse) flags |= 0x08; // not necessary?
+    if (expectStreamResponse) flags |= 0x08; // not necessary?
     if (isStreamResponse) flags |= 0x10;
     if (isAbortOrExtend) flags |= 0x20;
 
@@ -308,9 +374,33 @@ class TalkChannel extends Stream<TalkMessage> {
         _localAnyResponseStates.remove(responseId);
       }
     } else {
-      throw new TalkException("Already sent final response (or timeout)");
+      if (outgoingSafety) {
+        throw new TalkException("Already sent final response (or timeout)");
+      }
     }
   }
+
+  Future<TalkMessage> _sendingRequest(String procedureId, int requestId) {
+    // Create a completer
+    Completer<TalkMessage> completer = new Completer<TalkMessage>();
+    // Set a timer for the remote host to respond to this
+    RewindableTimer timer =
+        new RewindableTimer(new Duration(milliseconds: _receiveTimeOutMs), () {
+      _RemoteResponseState state = _remoteResponseStates.remove(requestId);
+      if (state != null) {
+        assert(state.completer == completer);
+        assert(!state.completer.isCompleted);
+        state.completer.completeError(new TalkAbort(
+            "TalkMessage '$procedureId' was not replied to by the remote program in time, "
+            "and did not receive remote timeout, abort locally."));
+      }
+    });
+    _RemoteResponseState state = new _RemoteResponseState(completer, timer);
+    _remoteResponseStates[requestId] = state;
+    return completer.future;
+  }
+
+  void _sendingStreamRequest(int requestId) {}
 
   void sendMessage(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
@@ -322,7 +412,7 @@ class TalkChannel extends Stream<TalkMessage> {
     int requestId = _makeRequestId();
     // _sendingResponse(responseId, isStreamResponse);
     _sendMessage(procedureId, data, responseId, isStreamResponse, requestId);
-    // TODO: Handle stuff // TODO -------------
+    return _sendingRequest(procedureId, requestId);
   }
 
   Stream<TalkMessage> sendStreamRequest(String procedureId, Uint8List data,
@@ -389,18 +479,49 @@ class TalkChannel extends Stream<TalkMessage> {
         "", new Uint8List(0), replying.requestId, true, 0, false, true);
   }
 
-  void procedureUnknown(TalkMessage replying) {
+  void unknownProcedure(TalkMessage replying) {
     // TODO: Log "Local Procedure Unknown: ${replying.procedureId}"
     if (replying.requestId != 0) {
       _sendingResponse(replying.requestId, false);
     }
-    _replyAbort(
-        replying.requestId, "Procedure Unknown: ${replying.procedureId}");
+    if (outgoingSafety) {
+      _replyAbort(
+          replying.requestId, "Unknown procedure '${replying.procedureId}'");
+    }
   }
 
-  void _forwardReply(TalkChannel sender, TalkMessage replying, TalkMessage message, bool stream) {
+  void _unknownResponseIdentifier(TalkMessage replying) {
+    // TODO: Log: Unknown response identifier '${replying.requestId}' in request for procedure '${replying.procedureId}'
+    if (replying.requestId != 0) {
+      _sendingResponse(replying.requestId, false);
+    }
+    if (outgoingSafety) {
+      _replyAbort(replying.requestId, "Unknown response identifier");
+    }
+  }
+
+  void _invalidResponseType(TalkMessage replying) {
+    // TODO: Log: Unknown response identifier '${replying.requestId}' in request for procedure '${replying.procedureId}'
+    if (replying.requestId != 0) {
+      _sendingResponse(replying.requestId, false);
+    }
+    if (outgoingSafety) {
+      _replyAbort(replying.requestId, "Invalid response type");
+    }
+  }
+
+  void _abortRequiresReply(TalkMessage replying) {
+    if (replying.requestId != 0) {
+      _sendingResponse(replying.requestId, false);
+      _replyAbort(replying.requestId, "Abort received");
+    }
+  }
+
+  void _forwardReply(TalkChannel sender, TalkMessage replying,
+      TalkMessage message, bool stream) {
     if (message.requestId != 0) {
-      replyStreamRequest(replying, message.procedureId, message.data).listen((TalkMessage reply) {
+      replyStreamRequest(replying, message.procedureId, message.data).listen(
+          (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
       }, onError: (error, stack) {
         if (error is TalkEndOfStream) {
@@ -421,7 +542,8 @@ class TalkChannel extends Stream<TalkMessage> {
 
   void forward(TalkChannel sender, TalkMessage message) {
     if (message.requestId != 0) {
-      sendStreamRequest(message.procedureId, message.data).listen((TalkMessage reply) {
+      sendStreamRequest(message.procedureId, message.data).listen(
+          (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
       }, onError: (error, stack) {
         if (error is TalkEndOfStream) {
@@ -439,6 +561,9 @@ class TalkChannel extends Stream<TalkMessage> {
       sendMessage(message.procedureId, message.data);
     }
   }
+
+  /// Set false to allow malformed messages to be sent
+  bool outgoingSafety = true;
 }
 
 // when creating a channel through switchboard, can specify an existing channel to receive the 'openChannel' callback
