@@ -1,3 +1,9 @@
+## 2.0.4
+
+- Rebranding
+- Rewrite from scratch with simplified interface
+- Support channels for allowing virtual services or protocols on the same host (virtual hosts, etc)
+
 ## 1.3.3
 
 - Can now request for streams. Stream responses can recursively be requests as well.

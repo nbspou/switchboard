@@ -1,4 +1,11 @@
 /*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018  NO-BREAK SPACE OÜ
+Author: Jan Boon <kaetemi@no-break.space>
+*/
+
+/*
 
 Checklist
 =========
@@ -17,7 +24,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import "package:test/test.dart";
-import 'package:wstalk/wstalk.dart';
+import 'package:switchboard/switchboard.dart';
 
 @Timeout(const Duration(seconds: 45))
 HttpServer server;

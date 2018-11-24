@@ -1,11 +1,18 @@
+/*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018  NO-BREAK SPACE OÜ
+Author: Jan Boon <kaetemi@no-break.space>
+*/
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/talk_message.dart';
-import 'package:wstalk/src/mux_connection.dart';
-import 'package:wstalk/src/mux_channel.dart';
-import 'package:wstalk/src/rewindable_timer.dart';
+import 'package:switchboard/src/talk_message.dart';
+import 'package:switchboard/src/mux_connection.dart';
+import 'package:switchboard/src/mux_channel.dart';
+import 'package:switchboard/src/rewindable_timer.dart';
 
 /*
 Message, no request id, no response id

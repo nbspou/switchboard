@@ -1,7 +1,7 @@
-name: wstalk
-description: Library providing a natural interface to asynchronous network messaging by implementing a back-and-forth binary messaging protocol on top of WebSocket. 
-version: 1.3.3
-homepage: https://github.com/nbspou/wstalk
+name: switchboard
+description: Microservice communication protocol layers.  
+version: 2.0.4
+homepage: https://github.com/nbspou/switchboard
 author: NO-BREAK SPACE OÜ <support@no-break.space>
 
 environment:
