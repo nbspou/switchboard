@@ -1,4 +1,11 @@
 /*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018  Jan BOON (Kaetemi)
+Author: Jan Boon <jan.boon@kaetemi.be>
+*/
+
+/*
 
 Checklist
 =========
@@ -17,7 +24,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import "package:test/test.dart";
-import 'package:wstalk/wstalk.dart';
+import 'package:switchboard/switchboard.dart';
 
 @Timeout(const Duration(seconds: 45))
 HttpServer server;

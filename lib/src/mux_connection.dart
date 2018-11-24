@@ -32,10 +32,10 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/mux_channel.dart';
-import 'package:wstalk/src/mux_channel_impl.dart';
+import 'package:switchboard/src/mux_channel.dart';
+import 'package:switchboard/src/mux_channel_impl.dart';
 
-import 'package:wstalk/src/mux_connection_impl.dart';
+import 'package:switchboard/src/mux_connection_impl.dart';
 
 const int kReserveMuxConnectionHeaderSize = 7;
 

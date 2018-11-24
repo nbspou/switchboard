@@ -1,3 +1,10 @@
+/*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018  Jan BOON (Kaetemi)
+Author: Jan Boon <jan.boon@kaetemi.be>
+*/
+
 import 'dart:typed_data';
 
 class TalkMessage {
@@ -46,3 +53,5 @@ class TalkMessage {
     return "TalkMessage: $procedureId, $requestId, $responseId, $expectStreamResponse, $data";
   }
 }
+
+/* end of file */

@@ -1,8 +1,15 @@
+/*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018  Jan BOON (Kaetemi)
+Author: Jan Boon <jan.boon@kaetemi.be>
+*/
+
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:wstalk/src/mux_connection_impl.dart';
-import 'package:wstalk/src/mux_channel.dart';
+import 'package:switchboard/src/mux_connection_impl.dart';
+import 'package:switchboard/src/mux_channel.dart';
 
 class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
   final MuxConnectionImpl connection;

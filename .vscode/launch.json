@@ -4,20 +4,20 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+        // {
+        //     "name": "Switchboard Example",
+        //     "program": "example/wstalk_example.dart",
+        //     "request": "launch",
+        //     "type": "dart"
+        // },
         {
-            "name": "WSTalk Example",
-            "program": "example/wstalk_example.dart",
-            "request": "launch",
-            "type": "dart"
-        },
-        {
-            "name": "WSTalk2 Mux Test",
+            "name": "Switchboard2 Mux Test",
             "program": "test/test_mux.dart",
             "request": "launch",
             "type": "dart",
         },
         {
-            "name": "WSTalk2 Talk Test",
+            "name": "Switchboard2 Talk Test",
             "program": "test/test_talk.dart",
             "request": "launch",
             "type": "dart",
