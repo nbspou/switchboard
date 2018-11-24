@@ -178,7 +178,7 @@ class TalkChannel extends Stream<TalkMessage> {
       bool isTimeoutExtend = (flags & 0x30) == 0x30;
       // Abort message (must be non-stream response) (an abort message with a request id is a request cancellation)
       bool isAbort = (flags & 0x30) == 0x20;
-      TalkMessage message = new TalkMessage(
+      TalkMessage message = new TalkMessage(this,
           procedureId, requestId, responseId, expectStreamResponse, subFrame);
 
       // Process message

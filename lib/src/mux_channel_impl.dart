@@ -38,6 +38,11 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
   }
 
   @override
+  bool get isOpen {
+    return !_streamController.isClosed;
+  }
+
+  @override
   void add(Uint8List event) {
     // Local to remote
     connection.sendFrame(channelId, event);

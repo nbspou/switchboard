@@ -12,6 +12,8 @@ import 'dart:typed_data';
 
 import 'package:switchboard/src/mux_channel.dart';
 import 'package:switchboard/src/mux_connection.dart';
+import 'package:switchboard/src/talk_channel.dart';
+import 'package:switchboard/src/talk_message.dart';
 
 class SwitchboardException implements Exception {
   final String message;
@@ -19,6 +21,14 @@ class SwitchboardException implements Exception {
   String toString() {
     return "SwitchboardException: $message";
   }
+}
+
+class MessageOptions {
+  final String uri;
+  final String service;
+  final int shardSlot;
+  final Uint8List payload;
+  const MessageOptions(this.uri, this.service, this.shardSlot, this.payload);
 }
 
 class ChannelInfo {
@@ -97,8 +107,7 @@ class ChannelInfo {
         4 +
         1 +
         ((serviceName?.length ?? 0) * 4) +
-        payload.length);
-
+        (payload?.length ?? 0));
     int o = 1;
     int flags = 0;
     if (host != null) {
@@ -130,8 +139,10 @@ class ChannelInfo {
       res.buffer.asUint32List(o)[0] = shardSlot;
       o += 4;
     }
-    res.setAll(o, payload);
-    o += payload.length;
+    if (payload != null) {
+      res.setAll(o, payload);
+      o += payload.length;
+    }
     res[0] = flags;
     return res.buffer.asUint8List(0, o);
   }
@@ -144,6 +155,8 @@ class Switchboard extends Stream<ChannelInfo> {
   final Set<MuxConnection> _muxConnections = new Set<MuxConnection>();
   final Map<String, MuxConnection> _openedConnectionMap =
       new Map<String, MuxConnection>();
+  final Map<String, TalkChannel> _sharedTalkChannelMap =
+      new Map<String, TalkChannel>();
 
   @override
   StreamSubscription<ChannelInfo> listen(
@@ -197,10 +210,43 @@ class Switchboard extends Stream<ChannelInfo> {
       }
     }
     if (connection != null) {
-      return connection.openChannel(new ChannelInfo(
+      MuxChannel channel = connection.openChannel(new ChannelInfo(
               null, u.host, service, serviceId, serviceName, shardSlot, payload)
           .toPayload());
+      return channel;
     }
+    return null;
+  }
+
+  Future<TalkChannel> openTalkChannel(
+    String uri, {
+    String service,
+    int serviceId,
+    String serviceName,
+    int shardSlot,
+    Uint8List payload,
+    bool autoCloseEmptyConnection = false,
+    bool shared = false,
+  }) async {
+    Uri u = Uri.parse(uri);
+    String us = u.toString();
+    String ush = us +
+        "#" +
+        (service ??
+            (serviceId != null ? "~$serviceId" : ("@serviceName" ?? "*"))) +
+        (shardSlot != 0 ? "/$shardSlot" : "");
+    if (shared && _sharedTalkChannelMap[ush]?.channel?.isOpen == true) {
+      return _sharedTalkChannelMap[ush];
+    }
+    MuxChannel channel = await openChannel(uri, service: service, serviceId: serviceId, serviceName: serviceName, shardSlot: shardSlot, payload: payload, autoCloseEmptyConnection: autoCloseEmptyConnection);
+    if (channel != null) {
+      TalkChannel talkChannel = new TalkChannel(channel);
+      if (shared) {
+        _sharedTalkChannelMap[ush] = talkChannel;
+      }
+      return talkChannel;
+    }
+    return null;
   }
 
   Future<void> bindWebSocket(dynamic address, int port, String path,
@@ -248,6 +294,23 @@ class Switchboard extends Stream<ChannelInfo> {
       _boundWebSockets.remove(server);
       server.close();
       rethrow;
+    }
+  }
+
+  Future<void> sendMessage(MessageOptions options, String procedureId, Uint8List data) async {
+    TalkChannel channel = await openTalkChannel(options.uri, service: options.service, shardSlot: options.shardSlot, payload: options.payload, shared: true);
+    channel.sendMessage(procedureId, data);
+  }
+
+  Future<TalkMessage> sendRequest(MessageOptions options, String procedureId, Uint8List data) async {
+    TalkChannel channel = await openTalkChannel(options.uri, service: options.service, shardSlot: options.shardSlot, payload: options.payload, shared: true);
+    return await channel.sendRequest(procedureId, data);
+  }
+
+  Stream<TalkMessage> sendStreamRequest(MessageOptions options, String procedureId, Uint8List data) async* {
+    TalkChannel channel = await openTalkChannel(options.uri, service: options.service, shardSlot: options.shardSlot, payload: options.payload, shared: true);
+    await for (TalkMessage message in channel.sendStreamRequest(procedureId, data)) {
+      yield message;
     }
   }
 
