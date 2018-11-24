@@ -238,13 +238,15 @@ class Switchboard extends Stream<ChannelInfo> {
         (service ??
             (serviceId != null ? "~$serviceId" : ("@serviceName" ?? "*"))) +
         (shardSlot != 0 ? "/$shardSlot" : "");
-    if (shared && _sharedTalkChannelMap[ush]?.channel?.isOpen == true) {
-      return _sharedTalkChannelMap[ush];
-    }
-    if (shared && _openingSharedTalkChannelMap[ush] != null) {
-      TalkChannel channel = await _openingSharedTalkChannelMap[ush];
-      if (channel?.channel?.isOpen == true) {
-        return channel;
+    if (shared) {
+      if (_sharedTalkChannelMap[ush]?.channel?.isOpen == true) {
+        return _sharedTalkChannelMap[ush];
+      }
+      while (_openingSharedTalkChannelMap[ush] != null) {
+        TalkChannel channel = await _openingSharedTalkChannelMap[ush];
+        if (channel?.channel?.isOpen == true) {
+          return channel;
+        }
       }
     }
     Completer<TalkChannel> completer;
