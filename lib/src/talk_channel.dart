@@ -76,11 +76,11 @@ class TalkChannel extends Stream<TalkMessage> {
 
   /// Waiting for a reply from the remote host
   Map<int, _RemoteResponseState> _remoteResponseStates =
-      new Map<int, _RemoteResponseState>(); // TODO -------------
+      new Map<int, _RemoteResponseState>();
 
   /// Waiting for a reply from the remote host
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
-      new Map<int, _RemoteStreamResponseState>(); // TODO -------------
+      new Map<int, _RemoteStreamResponseState>();
 
   MuxChannel get channel {
     return _channel;
@@ -192,7 +192,7 @@ class TalkChannel extends Stream<TalkMessage> {
               _localAnyResponseStates.remove(requestId);
           if (state != null) {
             print(
-                "TalkMessage '$procedureId' was not replied to by the local program in time, abort");
+                "TalkMessage '$procedureId' was not replied to by the local program in time, sending abort");
             if (outgoingSafety) {
               _replyAbort(requestId, "Reply not sent in time");
             }
@@ -213,6 +213,7 @@ class TalkChannel extends Stream<TalkMessage> {
             _abortRequiresReply(message);
             _remoteResponseStates.remove(responseId);
           } else if (isStreamResponse) {
+            // TODO: Log error
             state.timer.cancel();
             state.completer
                 .completeError(new TalkAbort("Received stream response."));
@@ -334,6 +335,7 @@ class TalkChannel extends Stream<TalkMessage> {
     if (expectStreamResponse) flags |= 0x08; // not necessary?
     if (isStreamResponse) flags |= 0x10;
     if (isAbortOrExtend) flags |= 0x20;
+    print("$procedureId, isStreamResponse: $isStreamResponse, isAbortOrExtend: $isAbortOrExtend, expectStreamResponse: $expectStreamResponse");
 
     // Set header data
     frame[0] = flags;
@@ -390,9 +392,9 @@ class TalkChannel extends Stream<TalkMessage> {
       if (state != null) {
         assert(state.completer == completer);
         assert(!state.completer.isCompleted);
-        state.completer.completeError(new TalkAbort(
-            "TalkMessage '$procedureId' was not replied to by the remote program in time, "
-            "and did not receive remote timeout, abort locally."));
+        print("TalkMessage '$procedureId' was not replied to by the remote program in time, "
+            "and did not receive remote timeout, abort locally.");
+        state.completer.completeError(new TalkAbort("Reply not received in time"));
       }
     });
     _RemoteResponseState state = new _RemoteResponseState(completer, timer);
@@ -400,7 +402,26 @@ class TalkChannel extends Stream<TalkMessage> {
     return completer.future;
   }
 
-  void _sendingStreamRequest(int requestId) {}
+  Stream<TalkMessage> _sendingStreamRequest(String procedureId, int requestId) {
+    // Create a completer
+    StreamController<TalkMessage> controller = new StreamController<TalkMessage>();
+    // Set a timer for the remote host to respond to this
+    RewindableTimer timer =
+        new RewindableTimer(new Duration(milliseconds: _receiveTimeOutMs), () {
+      _RemoteStreamResponseState state = _remoteStreamResponseStates.remove(requestId);
+      if (state != null) {
+        assert(state.controller == controller);
+        assert(!state.controller.isClosed);
+        print("TalkMessage '$procedureId' was not replied to by the remote program in time, "
+            "and did not receive remote timeout, abort locally.");
+        state.controller.addError(new TalkAbort("Reply not received in time"));
+        state.controller.close();
+      }
+    });
+    _RemoteStreamResponseState state = new _RemoteStreamResponseState(controller, timer);
+    _remoteStreamResponseStates[requestId] = state;
+    return controller.stream;
+  }
 
   void sendMessage(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
@@ -410,7 +431,6 @@ class TalkChannel extends Stream<TalkMessage> {
   Future<TalkMessage> sendRequest(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
     int requestId = _makeRequestId();
-    // _sendingResponse(responseId, isStreamResponse);
     _sendMessage(procedureId, data, responseId, isStreamResponse, requestId);
     return _sendingRequest(procedureId, requestId);
   }
@@ -418,54 +438,34 @@ class TalkChannel extends Stream<TalkMessage> {
   Stream<TalkMessage> sendStreamRequest(String procedureId, Uint8List data,
       {int responseId = 0, bool isStreamResponse = false}) {
     int requestId = _makeRequestId();
-    // _sendingResponse(responseId, isStreamResponse);
     _sendMessage(
         procedureId, data, responseId, isStreamResponse, requestId, true);
-    // TODO: Handle stuff // TODO -------------
+    return _sendingStreamRequest(procedureId, requestId);
   }
 
   void replyMessage(TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, false);
-    sendMessage(procedureId, data, responseId: replying.requestId);
+    _sendingResponse(replying.requestId, replying.expectStreamResponse);
+    sendMessage(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
   }
 
   Future<TalkMessage> replyRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, false);
-    return sendRequest(procedureId, data, responseId: replying.requestId);
+    _sendingResponse(replying.requestId, replying.expectStreamResponse);
+    return sendRequest(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
   }
 
   Stream<TalkMessage> replyStreamRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, false);
-    return sendStreamRequest(procedureId, data, responseId: replying.requestId);
-  }
-
-  void replyMessageStream(
-      TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, true);
-    sendMessage(procedureId, data,
-        responseId: replying.requestId, isStreamResponse: true);
-  }
-
-  Future<TalkMessage> replyRequestStream(
-      TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, true);
-    return sendRequest(procedureId, data,
-        responseId: replying.requestId, isStreamResponse: true);
-  }
-
-  Stream<TalkMessage> replyStreamRequestStream(
-      TalkMessage replying, String procedureId, Uint8List data) {
-    _sendingResponse(replying.requestId, true);
-    return sendStreamRequest(procedureId, data,
-        responseId: replying.requestId, isStreamResponse: true);
+    _sendingResponse(replying.requestId, replying.expectStreamResponse);
+    return sendStreamRequest(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
   }
 
   void replyEndOfStream(TalkMessage replying,
       [String procedureId, Uint8List data]) {
-    // Data is not part of the stream, but post-stream. In the Dart implementation, this is thrown as a TalkEndOfStream error to the message stream.
-    replyMessage(replying, procedureId, data ?? new Uint8List(0));
+    // Data is not part of the stream, but post-stream. 
+    // In the Dart implementation, this is thrown as a TalkEndOfStream error to the message stream.
+    _sendingResponse(replying.requestId, false);
+    sendMessage(procedureId ?? "", data ?? new Uint8List(0), responseId: replying.requestId);
   }
 
   void replyAbort(TalkMessage replying, String reason) {
@@ -517,6 +517,7 @@ class TalkChannel extends Stream<TalkMessage> {
     }
   }
 
+  /// Untested
   void _forwardReply(TalkChannel sender, TalkMessage replying,
       TalkMessage message, bool stream) {
     if (message.requestId != 0) {
@@ -540,6 +541,7 @@ class TalkChannel extends Stream<TalkMessage> {
     }
   }
 
+  /// Untested
   void forward(TalkChannel sender, TalkMessage message) {
     if (message.requestId != 0) {
       sendStreamRequest(message.procedureId, message.data).listen(
@@ -566,7 +568,4 @@ class TalkChannel extends Stream<TalkMessage> {
   bool outgoingSafety = true;
 }
 
-// when creating a channel through switchboard, can specify an existing channel to receive the 'openChannel' callback
-// this permits to inherit state and other stuff
-
-// switchboard essentially handles the openChannel payload format
+/* end of file */
