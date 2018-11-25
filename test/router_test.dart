@@ -5,6 +5,8 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
+// TODO: Test case for proper reconnection if server disconnects
+
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -144,6 +146,65 @@ void main() {
       TalkMessage message = await serverMessageQueue.next;
       expect(message.procedureId, equals("WORLD"));
       expect(message.data, equals(messagePayload));
+      serverMessageQueue.cancel();
+      print("2");
+    }
+    serverQueue.cancel();
+    clientQueue.cancel();
+  });
+
+  test("Can reconnect", () async {
+    Uint8List payload = Uint8List.fromList([
+      random.nextInt(256),
+      random.nextInt(256),
+      random.nextInt(256),
+      random.nextInt(256),
+      random.nextInt(256),
+      random.nextInt(256),
+    ]);
+    StreamQueue<ChannelInfo> serverQueue = new StreamQueue<ChannelInfo>(server);
+    StreamQueue<ChannelInfo> clientQueue = new StreamQueue<ChannelInfo>(client);
+    client.setPayload(payload);
+    client.sendMessage("api", "HELLO", payload);
+    {
+      ChannelInfo serverChannelInfo = await serverQueue.next;
+      expect(serverChannelInfo.host, equals("localhost"));
+      expect(serverChannelInfo.service, equals("api"));
+      expect(serverChannelInfo.payload, equals(payload));
+      TalkChannel serverChannel = new TalkChannel(serverChannelInfo.channel);
+      StreamQueue<TalkMessage> serverMessageQueue =
+          new StreamQueue<TalkMessage>(serverChannel);
+      TalkMessage message = await serverMessageQueue.next;
+      expect(message.procedureId, equals("HELLO"));
+      expect(message.data, equals(payload));
+      serverMessageQueue.cancel();
+      print("1");
+    }
+    serverQueue.cancel();
+    await server.close();
+    await new Future.delayed(new Duration(seconds: 2));
+    expect(() async {
+      await client.sendMessage("api", "MY", payload);
+    }(), throwsA(isInstanceOf<Exception>()));
+    print("x");
+    await new Future.delayed(new Duration(seconds: 2));
+    server = new Switchboard();
+    await server.bindWebSocket("localhost", 9091, "/ws");
+    print("y");
+    await client.sendMessage("api", "WORLD", payload);
+    print("z");
+    serverQueue = new StreamQueue<ChannelInfo>(server);
+    {
+      ChannelInfo serverChannelInfo = await serverQueue.next;
+      expect(serverChannelInfo.host, equals("localhost"));
+      expect(serverChannelInfo.service, equals("api"));
+      expect(serverChannelInfo.payload, equals(payload));
+      TalkChannel serverChannel = new TalkChannel(serverChannelInfo.channel);
+      StreamQueue<TalkMessage> serverMessageQueue =
+          new StreamQueue<TalkMessage>(serverChannel);
+      TalkMessage message = await serverMessageQueue.next;
+      expect(message.procedureId, equals("WORLD"));
+      expect(message.data, equals(payload));
       serverMessageQueue.cancel();
       print("2");
     }

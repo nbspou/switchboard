@@ -1,8 +1,12 @@
+## 2.0.5
+
+- Fix issue reconnecting after previous error.
+
 ## 2.0.4
 
 - Rebranding
-- Rewrite from scratch with simplified interface
-- Support channels for allowing virtual services or protocols on the same host (virtual hosts, etc)
+- Rewrite from scratch with simplified interface.
+- Support channels for allowing virtual services or protocols on the same host (virtual hosts, etc.)
 
 ## 1.3.3
 

@@ -5,6 +5,11 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
+/*
+TODO:
+- Implement scheme:// remapping (cache remapped scheme, allow scheme connections) (e.g. ftpq:// to talq://)
+*/
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -185,24 +190,33 @@ class Switchboard extends Stream<ChannelInfo> {
   /// Either an end point or discovery service is set.
   Future<void> setEndPoint(String endPoint,
       {bool disconnectExisting: true}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     _log.finest("Request to set endpoint to '$endPoint'.");
     _discoveryEndPoint = null;
-    _endPoint = Uri.parse(endPoint).toString();
-    return await _lock.synchronized(() async {
-      _log.finest("Set endpoint to '$endPoint'.");
-      MuxConnection endPointConnection = _endPointConnection;
-      _endPointConnection = null;
-      TalkChannel discoveryChannel = _discoveryChannel;
-      _discoveryChannel = null;
-      if (disconnectExisting) await endPointConnection?.closeChannels();
-      await discoveryChannel?.close();
-    });
+    String ep = Uri.parse(endPoint).toString();
+    if (_endPoint != ep) {
+      _endPoint = ep;
+      return await _lock.synchronized(() async {
+        _log.finest("Set endpoint to '$endPoint'.");
+        MuxConnection endPointConnection = _endPointConnection;
+        _endPointConnection = null;
+        TalkChannel discoveryChannel = _discoveryChannel;
+        _discoveryChannel = null;
+        if (disconnectExisting) await endPointConnection?.closeChannels();
+        await discoveryChannel?.close();
+      });
+    }
   }
 
   /// Sets the discovery service to use to find services to connect to.
   /// Either an end point or discovery service is set.
   Future<void> setDiscoveryService(String endPoint,
       {String service = "discover", bool disconnectExisting: true}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     _log.finest("Request to set discovery service to '$endPoint' '$service'.");
     _endPoint = null;
     _discoveryEndPoint = endPoint;
@@ -219,6 +233,9 @@ class Switchboard extends Stream<ChannelInfo> {
   }
 
   Future<void> setPayload(Uint8List payload, {bool closeExisting: true}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     _log.finest("Request to set channel payload to '$payload'.");
     _payload = payload;
     return await _lock.synchronized(() async {
@@ -275,40 +292,55 @@ class Switchboard extends Stream<ChannelInfo> {
     Uint8List payload,
     bool autoCloseEmptyConnection = false,
   }) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     Uint8List pl = payload ?? _payload;
     Uri u = Uri.parse(uri ?? _endPoint);
     String us = u.toString();
     MuxConnection connection = _openedConnectionMap[us];
-    await _lock.synchronized(() async {
-      connection = _openedConnectionMap[us];
-      if (connection == null) {
-        if (u.scheme == "ws" || u.scheme == "wss") {
-          _log.fine("Attempt to connect to WebSocket endpoint '${us}'.");
-          WebSocket ws = await WebSocket.connect(us, protocols: ['wstalk2']);
-          connection = new MuxConnection(
-            ws,
-            onChannel: _onMuxChannel,
-            onClose: (MuxConnection connection) {
-              _onMuxConnectionClose(connection);
-              _openedConnectionMap.remove(us);
-            },
-            client: true,
-            autoCloseEmptyConnection: autoCloseEmptyConnection,
-            keepActiveAlivePing: true,
-          );
-          _openedConnectionMap[us] = connection;
-          if (us == _endPoint) {
-            _endPointConnection = connection;
-          }
-          _muxConnections.add(connection);
-        } else {
-          _log.severe(
-              "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
-          throw new SwitchboardException(
-              "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
+    if (connection != null && connection.isOpen != true) {
+      _openedConnectionMap.remove(us);
+      connection = null;
+    }
+    if (connection == null) {
+      _log.fine("Request to open new endpoint '${us}'.");
+      await _lock.synchronized(() async {
+        if (connection != null && connection.isOpen != true) {
+          _openedConnectionMap.remove(us);
+          connection = null;
         }
-      }
-    });
+        if (connection == null) {
+          if (u.scheme == "ws" || u.scheme == "wss") {
+            _log.fine("Attempt to connect to WebSocket endpoint '${us}'.");
+            WebSocket ws = await WebSocket.connect(us, protocols: ['wstalk2']);
+            connection = new MuxConnection(
+              ws,
+              onChannel: _onMuxChannel,
+              onClose: (MuxConnection connection) {
+                _onMuxConnectionClose(connection);
+                if (_openedConnectionMap[us] == connection) {
+                  _openedConnectionMap.remove(us);
+                }
+              },
+              client: true,
+              autoCloseEmptyConnection: autoCloseEmptyConnection,
+              keepActiveAlivePing: true,
+            );
+            _openedConnectionMap[us] = connection;
+            if (us == _endPoint) {
+              _endPointConnection = connection;
+            }
+            _muxConnections.add(connection);
+          } else {
+            _log.severe(
+                "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
+            throw new SwitchboardException(
+                "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
+          }
+        }
+      });
+    }
     if (connection != null) {
       ChannelInfo info = new ChannelInfo(
           null, u.host, service, serviceId, serviceName, shardSlot, pl);
@@ -331,17 +363,24 @@ class Switchboard extends Stream<ChannelInfo> {
     bool autoCloseEmptyConnection = false,
     bool shared = false,
   }) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     Uint8List pl = payload ?? _payload;
     String us = Uri.parse(uri ?? _endPoint).toString();
     String ush = us +
         "#" +
         (service ??
             (serviceId != null ? "~$serviceId" : ("@serviceName" ?? "*"))) +
-        (shardSlot != 0 ? "/$shardSlot" : "");
+        (shardSlot != null ? "/$shardSlot" : "");
     if (shared) {
       if (_sharedTalkChannelMap[ush]?.channel?.isOpen == true) {
         return _sharedTalkChannelMap[ush];
       }
+      _log.finest(
+          "Request to open new talk channel on endpoint '$us', service '${service}', "
+          "serviceId '${serviceId}', serviceName '${serviceName}', "
+          "shardSlot '${shardSlot}', payload ${payload}");
       while (_openingSharedTalkChannelMap[ush] != null) {
         TalkChannel channel = await _openingSharedTalkChannelMap[ush];
         if (channel?.channel?.isOpen == true) {
@@ -354,34 +393,46 @@ class Switchboard extends Stream<ChannelInfo> {
       completer = new Completer<TalkChannel>();
       _openingSharedTalkChannelMap[ush] = completer.future;
     }
-    MuxChannel channel = await openChannel(uri,
-        service: service,
-        serviceId: serviceId,
-        serviceName: serviceName,
-        shardSlot: shardSlot,
-        payload: pl,
-        autoCloseEmptyConnection: autoCloseEmptyConnection);
-    if (channel != null) {
-      TalkChannel talkChannel = new TalkChannel(channel);
+    try {
+      MuxChannel channel = await openChannel(uri,
+          service: service,
+          serviceId: serviceId,
+          serviceName: serviceName,
+          shardSlot: shardSlot,
+          payload: pl,
+          autoCloseEmptyConnection: autoCloseEmptyConnection);
+      if (channel != null) {
+        _log.finest("Open new channel as talk channel.");
+        TalkChannel talkChannel = new TalkChannel(channel);
+        if (shared) {
+          _openingSharedTalkChannelMap.remove(ush);
+          if (_isPayload(pl)) {
+            _sharedTalkChannelMap[ush] = talkChannel;
+            completer.complete(talkChannel);
+          } else {
+            completer.complete(null);
+          }
+        }
+        return talkChannel;
+      }
+    } finally {
       if (shared) {
-        _openingSharedTalkChannelMap.remove(ush);
-        if (_isPayload(pl)) {
-          _sharedTalkChannelMap[ush] = talkChannel;
-          completer.complete(talkChannel);
-        } else {
+        if (_openingSharedTalkChannelMap[ush] == completer.future) {
+          _openingSharedTalkChannelMap.remove(ush);
+        }
+        if (!completer.isCompleted) {
           completer.complete(null);
         }
       }
-      return talkChannel;
-    }
-    if (shared) {
-      completer.complete(null);
     }
     return null;
   }
 
   Future<void> bindWebSocket(dynamic address, int port, String path,
       {bool autoCloseEmptyConnection = false}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     await _lock.synchronized(() async {
       _log.info(
           "Listen to WebSocket on address '${address}', port '${port}', path '$path'");
@@ -426,6 +477,8 @@ class Switchboard extends Stream<ChannelInfo> {
           if (_boundWebSockets.remove(server)) {
             _log.severe("HttpServer closed unexpectedly.");
             // TODO: Automatically attempt to rebind?
+          } else {
+            _log.fine("HttpServer closed.");
           }
         });
       } catch (error, stack) {
@@ -440,6 +493,9 @@ class Switchboard extends Stream<ChannelInfo> {
 
   Future<TalkChannel> openServiceChannel(String service,
       {int shardSlot}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     TalkChannel channel = await openTalkChannel(
         _endPoint ?? _discoverService(service),
         service: service,
@@ -451,6 +507,9 @@ class Switchboard extends Stream<ChannelInfo> {
   }
 
   String _discoverService(String service) {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     if (_discoveryEndPoint != null) {
       // TODO
     }
@@ -459,6 +518,9 @@ class Switchboard extends Stream<ChannelInfo> {
 
   Future<void> sendMessage(String service, String procedureId, Uint8List data,
       {int shardSlot}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     TalkChannel channel = await openTalkChannel(
         _endPoint ?? _discoverService(service),
         service: service,
@@ -472,6 +534,9 @@ class Switchboard extends Stream<ChannelInfo> {
   Future<TalkMessage> sendRequest(
       String service, String procedureId, Uint8List data,
       {int shardSlot}) async {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     TalkChannel channel = await openTalkChannel(_endPoint,
         service: service,
         shardSlot: shardSlot,
@@ -484,6 +549,9 @@ class Switchboard extends Stream<ChannelInfo> {
   Stream<TalkMessage> sendStreamRequest(
       String service, String procedureId, Uint8List data,
       {int shardSlot}) async* {
+    if (_closing) {
+      throw new SwitchboardException("Switchboard already closed.");
+    }
     TalkChannel channel = await openTalkChannel(_endPoint,
         service: service,
         shardSlot: shardSlot,
@@ -496,9 +564,13 @@ class Switchboard extends Stream<ChannelInfo> {
     }
   }
 
+  bool _closing = false;
+
   Future<void> close() async {
     List<Future<dynamic>> opening =
         _openingSharedTalkChannelMap.values.toList();
+    _log.finer("Request to close switchboard.");
+    _closing = true;
     await _lock.synchronized(() async {
       _log.fine("Close switchboard.");
       List<Future<dynamic>> futures = new List<Future<dynamic>>();
@@ -506,15 +578,17 @@ class Switchboard extends Stream<ChannelInfo> {
       List<HttpServer> boundWebSockets = _boundWebSockets.toList();
       for (HttpServer server in boundWebSockets) {
         _boundWebSockets.remove(server);
-        futures.add(server.close());
+        futures.add(server.close(force: true));
       }
-      List<MuxConnection> openedMuxConnections =
-          _openedConnectionMap.values.toList();
+      List<MuxConnection> muxConnections = _muxConnections.toList();
       _openedConnectionMap.clear();
-      for (MuxConnection connection in openedMuxConnections) {
+      for (MuxConnection connection in muxConnections) {
         futures.add(connection.close());
       }
+      _log.finest(
+          "Closing switchboard (${boundWebSockets.length}, ${muxConnections.length}).");
       await futures + opening;
+      _log.finer("Closed switchboard.");
     });
   }
 }
