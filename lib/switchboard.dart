@@ -11,5 +11,6 @@ export 'src/mux_connection.dart';
 export 'src/mux_channel.dart';
 export 'src/talk_channel.dart';
 export 'src/talk_message.dart';
+export 'src/switchboard.dart';
 
 /* end of file */

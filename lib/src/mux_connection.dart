@@ -74,6 +74,7 @@ abstract class MuxConnection {
   bool get channelsAvailable;
   MuxChannel openChannel(Uint8List payLoad);
 
+  Future<void> closeChannels();
   Future<void> close();
 }
 
