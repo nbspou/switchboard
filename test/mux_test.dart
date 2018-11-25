@@ -118,8 +118,8 @@ void main() {
     Uint8List receivedPayload = await payloadCompleter.future;
     expect(receivedPayload, equals(sentPayload));
     clientMuxChannel.close();
-    await for (dynamic f in clientMuxChannel) {}
-    await for (dynamic f in serverMuxChannel) {}
+    await for (dynamic _ in clientMuxChannel) {}
+    await for (dynamic _ in serverMuxChannel) {}
     await clientMuxChannel.done;
     await serverMuxChannel.done;
   });

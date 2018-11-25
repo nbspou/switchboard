@@ -5,8 +5,6 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
-import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
