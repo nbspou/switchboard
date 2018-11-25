@@ -16,7 +16,7 @@ import 'package:switchboard/src/mux_channel.dart';
 import 'package:switchboard/src/mux_channel_impl.dart';
 
 class MuxConnectionImpl implements MuxConnection {
-  static Logger _log = new Logger('Switchboard.Mux');
+  static final Logger _log = new Logger('Switchboard.Mux');
   WebSocket _webSocket;
   Function(MuxChannel channel, Uint8List payLoad) _onChannel;
   Function() _onClose;
