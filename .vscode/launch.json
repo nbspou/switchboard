@@ -23,8 +23,8 @@
             "type": "dart",
         },
         {
-            "name": "Switchboard Switch Test",
-            "program": "test/test_switchboard.dart",
+            "name": "Switchboard Router Test",
+            "program": "test/test_router.dart",
             "request": "launch",
             "type": "dart",
         }

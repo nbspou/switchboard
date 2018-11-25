@@ -5,13 +5,13 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
-// TODO: Lock creating new connections and channels (shared lock) while changing configuration
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
+import 'package:synchronized/synchronized.dart';
 import 'package:switchboard/src/mux_channel.dart';
 import 'package:switchboard/src/mux_connection.dart';
 import 'package:switchboard/src/talk_channel.dart';
@@ -143,14 +143,14 @@ class ChannelInfo {
 }
 
 class Switchboard extends Stream<ChannelInfo> {
+  static Logger _log = new Logger('Switchboard.Router');
+  final Lock _lock = new Lock();
   final StreamController<ChannelInfo> _controller =
       new StreamController<ChannelInfo>();
   final Set<HttpServer> _boundWebSockets = new Set<HttpServer>();
   final Set<MuxConnection> _muxConnections = new Set<MuxConnection>();
   final Map<String, MuxConnection> _openedConnectionMap =
       new Map<String, MuxConnection>();
-  final Map<String, Future<MuxConnection>> _openingConnectionMap =
-      new Map<String, Future<MuxConnection>>();
   final Map<String, TalkChannel> _sharedTalkChannelMap =
       new Map<String, TalkChannel>();
   final Map<String, Future<TalkChannel>> _openingSharedTalkChannelMap =
@@ -165,43 +165,71 @@ class Switchboard extends Stream<ChannelInfo> {
 
   Uint8List _payload = new Uint8List(0);
 
+  bool _isPayload(Uint8List payload) {
+    bool equalData = _payload == payload;
+    if (!equalData && _payload != null && payload != null) {
+      if (_payload.length == payload.length) {
+        equalData = true;
+        for (int i = 0; i < payload.length; ++i) {
+          if (_payload[i] != payload[i]) {
+            equalData = false;
+            break;
+          }
+        }
+      }
+    }
+    return equalData;
+  }
+
   /// Sets the end point through which to connect to services.
   /// Either an end point or discovery service is set.
   Future<void> setEndPoint(String endPoint,
       {bool disconnectExisting: true}) async {
+    _log.finest("Request to set endpoint to '$endPoint'.");
     _discoveryEndPoint = null;
     _endPoint = Uri.parse(endPoint).toString();
-    MuxConnection endPointConnection = _endPointConnection;
-    _endPointConnection = null;
-    TalkChannel discoveryChannel = _discoveryChannel;
-    _discoveryChannel = null;
-    if (disconnectExisting) await endPointConnection?.closeChannels();
-    await discoveryChannel?.close();
+    return await _lock.synchronized(() async {
+      _log.finest("Set endpoint to '$endPoint'.");
+      MuxConnection endPointConnection = _endPointConnection;
+      _endPointConnection = null;
+      TalkChannel discoveryChannel = _discoveryChannel;
+      _discoveryChannel = null;
+      if (disconnectExisting) await endPointConnection?.closeChannels();
+      await discoveryChannel?.close();
+    });
   }
 
   /// Sets the discovery service to use to find services to connect to.
   /// Either an end point or discovery service is set.
   Future<void> setDiscoveryService(String endPoint,
       {String service = "discover", bool disconnectExisting: true}) async {
+    _log.finest("Request to set discovery service to '$endPoint' '$service'.");
     _endPoint = null;
     _discoveryEndPoint = endPoint;
     _discoveryService = service;
-    MuxConnection endPointConnection = _endPointConnection;
-    _endPointConnection = null;
-    TalkChannel discoveryChannel = _discoveryChannel;
-    _discoveryChannel = null;
-    if (disconnectExisting) await discoveryChannel?.close();
-    await endPointConnection?.closeChannels();
+    return await _lock.synchronized(() async {
+      _log.finest("Set discovery service to '$endPoint' '$service'.");
+      MuxConnection endPointConnection = _endPointConnection;
+      _endPointConnection = null;
+      TalkChannel discoveryChannel = _discoveryChannel;
+      _discoveryChannel = null;
+      if (disconnectExisting) await discoveryChannel?.close();
+      await endPointConnection?.closeChannels();
+    });
   }
 
   Future<void> setPayload(Uint8List payload, {bool closeExisting: true}) async {
-    // Wait for any pending opening channels
-    await _openingSharedTalkChannelMap.values.toList();
+    _log.finest("Request to set channel payload to '$payload'.");
     _payload = payload;
-    // Wait for all existing channels to close
-    if (closeExisting)
-      await _openedConnectionMap.values
-          .map((MuxConnection connection) => connection.closeChannels());
+    return await _lock.synchronized(() async {
+      _log.finest("Set channel payload to '$payload'.");
+      // Wait for any pending opening channels
+      await _openingSharedTalkChannelMap.values.toList();
+      // Wait for all existing channels to close
+      if (closeExisting)
+        await _openedConnectionMap.values
+            .map((MuxConnection connection) => connection.closeChannels());
+    });
   }
 
   void listenDiscard() {
@@ -222,11 +250,20 @@ class Switchboard extends Stream<ChannelInfo> {
   }
 
   void _onMuxChannel(MuxChannel channel, Uint8List payload) {
-    _controller.add(new ChannelInfo.fromPayload(channel, payload));
+    _lock.synchronized(() {
+      ChannelInfo info = new ChannelInfo.fromPayload(channel, payload);
+      _log.fine(
+          "Incoming channel to host '${info.host}', service '${info.service}', "
+          "serviceId '${info.serviceId}', serviceName '${info.serviceName}', "
+          "shardSlot '${info.shardSlot}'.");
+      _controller.add(info);
+    });
   }
 
   void _onMuxConnectionClose(MuxConnection connection) {
     _muxConnections.remove(connection);
+    _log.fine(
+        "Connection closed, ${_muxConnections.length} open connections remaining.");
   }
 
   Future<MuxChannel> openChannel(
@@ -238,23 +275,16 @@ class Switchboard extends Stream<ChannelInfo> {
     Uint8List payload,
     bool autoCloseEmptyConnection = false,
   }) async {
-    Uri u = Uri.parse(uri);
+    Uint8List pl = payload ?? _payload;
+    Uri u = Uri.parse(uri ?? _endPoint);
     String us = u.toString();
     MuxConnection connection = _openedConnectionMap[us];
-    if (connection == null) {
-      while (_openingConnectionMap[us] != null) {
-        MuxConnection c = await _openingConnectionMap[us];
-        if (c.isOpen) {
-          connection = c;
-        }
-      }
-    }
-    if (connection == null) {
-      Completer<MuxConnection> completer = new Completer<MuxConnection>();
-      _openingConnectionMap[us] = completer.future;
-      try {
+    await _lock.synchronized(() async {
+      connection = _openedConnectionMap[us];
+      if (connection == null) {
         if (u.scheme == "ws" || u.scheme == "wss") {
-          WebSocket ws = await WebSocket.connect(uri, protocols: ['wstalk2']);
+          _log.fine("Attempt to connect to WebSocket endpoint '${us}'.");
+          WebSocket ws = await WebSocket.connect(us, protocols: ['wstalk2']);
           connection = new MuxConnection(
             ws,
             onChannel: _onMuxChannel,
@@ -271,21 +301,21 @@ class Switchboard extends Stream<ChannelInfo> {
             _endPointConnection = connection;
           }
           _muxConnections.add(connection);
-          completer.complete(connection);
         } else {
+          _log.severe(
+              "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
           throw new SwitchboardException(
-              "Unknown uri scheme '${u.scheme}' in '$uri'.");
-        }
-      } finally {
-        if (!completer.isCompleted) {
-          completer.complete(null);
+              "Unknown uri scheme '${u.scheme}' in '${uri ?? _endPoint}'.");
         }
       }
-    }
+    });
     if (connection != null) {
-      MuxChannel channel = connection.openChannel(new ChannelInfo(
-              null, u.host, service, serviceId, serviceName, shardSlot, payload)
-          .toPayload());
+      ChannelInfo info = new ChannelInfo(
+          null, u.host, service, serviceId, serviceName, shardSlot, pl);
+      _log.fine("Open channel on endpoint '$us', service '${info.service}', "
+          "serviceId '${info.serviceId}', serviceName '${info.serviceName}', "
+          "shardSlot '${info.shardSlot}', payload ${info.payload}");
+      MuxChannel channel = connection.openChannel(info.toPayload());
       return channel;
     }
     return null;
@@ -301,8 +331,8 @@ class Switchboard extends Stream<ChannelInfo> {
     bool autoCloseEmptyConnection = false,
     bool shared = false,
   }) async {
-    Uri u = Uri.parse(uri);
-    String us = u.toString();
+    Uint8List pl = payload ?? _payload;
+    String us = Uri.parse(uri ?? _endPoint).toString();
     String ush = us +
         "#" +
         (service ??
@@ -329,14 +359,18 @@ class Switchboard extends Stream<ChannelInfo> {
         serviceId: serviceId,
         serviceName: serviceName,
         shardSlot: shardSlot,
-        payload: payload,
+        payload: pl,
         autoCloseEmptyConnection: autoCloseEmptyConnection);
     if (channel != null) {
       TalkChannel talkChannel = new TalkChannel(channel);
       if (shared) {
         _openingSharedTalkChannelMap.remove(ush);
-        _sharedTalkChannelMap[ush] = talkChannel;
-        completer.complete(talkChannel);
+        if (_isPayload(pl)) {
+          _sharedTalkChannelMap[ush] = talkChannel;
+          completer.complete(talkChannel);
+        } else {
+          completer.complete(null);
+        }
       }
       return talkChannel;
     }
@@ -348,50 +382,54 @@ class Switchboard extends Stream<ChannelInfo> {
 
   Future<void> bindWebSocket(dynamic address, int port, String path,
       {bool autoCloseEmptyConnection = false}) async {
-    HttpServer server = await HttpServer.bind(address, port);
-    _boundWebSockets.add(server);
-    try {
-      server.listen((HttpRequest request) async {
-        try {
-          if (request.uri.path == path || request.uri.path == path + '/') {
-            try {
-              WebSocket ws = await WebSocketTransformer.upgrade(request);
-              MuxConnection connection = new MuxConnection(
-                ws,
-                onChannel: _onMuxChannel,
-                onClose: _onMuxConnectionClose,
-                client: false,
-                autoCloseEmptyConnection: autoCloseEmptyConnection,
-                keepActiveAlivePing: false,
-              );
-              _muxConnections.add(connection);
-            } catch (error, stack) {
+    await _lock.synchronized(() async {
+      _log.info(
+          "Listen to WebSocket on address '${address}', port '${port}', path '$path'");
+      HttpServer server = await HttpServer.bind(address, port);
+      _boundWebSockets.add(server);
+      try {
+        server.listen((HttpRequest request) async {
+          try {
+            if (request.uri.path == path || request.uri.path == path + '/') {
+              try {
+                WebSocket ws = await WebSocketTransformer.upgrade(request);
+                MuxConnection connection = new MuxConnection(
+                  ws,
+                  onChannel: _onMuxChannel,
+                  onClose: _onMuxConnectionClose,
+                  client: false,
+                  autoCloseEmptyConnection: autoCloseEmptyConnection,
+                  keepActiveAlivePing: false,
+                );
+                _muxConnections.add(connection);
+              } catch (error, stack) {
+                // TODO: Log
+              }
+            } else {
               // TODO: Log
+              try {
+                request.response.statusCode = HttpStatus.forbidden;
+                request.response.close();
+              } catch (error, stack) {
+                // TODO: Log
+              }
             }
-          } else {
+          } catch (error, stack) {
             // TODO: Log
-            try {
-              request.response.statusCode = HttpStatus.forbidden;
-              request.response.close();
-            } catch (error, stack) {
-              // TODO: Log
-            }
           }
-        } catch (error, stack) {
+        }, onError: (error, stack) {
           // TODO: Log
-        }
-      }, onError: (error, stack) {
-        // TODO: Log
-      }, onDone: () {
-        if (_boundWebSockets.remove(server) != null) {
-          // TODO: Log (ended without being closed, rebind?)
-        }
-      });
-    } catch (error, stack) {
-      _boundWebSockets.remove(server);
-      server.close();
-      rethrow;
-    }
+        }, onDone: () {
+          if (_boundWebSockets.remove(server) != null) {
+            // TODO: Log (ended without being closed, rebind?)
+          }
+        });
+      } catch (error, stack) {
+        _boundWebSockets.remove(server);
+        server.close();
+        rethrow;
+      }
+    });
   }
 
   Future<void> sendMessage(String service, String procedureId, Uint8List data,
@@ -430,21 +468,25 @@ class Switchboard extends Stream<ChannelInfo> {
   }
 
   Future<void> close() async {
-    List<Future<dynamic>> futures = new List<Future<dynamic>>();
-    await _openingSharedTalkChannelMap.values.toList();
-    await _openingConnectionMap.values.toList();
-    List<HttpServer> boundWebSockets = _boundWebSockets.toList();
-    for (HttpServer server in boundWebSockets) {
-      _boundWebSockets.remove(server);
-      futures.add(server.close());
-    }
-    List<MuxConnection> openedMuxConnections =
-        _openedConnectionMap.values.toList();
-    _openedConnectionMap.clear();
-    for (MuxConnection connection in openedMuxConnections) {
-      futures.add(connection.close());
-    }
-    await futures;
+    List<Future<dynamic>> opening =
+        _openingSharedTalkChannelMap.values.toList();
+    await _lock.synchronized(() async {
+      _log.fine("Close switchboard.");
+      List<Future<dynamic>> futures = new List<Future<dynamic>>();
+      // await _openingConnectionMap.values.toList();
+      List<HttpServer> boundWebSockets = _boundWebSockets.toList();
+      for (HttpServer server in boundWebSockets) {
+        _boundWebSockets.remove(server);
+        futures.add(server.close());
+      }
+      List<MuxConnection> openedMuxConnections =
+          _openedConnectionMap.values.toList();
+      _openedConnectionMap.clear();
+      for (MuxConnection connection in openedMuxConnections) {
+        futures.add(connection.close());
+      }
+      await futures + opening;
+    });
   }
 }
 
