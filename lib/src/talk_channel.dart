@@ -472,6 +472,10 @@ class TalkChannel extends Stream<TalkMessage> {
     return _sendingStreamRequest(procedureId, requestId);
   }
 
+  void sendAbort(String reason) {
+    _replyAbort(0, reason);
+  }
+
   void replyMessage(TalkMessage replying, String procedureId, Uint8List data) {
     _sendingResponse(replying.requestId, replying.expectStreamResponse);
     sendMessage(procedureId, data,

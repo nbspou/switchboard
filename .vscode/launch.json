@@ -6,25 +6,25 @@
     "configurations": [
         // {
         //     "name": "Switchboard Example",
-        //     "program": "example/wstalk_example.dart",
+        //     "program": "example/switchboard_example.dart",
         //     "request": "launch",
         //     "type": "dart"
         // },
         {
             "name": "Switchboard Mux Test",
-            "program": "test/test_mux.dart",
+            "program": "test/mux_test.dart",
             "request": "launch",
             "type": "dart",
         },
         {
             "name": "Switchboard Talk Test",
-            "program": "test/test_talk.dart",
+            "program": "test/talk_test.dart",
             "request": "launch",
             "type": "dart",
         },
         {
             "name": "Switchboard Router Test",
-            "program": "test/test_router.dart",
+            "program": "test/router_test.dart",
             "request": "launch",
             "type": "dart",
         }
