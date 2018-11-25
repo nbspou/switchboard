@@ -124,12 +124,16 @@ void main() {
     ]);
     expect(
         serverChannel,
-        emitsInOrder(
-            [new TalkMessage(serverChannel, "HELLO", 0, 0, false, sentPayload), emitsDone]));
+        emitsInOrder([
+          new TalkMessage(serverChannel, "HELLO", 0, 0, false, sentPayload),
+          emitsDone
+        ]));
     expect(
         clientChannel,
-        emitsInOrder(
-            [new TalkMessage(clientChannel, "WORLD", 0, 0, false, sentPayload), emitsDone]));
+        emitsInOrder([
+          new TalkMessage(clientChannel, "WORLD", 0, 0, false, sentPayload),
+          emitsDone
+        ]));
     clientChannel.sendMessage("HELLO", sentPayload);
     serverChannel.sendMessage("WORLD", sentPayload);
     await serverChannel.close();
@@ -138,8 +142,8 @@ void main() {
   test("Reply to bad message should except", () async {
     expect(() async {
       serverChannel.replyMessage(
-          new TalkMessage(
-              serverChannel, "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
+          new TalkMessage(serverChannel, "ABC", 5, 0, false,
+              new Uint8List(0)), // non-existent message
           "XYZ",
           new Uint8List(0));
     }(), throwsA(isInstanceOf<TalkException>()));
@@ -151,8 +155,8 @@ void main() {
   test("Sending a bad reply should return an abort", () async {
     serverChannel.outgoingSafety = false;
     serverChannel.replyMessage(
-        new TalkMessage(
-            serverChannel, "ABC", 5, 0, false, new Uint8List(0)), // non-existent message
+        new TalkMessage(serverChannel, "ABC", 5, 0, false,
+            new Uint8List(0)), // non-existent message
         "XYZ",
         new Uint8List(0));
     expect(serverChannel,
@@ -177,8 +181,10 @@ void main() {
     }, onError: (error, stack) {
       fail("$error\n$stack");
     });
-    expect(await clientChannel.sendRequest("HELLO", sentPayload),
-        equals(new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
+    expect(
+        await clientChannel.sendRequest("HELLO", sentPayload),
+        equals(
+            new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
   });
 
   test("Can reply to stream", () async {
@@ -304,8 +310,10 @@ void main() {
     }, onError: (error, stack) {
       fail("$error\n$stack");
     });
-    expect(await clientChannel.sendRequest("HELLO", sentPayload),
-        equals(new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
+    expect(
+        await clientChannel.sendRequest("HELLO", sentPayload),
+        equals(
+            new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload)));
   });
 }
 

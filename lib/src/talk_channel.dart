@@ -178,8 +178,8 @@ class TalkChannel extends Stream<TalkMessage> {
       bool isTimeoutExtend = (flags & 0x30) == 0x30;
       // Abort message (must be non-stream response) (an abort message with a request id is a request cancellation)
       bool isAbort = (flags & 0x30) == 0x20;
-      TalkMessage message = new TalkMessage(this,
-          procedureId, requestId, responseId, expectStreamResponse, subFrame);
+      TalkMessage message = new TalkMessage(this, procedureId, requestId,
+          responseId, expectStreamResponse, subFrame);
 
       // Process message
       if (requestId != 0) {
@@ -399,9 +399,11 @@ class TalkChannel extends Stream<TalkMessage> {
       if (state != null) {
         assert(state.completer == completer);
         assert(!state.completer.isCompleted);
-        print("TalkMessage '$procedureId' was not replied to by the remote program in time, "
+        print(
+            "TalkMessage '$procedureId' was not replied to by the remote program in time, "
             "and did not receive remote timeout, abort locally.");
-        state.completer.completeError(new TalkAbort("Reply not received in time"));
+        state.completer
+            .completeError(new TalkAbort("Reply not received in time"));
       }
     });
     _RemoteResponseState state = new _RemoteResponseState(completer, timer);
@@ -411,21 +413,25 @@ class TalkChannel extends Stream<TalkMessage> {
 
   Stream<TalkMessage> _sendingStreamRequest(String procedureId, int requestId) {
     // Create a completer
-    StreamController<TalkMessage> controller = new StreamController<TalkMessage>();
+    StreamController<TalkMessage> controller =
+        new StreamController<TalkMessage>();
     // Set a timer for the remote host to respond to this
     RewindableTimer timer =
         new RewindableTimer(new Duration(milliseconds: _receiveTimeOutMs), () {
-      _RemoteStreamResponseState state = _remoteStreamResponseStates.remove(requestId);
+      _RemoteStreamResponseState state =
+          _remoteStreamResponseStates.remove(requestId);
       if (state != null) {
         assert(state.controller == controller);
         assert(!state.controller.isClosed);
-        print("TalkMessage '$procedureId' was not replied to by the remote program in time, "
+        print(
+            "TalkMessage '$procedureId' was not replied to by the remote program in time, "
             "and did not receive remote timeout, abort locally.");
         state.controller.addError(new TalkAbort("Reply not received in time"));
         state.controller.close();
       }
     });
-    _RemoteStreamResponseState state = new _RemoteStreamResponseState(controller, timer);
+    _RemoteStreamResponseState state =
+        new _RemoteStreamResponseState(controller, timer);
     _remoteStreamResponseStates[requestId] = state;
     return controller.stream;
   }
@@ -452,27 +458,34 @@ class TalkChannel extends Stream<TalkMessage> {
 
   void replyMessage(TalkMessage replying, String procedureId, Uint8List data) {
     _sendingResponse(replying.requestId, replying.expectStreamResponse);
-    sendMessage(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
+    sendMessage(procedureId, data,
+        responseId: replying.requestId,
+        isStreamResponse: replying.expectStreamResponse);
   }
 
   Future<TalkMessage> replyRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
     _sendingResponse(replying.requestId, replying.expectStreamResponse);
-    return sendRequest(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
+    return sendRequest(procedureId, data,
+        responseId: replying.requestId,
+        isStreamResponse: replying.expectStreamResponse);
   }
 
   Stream<TalkMessage> replyStreamRequest(
       TalkMessage replying, String procedureId, Uint8List data) {
     _sendingResponse(replying.requestId, replying.expectStreamResponse);
-    return sendStreamRequest(procedureId, data, responseId: replying.requestId, isStreamResponse: replying.expectStreamResponse);
+    return sendStreamRequest(procedureId, data,
+        responseId: replying.requestId,
+        isStreamResponse: replying.expectStreamResponse);
   }
 
   void replyEndOfStream(TalkMessage replying,
       [String procedureId, Uint8List data]) {
-    // Data is not part of the stream, but post-stream. 
+    // Data is not part of the stream, but post-stream.
     // In the Dart implementation, this is thrown as a TalkEndOfStream error to the message stream.
     _sendingResponse(replying.requestId, false);
-    sendMessage(procedureId ?? "", data ?? new Uint8List(0), responseId: replying.requestId);
+    sendMessage(procedureId ?? "", data ?? new Uint8List(0),
+        responseId: replying.requestId);
   }
 
   void replyAbort(TalkMessage replying, String reason) {

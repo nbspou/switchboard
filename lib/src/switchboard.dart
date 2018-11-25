@@ -432,13 +432,34 @@ class Switchboard extends Stream<ChannelInfo> {
     });
   }
 
-  Future<void> sendMessage(String service, String procedureId, Uint8List data,
+  Future<TalkChannel> openServiceChannel(String service,
       {int shardSlot}) async {
-    TalkChannel channel = await openTalkChannel(_endPoint,
+    TalkChannel channel = await openTalkChannel(
+        _endPoint ?? _discoverService(service),
         service: service,
         shardSlot: shardSlot,
         payload: _payload,
-        shared: true);
+        shared: true,
+        autoCloseEmptyConnection: _endPoint == null);
+    return channel;
+  }
+
+  String _discoverService(String service) {
+    if (_discoveryEndPoint != null) {
+      // TODO
+    }
+    return null;
+  }
+
+  Future<void> sendMessage(String service, String procedureId, Uint8List data,
+      {int shardSlot}) async {
+    TalkChannel channel = await openTalkChannel(
+        _endPoint ?? _discoverService(service),
+        service: service,
+        shardSlot: shardSlot,
+        payload: _payload,
+        shared: true,
+        autoCloseEmptyConnection: _endPoint == null);
     channel.sendMessage(procedureId, data);
   }
 
@@ -449,7 +470,8 @@ class Switchboard extends Stream<ChannelInfo> {
         service: service,
         shardSlot: shardSlot,
         payload: _payload,
-        shared: true);
+        shared: true,
+        autoCloseEmptyConnection: _discoveryEndPoint != null);
     return await channel.sendRequest(procedureId, data);
   }
 
@@ -460,7 +482,8 @@ class Switchboard extends Stream<ChannelInfo> {
         service: service,
         shardSlot: shardSlot,
         payload: _payload,
-        shared: true);
+        shared: true,
+        autoCloseEmptyConnection: _discoveryEndPoint != null);
     await for (TalkMessage message
         in channel.sendStreamRequest(procedureId, data)) {
       yield message;
