@@ -21,12 +21,12 @@ Switchboard client;
 
 runServer() async {
   server = new Switchboard();
-  await server.bindWebSocket("localhost", 9090, "/ws");
+  await server.bindWebSocket("localhost", 9091, "/ws");
 }
 
 runClient() async {
   client = new Switchboard();
-  client.setEndPoint("ws://localhost:9090/ws");
+  client.setEndPoint("ws://localhost:9091/ws");
 }
 
 void main() {

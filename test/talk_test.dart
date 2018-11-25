@@ -29,6 +29,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
 import "package:test/test.dart";
 import 'package:switchboard/switchboard.dart';
 
@@ -42,7 +43,7 @@ Completer<void> awaitServer;
 
 runServer() async {
   awaitServer = new Completer<void>();
-  server = await HttpServer.bind('127.0.0.1', 9090);
+  server = await HttpServer.bind('127.0.0.1', 9092);
   print("bound");
   () async {
     await for (HttpRequest request in server) {
@@ -72,7 +73,7 @@ runServer() async {
 
 runClient() async {
   WebSocket ws =
-      await WebSocket.connect("ws://localhost:9090/ws", protocols: ['wstalk2']);
+      await WebSocket.connect("ws://localhost:9092/ws", protocols: ['wstalk2']);
   print("connected");
   clientMux =
       new MuxConnection(ws, onChannel: (MuxChannel channel, Uint8List payload) {
@@ -84,6 +85,17 @@ runClient() async {
 }
 
 void main() {
+  hierarchicalLoggingEnabled = true;
+  Logger.root.level = Level.ALL;
+  Logger.root.onRecord.listen((LogRecord rec) {
+    print('${rec.loggerName}: ${rec.level.name}: ${rec.time}: ${rec.message}');
+  });
+  new Logger('Switchboard').level = Level.ALL;
+  new Logger('Switchboard.Mux').level = Level.ALL;
+  new Logger('Switchboard.Talk').level = Level.ALL;
+  new Logger('Switchboard.Router').level = Level.ALL;
+  
+
   setUp(() async {
     await runServer();
     await runClient();

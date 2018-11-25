@@ -423,7 +423,7 @@ class Switchboard extends Stream<ChannelInfo> {
           _log.severe("Error signaled by HttpServer: $error\n$stack");
           // TODO: Automatically attempt to rebind?
         }, onDone: () {
-          if (_boundWebSockets.remove(server) != null) {
+          if (_boundWebSockets.remove(server)) {
             _log.severe("HttpServer closed unexpectedly.");
             // TODO: Automatically attempt to rebind?
           }
