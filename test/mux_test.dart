@@ -23,6 +23,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
 import "package:test/test.dart";
 import 'package:switchboard/switchboard.dart';
 
@@ -66,6 +67,16 @@ runClient() async {
 }
 
 void main() {
+  hierarchicalLoggingEnabled = true;
+  Logger.root.level = Level.ALL;
+  Logger.root.onRecord.listen((LogRecord rec) {
+    print('${rec.loggerName}: ${rec.level.name}: ${rec.time}: ${rec.message}');
+  });
+  new Logger('Switchboard').level = Level.ALL;
+  new Logger('Switchboard.Mux').level = Level.ALL;
+  new Logger('Switchboard.Talk').level = Level.ALL;
+  new Logger('Switchboard.Router').level = Level.ALL;
+
   setUp(() async {
     await runServer();
     await runClient();

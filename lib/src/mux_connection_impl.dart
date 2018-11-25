@@ -265,7 +265,9 @@ class MuxConnectionImpl implements MuxConnection {
               }
             }
           } else {
-            _log.severe("Invalid channel specified by remote.");
+            if (_onClose != null) {
+              _log.severe("Invalid channel specified by remote.");
+            }
             close();
           }
           break;
