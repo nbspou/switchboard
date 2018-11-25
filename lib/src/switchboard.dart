@@ -143,7 +143,7 @@ class ChannelInfo {
 }
 
 class Switchboard extends Stream<ChannelInfo> {
-  static Logger _log = new Logger('Switchboard.Router');
+  static final Logger _log = new Logger('Switchboard.Router');
   final Lock _lock = new Lock();
   final StreamController<ChannelInfo> _controller =
       new StreamController<ChannelInfo>();
@@ -403,28 +403,34 @@ class Switchboard extends Stream<ChannelInfo> {
                 );
                 _muxConnections.add(connection);
               } catch (error, stack) {
-                // TODO: Log
+                _log.severe(
+                    "Error upgrading request to WebSocket: $error\n$stack");
               }
             } else {
-              // TODO: Log
+              _log.fine("Unknown path '${request.uri.path}'.");
               try {
                 request.response.statusCode = HttpStatus.forbidden;
                 request.response.close();
               } catch (error, stack) {
-                // TODO: Log
+                _log.severe("Error sending forbidden response: $error\n$stack");
               }
             }
           } catch (error, stack) {
-            // TODO: Log
+            _log.severe(
+                "Unknown error with request, severe error, must not happen: $error\n$stack");
           }
         }, onError: (error, stack) {
-          // TODO: Log
+          _log.severe("Error signaled by HttpServer: $error\n$stack");
+          // TODO: Automatically attempt to rebind?
         }, onDone: () {
           if (_boundWebSockets.remove(server) != null) {
-            // TODO: Log (ended without being closed, rebind?)
+            _log.severe("HttpServer closed unexpectedly.");
+            // TODO: Automatically attempt to rebind?
           }
         });
       } catch (error, stack) {
+        _log.severe(
+            "Unknown error listening to HttpServer, severe error, must not happen: $error\n$stack");
         _boundWebSockets.remove(server);
         server.close();
         rethrow;

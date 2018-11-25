@@ -8,10 +8,12 @@ Author: Jan Boon <kaetemi@no-break.space>
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
 import 'package:switchboard/src/mux_connection_impl.dart';
 import 'package:switchboard/src/mux_channel.dart';
 
 class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
+  static final Logger _log = new Logger('Switchboard.Mux');
   final MuxConnectionImpl connection;
   final int channelId;
   MuxChannelImpl(this.connection, this.channelId);
@@ -33,7 +35,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
         _streamController.close();
       }
     } catch (error, stack) {
-      // LOG: Ignore error
+      _log.fine("Error closing channel: $error\n$stack");
     }
   }
 
@@ -50,7 +52,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
 
   @override
   void addError(Object error, [StackTrace stackTrace]) {
-    // TODO: LOG
+    _log.severe("Error in channel stream: $error\n$stackTrace");
   }
 
   @override
@@ -66,7 +68,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
       _closing = true;
       try {
         connection.closeChannel(this);
-      } catch (error, stack) {
+      } catch (error) {
         _closing = false;
         rethrow;
       }
