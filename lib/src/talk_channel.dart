@@ -342,7 +342,7 @@ class TalkChannel extends Stream<TalkMessage> {
     if (expectStreamResponse) flags |= 0x08; // not necessary?
     if (isStreamResponse) flags |= 0x10;
     if (isAbortOrExtend) flags |= 0x20;
-    print("$procedureId, isStreamResponse: $isStreamResponse, isAbortOrExtend: $isAbortOrExtend, expectStreamResponse: $expectStreamResponse");
+    // print("$procedureId, isStreamResponse: $isStreamResponse, isAbortOrExtend: $isAbortOrExtend, expectStreamResponse: $expectStreamResponse");
 
     // Set header data
     frame[0] = flags;

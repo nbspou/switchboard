@@ -11,14 +11,20 @@
         //     "type": "dart"
         // },
         {
-            "name": "Switchboard2 Mux Test",
+            "name": "Switchboard Mux Test",
             "program": "test/test_mux.dart",
             "request": "launch",
             "type": "dart",
         },
         {
-            "name": "Switchboard2 Talk Test",
+            "name": "Switchboard Talk Test",
             "program": "test/test_talk.dart",
+            "request": "launch",
+            "type": "dart",
+        },
+        {
+            "name": "Switchboard Switch Test",
+            "program": "test/test_switchboard.dart",
             "request": "launch",
             "type": "dart",
         }

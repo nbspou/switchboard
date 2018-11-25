@@ -102,6 +102,15 @@ class MuxConnectionImpl implements MuxConnection {
     return _webSocket != null;
   }
 
+  Future<void> closeChannels() async {
+    List<MuxChannelImpl> channels = _channels.values.toList();
+    List<Future<void>> futures = new List<Future<void>>();
+    for (MuxChannelImpl channel in channels) {
+      futures.add(channel.close());
+    }
+    await futures;
+  }
+
   Future<void> close() {
     Completer<void> completer = new Completer<void>();
     try {
