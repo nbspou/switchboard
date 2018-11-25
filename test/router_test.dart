@@ -5,8 +5,6 @@ Copyright (C) 2018  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
-import 'dart:async';
-import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
