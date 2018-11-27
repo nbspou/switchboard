@@ -117,11 +117,11 @@ void main() {
     MuxChannel serverMuxChannel = await channelCompleter.future;
     Uint8List receivedPayload = await payloadCompleter.future;
     expect(receivedPayload, equals(sentPayload));
-    clientMuxChannel.close();
-    await for (dynamic _ in clientMuxChannel) {}
-    await for (dynamic _ in serverMuxChannel) {}
-    await clientMuxChannel.done;
-    await serverMuxChannel.done;
+    clientMuxChannel.sink.close();
+    await for (dynamic _ in clientMuxChannel.stream) {}
+    await for (dynamic _ in serverMuxChannel.stream) {}
+    await clientMuxChannel.sink.done;
+    await serverMuxChannel.sink.done;
   });
 
   test("Can open and close multiple raw channels with opening payload",
@@ -150,13 +150,13 @@ void main() {
     int i = 0;
     for (MuxChannel channel in channels) {
       print(i++);
-      channel.close();
+      channel.sink.close();
     }
     i = 0;
     for (MuxChannel channel in channels) {
       print(i++);
-      await for (dynamic f in channel) {}
-      await channel.done;
+      await for (dynamic f in channel.stream) {}
+      await channel.sink.done;
     }
   });
 
@@ -176,10 +176,10 @@ void main() {
     Uint8List receivedPayload = await payloadCompleter.future;
     expect(receivedPayload, equals(sentPayload));
     await serverMux.close();
-    await for (dynamic f in clientMuxChannel) {}
-    await for (dynamic f in serverMuxChannel) {}
-    await clientMuxChannel.done;
-    await serverMuxChannel.done;
+    await for (dynamic f in clientMuxChannel.stream) {}
+    await for (dynamic f in serverMuxChannel.stream) {}
+    await clientMuxChannel.sink.done;
+    await serverMuxChannel.sink.done;
     expect(serverMux.isOpen, equals(false));
     expect(clientMux.isOpen, equals(false));
   });
@@ -207,7 +207,7 @@ void main() {
       random.nextInt(256),
       random.nextInt(256),
     ]);
-    clientMuxChannel.add(sentMessageClient);
+    clientMuxChannel.sink.add(sentMessageClient);
     Uint8List sentMessageServer = Uint8List.fromList([
       random.nextInt(256),
       random.nextInt(256),
@@ -216,12 +216,12 @@ void main() {
       random.nextInt(256),
       random.nextInt(256),
     ]);
-    serverMuxChannel.add(sentMessageServer);
-    clientMuxChannel.close();
-    expect(clientMuxChannel, emitsInOrder([sentMessageServer, emitsDone]));
-    expect(serverMuxChannel, emitsInOrder([sentMessageClient, emitsDone]));
-    await clientMuxChannel.done;
-    await serverMuxChannel.done;
+    serverMuxChannel.sink.add(sentMessageServer);
+    clientMuxChannel.sink.close();
+    expect(clientMuxChannel.stream, emitsInOrder([sentMessageServer, emitsDone]));
+    expect(serverMuxChannel.stream, emitsInOrder([sentMessageClient, emitsDone]));
+    await clientMuxChannel.sink.done;
+    await serverMuxChannel.sink.done;
   }); //
 
   test("Exception when sending messages over closed channels", () async {
@@ -239,9 +239,9 @@ void main() {
     MuxChannel serverMuxChannel = await channelCompleter.future;
     Uint8List receivedPayload = await payloadCompleter.future;
     expect(receivedPayload, equals(sentPayload));
-    clientMuxChannel.close();
+    clientMuxChannel.sink.close();
     expect(() async {
-      clientMuxChannel.add(sentPayload);
+      clientMuxChannel.sink.add(sentPayload);
     }(), throwsA(isInstanceOf<MuxException>()));
   });
 }

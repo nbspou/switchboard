@@ -10,6 +10,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/talk_message.dart';
 import 'package:switchboard/src/mux_connection.dart';
 import 'package:switchboard/src/mux_channel.dart';
@@ -92,22 +93,22 @@ class TalkChannel extends Stream<TalkMessage> {
   Map<int, _RemoteStreamResponseState> _remoteStreamResponseStates =
       new Map<int, _RemoteStreamResponseState>();
 
-  MuxChannel get channel {
+  StreamChannel get channel {
     return _channel;
   }
 
-  MuxChannel _channel;
-  TalkChannel(MuxChannel raw) {
+  StreamChannel _channel;
+  TalkChannel(StreamChannel raw) {
     _channel = raw;
     _listen();
   }
 
   int _lastRequestId = 0;
 
-  Future<void> get done => _channel.done;
+  Future<void> get done => _channel.sink.done;
   Future<void> close() async {
     try {
-      await _channel.close();
+      await _channel.sink.close();
     } catch (error) {}
     /*
     for (StreamController<TalkMessage> streamController in _streams.values) {
@@ -148,7 +149,8 @@ class TalkChannel extends Stream<TalkMessage> {
 
   static Uint8List _emptyProcedureId = new Uint8List(8);
 
-  void _onFrame(Uint8List frame) {
+  void _onFrame(dynamic f) {
+    Uint8List frame = f;
     _log.finest("Received frame.");
     try {
       // Parse general header of the message
@@ -292,7 +294,7 @@ class TalkChannel extends Stream<TalkMessage> {
   }
 
   void _listen() {
-    _channel.listen(
+    _channel.stream.listen(
       _onFrame,
       onError: (error, stackTrace) {
         _log.severe("Error from channel: $error\n$stackTrace");
@@ -381,7 +383,7 @@ class TalkChannel extends Stream<TalkMessage> {
 
     // Send frame
     _log.finest("Send frame.");
-    _channel.add(frame);
+    _channel.sink.add(frame);
   }
 
   void _replyAbort(int responseId, String reason) {
