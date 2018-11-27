@@ -34,8 +34,8 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
       if (!_streamController.isClosed) {
         _streamController.close();
       }
-    } catch (error, stack) {
-      _log.fine("Error closing channel: $error\n$stack");
+    } catch (error, stackTrace) {
+      _log.fine("Error closing channel: $error\n$stackTrace");
     }
   }
 

@@ -284,9 +284,9 @@ class TalkChannel extends Stream<TalkMessage> {
         // New message, or new request chain
         _onMessage(message);
       }
-    } catch (error, stack) {
+    } catch (error, stackTrace) {
       _log.severe(
-          "Error while handling channel frame, channel closed: $error\n$stack");
+          "Error while handling channel frame, channel closed: $error\n$stackTrace");
       close();
     }
   }
@@ -294,9 +294,9 @@ class TalkChannel extends Stream<TalkMessage> {
   void _listen() {
     _channel.listen(
       _onFrame,
-      onError: (error, stack) {
-        _log.severe("Error from channel: $error\n$stack");
-        _listenController.addError(error, stack);
+      onError: (error, stackTrace) {
+        _log.severe("Error from channel: $error\n$stackTrace");
+        _listenController.addError(error, stackTrace);
       },
       onDone: () {
         _listenController.close();
@@ -564,7 +564,7 @@ class TalkChannel extends Stream<TalkMessage> {
       replyStreamRequest(replying, message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stack) {
+      }, onError: (error, stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);
@@ -587,7 +587,7 @@ class TalkChannel extends Stream<TalkMessage> {
       sendStreamRequest(message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stack) {
+      }, onError: (error, stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);

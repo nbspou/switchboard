@@ -86,8 +86,8 @@ class MuxConnectionImpl implements MuxConnection {
     if (onClose != null) {
       try {
         onClose(this);
-      } catch (error, stack) {
-        _log.severe("Error in close callback: $error\n$stack");
+      } catch (error, stackTrace) {
+        _log.severe("Error in close callback: $error\n$stackTrace");
       }
     }
     List<MuxChannelImpl> channels =
@@ -97,8 +97,8 @@ class MuxConnectionImpl implements MuxConnection {
     for (MuxChannelImpl channel in channels) {
       try {
         channel.channelRemoteClosed();
-      } catch (error, stack) {
-        _log.severe("Error in closing channels: $error\n$stack");
+      } catch (error, stackTrace) {
+        _log.severe("Error in closing channels: $error\n$stackTrace");
       }
     }
   }
@@ -122,7 +122,7 @@ class MuxConnectionImpl implements MuxConnection {
       if (_webSocket != null) {
         WebSocket webSocket = _webSocket;
         _webSocket = null;
-        webSocket.close().catchError((error, stack) {
+        webSocket.close().catchError((error, stackTrace) {
           // Ignore error, close does not throw.
         }).whenComplete(() {
           if (!completer.isCompleted) {
@@ -137,11 +137,11 @@ class MuxConnectionImpl implements MuxConnection {
       } else {
         completer.complete();
       }
-    } catch (error, stack) {
+    } catch (error, stackTrace) {
       _log.severe(
-          "Error closing, severe error, must not occur: $error\n$stack");
+          "Error closing, severe error, must not occur: $error\n$stackTrace");
       if (!completer.isCompleted) {
-        completer.completeError(error, stack);
+        completer.completeError(error, stackTrace);
       }
     }
     return completer.future;
@@ -151,7 +151,7 @@ class MuxConnectionImpl implements MuxConnection {
     try {
       _webSocket.listen(
         _onFrame,
-        onError: (error, stack) {
+        onError: (error, stackTrace) {
           // Ignore error
           close();
         },
@@ -161,8 +161,8 @@ class MuxConnectionImpl implements MuxConnection {
         },
         cancelOnError: true,
       );
-    } catch (error, stack) {
-      _log.severe("Error while trying to listen to WebSocket: $error\n$stack");
+    } catch (error, stackTrace) {
+      _log.severe("Error while trying to listen to WebSocket: $error\n$stackTrace");
       close();
     }
   }
@@ -276,8 +276,8 @@ class MuxConnectionImpl implements MuxConnection {
           close();
           break;
       }
-    } catch (error, stack) {
-      _log.severe("Error processing frame: $error\n$stack");
+    } catch (error, stackTrace) {
+      _log.severe("Error processing frame: $error\n$stackTrace");
       close();
     }
   }
