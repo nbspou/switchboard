@@ -1,3 +1,7 @@
+## 2.0.6
+
+- Don't reset payload if identical.
+
 ## 2.0.5
 
 - Fix issue reconnecting after previous error.
