@@ -193,10 +193,10 @@ class Switchboard extends Stream<ChannelInfo> {
     if (_closing) {
       throw new SwitchboardException("Switchboard already closed.");
     }
-    _log.finest("Request to set endpoint to '$endPoint'.");
     _discoveryEndPoint = null;
     String ep = Uri.parse(endPoint).toString();
     if (_endPoint != ep) {
+      _log.finest("Request to set endpoint to '$endPoint'.");
       _endPoint = ep;
       return await _lock.synchronized(() async {
         _log.finest("Set endpoint to '$endPoint'.");
@@ -236,17 +236,19 @@ class Switchboard extends Stream<ChannelInfo> {
     if (_closing) {
       throw new SwitchboardException("Switchboard already closed.");
     }
-    _log.finest("Request to set channel payload to '$payload'.");
-    _payload = payload;
-    return await _lock.synchronized(() async {
-      _log.finest("Set channel payload to '$payload'.");
-      // Wait for any pending opening channels
-      await _openingSharedTalkChannelMap.values.toList();
-      // Wait for all existing channels to close
-      if (closeExisting)
-        await _openedConnectionMap.values
-            .map((MuxConnection connection) => connection.closeChannels());
-    });
+    if (!_isPayload(payload)) {
+      _log.finest("Request to set channel payload to '$payload'.");
+      _payload = payload;
+      return await _lock.synchronized(() async {
+        _log.finest("Set channel payload to '$payload'.");
+        // Wait for any pending opening channels
+        await _openingSharedTalkChannelMap.values.toList();
+        // Wait for all existing channels to close
+        if (closeExisting)
+          await _openedConnectionMap.values
+              .map((MuxConnection connection) => connection.closeChannels());
+      });
+    }
   }
 
   void listenDiscard() {
@@ -453,25 +455,25 @@ class Switchboard extends Stream<ChannelInfo> {
                   keepActiveAlivePing: false,
                 );
                 _muxConnections.add(connection);
-              } catch (error, stack) {
+              } catch (error, stackTrace) {
                 _log.severe(
-                    "Error upgrading request to WebSocket: $error\n$stack");
+                    "Error upgrading request to WebSocket: $error\n$stackTrace");
               }
             } else {
               _log.fine("Unknown path '${request.uri.path}'.");
               try {
                 request.response.statusCode = HttpStatus.forbidden;
                 request.response.close();
-              } catch (error, stack) {
-                _log.severe("Error sending forbidden response: $error\n$stack");
+              } catch (error, stackTrace) {
+                _log.severe("Error sending forbidden response: $error\n$stackTrace");
               }
             }
-          } catch (error, stack) {
+          } catch (error, stackTrace) {
             _log.severe(
-                "Unknown error with request, severe error, must not happen: $error\n$stack");
+                "Unknown error with request, severe error, must not happen: $error\n$stackTrace");
           }
-        }, onError: (error, stack) {
-          _log.severe("Error signaled by HttpServer: $error\n$stack");
+        }, onError: (error, stackTrace) {
+          _log.severe("Error signaled by HttpServer: $error\n$stackTrace");
           // TODO: Automatically attempt to rebind?
         }, onDone: () {
           if (_boundWebSockets.remove(server)) {
@@ -481,9 +483,9 @@ class Switchboard extends Stream<ChannelInfo> {
             _log.fine("HttpServer closed.");
           }
         });
-      } catch (error, stack) {
+      } catch (error, stackTrace) {
         _log.severe(
-            "Unknown error listening to HttpServer, severe error, must not happen: $error\n$stack");
+            "Unknown error listening to HttpServer, severe error, must not happen: $error\n$stackTrace");
         _boundWebSockets.remove(server);
         server.close();
         rethrow;

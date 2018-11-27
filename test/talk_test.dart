@@ -190,8 +190,8 @@ void main() {
     serverChannel.listen((TalkMessage message) {
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.close();
-    }, onError: (error, stack) {
-      fail("$error\n$stack");
+    }, onError: (error, stackTrace) {
+      fail("$error\n$stackTrace");
     });
     expect(
         await clientChannel.sendRequest("HELLO", sentPayload),
@@ -217,8 +217,8 @@ void main() {
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyEndOfStream(message);
       serverChannel.close();
-    }, onError: (error, stack) {
-      fail("$error\n$stack");
+    }, onError: (error, stackTrace) {
+      fail("$error\n$stackTrace");
     });
     expect(
       clientChannel.sendStreamRequest("HELLO", sentPayload),
@@ -280,8 +280,8 @@ void main() {
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyEndOfStream(message);
       serverChannel.close();
-    }, onError: (error, stack) {
-      fail("$error\n$stack");
+    }, onError: (error, stackTrace) {
+      fail("$error\n$stackTrace");
     });
     expect(
       clientChannel.sendStreamRequest("HELLO", sentPayload),
@@ -319,8 +319,8 @@ void main() {
       await new Future.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.close();
-    }, onError: (error, stack) {
-      fail("$error\n$stack");
+    }, onError: (error, stackTrace) {
+      fail("$error\n$stackTrace");
     });
     expect(
         await clientChannel.sendRequest("HELLO", sentPayload),
