@@ -1,3 +1,7 @@
+## 2.1.7
+
+- Use `WebSocketChannel` and `StreamChannel` interfaces.
+
 ## 2.0.6
 
 - Don't reset payload if identical.

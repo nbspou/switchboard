@@ -253,8 +253,8 @@ class Switchboard extends Stream<ChannelInfo> {
 
   void listenDiscard() {
     listen((ChannelInfo event) {
-      event.channel.listen(null);
-      event.channel.close();
+      event.channel.stream.listen(null);
+      event.channel.sink.close();
     });
   }
 
@@ -376,7 +376,7 @@ class Switchboard extends Stream<ChannelInfo> {
             (serviceId != null ? "~$serviceId" : ("@serviceName" ?? "*"))) +
         (shardSlot != null ? "/$shardSlot" : "");
     if (shared) {
-      if (_sharedTalkChannelMap[ush]?.channel?.isOpen == true) {
+      if ((_sharedTalkChannelMap[ush]?.channel as MuxChannel)?.isOpen == true) {
         return _sharedTalkChannelMap[ush];
       }
       _log.finest(
@@ -385,7 +385,7 @@ class Switchboard extends Stream<ChannelInfo> {
           "shardSlot '${shardSlot}', payload ${payload}");
       while (_openingSharedTalkChannelMap[ush] != null) {
         TalkChannel channel = await _openingSharedTalkChannelMap[ush];
-        if (channel?.channel?.isOpen == true) {
+        if ((_sharedTalkChannelMap[ush]?.channel as MuxChannel)?.isOpen == true) {
           return channel;
         }
       }

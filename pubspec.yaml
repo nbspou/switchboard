@@ -1,6 +1,6 @@
 name: switchboard
 description: Microservice communication protocol layers.  
-version: 2.0.6
+version: 2.1.7
 homepage: https://github.com/nbspou/switchboard
 author: NO-BREAK SPACE OÜ <support@no-break.space>
 
@@ -11,6 +11,8 @@ dependencies:
   meta: ^1.1.5
   synchronized: ^1.5.3
   logging: ^0.11.3+2
+  stream_channel: ^1.6.8
+  web_socket_channel: ^1.0.9
 
 dev_dependencies:
   test: ^1.0.0

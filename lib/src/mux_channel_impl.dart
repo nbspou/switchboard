@@ -9,10 +9,11 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/mux_connection_impl.dart';
 import 'package:switchboard/src/mux_channel.dart';
 
-class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
+class MuxChannelImpl with StreamChannelMixin<Uint8List> implements MuxChannel, StreamSink<Uint8List> {
   static final Logger _log = new Logger('Switchboard.Mux');
   final MuxConnectionImpl connection;
   final int channelId;
@@ -86,4 +87,10 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
     return _streamController.stream.listen(onData,
         onError: onError, onDone: onDone, cancelOnError: cancelOnError);
   }
+
+  @override
+  StreamSink<Uint8List> get sink => this;
+
+  @override
+  Stream<Uint8List> get stream => _streamController.stream;
 }

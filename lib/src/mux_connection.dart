@@ -34,6 +34,7 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/mux_channel.dart';
 import 'package:switchboard/src/mux_channel_impl.dart';
 
