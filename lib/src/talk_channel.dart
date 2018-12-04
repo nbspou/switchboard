@@ -193,7 +193,7 @@ class TalkChannel extends Stream<TalkMessage> {
         // Ensure we're not past the concurrency limit
         int concurrentRequests = _localAnyResponseStates.length;
         if (concurrentRequests >= _maxConcurrentRequests) {
-          if (outgoingSafety) {
+          if (outgoingSafety && channel.isOpen) {
             _replyAbort(requestId, "Too many incoming concurrent requests.");
           }
           return;
@@ -206,7 +206,7 @@ class TalkChannel extends Stream<TalkMessage> {
           if (state != null) {
             _log.severe(
                 "TalkMessage '$procedureId' was not replied to by the local program in time, sending abort.");
-            if (outgoingSafety) {
+            if (outgoingSafety && channel.isOpen) {
               _replyAbort(requestId, "Reply not sent in time.");
             }
           }
