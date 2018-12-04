@@ -465,7 +465,8 @@ class Switchboard extends Stream<ChannelInfo> {
                 request.response.statusCode = HttpStatus.forbidden;
                 request.response.close();
               } catch (error, stackTrace) {
-                _log.severe("Error sending forbidden response: $error\n$stackTrace");
+                _log.severe(
+                    "Error sending forbidden response: $error\n$stackTrace");
               }
             }
           } catch (error, stackTrace) {
