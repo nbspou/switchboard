@@ -16,11 +16,10 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
   static final Logger _log = new Logger('Switchboard.Mux');
   final MuxConnectionImpl connection;
   final int channelId;
-  MuxChannelImpl(this.connection, this.channelId) {
-    _streamController = new StreamController<Uint8List>(onCancel: close);
-  }
+  MuxChannelImpl(this.connection, this.channelId);
 
-  StreamController<Uint8List> _streamController;
+  StreamController<Uint8List> _streamController =
+      new StreamController<Uint8List>();
 
   bool _closing = false;
 
