@@ -41,7 +41,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
 
   @override
   bool get isOpen {
-    return !_streamController.isClosed;
+    return !_streamController.isClosed && !_closing;
   }
 
   @override
