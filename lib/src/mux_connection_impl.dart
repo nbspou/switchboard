@@ -87,7 +87,7 @@ class MuxConnectionImpl implements MuxConnection {
       try {
         onClose(this);
       } catch (error, stackTrace) {
-        _log.severe('Error in close callback: $error\n$stackTrace');
+        _log.severe('Error in close callback', error, stackTrace);
       }
     }
     final List<MuxChannelImpl> channels =
@@ -98,7 +98,7 @@ class MuxConnectionImpl implements MuxConnection {
       try {
         channel.channelRemoteClosed();
       } catch (error, stackTrace) {
-        _log.severe('Error in closing channels: $error\n$stackTrace');
+        _log.severe('Error in closing channels', error, stackTrace);
       }
     }
   }
@@ -156,7 +156,7 @@ class MuxConnectionImpl implements MuxConnection {
       }
     } catch (error, stackTrace) {
       _log.severe(
-          'Error closing, severe error, must not occur: $error\n$stackTrace');
+          'Error closing, severe error, must not occur', error, stackTrace);
       if (!completer.isCompleted) {
         completer.completeError(error, stackTrace);
       }
@@ -180,7 +180,7 @@ class MuxConnectionImpl implements MuxConnection {
       );
     } catch (error, stackTrace) {
       _log.severe(
-          'Error while trying to listen to WebSocket: $error\n$stackTrace');
+          'Error while trying to listen to WebSocket', error, stackTrace);
       close();
     }
   }
@@ -295,7 +295,7 @@ class MuxConnectionImpl implements MuxConnection {
           break;
       }
     } catch (error, stackTrace) {
-      _log.severe('Error processing frame: $error\n$stackTrace');
+      _log.severe('Error processing frame', error, stackTrace);
       close();
     }
   }

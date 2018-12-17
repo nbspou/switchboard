@@ -292,7 +292,7 @@ class TalkChannel extends Stream<TalkMessage> {
       }
     } catch (error, stackTrace) {
       _log.severe(
-          'Error while handling channel frame, channel closed: $error\n$stackTrace');
+          'Error while handling channel frame, channel closed', error, stackTrace);
       close();
     }
   }
@@ -301,7 +301,7 @@ class TalkChannel extends Stream<TalkMessage> {
     _channel.listen(
       _onFrame,
       onError: (dynamic error, StackTrace stackTrace) {
-        _log.severe('Error from channel: $error\n$stackTrace');
+        _log.severe('Error from channel', error, stackTrace);
         _listenController.addError(error, stackTrace);
       },
       onDone: () {

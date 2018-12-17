@@ -35,7 +35,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
         _streamController.close();
       }
     } catch (error, stackTrace) {
-      _log.fine("Error closing channel: $error\n$stackTrace");
+      _log.fine("Error closing channel", error, stackTrace);
     }
   }
 
@@ -52,7 +52,7 @@ class MuxChannelImpl extends Stream<Uint8List> implements MuxChannel {
 
   @override
   void addError(Object error, [StackTrace stackTrace]) {
-    _log.severe("Error in channel stream: $error\n$stackTrace");
+    _log.severe("Error in channel stream", error, stackTrace);
   }
 
   @override
