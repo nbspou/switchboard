@@ -19,12 +19,12 @@ import 'package:switchboard/switchboard.dart';
 Switchboard server;
 Switchboard client;
 
-runServer() async {
+Future<void> runServer() async {
   server = new Switchboard();
   await server.bindWebSocket("localhost", 9091, "/ws");
 }
 
-runClient() async {
+Future<void> runClient() async {
   client = new Switchboard();
   client.setEndPoint("ws://localhost:9091/ws");
 }
@@ -182,13 +182,13 @@ void main() {
     }
     serverQueue.cancel();
     await server.close();
-    await new Future.delayed(new Duration(seconds: 2));
+    await Future<void>.delayed(new Duration(seconds: 2));
     expect(() async {
       await client.sendMessage("api", "MY", payload);
     }(), throwsA(isInstanceOf<Exception>()));
     print("x");
-    await new Future.delayed(new Duration(seconds: 2));
-    server = new Switchboard();
+    await Future<void>.delayed(new Duration(seconds: 2));
+    server = Switchboard();
     await server.bindWebSocket("localhost", 9091, "/ws");
     print("y");
     await client.sendMessage("api", "WORLD", payload);
