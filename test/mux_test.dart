@@ -39,7 +39,7 @@ void onChannel(MuxChannel channel, Uint8List payload) {
   payloadCompleter.complete(payload);
 }
 
-runServer() async {
+Future<void> runServer() async {
   server = await HttpServer.bind('127.0.0.1', 9090);
   print("bound");
   () async {
@@ -59,7 +59,7 @@ runServer() async {
   }();
 }
 
-runClient() async {
+Future<void> runClient() async {
   WebSocket ws =
       await WebSocket.connect("ws://localhost:9090/ws", protocols: ['wstalk2']);
   print("connected");
@@ -218,8 +218,8 @@ void main() {
     ]);
     serverMuxChannel.add(sentMessageServer);
     clientMuxChannel.close();
-    expect(clientMuxChannel, emitsInOrder([sentMessageServer, emitsDone]));
-    expect(serverMuxChannel, emitsInOrder([sentMessageClient, emitsDone]));
+    expect(clientMuxChannel, emitsInOrder(<dynamic>[sentMessageServer, emitsDone]));
+    expect(serverMuxChannel, emitsInOrder(<dynamic>[sentMessageClient, emitsDone]));
     await clientMuxChannel.done;
     await serverMuxChannel.done;
   }); //

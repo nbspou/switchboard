@@ -284,7 +284,7 @@ class TalkChannel extends Stream<TalkMessage> {
         // Invalid message state
         _log.severe(
             "Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
-        throw new TalkException(
+        throw TalkException(
             "Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
       } else {
         // New message, or new request chain
@@ -292,7 +292,7 @@ class TalkChannel extends Stream<TalkMessage> {
       }
     } catch (error, stackTrace) {
       _log.severe(
-          "Error while handling channel frame, channel closed: $error\n$stackTrace");
+          'Error while handling channel frame, channel closed: $error\n$stackTrace');
       close();
     }
   }
@@ -300,8 +300,8 @@ class TalkChannel extends Stream<TalkMessage> {
   void _listen() {
     _channel.listen(
       _onFrame,
-      onError: (error, stackTrace) {
-        _log.severe("Error from channel: $error\n$stackTrace");
+      onError: (dynamic error, StackTrace stackTrace) {
+        _log.severe('Error from channel: $error\n$stackTrace');
         _listenController.addError(error, stackTrace);
       },
       onDone: () {
@@ -578,7 +578,7 @@ class TalkChannel extends Stream<TalkMessage> {
       replyStreamRequest(replying, message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stackTrace) {
+      }, onError: (dynamic error, StackTrace stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);
@@ -601,7 +601,7 @@ class TalkChannel extends Stream<TalkMessage> {
       sendStreamRequest(message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stackTrace) {
+      }, onError: (dynamic error, StackTrace stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);

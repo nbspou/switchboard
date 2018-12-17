@@ -1,6 +1,6 @@
 name: switchboard
 description: Microservice communication protocol layers.  
-version: 2.0.9
+version: 2.0.11
 homepage: https://github.com/nbspou/switchboard
 author: NO-BREAK SPACE OÜ <support@no-break.space>
 

@@ -25,8 +25,10 @@ import 'package:switchboard/src/talk_message.dart';
 class SwitchboardException implements Exception {
   final String message;
   const SwitchboardException(this.message);
+
+  @override
   String toString() {
-    return "SwitchboardException: $message";
+    return 'SwitchboardException: $message';
   }
 }
 
@@ -46,38 +48,38 @@ class ChannelInfo {
   const ChannelInfo(this.channel, this.host, this.service, this.serviceId,
       this.serviceName, this.shardSlot, this.payload);
   factory ChannelInfo.fromPayload(MuxChannel channel, Uint8List payload) {
-    int flags = payload[0];
-    ByteBuffer buffer = payload.buffer;
+    final int flags = payload[0];
+    final ByteBuffer buffer = payload.buffer;
     int o = 1 + payload.offsetInBytes;
 
-    bool hasHost = (flags & 0x01) == 0x01;
+    final bool hasHost = (flags & 0x01) == 0x01;
     String host;
 
-    bool hasService = (flags & 0x06) == 0x02;
-    bool hasServiceId = (flags & 0x06) == 0x04;
-    bool hasServiceName = (flags & 0x06) == 0x06;
+    final bool hasService = (flags & 0x06) == 0x02;
+    final bool hasServiceId = (flags & 0x06) == 0x04;
+    final bool hasServiceName = (flags & 0x06) == 0x06;
     String service;
     int serviceId;
     String serviceName;
 
-    bool hasShardSlot = (flags & 0x08) == 0x08;
+    final bool hasShardSlot = (flags & 0x08) == 0x08;
     int shardSlot;
 
     if (hasHost) {
-      int length = buffer.asUint8List(o++)[0];
+      final int length = buffer.asUint8List(o++)[0];
       host = utf8.decode(buffer.asUint8List(o, length));
       o += length;
     }
 
     if (hasService) {
-      int length = buffer.asUint8List(o++)[0];
+      final int length = buffer.asUint8List(o++)[0];
       service = utf8.decode(buffer.asUint8List(o, length));
       o += length;
     } else if (hasServiceId) {
       serviceId = buffer.asUint32List(o)[0];
       o += 4;
     } else if (hasServiceName) {
-      int length = buffer.asUint8List(o++)[0];
+      final int length = buffer.asUint8List(o++)[0];
       serviceName = utf8.decode(buffer.asUint8List(o, length));
       o += length;
     }
@@ -87,7 +89,7 @@ class ChannelInfo {
       o += 4;
     }
 
-    return new ChannelInfo(
+    return ChannelInfo(
         channel,
         host,
         service,
@@ -98,7 +100,7 @@ class ChannelInfo {
   }
 
   Uint8List toPayload() {
-    Uint8List res = new Uint8List(1 +
+    final Uint8List res = Uint8List(1 +
         1 +
         ((host?.length ?? 0) * 4) +
         1 +
@@ -111,14 +113,14 @@ class ChannelInfo {
     int flags = 0;
     if (host != null) {
       flags |= 0x01;
-      Uint8List str = utf8.encode(host);
+      final Uint8List str = utf8.encode(host);
       res[o++] = str.length;
       res.setAll(o, str);
       o += str.length;
     }
     if (service != null) {
       flags |= 0x02;
-      Uint8List str = utf8.encode(service);
+      final Uint8List str = utf8.encode(service);
       res[o++] = str.length;
       res.setAll(o, str);
       o += str.length;
@@ -128,7 +130,7 @@ class ChannelInfo {
       o += 4;
     } else if (serviceName != null) {
       flags |= 0x06;
-      Uint8List str = utf8.encode(service);
+      final Uint8List str = utf8.encode(service);
       res[o++] = str.length;
       res.setAll(o, str);
       o += str.length;
@@ -148,18 +150,18 @@ class ChannelInfo {
 }
 
 class Switchboard extends Stream<ChannelInfo> {
-  static final Logger _log = new Logger('Switchboard.Router');
-  final Lock _lock = new Lock();
+  static final Logger _log = Logger('Switchboard.Router');
+  final Lock _lock = Lock();
   final StreamController<ChannelInfo> _controller =
-      new StreamController<ChannelInfo>();
-  final Set<HttpServer> _boundWebSockets = new Set<HttpServer>();
-  final Set<MuxConnection> _muxConnections = new Set<MuxConnection>();
+      StreamController<ChannelInfo>();
+  final Set<HttpServer> _boundWebSockets = Set<HttpServer>();
+  final Set<MuxConnection> _muxConnections = Set<MuxConnection>();
   final Map<String, MuxConnection> _openedConnectionMap =
-      new Map<String, MuxConnection>();
+      <String, MuxConnection>{};
   final Map<String, TalkChannel> _sharedTalkChannelMap =
-      new Map<String, TalkChannel>();
+      <String, TalkChannel>{};
   final Map<String, Future<TalkChannel>> _openingSharedTalkChannelMap =
-      new Map<String, Future<TalkChannel>>();
+      <String, Future<TalkChannel>>{};
 
   MuxConnection _endPointConnection;
   String _endPoint;
@@ -168,7 +170,7 @@ class Switchboard extends Stream<ChannelInfo> {
   String _discoveryEndPoint;
   String _discoveryService = "discover";
 
-  Uint8List _payload = new Uint8List(0);
+  Uint8List _payload = Uint8List(0);
 
   bool _isPayload(Uint8List payload) {
     bool equalData = _payload == payload;
@@ -191,20 +193,20 @@ class Switchboard extends Stream<ChannelInfo> {
   Future<void> setEndPoint(String endPoint,
       {bool disconnectExisting: true}) async {
     if (_closing) {
-      throw new SwitchboardException("Switchboard already closed.");
+      throw const SwitchboardException('Switchboard already closed.');
     }
     _discoveryEndPoint = null;
-    String ep = Uri.parse(endPoint).toString();
+    final String ep = Uri.parse(endPoint).toString();
     if (_endPoint != ep) {
       _log.finest("Request to set endpoint to '$endPoint'.");
       _endPoint = ep;
       return await _lock.synchronized(() async {
         _log.finest("Set endpoint to '$endPoint'.");
-        MuxConnection endPointConnection = _endPointConnection;
+        final MuxConnection endPointConnection = _endPointConnection;
         _endPointConnection = null;
-        TalkChannel discoveryChannel = _discoveryChannel;
+        final TalkChannel discoveryChannel = _discoveryChannel;
         _discoveryChannel = null;
-        if (disconnectExisting) await endPointConnection?.closeChannels();
+        if (disconnectExisting) {await endPointConnection?.closeChannels();}
         await discoveryChannel?.close();
       });
     }
@@ -213,9 +215,9 @@ class Switchboard extends Stream<ChannelInfo> {
   /// Sets the discovery service to use to find services to connect to.
   /// Either an end point or discovery service is set.
   Future<void> setDiscoveryService(String endPoint,
-      {String service = "discover", bool disconnectExisting: true}) async {
+      {String service = 'discover', bool disconnectExisting: true}) async {
     if (_closing) {
-      throw new SwitchboardException("Switchboard already closed.");
+      throw const SwitchboardException('Switchboard already closed.');
     }
     _log.finest("Request to set discovery service to '$endPoint' '$service'.");
     _endPoint = null;
@@ -223,18 +225,20 @@ class Switchboard extends Stream<ChannelInfo> {
     _discoveryService = service;
     return await _lock.synchronized(() async {
       _log.finest("Set discovery service to '$endPoint' '$service'.");
-      MuxConnection endPointConnection = _endPointConnection;
+      final MuxConnection endPointConnection = _endPointConnection;
       _endPointConnection = null;
-      TalkChannel discoveryChannel = _discoveryChannel;
+      final TalkChannel discoveryChannel = _discoveryChannel;
       _discoveryChannel = null;
-      if (disconnectExisting) await discoveryChannel?.close();
+      if (disconnectExisting) {
+        await discoveryChannel?.close();
+      }
       await endPointConnection?.closeChannels();
     });
   }
 
   Future<void> setPayload(Uint8List payload, {bool closeExisting: true}) async {
     if (_closing) {
-      throw new SwitchboardException("Switchboard already closed.");
+      throw const SwitchboardException('Switchboard already closed.');
     }
     if (!_isPayload(payload)) {
       _log.finest("Request to set channel payload to '$payload'.");
@@ -315,7 +319,7 @@ class Switchboard extends Stream<ChannelInfo> {
         if (connection == null) {
           if (u.scheme == "ws" || u.scheme == "wss") {
             _log.fine("Attempt to connect to WebSocket endpoint '${us}'.");
-            WebSocket ws = await WebSocket.connect(us, protocols: ['wstalk2']);
+            WebSocket ws = await WebSocket.connect(us, protocols: ['wstalk2']).timeout(Duration(seconds: 3));
             connection = new MuxConnection(
               ws,
               onChannel: _onMuxChannel,
@@ -473,20 +477,20 @@ class Switchboard extends Stream<ChannelInfo> {
             _log.severe(
                 "Unknown error with request, severe error, must not happen: $error\n$stackTrace");
           }
-        }, onError: (error, stackTrace) {
-          _log.severe("Error signaled by HttpServer: $error\n$stackTrace");
+        }, onError: (dynamic error, StackTrace stackTrace) {
+          _log.severe('Error signaled by HttpServer: $error\n$stackTrace');
           // TODO: Automatically attempt to rebind?
         }, onDone: () {
           if (_boundWebSockets.remove(server)) {
-            _log.severe("HttpServer closed unexpectedly.");
+            _log.severe('HttpServer closed unexpectedly.');
             // TODO: Automatically attempt to rebind?
           } else {
-            _log.fine("HttpServer closed.");
+            _log.fine('HttpServer closed.');
           }
         });
       } catch (error, stackTrace) {
         _log.severe(
-            "Unknown error listening to HttpServer, severe error, must not happen: $error\n$stackTrace");
+            'Unknown error listening to HttpServer, severe error, must not happen: $error\n$stackTrace');
         _boundWebSockets.remove(server);
         server.close();
         rethrow;

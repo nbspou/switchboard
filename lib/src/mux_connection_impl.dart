@@ -5,7 +5,6 @@ Copyright (C) 2018  NO-BREAK SPACE OÜ
 Author: Jan Boon <kaetemi@no-break.space>
 */
 
-import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
@@ -16,17 +15,17 @@ import 'package:switchboard/src/mux_channel.dart';
 import 'package:switchboard/src/mux_channel_impl.dart';
 
 class MuxConnectionImpl implements MuxConnection {
-  static final Logger _log = new Logger('Switchboard.Mux');
+  static final Logger _log = Logger('Switchboard.Mux');
   WebSocket _webSocket;
   Function(MuxChannel channel, Uint8List payLoad) _onChannel;
   Function() _onClose;
 
   /// Open channels
-  final Map<int, MuxChannelImpl> _channels = new Map<int, MuxChannelImpl>();
+  final Map<int, MuxChannelImpl> _channels = <int, MuxChannelImpl>{};
 
   /// Channels to which the close command has been sent, which have not yet received close confirmation
   final Map<int, MuxChannelImpl> _closingChannels =
-      new Map<int, MuxChannelImpl>();
+      <int, MuxChannelImpl>{};
 
   int _nextChannelId;
 
@@ -37,6 +36,7 @@ class MuxConnectionImpl implements MuxConnection {
   bool _autoCloseEmptyConnection;
   bool _keepActiveAlivePing;
 
+  @override
   bool get channelsAvailable {
     return _nextChannelId < 0x1000000000000;
   }
@@ -60,11 +60,11 @@ class MuxConnectionImpl implements MuxConnection {
     };
     if (keepActiveAlivePing) {
       _webSocket.pingInterval =
-          new Duration(milliseconds: _keepAliveIntervalMs);
+          Duration(milliseconds: _keepAliveIntervalMs);
     }
     if (autoCloseEmptyConnection) {
       _closeTimeoutTimer =
-          new Timer(new Duration(milliseconds: _closeTimeoutMs), () {
+          Timer(Duration(milliseconds: _closeTimeoutMs), () {
         // Empty connection timeout
         _closeTimeoutTimer = null;
         close();
@@ -78,7 +78,7 @@ class MuxConnectionImpl implements MuxConnection {
   }
 
   void _onCloseDo(Function(MuxConnection connection) onClose) {
-    _log.finest("Connection closed.");
+    _log.finest('Connection closed.');
     if (_closeTimeoutTimer != null) {
       _closeTimeoutTimer.cancel();
       _closeTimeoutTimer = null;
@@ -87,49 +87,66 @@ class MuxConnectionImpl implements MuxConnection {
       try {
         onClose(this);
       } catch (error, stackTrace) {
-        _log.severe("Error in close callback: $error\n$stackTrace");
+        _log.severe('Error in close callback: $error\n$stackTrace');
       }
     }
-    List<MuxChannelImpl> channels =
-        (_channels.values.toList()..addAll(_closingChannels.values));
+    final List<MuxChannelImpl> channels =
+        _channels.values.toList()..addAll(_closingChannels.values);
     _channels.clear();
     _closingChannels.clear();
     for (MuxChannelImpl channel in channels) {
       try {
         channel.channelRemoteClosed();
       } catch (error, stackTrace) {
-        _log.severe("Error in closing channels: $error\n$stackTrace");
+        _log.severe('Error in closing channels: $error\n$stackTrace');
       }
     }
   }
 
+  @override
   bool get isOpen {
-    return _webSocket != null;
+    if (_webSocket != null)
+    {
+      if (_webSocket.readyState != WebSocket.open) {
+        _log.severe('WebSocket exists but is not open.');
+        close();
+        return false;
+      }
+      if (_webSocket.closeCode != null) {
+        _log.severe('WebSocket exists but is closed (${_webSocket.closeCode}).');
+        close();
+        return false;
+      }
+      return true;
+    }
+    return false;
   }
 
+  @override
   Future<void> closeChannels() async {
-    List<MuxChannelImpl> channels = _channels.values.toList();
-    List<Future<void>> futures = new List<Future<void>>();
+    final List<MuxChannelImpl> channels = _channels.values.toList();
+    final List<Future<void>> futures = <Future<void>>[];
     for (MuxChannelImpl channel in channels) {
       futures.add(channel.close());
     }
-    await futures;
+    await Future.wait(futures);
   }
 
+  @override
   Future<void> close() {
-    Completer<void> completer = new Completer<void>();
+    final Completer<void> completer = Completer<void>();
     try {
       if (_webSocket != null) {
-        WebSocket webSocket = _webSocket;
+        final WebSocket webSocket = _webSocket;
         _webSocket = null;
-        webSocket.close().catchError((error, stackTrace) {
+        webSocket.close().catchError((dynamic error, StackTrace stackTrace) {
           // Ignore error, close does not throw.
         }).whenComplete(() {
           if (!completer.isCompleted) {
             completer.complete();
           }
           if (_onClose != null) {
-            Function() onClose = _onClose;
+            final Function() onClose = _onClose;
             _onClose = null;
             onClose();
           }
@@ -139,7 +156,7 @@ class MuxConnectionImpl implements MuxConnection {
       }
     } catch (error, stackTrace) {
       _log.severe(
-          "Error closing, severe error, must not occur: $error\n$stackTrace");
+          'Error closing, severe error, must not occur: $error\n$stackTrace');
       if (!completer.isCompleted) {
         completer.completeError(error, stackTrace);
       }
@@ -151,7 +168,7 @@ class MuxConnectionImpl implements MuxConnection {
     try {
       _webSocket.listen(
         _onFrame,
-        onError: (error, stackTrace) {
+        onError: (dynamic error, StackTrace stackTrace) {
           // Ignore error
           close();
         },
@@ -162,33 +179,34 @@ class MuxConnectionImpl implements MuxConnection {
         cancelOnError: true,
       );
     } catch (error, stackTrace) {
-      _log.severe("Error while trying to listen to WebSocket: $error\n$stackTrace");
+      _log.severe(
+          'Error while trying to listen to WebSocket: $error\n$stackTrace');
       close();
     }
   }
 
   void _onFrame(dynamic f) {
     try {
-      Uint8List frame = f;
+      final Uint8List frame = f;
       final int offset = frame.offsetInBytes;
-      ByteBuffer buffer = frame.buffer;
-      int flags = frame[0];
+      final ByteBuffer buffer = frame.buffer;
+      final int flags = frame[0];
       // 2-byte channel id instead of 6-byte, more useful for client-server
-      bool shortChannelId = (flags & 0x02) != 0;
+      final bool shortChannelId = (flags & 0x02) != 0;
       // failure in case any of these reserved bits are set, useful for forced breaking of compatibility (changing channel Id format)
-      bool reservedBreakingFlags = (flags & 0xCD) != 0;
+      final bool reservedBreakingFlags = (flags & 0xCD) != 0;
       if (reservedBreakingFlags) {
         _log.severe(
-            "Remote is using protocol features which are not supported.");
+            'Remote is using protocol features which are not supported.');
         close();
         return;
       }
       // these bits are reserved for other protocol behaviour changes, which don't impact compatibility
-      bool unknownFlags = (flags & 0x80) != 0;
+      final bool unknownFlags = (flags & 0x80) != 0;
       if (unknownFlags) {
-        _log.warning("Remote is using an unknown protocol extension.");
+        _log.warning('Remote is using an unknown protocol extension.');
       }
-      int systemCommand = (flags & 0x30) >>
+      final int systemCommand = (flags & 0x30) >>
           4; // 0: data, 1: open channel, 2: close channel, 3: reserved.
       int channelId = (frame[1]) | (frame[2] << 8);
       Uint8List subFrame;
@@ -209,27 +227,27 @@ class MuxConnectionImpl implements MuxConnection {
           if (channel != null) {
             channel.receivedFrame(subFrame);
           } else {
-            _log.severe("Remote attempts to communicate on a closed channel.");
+            _log.severe('Remote attempts to communicate on a closed channel.');
             close();
           }
           break;
         case 1: // open channel
           if (channel == null) {
-            channel = new MuxChannelImpl(this, channelId);
+            channel = MuxChannelImpl(this, channelId);
             _channels[channelId] = channel;
             if (_keepActiveAlivePing) {
               _webSocket.pingInterval =
-                  new Duration(milliseconds: _keepAliveIntervalMs);
+                  Duration(milliseconds: _keepAliveIntervalMs);
             }
             if (_closeTimeoutTimer != null) {
               _closeTimeoutTimer.cancel();
               _closeTimeoutTimer = null;
             }
-            _log.finer("Remote opened channel.");
+            _log.finer('Remote opened channel.');
             _onChannel(channel, subFrame);
           } else {
             _log.severe(
-                "Remote attempts to open a channel which is already open or closing.");
+                'Remote attempts to open a channel which is already open or closing.');
             close();
           }
           break;
@@ -241,14 +259,14 @@ class MuxConnectionImpl implements MuxConnection {
               // This is the confirmation
               if (_closingChannels.remove(channelId) == null) {
                 _log.severe(
-                    "Attempt to close channel twice. Protocol violation, close connection.");
+                    'Attempt to close channel twice. Protocol violation, close connection.');
                 close();
               } else {
-                _log.finer("Remote confirmed channel closed.");
+                _log.finer('Remote confirmed channel closed.');
               }
             } else {
               // Reply confirmation
-              _log.finer("Remote is closing channel, channel closed.");
+              _log.finer('Remote is closing channel, channel closed.');
               _closeChannel(channelId);
             }
             if (_channels.isEmpty && _closingChannels.isEmpty) {
@@ -257,7 +275,7 @@ class MuxConnectionImpl implements MuxConnection {
               }
               if (_autoCloseEmptyConnection && _closeTimeoutTimer == null) {
                 _closeTimeoutTimer =
-                    new Timer(new Duration(milliseconds: _closeTimeoutMs), () {
+                    Timer(Duration(milliseconds: _closeTimeoutMs), () {
                   // Empty connection timeout
                   _closeTimeoutTimer = null;
                   close();
@@ -266,18 +284,18 @@ class MuxConnectionImpl implements MuxConnection {
             }
           } else {
             if (_onClose != null) {
-              _log.severe("Invalid channel specified by remote.");
+              _log.severe('Invalid channel specified by remote.');
             }
             close();
           }
           break;
         case 3:
-          _log.severe("Invalid system command.");
+          _log.severe('Invalid system command.');
           close();
           break;
       }
     } catch (error, stackTrace) {
-      _log.severe("Error processing frame: $error\n$stackTrace");
+      _log.severe('Error processing frame: $error\n$stackTrace');
       close();
     }
   }
@@ -285,22 +303,24 @@ class MuxConnectionImpl implements MuxConnection {
   /// Send a frame from a channel.
   void sendFrame(int channelId, Uint8List frame, {int command = 0}) {
     if (!_channels.containsKey(channelId) && command != 2) {
-      _log.severe("Attempt to send frame to closed channel.");
-      throw new MuxException("Attempt to send frame to closed channel.");
+      _log.severe('Attempt to send frame to closed channel.');
+      throw const MuxException('Attempt to send frame to closed channel.');
     }
-    int offset = frame.offsetInBytes;
-    bool shortChannelId = (channelId < 0x10000);
-    int headerSize = shortChannelId ? 3 : 7;
+    final int offset = frame.offsetInBytes;
+    final bool shortChannelId = channelId < 0x10000;
+    final int headerSize = shortChannelId ? 3 : 7;
     Uint8List expandedFrame;
     if (offset < headerSize) {
-      expandedFrame = new Uint8List.fromList(new Uint8List(headerSize) + frame);
+      expandedFrame = Uint8List.fromList(Uint8List(headerSize) + frame);
     } else {
       expandedFrame = frame.buffer
           .asUint8List(offset - headerSize, headerSize + frame.lengthInBytes);
     }
     int flags = 0;
-    if (shortChannelId) flags |= 0x02;
-    flags |= (command << 4);
+    if (shortChannelId) {
+      flags |= 0x02;
+    }
+    flags |= command << 4;
     expandedFrame[0] = flags;
     expandedFrame[1] = channelId & 0xFF;
     expandedFrame[2] = (channelId >> 8) & 0xFF;
@@ -316,7 +336,7 @@ class MuxConnectionImpl implements MuxConnection {
   // MuxChannel.close();
   void closeChannel(MuxChannelImpl channel) {
     if (_channels.remove(channel.channelId) != null) {
-      _log.finer("Closing channel.");
+      _log.finer('Closing channel.');
       _closingChannels[channel.channelId] = channel;
       _closeChannel(channel.channelId);
     }
@@ -324,29 +344,30 @@ class MuxConnectionImpl implements MuxConnection {
 
   // MuxChannel.close();
   void _closeChannel(int channelId) {
-    Uint8List frame = new Uint8List(kReserveMuxConnectionHeaderSize)
+    final Uint8List frame = Uint8List(kReserveMuxConnectionHeaderSize)
         .buffer
         .asUint8List(kReserveMuxConnectionHeaderSize);
     sendFrame(channelId, frame, command: 2);
   }
 
+  @override
   MuxChannel openChannel(Uint8List payLoad) {
     if (!channelsAvailable) {
-      _log.severe("No more channels available.");
+      _log.severe('No more channels available.');
       return null;
     }
-    int channelId = _nextChannelId++;
-    MuxChannelImpl channel = new MuxChannelImpl(this, channelId);
+    final int channelId = _nextChannelId++;
+    final MuxChannelImpl channel = MuxChannelImpl(this, channelId);
     _channels[channelId] = channel;
-    Uint8List frame = payLoad ??
-        new Uint8List(kReserveMuxConnectionHeaderSize)
+    final Uint8List frame = payLoad ??
+        Uint8List(kReserveMuxConnectionHeaderSize)
             .buffer
             .asUint8List(kReserveMuxConnectionHeaderSize);
-    _log.finer("Open channel.");
+    _log.finer('Open channel.');
     sendFrame(channelId, frame, command: 1);
     if (_keepActiveAlivePing) {
       _webSocket.pingInterval =
-          new Duration(milliseconds: _keepAliveIntervalMs);
+          Duration(milliseconds: _keepAliveIntervalMs);
     }
     if (_closeTimeoutTimer != null) {
       _closeTimeoutTimer.cancel();
