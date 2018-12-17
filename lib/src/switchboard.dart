@@ -461,7 +461,7 @@ class Switchboard extends Stream<ChannelInfo> {
                 _muxConnections.add(connection);
               } catch (error, stackTrace) {
                 _log.severe(
-                    "Error upgrading request to WebSocket: $error\n$stackTrace");
+                    "Error upgrading request to WebSocket", error, stackTrace);
               }
             } else {
               _log.fine("Unknown path '${request.uri.path}'.");
@@ -470,15 +470,15 @@ class Switchboard extends Stream<ChannelInfo> {
                 request.response.close();
               } catch (error, stackTrace) {
                 _log.severe(
-                    "Error sending forbidden response: $error\n$stackTrace");
+                    "Error sending forbidden response", error, stackTrace);
               }
             }
           } catch (error, stackTrace) {
             _log.severe(
-                "Unknown error with request, severe error, must not happen: $error\n$stackTrace");
+                "Unknown error with request, severe error, must not happen", error, stackTrace);
           }
         }, onError: (dynamic error, StackTrace stackTrace) {
-          _log.severe('Error signaled by HttpServer: $error\n$stackTrace');
+          _log.severe('Error signaled by HttpServer', error, stackTrace);
           // TODO: Automatically attempt to rebind?
         }, onDone: () {
           if (_boundWebSockets.remove(server)) {
@@ -490,7 +490,7 @@ class Switchboard extends Stream<ChannelInfo> {
         });
       } catch (error, stackTrace) {
         _log.severe(
-            'Unknown error listening to HttpServer, severe error, must not happen: $error\n$stackTrace');
+            'Unknown error listening to HttpServer, severe error, must not happen', error, stackTrace);
         _boundWebSockets.remove(server);
         server.close();
         rethrow;
