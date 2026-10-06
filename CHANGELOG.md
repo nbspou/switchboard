@@ -1,3 +1,11 @@
+## 3.0.0-dev.1
+
+- Restart of the project on Dart 3.13 with a completed protocol design.
+- New wire format details: control channel, status codes, cancellation,
+  channel id reuse, service addressing header, naming service protocol,
+  stream transport binding. Not compatible with 2.x, which was never deployed.
+- Protocol specification lives in the project wiki (`switchboard/` section).
+
 ## 2.1.7
 
 - Use `WebSocketChannel` and `StreamChannel` interfaces.

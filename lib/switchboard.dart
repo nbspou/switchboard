@@ -1,16 +1,13 @@
 /*
 Switchboard
 Microservice Network Architecture
-Copyright (C) 2018  Jan BOON (Kaetemi)
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
-library switchboard;
+/// Switchboard: microservice mesh protocol.
+///
+/// See the wiki section "Switchboard" for the protocol specification.
+library;
 
-export 'src/mux_connection.dart';
-export 'src/mux_channel.dart';
-export 'src/talk_channel.dart';
-export 'src/talk_message.dart';
-export 'src/switchboard.dart';
-
-/* end of file */
+export 'core.dart';
