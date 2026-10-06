@@ -8,7 +8,8 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 /// Platform independent core of Switchboard: status codes, names, byte
 /// helpers, the in-memory and WebSocket transports, the stream binding's
 /// wire format, the mux and talk layers, addressing, the naming service and
-/// client, resolvers, and the reference key-to-slot function.
+/// client, resolvers, the reference key-to-slot function, and the
+/// reconnecting client for frontends.
 ///
 /// Nothing in this library imports `dart:io`. Use
 /// `package:switchboard/switchboard.dart` for the full library including the
@@ -18,6 +19,7 @@ library;
 export 'src/address/channel_address.dart';
 export 'src/address/service_address.dart';
 export 'src/bytes.dart' show hexBytes, hexString;
+export 'src/client/reconnecting_client.dart';
 export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState;
 export 'src/mux/mux_connection.dart';
 export 'src/mux/mux_frame.dart'

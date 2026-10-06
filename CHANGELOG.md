@@ -33,6 +33,9 @@ The protocol specification lives in the project wiki (section
   `LOOKUP`, heartbeat, assignment hold after a restart), `NamingClient`
   (re-registration on reconnect, mirrored table served while stale),
   `NamingResolver`, and `MeshNode` to join a node to a mesh.
+- `ReconnectingClient` (core, web-capable) for frontend apps: backoff
+  reconnect, a client state stream, persistent channels re-opened after
+  every reconnect, server-pushed channels across reconnects.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
   host hint relays, routing by shard slot with a one-shot retry on `MOVED`.
 - Sharding: slot spaces per service type in the naming service (`SLOTS`,

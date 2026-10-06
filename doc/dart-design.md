@@ -35,6 +35,8 @@ lib/src/talk/talk_request.dart TalkRequest (handle for an outgoing single-respon
 lib/src/talk/talk_stream.dart  TalkStream (handle for an outgoing stream request)
 lib/src/address/service_address.dart   ServiceAddress
 lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
+lib/src/client/reconnecting_client.dart  ReconnectingClient, ClientState, ClientPhase, TransportConnector (frontend client, core)
+lib/src/client/persistent_channel.dart   PersistentChannel, PersistentTalk (part of reconnecting_client.dart)
 lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGSTR/WATCH/LOOKUP/UP/DOWN/SYNCED and the sharding payloads, MovedStatus
 lib/src/naming/naming_service.dart     NamingService (server side handler)
 lib/src/naming/naming_service_slots.dart  part of naming_service.dart: slot tables, slot procedures, hand-over, allocator
@@ -61,7 +63,7 @@ Rules:
 * `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. `proxy.dart`, `mesh.dart`, `slot_gate.dart`, `slot_channel.dart` and `naming_client_io.dart` build on `Switchboard` and are exported from `switchboard.dart` only. Everything else must compile for the web.
 * The wire codecs must be correct when compiled to JavaScript, where bitwise operations are 32-bit: use `ByteReader`/`ByteWriter` (or the same split arithmetic) for `u32` and `u48`. `dart test -P node` runs the codec tests on Node.js (see `dart_test.yaml`).
 * All wire codecs are pure functions over `Uint8List` and are unit tested against the wiki test vectors.
-* Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`.
+* Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`, `Switchboard.Client`.
 * No `print`. No fixed ports in tests (bind to port 0). No multi-second sleeps in tests; timeouts under test are configured in tens of milliseconds through options.
 * Every public member has a doc comment. `dart analyze` is clean with the repo `analysis_options.yaml`. `dart format` applied.
 * File header comment block as in `status.dart`.
@@ -389,6 +391,43 @@ class ChannelAddress {
 }
 ```
 
+## Reconnecting client
+
+A frontend (Flutter on the web or mobile) keeps one connection to its endpoint and needs its long-lived channels back after every reconnect. `ReconnectingClient` (core, no `dart:io`) does that over any transport; it does no resolution (the endpoint's proxy does, see the wiki "Endpoint" resolver).
+
+```dart
+typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();   // e.g. () => WebSocketTransport.connect(uri)
+enum ClientPhase { disconnected, connecting, connected }
+class ClientState { ClientPhase phase; int attempt; Status? lastStatus; DateTime? since; bool get isConnected; }
+
+class ReconnectingClient {
+  ReconnectingClient(TransportConnector connect, {MuxOptions? muxOptions, TalkOptions? talkOptions,
+      Duration initialBackoff = 500 ms, Duration maxBackoff = 30 s, double backoffFactor = 2, double jitter = 0.2,
+      Duration connectTimeout = 10 s, Uint8List? defaultPayload, bool autoStart = true, Random? random});
+  Uint8List defaultPayload;                        // mutable: re-opened channels carry the current value
+  Stream<ClientState> get states;              // broadcast, replays the current state to each listener
+  ClientState get state; MuxConnection? get connection; Future<MuxConnection> get connected;
+  bool get isRunning; bool get isClosed;
+  void start(); void stop(); Future<void> close();
+  Future<MuxChannel> openChannel(ChannelAddress address, {Duration openTimeout = 30 s});
+  Future<TalkChannel> openTalk(ChannelAddress address, {TalkOptions? options, Duration openTimeout = 30 s});
+  PersistentChannel openPersistent(ChannelAddress address, FutureOr<void> Function(MuxChannel) onOpen, {void Function(Status)? onClosed});
+  PersistentTalk openPersistentTalk(ChannelAddress address, FutureOr<void> Function(TalkChannel) onOpen, {TalkOptions? options, void Function(Status)? onClosed});
+  Stream<IncomingChannel> get incoming;            // channels the endpoint pushes, across reconnects
+}
+class PersistentChannel { ChannelAddress address; MuxChannel? current; Stream<MuxChannel> opened; bool isClosed; Future<Status> done; Future<void> close(); }
+class PersistentTalk    { ChannelAddress address; TalkChannel? current; Stream<TalkChannel> opened; bool isClosed; Future<Status> done; Future<void> close(); }
+```
+
+Behaviour notes:
+
+* Backoff: first attempt immediate; after `n` consecutive failures the delay is `min(initial * factor^n, max)` times a uniform factor in `[1 - jitter, 1 + jitter]` (a delay may exceed `max` by the jitter). A connection that ends is a failure unless it lived longer than `maxBackoff`, which resets the sequence. `start()` resets it too. Connect timeout and connector errors report `UNAVAILABLE` (a `SwitchboardException` from the connector keeps its own status).
+* On connect: state `connected`, `connected` completes, every persistent channel is opened (all at once, in creation order; `onOpen` exceptions and failed futures are logged), then waiting `openChannel` calls proceed. Peer OPENs go to `incoming` as `IncomingChannel`; a malformed address is closed with `PROTOCOL_ERROR`, and after the listener cancels, OPENs are closed with `UNAVAILABLE`.
+* On loss (any status, including after a peer GOAWAY once the connection has ended): state `disconnected` with the status first, then each persistent channel's `onClosed` with its channel's end status, then the backoff. Nothing is opened on a connection that received GOAWAY; `openChannel` waits for the next one.
+* Persistent channels: every `onOpen` is followed by exactly one `onClosed`. A channel that ends while the connection stays up (closed by the peer, or by the application through `current`) is opened again after a backoff kept per persistent channel (same schedule, reset by a channel that lived longer than `maxBackoff`), except after `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` or `NOT_FOUND`: the persistent channel then ends for good (`done` completes with that status) and the application decides. A refused OPEN: `FAILED_PRECONDITION` (GOAWAY) waits for the next connection, `RESOURCE_EXHAUSTED` backs off, anything else ends it. `onOpen` is never called synchronously from `openPersistent`.
+* `stop()`: abandons an attempt in progress (a late transport is closed), closes the persistent channels with `GOING_AWAY` (re-opened after `start()`), sends GOAWAY; state `disconnected` with `CANCELLED`. `close()` also ends the persistent channels for good, fails waiting opens and `connected` with `CANCELLED`, ends `states` and `incoming`, and completes when every connection is gone (application channels get the GOAWAY grace); no client timer remains. Neither throws.
+* Lifetimes are measured with timers rather than `Stopwatch`, so fake_async drives them.
+
 ## Naming protocol codecs
 
 ```dart
@@ -680,7 +719,7 @@ The first four were adopted by the wiki since.
 
 ## Tests
 
-* `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`.
+* `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`, the name and status tests, and `test/reconnecting_client_test.dart` (fake_async over `MemoryTransport`).
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).
 * `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing.

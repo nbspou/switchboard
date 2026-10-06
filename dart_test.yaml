@@ -2,7 +2,8 @@
 #
 # `dart test -P node` (or `dart test -p node test/vectors/`) runs the
 # platform independent codec tests compiled to JavaScript on Node.js, which
-# checks the 32 and 48-bit arithmetic of the wire codecs on the web.
+# checks the 32 and 48-bit arithmetic of the wire codecs on the web, and the
+# reconnecting client, which is meant for web frontends.
 presets:
   node:
     platforms: [node]
@@ -11,3 +12,4 @@ presets:
       - test/bytes_test.dart
       - test/name_test.dart
       - test/status_test.dart
+      - test/reconnecting_client_test.dart
