@@ -34,7 +34,16 @@ The protocol specification lives in the project wiki (section
   (re-registration on reconnect, mirrored table served while stale),
   `NamingResolver`, and `MeshNode` to join a node to a mesh.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
-  host hint relays.
+  host hint relays, routing by shard slot with a one-shot retry on `MOVED`.
+- Sharding: slot spaces per service type in the naming service (`SLOTS`,
+  `HOLDING`, `CLAIM`, `RELEASE`, `LOCATE`, `MIGRATE`, `SLOTSPC` and `SLOT`
+  table items), managed and static modes, lazy and shared-recovery flags,
+  holder tracking for reboot, the allocator, and the `DRAIN`, `ASSIGN`,
+  `FORWARD`, `RESUME` hand-over; on the node, slot-aware routing,
+  `openChannelToSlot`, `SlotGate` and `SlotLifecycle`, and
+  `MeshNode.publishSharded`; the `MOVED` status; use case integration tests
+  (key-value store, Discord frontends, per-user workers, zone servers, chat
+  rooms, job partitions).
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for
