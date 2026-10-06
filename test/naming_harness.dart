@@ -57,8 +57,10 @@ Future<void> until(bool Function() condition) async {
 }
 
 /// A naming service and in-memory links to it. No assignment hold and no
-/// settle window after `SLOTS` unless asked for; the `ASSIGN` backoff of
-/// the service by default.
+/// settle window after `SLOTS` unless asked for (most tests assign fresh
+/// slots and check the timing of what follows; [productionSettle] opts in
+/// to the service's default window); the `ASSIGN` backoff and the
+/// hand-over bound of the service by default.
 class Harness {
   Harness({
     Duration heartbeat = ms50,
@@ -68,6 +70,7 @@ class Harness {
     Duration assignBackoff = const Duration(milliseconds: 200),
     Duration assignBackoffMax = const Duration(seconds: 10),
     Duration holdingSettle = Duration.zero,
+    Duration handoverMaxDuration = const Duration(minutes: 10),
   }) : service = NamingService(
          heartbeat: heartbeat,
          assignmentHold: assignmentHold,
@@ -76,7 +79,11 @@ class Harness {
          assignBackoff: assignBackoff,
          assignBackoffMax: assignBackoffMax,
          holdingSettle: holdingSettle,
+         handoverMaxDuration: handoverMaxDuration,
        );
+
+  /// The service's default `holdingSettle`, for tests that run with it.
+  static const Duration productionSettle = Duration(seconds: 1);
 
   final NamingService service;
 

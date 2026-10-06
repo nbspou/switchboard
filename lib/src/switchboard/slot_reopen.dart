@@ -36,7 +36,8 @@ final Logger _log = Logger('Switchboard.Router');
 /// The replacement carries [header] with the instance set to the selected
 /// one and no host hint; the application payload is unchanged. [resolver]
 /// defaults to the node's; [excludeOwnEndpoints] as in
-/// [Switchboard.selectAndConnect]. Throws like
+/// [Switchboard.selectAndConnect]. [mayLocate], when given, is asked
+/// before a `LOCATE`; false gives up (null). Throws like
 /// [Switchboard.selectAndConnect] and [SlotResolver.locateSlot].
 Future<MuxChannel?> reopenAtSlotOwner(
   Switchboard switchboard,
@@ -45,6 +46,7 @@ Future<MuxChannel?> reopenAtSlotOwner(
   Status moved, {
   Resolver? resolver,
   bool excludeOwnEndpoints = false,
+  bool Function()? mayLocate,
 }) async {
   final type = header.type!;
   final slot = header.shard!;
@@ -62,6 +64,10 @@ Future<MuxChannel?> reopenAtSlotOwner(
       target = mirrored.owner;
     }
     if (target == 0) {
+      if (mayLocate != null && !mayLocate()) {
+        _log.fine('$type/$slot: MOVED by $rejectedBy, no LOCATE allowed');
+        return null;
+      }
       final located = await r
           .locateSlot(type, slot)
           .timeout(switchboard.slotRefreshTimeout);

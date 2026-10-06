@@ -6,6 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -15,6 +16,7 @@ import '../address/service_address.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
+import '../naming/naming_protocol.dart';
 import '../status.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
@@ -46,10 +48,12 @@ final Logger _log = Logger('Switchboard.Router');
 Future<void> pipeChannels(MuxChannel a, MuxChannel b) =>
     _pipe(_MuxEnd(a), _MuxEnd(b));
 
-Future<void> _pipe(_End a, _End b) {
+/// [pipeChannels] over [_End]s; [toA] rewrites the status [a] is closed
+/// with when [b] ends.
+Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
   try {
     _forward(a, b);
-    _forward(b, a);
+    _forward(b, a, rewrite: toA);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
@@ -108,7 +112,7 @@ class _SlotEnd implements _End {
   int get id => channel.channel.id;
 }
 
-void _forward(_End from, _End to) {
+void _forward(_End from, _End to, {Status Function(Status status)? rewrite}) {
   from.stream.listen(
     (subframe) {
       if (!to.canSend) {
@@ -131,7 +135,12 @@ void _forward(_End from, _End to) {
     },
     onError: (Object e) => _log.fine('proxy: channel ${from.id} failed: $e'),
     onDone: () {
-      unawaited(from.done.then((status) => to.close(_closeStatusFor(status))));
+      unawaited(
+        from.done.then((status) {
+          final forwarded = _closeStatusFor(status);
+          return to.close(rewrite == null ? forwarded : rewrite(forwarded));
+        }),
+      );
     },
   );
 }
@@ -200,7 +209,19 @@ Status _closeStatusFor(Status status) {
 ///    resolver or a closing node is `UNAVAILABLE`.
 ///    A channel with a shard slot whose type has a slot table in the
 ///    resolver goes to the slot's owner (the old owner while the slot
-///    migrates; see [Switchboard.selectAndConnect]).
+///    migrates; see [Switchboard.selectAndConnect]). Unless
+///    [allowExplicitInstance] is set, an instance in its address (the
+///    client's, or one [authorize] set) is ignored for such a channel:
+///    it is routed by the slot table, and the instance is replaced by the
+///    selected owner, so that a client cannot reach an instance that is
+///    still loading the slot, or one that handed it over, and overtake
+///    the hand-over. When the table has no owner for the slot and the
+///    proxy would have to ask the naming service (`LOCATE`, which assigns
+///    a free slot of a managed space), the client connection must have a
+///    token left in its bucket of [maxLocatesPerConnection] tokens,
+///    refilled by one every [locateRefillInterval]; otherwise the channel
+///    is rejected with `RESOURCE_EXHAUSTED`. The `LOCATE` itself waits at
+///    most [Switchboard.slotRefreshTimeout] (then `UNAVAILABLE`).
 /// 5. A channel is opened to the destination with the same open payload
 ///    (as rewritten by [authorize]), except that the host hint is removed
 ///    and the instance is set to the selected one. The application payload
@@ -216,16 +237,29 @@ Status _closeStatusFor(Status status) {
 ///    After the first subframe, or when no other owner is found, the
 ///    `MOVED` is forwarded to the client, which may open the channel again
 ///    and resend, since `MOVED` means nothing was processed (see
-///    `Switchboard.openChannelToSlot`). An `ABORTED` for a slot move (the
-///    owner was serving the channel) is forwarded unchanged and never
+///    `Switchboard.openChannelToSlot`). A `RELOCATED` (the owner was
+///    serving the channel when the slot moved) is forwarded and never
 ///    retried. The retry counts as the same channel for
-///    [maxChannelsPerConnection].
+///    [maxChannelsPerConnection], and a `LOCATE` it needs takes a token as
+///    in step 4.
+///
+/// A `MOVED` or `RELOCATED` a backend closes the channel with reaches the
+/// client with its owner and epoch fields set to 0 (unknown) and no
+/// reason, unless [revealOwners] is set: instance ids are internal to the
+/// mesh, and a client behind the proxy reopens through the proxy, which
+/// routes by its own table. With [revealOwners] the status is forwarded
+/// byte for byte. Statuses inside the channel (a Talk `ABORT`) are not
+/// looked at.
 ///
 /// Rejections carry the status code and a generic reason only; the
 /// details (instance ids, endpoints, resolver state) are logged locally.
 ///
 /// Honouring host hints makes the node an open relay; see
 /// [Switchboard.allowHostHint].
+///
+/// Throws [RangeError] if [maxChannelsPerConnection] or
+/// [maxLocatesPerConnection] is negative, [ArgumentError] if
+/// [authorizeTimeout] or [locateRefillInterval] is negative.
 ChannelHandler proxyHandler(
   Switchboard switchboard, {
   bool Function(ChannelAddress address)? allow,
@@ -233,21 +267,32 @@ ChannelHandler proxyHandler(
   Duration authorizeTimeout = const Duration(seconds: 10),
   Resolver? resolver,
   int maxChannelsPerConnection = 256,
+  bool allowExplicitInstance = false,
+  bool revealOwners = false,
+  int maxLocatesPerConnection = 32,
+  Duration locateRefillInterval = const Duration(seconds: 1),
 }) {
   RangeError.checkNotNegative(
     maxChannelsPerConnection,
     'maxChannelsPerConnection',
   );
-  if (authorizeTimeout.isNegative) {
-    throw ArgumentError.value(
-      authorizeTimeout,
-      'authorizeTimeout',
-      'must not be negative',
-    );
+  RangeError.checkNotNegative(
+    maxLocatesPerConnection,
+    'maxLocatesPerConnection',
+  );
+  for (final (name, value) in [
+    ('authorizeTimeout', authorizeTimeout),
+    ('locateRefillInterval', locateRefillInterval),
+  ]) {
+    if (value.isNegative) {
+      throw ArgumentError.value(value, name, 'must not be negative');
+    }
   }
   final permitted = allow ?? _notReserved;
   // Channels being forwarded, per client connection.
   final forwarding = Expando<int>('forwarded channels');
+  final locates = _LocateBuckets(maxLocatesPerConnection, locateRefillInterval);
+  final Status Function(Status status)? hide = revealOwners ? null : _hideOwner;
   return (incoming) async {
     var address = incoming.address;
     bool allowed;
@@ -305,6 +350,27 @@ ChannelHandler proxyHandler(
         await incoming.reject(genericStatus(StatusCode.notFound));
         return;
       }
+      final r = resolver ?? switchboard.resolver;
+      final shard = address.shard;
+      final table = shard != null && r is SlotResolver
+          ? r.slotTable(type)
+          : null;
+      final relaying = address.host != null && switchboard.allowHostHint;
+      if (table != null && !relaying) {
+        if (address.instance != 0 && !allowExplicitInstance) {
+          _log.fine('proxy: $incoming routed by the slot table instead');
+          address = address.copyWith(instance: 0);
+        }
+        if (address.instance == 0 &&
+            shard! < table.count &&
+            table.space.mode == SlotMode.managed &&
+            (r as SlotResolver).slotOwner(type, shard) == null &&
+            !locates.take(client)) {
+          _log.info('proxy: $incoming refused, too many LOCATEs');
+          await incoming.reject(genericStatus(StatusCode.resourceExhausted));
+          return;
+        }
+      }
       final _Backend backend;
       try {
         backend = await _openBackend(switchboard, address, type, resolver);
@@ -319,8 +385,6 @@ ChannelHandler proxyHandler(
         '${channel.connection}',
       );
       final header = backend.header;
-      final r = resolver ?? switchboard.resolver;
-      final shard = header.shard;
       if (!backend.relayed &&
           shard != null &&
           r is SlotResolver &&
@@ -338,12 +402,17 @@ ChannelHandler proxyHandler(
             moved,
             resolver: r,
             excludeOwnEndpoints: true,
+            mayLocate: () => locates.take(client),
           ),
         );
-        await _pipe(_MuxEnd(incoming.channel), _SlotEnd(slotChannel));
+        await _pipe(
+          _MuxEnd(incoming.channel),
+          _SlotEnd(slotChannel),
+          toA: hide,
+        );
         return;
       }
-      await pipeChannels(incoming.channel, channel);
+      await _pipe(_MuxEnd(incoming.channel), _MuxEnd(channel), toA: hide);
     } finally {
       final left = (forwarding[client] ?? 1) - 1;
       forwarding[client] = left > 0 ? left : null;
@@ -353,6 +422,59 @@ ChannelHandler proxyHandler(
 
 bool _notReserved(ChannelAddress address) =>
     !(address.type?.isReserved ?? false);
+
+/// A `MOVED` or `RELOCATED` with its owner and epoch unknown and no
+/// reason; any other status unchanged.
+Status _hideOwner(Status status) {
+  if (!MovedStatus.carriesFields(status)) {
+    return status;
+  }
+  return MovedStatus.unknown.toStatus(
+    relocated: status.known == StatusCode.relocated,
+  );
+}
+
+/// The `LOCATE` budget of [proxyHandler]: a token bucket per client
+/// connection, [burst] tokens, refilled by one every [refill] (never when
+/// zero). A [burst] of 0 is no limit.
+class _LocateBuckets {
+  _LocateBuckets(this.burst, this.refill);
+
+  final int burst;
+  final Duration refill;
+  final Stopwatch _clock = Stopwatch()..start();
+  final Expando<_Bucket> _buckets = Expando<_Bucket>('LOCATE tokens');
+
+  /// Takes a token for [connection]; false when there is none left.
+  bool take(MuxConnection connection) {
+    if (burst == 0) {
+      return true;
+    }
+    final now = _clock.elapsedMicroseconds;
+    final bucket = _buckets[connection] ??= _Bucket(burst.toDouble(), now);
+    if (refill > Duration.zero) {
+      bucket.tokens = min(
+        burst.toDouble(),
+        bucket.tokens + (now - bucket.at) / refill.inMicroseconds,
+      );
+    }
+    bucket.at = now;
+    if (bucket.tokens < 1) {
+      return false;
+    }
+    bucket.tokens -= 1;
+    return true;
+  }
+}
+
+class _Bucket {
+  _Bucket(this.tokens, this.at);
+
+  double tokens;
+
+  /// Microseconds of [_LocateBuckets._clock] at the last refill.
+  int at;
+}
 
 /// Runs the `authorize` hook of [proxyHandler] on [incoming], bounded by
 /// [timeout] (zero: no bound). Returns the address to forward to, or null

@@ -8,7 +8,8 @@
 // slot (the gate's noSlotHandler). Clients open one channel per operation
 // to the slot's owner and write, per key, a sequence number that must come
 // back in order: no operation may be lost, applied twice or reordered
-// while slots move.
+// while slots move. A node that leaves the mesh hands its slots over
+// before it stops, so nothing it holds is lost.
 
 import 'dart:async';
 import 'dart:convert';
@@ -285,6 +286,10 @@ void main() {
       'one copy of every slot',
     );
 
+    // While slots moved, no PUT reached an owner twice: MOVED means
+    // nothing was processed, and a client only resends after MOVED.
+    expect(stats.replays, 0, reason: 'no PUT applied twice');
+
     // The second instance reboots with its id and its disk.
     final held = disks[0x12]!.keys.toSet();
     expect(held, clientMesh.client.slotTable(kv)!.slotsOf(0x12).toSet());
@@ -328,6 +333,60 @@ void main() {
         expect(disks[owner]![slot]![key], [for (var s = 1; s <= last; s++) s]);
       }
     }
+    expect(stats.gaps, 0);
+    // The crash may cut a PUT whose answer was on its way: the client
+    // resends it, and the store answers without applying it again. At
+    // most one per client.
+    expect(stats.replays, lessThanOrEqualTo(clients.length));
+  });
+
+  test('kv: a node that leaves hands its slots over before it stops; no '
+      'key is lost', () async {
+    final cluster = Cluster('tcp');
+    await cluster.start(holderGrace: const Duration(milliseconds: 300));
+    final stats = Stats();
+    final d11 = <int, Map<String, List<int>>>{};
+    final d12 = <int, Map<String, List<int>>>{};
+    final clientMesh = await cluster.member(listen: false);
+    final table = clientMesh.client;
+    await startStore(cluster, 0x11, d11, stats);
+    final (leaving, gate) = await startStore(cluster, 0x12, d12, stats);
+    await until(
+      () =>
+          table.slotTable(kv)?.slotsOf(0x11).length == slots ~/ 2 &&
+          table.slotTable(kv)?.slotsOf(0x12).length == slots ~/ 2,
+      'two instances with half the slots each',
+    );
+    // One key in every slot.
+    final keys = <int, String>{};
+    for (var i = 0; keys.length < slots; i++) {
+      keys.putIfAbsent(slotForText('k$i', slots), () => 'k$i');
+    }
+    final client = Client(clientMesh.switchboard, const [], Random(1));
+    for (final key in keys.values) {
+      expect(await client.call('PUT', key, '1'), '1');
+    }
+    final held = gate.servedSlots.keys.toList()..sort();
+    expect(held, hasLength(slots ~/ 2));
+    final fetches = stats.loads['fetch'] ?? 0;
+
+    final report = await leaving.leave();
+    await leaving.switchboard.close();
+    expect(report.handedOver, {kv: held});
+    expect(report.released, isEmpty);
+    expect(report.dropped, isEmpty);
+    expect(report.isComplete, isTrue);
+    // Taken over, fetched while the leaving node was still up.
+    expect(stats.loads['fetch'], fetches + held.length);
+    await until(
+      () => table.slotTable(kv)?.slotsOf(0x11).length == slots,
+      'every slot on the remaining instance',
+    );
+    for (final MapEntry(key: slot, value: key) in keys.entries) {
+      expect(await client.call('GET', key), '1', reason: 'slot $slot');
+      expect(d11[slot]![key], [1]);
+    }
+    expect(stats.replays, 0);
     expect(stats.gaps, 0);
   });
 }

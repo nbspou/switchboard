@@ -340,8 +340,8 @@ void checkMuxStatus(Status status) {
 /// `u16` code and the bytes after it) is at most [maxPayload] bytes.
 ///
 /// Cuts the encoded bytes on a UTF-8 character boundary, so that fixed
-/// fields a code places before its reason (`MOVED`, and `ABORTED` for a
-/// slot move: 10 bytes) are kept whole; when they do not fit, everything
+/// fields a code places before its reason (`MOVED` and `RELOCATED`: 10
+/// bytes) are kept whole; when they do not fit, everything
 /// after the code is dropped. Returns [status] itself when it fits; drops
 /// the reason entirely when [maxPayload] leaves no room for it.
 @internal
@@ -369,15 +369,15 @@ Status truncateStatus(Status status, int maxPayload) {
     cut--;
   }
   final code = status.known;
-  if ((code == StatusCode.moved || code == StatusCode.aborted) &&
+  if ((code == StatusCode.moved || code == StatusCode.relocated) &&
       cut < 2 + _slotMoveFields) {
     return Status(status.code);
   }
   return Status.decode(Uint8List.sublistView(encoded, 0, cut));
 }
 
-/// Fixed fields of `MOVED` (and of `ABORTED` for a slot move) before the
-/// reason: `u48 owner`, `u32 epoch` (`MovedStatus.fieldsLength`).
+/// Fixed fields of `MOVED` and `RELOCATED` before the reason: `u48 owner`,
+/// `u32 epoch` (`MovedStatus.fieldsLength`).
 const int _slotMoveFields = 10;
 
 /// [status] shortened (see [truncateStatus]) so that a frame carrying it

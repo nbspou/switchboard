@@ -44,7 +44,8 @@ class _SlotManager {
   final Completer<void> _holdOver = Completer<void>();
   bool closed = false;
 
-  /// Deadlines of `LOCATE` requests waiting for a backoff to end.
+  /// Deadlines of `LOCATE` requests waiting for a backoff to end, and of
+  /// `ASSIGN` and `DRAIN` requests ([NamingService.handoverMaxDuration]).
   final Set<Timer> _deadlines = {};
 
   bool get holding => service.isHoldingAssignments;
@@ -386,6 +387,7 @@ class _SlotManager {
     final me = registrationOf(session, request.type)!.instance;
     final discard = <int>[];
     final seen = <int>{};
+    final waiting = <int>[];
     for (final slot in request.slots) {
       if (!seen.add(slot)) {
         continue;
@@ -394,27 +396,107 @@ class _SlotManager {
         discard.add(slot);
         continue;
       }
-      final entry = space.entry(slot);
-      if (entry.holder == me) {
-        continue;
-      }
-      if (entry.holder == 0 && entry.isFree) {
-        final target = space.assigning[slot];
-        if (target == null) {
-          // Nothing recorded (a fresh or restarted naming service): this
-          // instance becomes the holder, and gets the slot back first.
-          setEntry(space, slot, SlotEntry.free(holder: me, epoch: entry.epoch));
-          continue;
-        }
-        if (target == me) {
-          continue;
-        }
-      }
-      discard.add(slot);
+      _declareHeld(space, slot, me, discard, waiting);
     }
+    if (waiting.isEmpty) {
+      _answerHolding(message, space, me, discard);
+      return;
+    }
+    // Being assigned fresh to another instance: answered once that is
+    // decided, since a failed ASSIGN leaves the slot to this instance.
+    wait(message);
+    unawaited(
+      _holdingAfterAssignments(
+        session,
+        message,
+        space.type,
+        me,
+        discard,
+        waiting,
+      ),
+    );
+    scheduleBalance(space);
+  }
+
+  /// Applies a `HOLDING` declaration of [slot] by instance [me]: a free
+  /// slot without holder gets [me] as holder; one being assigned to [me]
+  /// is fine; one being assigned fresh (holder 0) to another instance goes
+  /// to [waiting]; any other slot held elsewhere goes to [discard].
+  void _declareHeld(
+    _Space space,
+    int slot,
+    int me,
+    List<int> discard,
+    List<int> waiting,
+  ) {
+    final entry = space.entry(slot);
+    if (entry.holder == me) {
+      return;
+    }
+    if (entry.holder == 0 && entry.isFree) {
+      final target = space.assigning[slot];
+      if (target == null) {
+        // Nothing recorded (a fresh or restarted naming service): this
+        // instance becomes the holder, and gets the slot back first.
+        setEntry(space, slot, SlotEntry.free(holder: me, epoch: entry.epoch));
+        return;
+      }
+      if (target != me) {
+        waiting.add(slot);
+      }
+      return;
+    }
+    discard.add(slot);
+  }
+
+  /// Answers a `HOLDING` once the fresh assignments of [waiting] to other
+  /// instances are decided: a slot whose `ASSIGN` failed is this
+  /// instance's again (it becomes the holder); one that went through is
+  /// to discard.
+  Future<void> _holdingAfterAssignments(
+    _Session session,
+    TalkMessage message,
+    Name type,
+    int me,
+    List<int> discard,
+    List<int> waiting,
+  ) async {
+    var slots = waiting;
+    while (true) {
+      final space = spaces[type]!;
+      await Future.wait([
+        for (final slot in slots)
+          if (space.busy[slot] case final busy?) busy.future,
+      ]);
+      if (closed || !message.canReply || !session.active) {
+        unwait(message);
+        return;
+      }
+      final next = <int>[];
+      for (final slot in slots) {
+        if (slot < space.space.count) {
+          _declareHeld(space, slot, me, discard, next);
+        } else {
+          discard.add(slot);
+        }
+      }
+      if (next.isEmpty) {
+        _answerHolding(message, space, me, discard);
+        return;
+      }
+      slots = next;
+    }
+  }
+
+  void _answerHolding(
+    TalkMessage message,
+    _Space space,
+    int me,
+    List<int> discard,
+  ) {
     if (discard.isNotEmpty) {
       _log.info(
-        '${ServiceAddress(request.type, me)} should discard '
+        '${ServiceAddress(space.type, me)} should discard '
         '${discard.length} slots',
       );
     }
@@ -870,6 +952,7 @@ class _SlotManager {
           from,
           Procedures.drain,
           DrainRequest(type, slot, epoch: next, to: to.instance).encode(),
+          bounded: true,
         );
       } catch (e) {
         failure = e;
@@ -884,10 +967,14 @@ class _SlotManager {
         return;
       }
       if (failure != null) {
+        // Not moved away from it again by the allocator before the
+        // backoff ends.
+        drainFailed(space, slot, from);
         _resume(space, slot, from, epoch, holder);
         _rollBack(migration, '$what: DRAIN failed: ${_statusOf(failure)}');
         return;
       }
+      drainSucceeded(space, slot, from.instance);
       migration.phase(MigrationPhase.assigning);
       TalkMessage? response;
       try {
@@ -901,6 +988,7 @@ class _SlotManager {
             holder: holder,
             shared: space.space.shared,
           ).encode(),
+          bounded: true,
         );
       } catch (e) {
         failure = e;
@@ -1023,12 +1111,16 @@ class _SlotManager {
   /// Sends a request to [target] over its registration channel. Fails with
   /// the instance's abort, with `DEADLINE_EXCEEDED` after
   /// [NamingService.handoverTimeout] without an answer or `EXTEND`, and
-  /// with `UNAVAILABLE` as soon as the registration goes away.
+  /// with `UNAVAILABLE` as soon as the registration goes away. With
+  /// [bounded] (`ASSIGN` and `DRAIN`) it also fails with
+  /// `DEADLINE_EXCEEDED`, and the request is cancelled, once it has run
+  /// for [NamingService.handoverMaxDuration], `EXTEND`s or not.
   Future<TalkMessage> ask(
     _Registration target,
     Name procedure,
-    Uint8List payload,
-  ) {
+    Uint8List payload, {
+    bool bounded = false,
+  }) {
     final session = target.owner;
     if (session == null || !target.up) {
       return Future.error(
@@ -1062,15 +1154,42 @@ class _SlotManager {
     }
 
     target.onGone.add(onGone);
+    Timer? deadline;
+    final bound = service.handoverMaxDuration;
+    if (bounded && bound > Duration.zero) {
+      deadline = Timer(bound, () {
+        _deadlines.remove(deadline);
+        if (completer.isCompleted) {
+          return;
+        }
+        target.onGone.remove(onGone);
+        final status = Status.of(
+          StatusCode.deadlineExceeded,
+          '$procedure to ${target.address} ran longer than $bound',
+        );
+        _log.warning(status.reason);
+        request.cancel(status);
+        completer.completeError(SwitchboardException(status));
+      });
+      _deadlines.add(deadline);
+    }
+    void settled() {
+      target.onGone.remove(onGone);
+      if (deadline != null) {
+        deadline.cancel();
+        _deadlines.remove(deadline);
+      }
+    }
+
     request.response.then(
       (response) {
-        target.onGone.remove(onGone);
+        settled();
         if (!completer.isCompleted) {
           completer.complete(response);
         }
       },
       onError: (Object e, StackTrace st) {
-        target.onGone.remove(onGone);
+        settled();
         if (!completer.isCompleted) {
           completer.completeError(e, st);
         }
@@ -1105,7 +1224,12 @@ class _SlotManager {
       );
       final TalkMessage response;
       try {
-        response = await ask(target, Procedures.assign, request.encode());
+        response = await ask(
+          target,
+          Procedures.assign,
+          request.encode(),
+          bounded: true,
+        );
       } catch (e) {
         final status = _statusOf(e);
         _log.info('$request to ${target.address} failed: $status');
@@ -1279,13 +1403,16 @@ class _SlotManager {
     return best;
   }
 
-  /// Moves one slot from the most over-share candidate to the most
-  /// under-share one when that one is short by at least one slot. Runs
-  /// only when nothing else is in flight in the space, so the allocator's
-  /// migrations are strictly one at a time. A candidate in its backoff for
-  /// any slot of the space is not given an owned slot: a failed hand-over
-  /// costs the old owner a `DRAIN` and a `RESUME`, so the expiry of the
-  /// backoff paces the attempts.
+  /// Moves one slot to the most under-share candidate when that one is
+  /// short by at least one slot, from the most over-share candidate that
+  /// has a slot it can move (not busy, and not in the `DRAIN` backoff of
+  /// that owner), else from the next most over-share one, and so on among
+  /// the candidates over their share. Runs only when nothing else is in
+  /// flight in the space, so the allocator's migrations are strictly one
+  /// at a time. A candidate in its backoff for any slot of the space is
+  /// not given an owned slot: a failed hand-over costs the old owner a
+  /// `DRAIN` and a `RESUME`, so the expiry of the backoff paces the
+  /// attempts; a refused `DRAIN` is paced the same way.
   void _rebalance(_Space space, List<_Registration> candidates) {
     if (candidates.length < 2 ||
         space.assigning.isNotEmpty ||
@@ -1306,37 +1433,46 @@ class _SlotManager {
     int deficit(_Registration c) =>
         c.weight * assigned - space.loadOf(c.instance) * total;
     _Registration? under;
-    var over = candidates.first;
     for (final c in candidates) {
       if (!space.cooling.containsKey(c.instance) &&
           (under == null || deficit(c) > deficit(under))) {
         under = c;
       }
-      if (deficit(c) < deficit(over)) {
-        over = c;
-      }
     }
-    if (under == null || identical(under, over) || deficit(under) < total) {
+    if (under == null || deficit(under) < total) {
       return;
     }
-    int? slot;
-    for (final MapEntry(key: s, value: entry) in space.entries.entries) {
-      if (entry.state == SlotState.owned &&
-          entry.owner == over.instance &&
-          !space.busy.containsKey(s) &&
-          (slot == null || s < slot)) {
-        slot = s;
+    // Most over-share first, ties to the lower id.
+    final overs =
+        [
+          for (final c in candidates)
+            if (!identical(c, under) && deficit(c) < 0) c,
+        ]..sort((a, b) {
+          final byDeficit = deficit(a).compareTo(deficit(b));
+          return byDeficit != 0 ? byDeficit : a.instance.compareTo(b.instance);
+        });
+    for (final over in overs) {
+      int? slot;
+      for (final MapEntry(key: s, value: entry) in space.entries.entries) {
+        if (entry.state == SlotState.owned &&
+            entry.owner == over.instance &&
+            !space.busy.containsKey(s) &&
+            !drainBackingOff(space, s, over.instance) &&
+            (slot == null || s < slot)) {
+          slot = s;
+        }
       }
-    }
-    if (slot == null) {
+      if (slot == null) {
+        continue;
+      }
+      _log.info(
+        'rebalancing ${space.type}: slot $slot from ${over.address} to '
+        '${under.address}',
+      );
+      space.queue.add(_Migration(slot, under.instance, null));
+      pumpMigrations(space);
       return;
     }
-    _log.info(
-      'rebalancing ${space.type}: slot $slot from ${over.address} to '
-      '${under.address}',
-    );
-    space.queue.add(_Migration(slot, under.instance, null));
-    pumpMigrations(space);
   }
 
   // ---------------------------------------------------------------------
@@ -1355,12 +1491,47 @@ class _SlotManager {
   /// Nothing is kept for an instance that went down (it starts afresh if
   /// it comes back).
   void assignFailed(_Space space, int slot, _Registration target) {
-    if (closed || !target.up) {
-      return;
+    final delay = _startBackoff(
+      space,
+      space.backoffs,
+      slot,
+      target,
+      onStart: () => space.cooling.update(
+        target.instance,
+        (n) => n + 1,
+        ifAbsent: () => 1,
+      ),
+      onEnd: () {
+        space.cooled(target.instance);
+        space.wake(slot);
+      },
+    );
+    if (delay != null) {
+      _log.info(
+        '${target.address} not offered ${space.type}/$slot again for $delay',
+      );
     }
-    final instance = target.instance;
-    final backoff = space.backoffs
-        .putIfAbsent(instance, () => {})
+  }
+
+  /// Starts or extends the backoff of [target] for [slot] in [backoffs]:
+  /// [NamingService.assignBackoff] the first time, doubled at every
+  /// further failure up to [NamingService.assignBackoffMax]. [onStart]
+  /// runs when no backoff was running, [onEnd] when it ends; then the
+  /// allocator runs. Returns the delay, or null when nothing is kept (the
+  /// service is closed, or [target] went down).
+  Duration? _startBackoff(
+    _Space space,
+    Map<int, Map<int, _Backoff>> backoffs,
+    int slot,
+    _Registration target, {
+    void Function()? onStart,
+    void Function()? onEnd,
+  }) {
+    if (closed || !target.up) {
+      return null;
+    }
+    final backoff = backoffs
+        .putIfAbsent(target.instance, () => {})
         .putIfAbsent(slot, _Backoff.new);
     final previous = backoff.delay;
     final doubled = previous == null ? service.assignBackoff : previous * 2;
@@ -1372,17 +1543,45 @@ class _SlotManager {
     if (running != null) {
       running.cancel();
     } else {
-      space.cooling.update(instance, (n) => n + 1, ifAbsent: () => 1);
+      onStart?.call();
     }
     backoff.timer = Timer(delay, () {
       backoff.timer = null;
-      space.cooled(instance);
-      space.wake(slot);
+      onEnd?.call();
       scheduleBalance(space);
     });
-    _log.info(
-      '${target.address} not offered ${space.type}/$slot again for $delay',
-    );
+    return delay;
+  }
+
+  /// Whether the allocator leaves [slot] with its owner [instance] for
+  /// now: the owner refused or failed a `DRAIN` of it recently.
+  bool drainBackingOff(_Space space, int slot, int instance) =>
+      space.drainBackoffs[instance]?[slot]?.timer != null;
+
+  /// [from] refused or failed a `DRAIN` of [slot]: the allocator does not
+  /// try to move the slot away from it again until its backoff ends, with
+  /// the same intervals as the `ASSIGN` backoff.
+  void drainFailed(_Space space, int slot, _Registration from) {
+    final delay = _startBackoff(space, space.drainBackoffs, slot, from);
+    if (delay != null) {
+      _log.info(
+        '${space.type}/$slot not moved away from ${from.address} again for '
+        '$delay',
+      );
+    }
+  }
+
+  /// [instance] drained [slot]: its `DRAIN` backoff for the slot is over.
+  void drainSucceeded(_Space space, int slot, int instance) {
+    final bySlot = space.drainBackoffs[instance];
+    final backoff = bySlot?.remove(slot);
+    if (backoff == null) {
+      return;
+    }
+    if (bySlot!.isEmpty) {
+      space.drainBackoffs.remove(instance);
+    }
+    backoff.timer?.cancel();
   }
 
   /// [instance] accepted an `ASSIGN` of [slot]: its backoff for the slot is
@@ -1637,6 +1836,9 @@ class _Space {
   final Map<int, Map<int, _Backoff>> backoffs = {};
   final Map<int, int> cooling = {};
 
+  /// `DRAIN` backoffs by owner, then slot (see `_SlotManager.drainFailed`).
+  final Map<int, Map<int, _Backoff>> drainBackoffs = {};
+
   /// `LOCATE` requests waiting for a slot to change, by slot.
   final Map<int, Completer<void>> _wakers = {};
 
@@ -1702,15 +1904,16 @@ class _Space {
 
   /// Forgets the backoffs of [instance] (it went down).
   void dropBackoffs(int instance) {
-    final bySlot = backoffs.remove(instance);
     cooling.remove(instance);
-    for (final backoff in bySlot?.values ?? const <_Backoff>[]) {
-      backoff.timer?.cancel();
+    for (final map in [backoffs, drainBackoffs]) {
+      for (final backoff in map.remove(instance)?.values ?? <_Backoff>[]) {
+        backoff.timer?.cancel();
+      }
     }
   }
 
   void clearBackoffs() {
-    for (final instance in backoffs.keys.toList()) {
+    for (final instance in {...backoffs.keys, ...drainBackoffs.keys}) {
       dropBackoffs(instance);
     }
   }

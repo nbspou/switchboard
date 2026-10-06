@@ -53,8 +53,9 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// definitions, the declared storage and the slots it serves; after a
 /// reconnect it registers again, then re-sends `SLOTS` and `HOLDING` and
 /// claims every slot it was serving with its last epoch. When the channel
-/// is lost, every slot locked by `DRAIN` is unlocked through
-/// [SlotHandler.onResume].
+/// is lost, or the client is closed, every slot locked by `DRAIN` is
+/// unlocked through [SlotHandler.onResume]. Every `HOLDING` response's
+/// list of slots to discard reaches [SlotHandler.onDiscard].
 ///
 /// See the wiki page "Switchboard Naming Service", section "Mirror
 /// behaviour".
@@ -72,11 +73,20 @@ class NamingClient {
   /// (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`) is answered with `EXTEND`
   /// while the [slotHandler] works on it; it must be shorter than the
   /// service's `handoverTimeout` (60 s by default).
+  /// [slotHandlerMaxDuration] bounds that: a handler call still running
+  /// after it is answered `ABORT DEADLINE_EXCEEDED` (the naming service
+  /// rolls the hand-over back) and its late outcome is ignored (an
+  /// `ASSIGN` answered so is revoked, [SlotHandler.onRevoke]).
+  /// [Duration.zero] removes the bound.
+  ///
+  /// Throws [ArgumentError] if [slotExtendInterval] is not positive or
+  /// [slotHandlerMaxDuration] is negative.
   NamingClient(
     TalkConnector connect, {
     this.reconnectDelay = const Duration(seconds: 1),
     Duration? watchTimeout,
     this.slotExtendInterval = const Duration(seconds: 4),
+    this.slotHandlerMaxDuration = const Duration(minutes: 10),
   }) : _connect = connect,
        watchTimeout = watchTimeout ?? const Duration(seconds: 15) {
     if (slotExtendInterval <= Duration.zero) {
@@ -84,6 +94,13 @@ class NamingClient {
         slotExtendInterval,
         'slotExtendInterval',
         'must be positive',
+      );
+    }
+    if (slotHandlerMaxDuration < Duration.zero) {
+      throw ArgumentError.value(
+        slotHandlerMaxDuration,
+        'slotHandlerMaxDuration',
+        'must not be negative',
       );
     }
   }
@@ -98,6 +115,11 @@ class NamingClient {
 
   /// Interval of `EXTEND` while a [slotHandler] call runs.
   final Duration slotExtendInterval;
+
+  /// Longest a [slotHandler] call is kept alive with `EXTEND` before the
+  /// request is answered `ABORT DEADLINE_EXCEEDED`; [Duration.zero] for no
+  /// bound. Default 10 minutes.
+  final Duration slotHandlerMaxDuration;
 
   late final _ClientSlots _slots = _ClientSlots(this);
 
@@ -522,9 +544,12 @@ class NamingClient {
   }
 
   /// Stops reconnecting, closes the channel (the naming service then drops
-  /// this client's registrations), fails pending [register] futures and
-  /// [synced] with [StatusCode.cancelled], and ends [events]. No timer is
-  /// left running. Calling it again returns the same future.
+  /// this client's registrations and frees their slots), fails pending
+  /// [register] futures and [synced] with [StatusCode.cancelled], and ends
+  /// [events]. Slots locked by `DRAIN` are unlocked through
+  /// [SlotHandler.onResume] once their `DRAIN` handler is done, as on a
+  /// loss of the naming service. No timer is left running. Calling it
+  /// again returns the same future.
   Future<void> close() => _closeFuture ??= _close();
 
   Future<void> _close() async {

@@ -1380,9 +1380,8 @@ class SlotItem {
   String toString() => 'SLOT $type/$slot $entry';
 }
 
-/// The fields of a `MOVED` status, which also follow the code of an
-/// `ABORTED` status sent because a slot moved after work started (wiki
-/// pages "Switchboard Status Codes" and "Switchboard Sharding", section
+/// The fixed fields of a `MOVED` or `RELOCATED` status (wiki pages
+/// "Switchboard Status Codes" and "Switchboard Sharding", section
 /// "Routing").
 ///
 /// The status payload is `u16 code`, `u48 owner` (the slot's current
@@ -1390,10 +1389,11 @@ class SlotItem {
 /// 0 = unknown), then the usual optional UTF-8 reason. The owner's type is
 /// the one the channel was addressed to.
 ///
-/// `MOVED` means nothing on the channel (or in the request) was
-/// processed, so it may be sent again to the owner; `ABORTED` with these
-/// fields means the slot moved while work was under way, so the work may
-/// or may not have taken effect.
+/// `MOVED` (37) means nothing on the channel (or in the request) was
+/// processed, so it may be sent again to the owner; `RELOCATED` (38) means
+/// the slot moved after work on the channel (or request) had started, so
+/// the work may or may not have taken effect, and it is never retried
+/// automatically.
 class MovedStatus {
   /// Creates the fields; [owner] and [epoch] 0 mean unknown.
   ///
@@ -1428,11 +1428,18 @@ class MovedStatus {
   ServiceAddress? ownerOf(Name type) =>
       owner == 0 ? null : ServiceAddress(type, owner);
 
+  /// Whether [status] is a `MOVED` or a `RELOCATED`, the two codes that
+  /// carry these fields.
+  static bool carriesFields(Status status) {
+    final code = status.known;
+    return code == StatusCode.moved || code == StatusCode.relocated;
+  }
+
   /// The status payload: `u16` code ([StatusCode.moved], or
-  /// [StatusCode.aborted] when [aborted]), the fields and the reason.
-  Uint8List encode({bool aborted = false}) {
+  /// [StatusCode.relocated] when [relocated]), the fields and the reason.
+  Uint8List encode({bool relocated = false}) {
     final w = ByteWriter(2 + fieldsLength + reason.length * 3)
-      ..u16(aborted ? StatusCode.aborted.code : StatusCode.moved.code)
+      ..u16(relocated ? StatusCode.relocated.code : StatusCode.moved.code)
       ..u48(owner)
       ..u32(epoch);
     if (reason.isNotEmpty) {
@@ -1441,21 +1448,21 @@ class MovedStatus {
     return w.toBytes();
   }
 
-  /// A [StatusCode.moved] status carrying the fields, or an
-  /// [StatusCode.aborted] one when [aborted].
-  Status toStatus({bool aborted = false}) =>
-      Status.decode(encode(aborted: aborted));
+  /// A [StatusCode.moved] status carrying the fields, or a
+  /// [StatusCode.relocated] one when [relocated].
+  Status toStatus({bool relocated = false}) =>
+      Status.decode(encode(relocated: relocated));
 
   /// Reads the fields of a status payload. Never throws: a payload whose
-  /// code is neither `MOVED` nor `ABORTED`, or that is too short for the
-  /// fields, reads as [unknown].
+  /// code is neither `MOVED` (37) nor `RELOCATED` (38), or that is too
+  /// short for the fields, reads as [unknown].
   static MovedStatus parse(Uint8List statusPayload) {
     if (statusPayload.length < 2 + fieldsLength) {
       return unknown;
     }
     final r = ByteReader(statusPayload);
     final code = r.u16();
-    if (code != StatusCode.moved.code && code != StatusCode.aborted.code) {
+    if (code != StatusCode.moved.code && code != StatusCode.relocated.code) {
       return unknown;
     }
     final owner = r.u48();
@@ -1469,12 +1476,9 @@ class MovedStatus {
   }
 
   /// Reads the fields of [status] (see [parse]): [unknown] unless it is a
-  /// `MOVED` or `ABORTED` status long enough to carry them. An `ABORTED`
-  /// status that does not come from a slot move has no fields; only read
-  /// it on a channel or request addressed to a shard slot.
+  /// `MOVED` or `RELOCATED` status long enough to carry them.
   static MovedStatus fromStatus(Status status) {
-    final code = status.known;
-    if (code != StatusCode.moved && code != StatusCode.aborted) {
+    if (!carriesFields(status)) {
       return unknown;
     }
     return parse(status.encode());

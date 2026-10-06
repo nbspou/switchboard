@@ -275,6 +275,9 @@ class RecordingHandler extends SlotHandler {
   Future<void> Function(ResumeRequest) resume = (_) async {};
   final List<String> revoked = [];
 
+  /// Every [onDiscard], as `type: slots`.
+  final List<String> discarded = [];
+
   @override
   Future<AssignResult> onAssign(AssignRequest r) {
     log.add('$name ASSIGN ${r.slot} e${r.epoch} h${r.holder}');
@@ -304,4 +307,8 @@ class RecordingHandler extends SlotHandler {
     log.add('$name REVOKE $slot');
     revoked.add('$type/$slot');
   }
+
+  @override
+  void onDiscard(Name type, List<int> slots) =>
+      discarded.add('$type: ${slots.join(',')}');
 }

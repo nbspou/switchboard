@@ -103,6 +103,13 @@ class NamingService {
   /// sends to instances (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`); every
   /// `EXTEND` from the instance restarts it. [Duration.zero] disables it.
   ///
+  /// [handoverMaxDuration] bounds an `ASSIGN` or `DRAIN` overall, whatever
+  /// the `EXTEND`s: one still running after it is cancelled (Talk cancel
+  /// with `DEADLINE_EXCEEDED`) and handled as a failure, so that a hung
+  /// load or drain cannot keep a slot locked or busy forever. A migration
+  /// is then rolled back with `RESUME`; an instance whose `ASSIGN` timed
+  /// out enters its `ASSIGN` backoff. [Duration.zero] removes the bound.
+  ///
   /// [maxSlotCount] bounds the slot count of a space; `SLOTS` with more is
   /// refused with `OUT_OF_RANGE`.
   ///
@@ -117,6 +124,11 @@ class NamingService {
   /// allocator moves no owned slot of that space to it. `CLAIM` and a
   /// `MIGRATE` to a given instance are explicit and not held back.
   ///
+  /// The same backoff, per slot and owner, paces the rebalancing
+  /// migrations of a slot whose owner refused or failed its `DRAIN`: the
+  /// allocator does not try to move that slot away from that owner again
+  /// until it ends.
+  ///
   /// [holdingSettle] protects the storage of instances returning after a
   /// naming service restart, which only `HOLDING` makes known again: after
   /// a `SLOTS` that gives an instance capacity, the allocator leaves the
@@ -128,8 +140,9 @@ class NamingService {
   ///
   /// Throws [ArgumentError] if [heartbeat] or [assignBackoff] is not
   /// positive, if [assignBackoffMax] is shorter than [assignBackoff], if
-  /// [assignmentHold], [holderGrace], [handoverTimeout] or [holdingSettle] is
-  /// negative, or if [maxSlotCount] is not positive.
+  /// [assignmentHold], [holderGrace], [handoverTimeout],
+  /// [handoverMaxDuration] or [holdingSettle] is negative, or if
+  /// [maxSlotCount] is not positive.
   NamingService({
     this.heartbeat = const Duration(seconds: 4),
     this.assignmentHold = const Duration(seconds: 2),
@@ -139,6 +152,7 @@ class NamingService {
     this.assignBackoff = const Duration(milliseconds: 200),
     this.assignBackoffMax = const Duration(seconds: 10),
     this.holdingSettle = const Duration(seconds: 1),
+    this.handoverMaxDuration = const Duration(minutes: 10),
   }) {
     if (heartbeat <= Duration.zero) {
       throw ArgumentError.value(heartbeat, 'heartbeat', 'must be positive');
@@ -161,6 +175,7 @@ class NamingService {
       ('assignmentHold', assignmentHold),
       ('holderGrace', holderGrace),
       ('handoverTimeout', handoverTimeout),
+      ('handoverMaxDuration', handoverMaxDuration),
       ('holdingSettle', holdingSettle),
     ]) {
       if (value < Duration.zero) {
@@ -197,6 +212,10 @@ class NamingService {
 
   /// The longest [assignBackoff] grows to with repeated failures.
   final Duration assignBackoffMax;
+
+  /// Longest an `ASSIGN` or `DRAIN` may run, `EXTEND`s or not, before it
+  /// is cancelled and handled as failed; [Duration.zero] for no bound.
+  final Duration handoverMaxDuration;
 
   /// How long the allocator waits for `HOLDING` after a `SLOTS` with
   /// capacity before it assigns free slots that have no holder.

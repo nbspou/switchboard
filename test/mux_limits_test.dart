@@ -553,16 +553,25 @@ void main() {
       );
       expect(truncateStatus(moved, 11), const Status(37));
       expect(truncateStatus(moved, 2), const Status(37));
+      // RELOCATED has the same fields.
+      final relocated = Status.decode(
+        Uint8List.fromList([38, 0, ...moved.encode().sublist(2)]),
+      );
+      expect(
+        MovedStatus.fromStatus(truncateStatus(relocated, 12)).owner,
+        0xFEDCBA987654,
+      );
+      expect(truncateStatus(relocated, 11), const Status(38));
     });
 
-    test('a MOVED status crosses a CLOSE byte for byte', () async {
+    test('a RELOCATED status crosses a CLOSE byte for byte', () async {
       final (a, b) = muxPair();
       final ca = a.open(empty);
       final cb = await b.incoming.first;
       final moved = MovedStatus(
         owner: 0x80FF80FF80FF,
         epoch: 0x80808080,
-      ).toStatus(aborted: true);
+      ).toStatus(relocated: true);
       await cb.close(moved);
       final received = await ca.done;
       expect(received.encode(), moved.encode());

@@ -1,5 +1,5 @@
 // The slot gate state machine: queueing, forwarding, resuming and
-// revoking slots, MOVED and ABORTED fields, bounds, request gating. Incoming
+// revoking slots, MOVED and RELOCATED fields, bounds, request gating. Incoming
 // channels arrive over in-memory mux links; forwarding goes to a node on
 // loopback TCP.
 
@@ -35,9 +35,9 @@ Matcher isMoved([int owner = 0, int epoch = 0]) => isA<Status>()
     .having((s) => s.known, 'code', StatusCode.moved)
     .having(MovedStatus.fromStatus, 'fields', fields(owner, epoch));
 
-/// An ABORTED status for a slot move, naming [owner] at [epoch].
-Matcher isAborted([int owner = 0, int epoch = 0]) => isA<Status>()
-    .having((s) => s.known, 'code', StatusCode.aborted)
+/// A RELOCATED status naming [owner] at [epoch].
+Matcher isRelocated([int owner = 0, int epoch = 0]) => isA<Status>()
+    .having((s) => s.known, 'code', StatusCode.relocated)
     .having(MovedStatus.fromStatus, 'fields', fields(owner, epoch));
 
 Matcher fields(int owner, int epoch) => isA<MovedStatus>()
@@ -378,17 +378,49 @@ void main() {
       expect(long.canSend, isTrue);
     });
 
-    test('a tracked channel holds DRAIN at most drainTimeout', () async {
+    test('a tracked channel holds DRAIN at most drainTimeout, then is '
+        'closed with RELOCATED before the drain', () async {
       newGate(drainTimeout: const Duration(milliseconds: 30));
       lifecycle.onServe = (_, _) {};
       await gate.onAssign(assign(1));
       final stuck = peer.open(shard: 1, payload: 'stuck');
       await until(() => lifecycle.served[1]?.length == 1);
       final watch = Stopwatch()..start();
-      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      lifecycle.drainGate = Completer<void>();
+      final drained = gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await until(() => lifecycle.log.last == 'drain 1 e2 to2');
       expect(watch.elapsed, greaterThanOrEqualTo(Duration(milliseconds: 25)));
-      expect(lifecycle.log.last, 'drain 1 e2 to2');
-      expect(stuck.canSend, isTrue);
+      // Closed while drain still runs, naming the new owner and epoch.
+      expect(await stuck.done.timeout(limit), isRelocated(2, 2));
+      lifecycle.drainGate!.complete();
+      await drained;
+      expect(gate.stateOf(1), SlotGateState.locked);
+    });
+
+    test('after DRAIN gave up waiting, the old owner serves nothing more on '
+        'the channel', () async {
+      // The channel outlives drainTimeout; it must not be served on state
+      // that is handed over (wiki: "The hand-over, step by step").
+      newGate(
+        drainTimeout: const Duration(milliseconds: 30),
+        forwardGrace: const Duration(seconds: 2),
+      );
+      await gate.onAssign(assign(1));
+      final stuck = peer.open(shard: 1, payload: 'stuck');
+      final answers = StreamQueue(stuck.stream.map(text));
+      stuck.send(bytes('before'));
+      expect(await answers.next.timeout(limit), '1:before');
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(gate.stateOf(1), SlotGateState.forwarding);
+      expect(await stuck.done.timeout(limit), isRelocated(2, 2));
+      if (stuck.canSend) {
+        stuck.send(bytes('after-forward'));
+      }
+      expect(await answers.hasNext.timeout(limit), isFalse);
+      await settle();
+      expect(lifecycle.served[1], hasLength(1));
+      expect(arrived, isEmpty);
     });
 
     test('FORWARD pipes the queue to the new owner in order, and late '
@@ -440,22 +472,15 @@ void main() {
       expect(await answers.next.timeout(limit), 'to:b');
     });
 
-    test('a served channel still open after the grace period: ABORTED naming '
-        'the new owner', () async {
-      newGate(
-        forwardGrace: const Duration(milliseconds: 30),
-        drainTimeout: const Duration(milliseconds: 20),
-      );
+    test('the RELOCATED status names the new owner while forwarding', () async {
+      newGate();
       await gate.onAssign(assign(1));
-      final served = peer.open(shard: 1);
-      expect(await ask(served, 'x'), '1:x');
-      // DRAIN gives up waiting for it.
+      expect(gate.relocatedStatus(1), isRelocated());
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
       expect(gate.movedTo(1), MovedStatus(owner: 2, epoch: 2));
-      expect(gate.abortedStatus(1), isAborted(2, 2));
-      expect(await served.done.timeout(limit), isAborted(2, 2));
-      expect(lifecycle.log.last, 'unload 1');
+      expect(gate.relocatedStatus(1), isRelocated(2, 2));
+      expect(gate.movedStatus(1), isMoved(2, 2));
     });
 
     test('a slot coming back during the grace period is unloaded, then '
@@ -480,7 +505,7 @@ void main() {
     });
 
     test('revocation refuses the queue with MOVED and closes served channels '
-        'with ABORTED', () async {
+        'with RELOCATED', () async {
       newGate();
       await gate.onAssign(assign(1));
       final served = peer.open(shard: 1);
@@ -500,7 +525,7 @@ void main() {
       await settle();
       await gate.onRevoke(kv, 1);
       expect(await queued.done, isMoved());
-      expect(await served.done, isAborted());
+      expect(await served.done, isRelocated());
       expect(lifecycle.log.last, 'unload 1');
       expect(gate.stateOf(1), isNull);
       await drained;
@@ -638,6 +663,96 @@ void main() {
       expect(await parked.timeout(limit), '1');
       await talk.close();
     });
+
+    test('a slot outside the mirrored space: ABORT OUT_OF_RANGE', () async {
+      final h = Harness();
+      addTearDown(h.close);
+      client = NamingClient(Connector(h).call);
+      await client.start();
+      await client.synced.timeout(limit);
+      await client.defineSlots(
+        kv,
+        count: 4,
+        mode: SlotMode.static,
+        capacity: 0,
+      );
+      await until(() => client.slotTable(kv) != null);
+      newGate(trackChannels: false);
+      lifecycle.onServe = (channel, _) {
+        gate.detach(channel);
+        channel.talk().messages.listen(
+          (m) => gate.serveRequest(m, int.parse(text(m.payload)), (m) {
+            m.reply(m.payload);
+          }),
+        );
+      };
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      Future<Object> outcome(String slot) => talk
+          .request('GET', bytes(slot))
+          .then<Object>(
+            (m) => text(m.payload),
+            onError: (Object e) => (e as SwitchboardException).code!,
+          );
+      expect(await outcome('1'), '1');
+      expect(await outcome('3'), StatusCode.moved);
+      expect(await outcome('4'), StatusCode.outOfRange);
+      await talk.close();
+    });
+
+    test('a queued request whose channel closed leaves the queue', () async {
+      newGate(trackChannels: false, maxQueuedRequests: 1);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final first = TalkChannel(peer.open(shard: 1));
+      final second = TalkChannel(peer.open(shard: 1));
+      expect(text((await first.request('GET', bytes('a'))).payload), '1:a');
+      await until(() => lifecycle.served[1]?.length == 2);
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final gone = first.request('GET', bytes('gone'));
+      gone.ignore();
+      await settle();
+      expect(
+        second.request('GET', bytes('refused')),
+        throwsA(isA<SwitchboardException>()),
+      );
+      await settle();
+      await first.close();
+      await settle();
+      // Its place in the queue is free again.
+      final queued = second.request('GET', bytes('b'));
+      await settle();
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(text((await queued.timeout(limit)).payload), '1:b');
+      expect(answered, ['a', 'b']);
+      await second.close();
+    });
+
+    test('the forwarding channel is closed once idle, and opened again for '
+        'a late request', () async {
+      newGate(trackChannels: false);
+      talkLifecycle();
+      target.registerService(kv, (incoming) {
+        arrived.add(incoming);
+        incoming.talk().messages.listen(
+          (m) => m.reply(bytes('to:${text(m.payload)}')),
+        );
+      }, instance: 2);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await settle();
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(text((await talk.request('GET', bytes('a'))).payload), 'to:a');
+      expect(text((await talk.request('GET', bytes('b'))).payload), 'to:b');
+      expect(arrived, hasLength(1));
+      // About a second without a request: closed.
+      final closed = await arrived.single.channel.done.timeout(limit);
+      expect(closed, Status.ok);
+      expect(text((await talk.request('GET', bytes('c'))).payload), 'to:c');
+      expect(arrived, hasLength(2));
+      await talk.close();
+    });
   });
 
   test('MOVED fields follow the naming client mirror', () async {
@@ -714,13 +829,46 @@ void main() {
     expect(gates.gates, isEmpty);
   });
 
-  test('a lifecycle serves one gate', () {
-    newGate();
-    expect(
-      () => SlotGate(node, client, kv, lifecycle: lifecycle),
-      throwsStateError,
-    );
-    expect(() => TestLifecycle().gate, throwsStateError);
-    expect(lifecycle.gate, same(gate));
+  test(
+    'a lifecycle serves one gate, and another once that is closed',
+    () async {
+      newGate();
+      expect(
+        () => SlotGate(node, client, kv, lifecycle: lifecycle),
+        throwsStateError,
+      );
+      expect(() => TestLifecycle().gate, throwsStateError);
+      expect(lifecycle.gate, same(gate));
+      await gate.close();
+      // Still answers for the closed gate until attached again.
+      expect(lifecycle.gate, same(gate));
+      final again = SlotGate(node, client, kv, lifecycle: lifecycle);
+      expect(lifecycle.gate, same(again));
+      await again.onAssign(assign(1));
+      expect(again.serves(1), isTrue);
+      await again.close();
+    },
+  );
+
+  test('HOLDING discards reach the lifecycle through SlotGates', () {
+    final discarded = <List<int>>[];
+    final gates = SlotGates();
+    lifecycle = _DiscardLog(discarded);
+    gates.add(SlotGate(node, client, kv, lifecycle: lifecycle));
+    gates.onDiscard(kv, [3, 5]);
+    gates.onDiscard(Name('zz'), [1]);
+    expect(discarded, [
+      [3, 5],
+    ]);
   });
+}
+
+/// Records [SlotLifecycle.discard] calls.
+class _DiscardLog extends TestLifecycle {
+  _DiscardLog(this.discarded);
+
+  final List<List<int>> discarded;
+
+  @override
+  void discard(List<int> slots) => discarded.add(slots);
 }
