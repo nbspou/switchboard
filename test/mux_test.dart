@@ -432,36 +432,96 @@ void main() {
     });
 
     test('allocation skips reserved long ids and wraps', () async {
-      final (a, b) = muxPair();
-      final bIncoming = StreamQueue(b.incoming);
+      final unlimited = quiet.copyWith(maxChannels: 0);
+      final (a, b) = muxPair(initiator: unlimited, acceptor: unlimited);
+      final atB = <MuxChannel>[];
+      final atA = <MuxChannel>[];
+      b.incoming.listen(atB.add);
+      a.incoming.listen(atA.add);
+      // The long range is only used once every short id is in use.
+      for (var i = 0; i < 0x7FFF; i++) {
+        a.open(empty);
+      }
       a.nextChannelIdForTesting = 0xFFFEFFFFFFFE;
       expect(a.open(empty).id, 0xFFFEFFFFFFFE);
       expect(a.open(empty).id, 0xFFFF00000002);
       a.nextChannelIdForTesting = 0xFFFFFFFFFFFE;
       expect(a.open(empty).id, 0xFFFFFFFFFFFE);
-      expect(a.open(empty).id, 2);
-      expect(
-        [for (var i = 0; i < 4; i++) (await bIncoming.next).id],
-        [0xFFFEFFFFFFFE, 0xFFFF00000002, 0xFFFFFFFFFFFE, 2],
-      );
+      // Wraps within the long range.
+      expect(a.open(empty).id, 0x10000);
+      await a.ping();
+      expect(atB.skip(0x7FFF).map((c) => c.id), [
+        0xFFFEFFFFFFFE,
+        0xFFFF00000002,
+        0xFFFFFFFFFFFE,
+        0x10000,
+      ]);
 
+      // Odd ids 3 to 0xFFFD, skipping the reserved 0xFFFF.
+      for (var i = 0; i < 0x7FFE; i++) {
+        b.open(empty);
+      }
       b.nextChannelIdForTesting = 0xFFFFFFFFFFFD;
       expect(b.open(empty).id, 0xFFFFFFFFFFFD);
-      expect(b.open(empty).id, 3);
-      b.nextChannelIdForTesting = 0xFFFD;
-      expect(b.open(empty).id, 0xFFFD);
       expect(b.open(empty).id, 0x10001);
       await b.ping();
+      expect(atA.skip(0x7FFE).map((c) => c.id), [0xFFFFFFFFFFFD, 0x10001]);
       expect(a.isOpen, isTrue);
       await a.close();
     });
 
     test('long ids use the long form on the wire', () async {
       final (mux, raw) = rawPair();
-      mux.nextChannelIdForTesting = 0x10000;
+      for (var i = 0; i < 0x7FFF; i++) {
+        mux.open(empty);
+      }
+      for (var i = 0; i < 0x7FFF; i++) {
+        await raw.frames.next;
+      }
       mux.open(hexBytes('AA'));
       expect(await raw.nextHex(), '10 00 00 01 00 00 00 AA');
       await mux.close();
+    });
+
+    test('ids wrap within the short range first', () async {
+      final unlimited = quiet.copyWith(maxChannels: 0);
+      final (a, b) = muxPair(acceptor: unlimited);
+      b.incoming.listen((_) {});
+      final channels = [for (var i = 0; i < 0x7FFF; i++) a.open(empty)];
+      expect(channels.first.id, 2);
+      expect(channels.last.id, 0xFFFE);
+      // Every short id of our parity is in use: the next one is long.
+      final long = a.open(empty);
+      expect(long.id, 0x10000);
+      // A freed short id is preferred over the long range again.
+      await channels[10].close();
+      expect(a.open(empty).id, channels[10].id);
+      expect(a.open(empty).id, 0x10002);
+      await a.ping();
+      expect(a.isOpen && b.isOpen, isTrue);
+      await a.close();
+    });
+
+    test('ids stay short over many channels to a short-id-only peer', () async {
+      final (a, b) = muxPair(acceptor: quiet.copyWith(shortIdsOnly: true));
+      b.incoming.listen((_) {});
+      var largest = 0;
+      // 40000 channels opened and closed, more than there are short ids.
+      for (var round = 0; round < 40; round++) {
+        final channels = [for (var i = 0; i < 1000; i++) a.open(empty)];
+        for (final channel in channels) {
+          largest = channel.id > largest ? channel.id : largest;
+        }
+        await Future.wait([for (final channel in channels) channel.close()]);
+        for (final channel in channels) {
+          expect(await channel.done, Status.ok);
+        }
+      }
+      expect(largest, 0xFFFE);
+      await a.ping();
+      expect(a.isOpen && b.isOpen, isTrue);
+      expect(a.open(empty).id, lessThan(0x10000));
+      await a.close();
     });
 
     test('a long form id addresses a channel opened in short form', () async {

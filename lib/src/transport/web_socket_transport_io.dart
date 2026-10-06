@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:web_socket_channel/io.dart';
 
+import 'web_socket_server.dart';
 import 'web_socket_transport.dart';
 
 /// The WebSocket binding on `dart:io`: accepting connections on an
@@ -20,7 +21,12 @@ import 'web_socket_transport.dart';
 /// Both helpers turn per-message compression off by default. A compressed
 /// message can inflate to far more than its wire size before any limit
 /// applies, which is why the transport's frame limit is only meaningful
-/// without it. See [WebSocketTransport] for the binding itself.
+/// without it. Even so, `dart:io` assembles each message, fragments
+/// included, before the transport's check sees it, so a peer can make it
+/// allocate a message of any size first. For listeners facing untrusted
+/// clients, use [WebSocketServerTransport], which bounds whole messages
+/// before buffering them. See [WebSocketTransport] for the binding
+/// itself.
 abstract final class IOWebSocketTransport {
   /// Upgrades [request] to a WebSocket and wraps it with
   /// [WebSocketTransport.wrap] and [maxFrameSize].

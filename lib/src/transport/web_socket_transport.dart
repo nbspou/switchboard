@@ -49,7 +49,8 @@ abstract final class WebSocketTransport {
   /// already assembled the message in memory, so this limit protects the
   /// layers above but does not bound the memory a peer can make the
   /// WebSocket implementation use. On servers, accept connections with
-  /// `IOWebSocketTransport.upgrade`, which also turns compression off, or
+  /// `WebSocketServerTransport.upgrade` (`dart:io`), which bounds whole
+  /// messages before buffering them and never negotiates compression, or
   /// put a proxy with a message size limit in front.
   static StreamChannel<Uint8List> wrap(
     WebSocketChannel channel, {

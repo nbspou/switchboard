@@ -17,9 +17,11 @@ lib/src/bytes.dart             ByteReader, ByteWriter, hexBytes, hexString      
 lib/src/transport/transport_capabilities.dart  FrameLimited, AbortableTransport, OutputBufferedTransport (optional transport capabilities)
 lib/src/transport/memory_transport.dart     in-memory StreamChannel<Uint8List> pair
 lib/src/transport/stream_framing.dart       stream binding wire format: StreamFraming, StreamFrameDecoder (no dart:io)
+lib/src/transport/framed_byte_transport.dart  FramedByteTransport, ByteFraming: output queue, throttling, close and linger shared by the byte stream transports (internal, not exported)
 lib/src/transport/stream_transport.dart     StreamTransport, StreamTransportChannel over byte streams; TCP helpers (dart:io)
 lib/src/transport/web_socket_transport.dart wraps package:web_socket_channel (binary only)
 lib/src/transport/web_socket_transport_io.dart  IOWebSocketTransport: server upgrade and connect on dart:io (exported from switchboard.dart only)
+lib/src/transport/web_socket_server.dart    WebSocketServerTransport, WebSocketServerChannel: own RFC 6455 server side (dart:io, exported from switchboard.dart only)
 lib/src/mux/mux_frame.dart     MuxFrame codec, MuxCommand, control message codecs
 lib/src/mux/mux_connection.dart MuxConnection, MuxOptions, MuxLimits
 lib/src/mux/mux_channel.dart   MuxChannel, MuxChannelState
@@ -36,6 +38,8 @@ lib/src/naming/naming_service.dart     NamingService (server side handler)
 lib/src/naming/naming_client.dart      NamingClient (register, watch, mirrored table)
 lib/src/naming/naming_client_io.dart   namingClientFor: a NamingClient connecting through a Switchboard (dart:io)
 lib/src/switchboard/resolver.dart      Resolver, StaticResolver, EndpointResolver, NamingResolver
+lib/src/switchboard/channel_policy.dart  ChannelPolicy, ChannelPolicies (listener policies)
+lib/src/switchboard/generic_status.dart  genericStatus: rejection statuses for peers (internal, not exported)
 lib/src/switchboard/switchboard.dart   Switchboard (dart:io), IncomingChannel, handlers
 lib/src/switchboard/proxy.dart         pipeChannels, ProxyHandler
 lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a naming service (dart:io)
@@ -43,7 +47,7 @@ lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a namin
 
 Rules:
 
-* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. Everything else must compile for the web.
+* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. Everything else must compile for the web.
 * The wire codecs must be correct when compiled to JavaScript, where bitwise operations are 32-bit: use `ByteReader`/`ByteWriter` (or the same split arithmetic) for `u32` and `u48`. `dart test -P node` runs the codec tests on Node.js (see `dart_test.yaml`).
 * All wire codecs are pure functions over `Uint8List` and are unit tested against the wiki test vectors.
 * Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`.
@@ -96,7 +100,7 @@ class StreamTransport {   // dart:io; re-exports stream_framing.dart; the static
   static StreamTransportChannel wrap(Stream<List<int>> input, StreamSink<List<int>> output,
       {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout, void Function()? abort});
   static Future<StreamTransportChannel> connectTcp(dynamic host, int port, {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout});
-  static StreamTransportChannel fromSocket(Socket socket, {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout});   // abort = socket.destroy
+  static StreamTransportChannel fromSocket(Socket socket, {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout});   // abort = socket.destroy; lingers on close
 }
 
 final class StreamTransportChannel implements StreamChannel<Uint8List>, FrameLimited, AbortableTransport, OutputBufferedTransport {
@@ -118,11 +122,41 @@ class WebSocketTransport {   // core, no dart:io
 class IOWebSocketTransport {   // dart:io, exported from switchboard.dart only
   /// Selects 'switchboard' when offered, accepts clients offering none,
   /// refuses clients offering only others. Compression off by default: a
-  /// compressed message can inflate far beyond its wire size.
+  /// compressed message can inflate far beyond its wire size. dart:io still
+  /// assembles fragmented messages without a bound before the check: the
+  /// simple alternative to WebSocketServerTransport, not for untrusted peers.
   static Future<StreamChannel<Uint8List>> upgrade(HttpRequest request, {int maxFrameSize, bool compression = false});
   static Future<StreamChannel<Uint8List>> connect(Uri uri, {int maxFrameSize, bool compression = false});
 }
+
+class WebSocketServerTransport {   // dart:io, exported from switchboard.dart only
+  static const int defaultMaxFrameSize = 1 MiB;
+  /// Own handshake (RFC 6455 4.2) and frame reader on the detached socket.
+  /// Not an upgrade (GET, HTTP/1.1, Upgrade: websocket, Connection: Upgrade): 426 + Upgrade: websocket;
+  /// version != 13: 426 + Sec-WebSocket-Version: 13; missing or malformed key, or only other
+  /// subprotocols offered: 400 (each: response sent, future fails with WebSocketException).
+  /// Selects 'switchboard' when offered; never negotiates extensions (no permessage-deflate).
+  /// Reader: masking required, RSV bits, reserved opcodes, fragmented or > 125 byte control frames,
+  /// stray continuations: ProtocolException + close 1002; text: ProtocolException + close 1003;
+  /// the sum of a message's fragments is checked against maxFrameSize (0 = none) on each fragment
+  /// header, before buffering it: SwitchboardException(frameTooLarge) + close 1009; ping -> pong;
+  /// client close echoed with its code, stream ends. Writer: unmasked frames; closing the sink
+  /// sends close 1000. Output queue, throttling, closeTimeout and linger as for fromSocket.
+  /// pingInterval: ping after a silent interval, abort after two more silent intervals.
+  static Future<WebSocketServerChannel> upgrade(HttpRequest request,
+      {int maxFrameSize, Duration? pingInterval, int outputHighWaterMark, Duration closeTimeout});
+  static Set<String> offeredProtocols(HttpRequest request);
+}
+
+final class WebSocketServerChannel implements StreamChannel<Uint8List>, FrameLimited, AbortableTransport, OutputBufferedTransport {
+  String? get protocol; int get maxFrameSize; Duration? get pingInterval;
+  int? get closeCode; String? get closeReason;   // the client's close frame
+  int get bufferedOutputBytes; int get acceptedOutputBytes; bool get isInputThrottled;
+  void abort();
+}
 ```
+
+**Linger.** `StreamTransport.fromSocket` and `WebSocketServerChannel` do not drop their input when they close: after their last bytes (and, for WebSocket, the close frame) they close their side of the connection and keep reading and discarding until the peer closes its side, for at most `closeTimeout`, then destroy the socket. Closing a TCP socket with unread input makes the kernel reset the connection, and the reset can destroy frames still in flight to the peer (the GOAWAY sent just before the close), which made a peer see `connectionLost` instead of `goingAway`. Input paused because the peer does not read our output stays paused, so a close that times out still resets such a peer. The stream ends and the sink's `done` completes as before; only the socket lives on. `StreamTransport.wrap` over arbitrary streams does not linger.
 
 `IOWebSocketTransport` is a separate class rather than a static `WebSocketTransport.upgrade` because Dart has no static extension members and `WebSocketTransport` must stay free of `dart:io`. The transport limits (`maxFrameSize` of the stream and WebSocket transports) and `MuxOptions.maxFrameSize` should agree; with the defaults they are all 1 MiB.
 
@@ -153,6 +187,7 @@ class MuxOptions {
   final int maxChannelBufferBytes;     // per channel receive buffer while unread or paused; default 4 MiB (0 = unlimited); beyond: CLOSE resourceExhausted
   final int receiveHighWaterMarkBytes; // all channel buffers; default 16 MiB (0 = never); above: stop reading the transport until half
   final Duration closeConfirmTimeout;  // MuxChannel.close() wait for the peer's CLOSE; default 30 s (Duration.zero = forever)
+  final int maxOpenPayloadBytes;       // OPEN payloads held for the peer's open channels; default 16 MiB, at most half of receiveHighWaterMarkBytes (so 8 MiB with the defaults); 0 = no budget of its own; beyond: CLOSE resourceExhausted
 }
 
 class MuxConnection {
@@ -169,7 +204,8 @@ class MuxConnection {
   MuxLimits? get peerLimits;
   int get openChannelCount;
   Iterable<MuxChannel> get channels;
-  int get bufferedBytes;                    // bytes in all channel receive buffers
+  int get bufferedBytes;                    // bytes in all channel receive buffers, plus the OPEN payloads held for the peer's open channels
+  int get openPayloadBytes;                 // OPEN payloads held for the peer's open channels
   bool get isReceivePaused;                 // transport reading paused by receiveHighWaterMarkBytes
   int get unconfirmedCloseCount;            // ids awaiting the peer's CLOSE without a channel
 }
@@ -191,9 +227,9 @@ class MuxChannel implements StreamChannel<Uint8List> {
 
 Behaviour notes:
 
-* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels`, after our GOAWAY, or once `incoming` was cancelled, reply CLOSE (`resourceExhausted`, `goingAway`, `unavailable`) instead; the channel never surfaces and only its id is kept until the peer confirms. A second OPEN on such an id before the confirmation is a protocol error, as is OPEN on any id that is open or half closed.
+* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels`, if its payload would take the held OPEN payloads beyond the budget (`maxOpenPayloadBytes`, at most half of `receiveHighWaterMarkBytes`), after our GOAWAY, or once `incoming` was cancelled, reply CLOSE (`resourceExhausted`, `resourceExhausted`, `goingAway`, `unavailable`) instead; the channel never surfaces and only its id is kept until the peer confirms. A second OPEN on such an id before the confirmation is a protocol error, as is OPEN on any id that is open or half closed.
 * Protocol errors: send GOAWAY `protocolError` with reason, close transport, `done` completes with `protocolError`. A stream binding preamble with another version gives GOAWAY `unsupported`; a frame over the transport limit gives GOAWAY `frameTooLarge`.
-* Ids: allocate incrementally from 2 or 3, step 2, skipping reserved ids, ids in use and ids awaiting a CLOSE confirmation, wrapping at 0xFFFFFFFFFFFF (or 0xFFFF if `shortIdsOnly`).
+* Ids: allocate incrementally from 2 or 3, step 2, skipping reserved ids, ids in use and ids awaiting a CLOSE confirmation, wrapping within the short range (below 0x10000) first. The long range (from 0x10000 or 0x10001, wrapping at 0xFFFFFFFFFFFF) is used only while every short id of our parity is in use; with `shortIdsOnly` that is `resourceExhausted` instead. A long-lived connection to a short-id-only peer therefore keeps working however many channels come and go. `nextChannelIdForTesting` sets the short cursor for ids below 0x10000, else the long one.
 * Keep-alive: timer restarted on any incoming frame; on expiry send PING; if nothing arrives within `keepAliveTimeout`, close with `connectionLost`. No probing while the mux paused reading (`receiveHighWaterMarkBytes`); while the transport throttles its input because of our output, the peer reading that output counts as hearing from it.
 * Incoming frames for channel 0 are control messages; unknown types ignored; PING answered immediately, whatever its size up to the 1024-byte control limit.
 * Statuses received in CLOSE or GOAWAY with application codes (256 and above, not allowed there) are reported as `unknown` with the original code in the reason, so they can be relayed.
@@ -208,9 +244,11 @@ Text for the integrator, suitable for the "Switchboard Mux" wiki page:
 >
 > * **Per-channel receive buffer.** Data received on a channel that the application is not reading (no listener yet, or paused) is buffered up to a cap (default 4 MiB, each subframe counted as its length plus a small overhead so floods of empty subframes count too). Beyond it the channel is closed with CLOSE `RESOURCE_EXHAUSTED` and its buffer dropped. This is a channel error, not a connection error; DATA still in flight is dropped until the peer confirms.
 > * **Connection receive high-water mark.** When the buffers of all channels together exceed a mark (default 16 MiB), the implementation stops reading the transport, which pushes back on the peer through TCP (or the WebSocket's) flow control, and resumes at half the mark. Keep-alive does not probe while reading is paused, since the silence is local.
+> * **Held OPEN payloads.** A channel keeps its OPEN payload for its whole life, so the payloads of the channels a peer opened count toward the connection's buffered bytes until each channel is closed, and their total is capped (default 16 MiB, and never more than half of the receive high-water mark, so that held payloads alone cannot keep the reading paused: the CLOSE frames that release them must still be read). An OPEN beyond the cap receives CLOSE `RESOURCE_EXHAUSTED`.
 > * **Rejected OPENs.** A rejected OPEN (over the channel cap, after GOAWAY, or when no longer accepting channels) costs only its id until the peer's confirming CLOSE arrives; no channel state or open payload is kept. If more than a cap of such ids (default 1024) are unconfirmed, the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. A second OPEN on a rejected id before its confirmation is a protocol error.
 > * **Reason truncation.** Reasons in CLOSE and GOAWAY are shortened at a UTF-8 character boundary so that the status payload is at most 1024 bytes and the frame fits the limit the peer announced with LIMITS (GOAWAY must anyway, as a control payload over 1024 bytes is a protocol error).
 > * **Close confirmation timeout.** If the peer does not confirm a CLOSE within a timeout (default 30 s), the channel is reported closed locally with its first status. Nothing is sent; the id stays reserved until the peer's CLOSE arrives after all or the connection ends, because the peer may still consider the channel open and its late frames must not land on a new channel with the same id. Such ids count toward the rejected-OPEN cap.
+> * **WebSocket messages.** The server side WebSocket transport checks the size of a message, all its fragments counted, on each fragment's header, before buffering the fragment, so a message of many fragments that are each within the limit is refused as early as a single oversized frame (close 1009, GOAWAY `FRAME_TOO_LARGE`). It never negotiates permessage-deflate.
 > * **Output.** A transport queues output the connection has not accepted (a peer that does not read). Above a high-water mark (default 16 MiB) it stops reading input, so a peer that sends PINGs without reading cannot make it produce unbounded PONGs; reading resumes once half has drained. While throttled this way, the peer reading our output counts as liveness for keep-alive. A close that cannot drain within the keep-alive timeout destroys the connection.
 
 ## Talk
@@ -358,6 +396,16 @@ Procedure names: Procedures.register ('REGISTER'), unregister ('UNREGSTR'), watc
 ```dart
 typedef ChannelHandler = void Function(IncomingChannel channel);
 
+/// Listener policy (channel_policy.dart, core): evaluated for every channel on a connection
+/// accepted by the listener, after the header is parsed and before any handler (local service,
+/// default service, catch-all). Refused or throwing: CLOSE PERMISSION_DENIED 'permission denied'.
+typedef ChannelPolicy = bool Function(ChannelAddress address, MuxConnection connection);
+abstract final class ChannelPolicies {
+  static bool allowAll(ChannelAddress, MuxConnection);
+  static bool denyReserved(ChannelAddress, MuxConnection);           // refuses `_` types, allows the rest and untyped
+  static ChannelPolicy allowTypes(Set<Name> types, {bool untyped = false});   // only these types (a listed reserved type is allowed)
+}
+
 class IncomingChannel {
   MuxChannel get channel; ChannelAddress get address; MuxConnection get connection;
   TalkChannel talk({TalkOptions? options});       // wrap once; cached
@@ -374,12 +422,18 @@ class EndpointResolver implements Resolver { EndpointResolver(Uri endpoint); }  
 class NamingResolver implements Resolver { NamingResolver(NamingClient); }
 
 class Switchboard {
-  Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions});
+  Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions,
+      Duration connectTimeout = 10 s, bool allowHostHint = false, int maxConnectionsPerEndpoint = 4});
   Resolver? resolver; Uint8List defaultPayload;
 
-  Future<Uri> listenWebSocket(dynamic address, int port, {String path = '/'});   // returns the bound ws:// uri (port resolved)
-  Future<Uri> listenTcp(dynamic address, int port);                              // returns tcp:// uri
+  // WebSocket listeners use WebSocketServerTransport, and dials IOWebSocketTransport.connect (no
+  // compression offered), both with maxFrameSize = muxOptions.maxFrameSize (0: the 1 MiB transport default).
+  // policy: null allows everything (internal listeners only); internet-facing listeners MUST set one
+  // that refuses reserved types. Connections this node initiates (connect) have no policy.
+  Future<Uri> listenWebSocket(dynamic address, int port, {String path = '/', ChannelPolicy? policy});   // returns the bound ws:// uri (port resolved)
+  Future<Uri> listenTcp(dynamic address, int port, {ChannelPolicy? policy});                              // returns tcp:// uri
   List<Uri> get listeningEndpoints;
+  bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses
 
   void registerService(Name type, ChannelHandler handler, {int instance = 0});
   void unregisterService(Name type, {int instance = 0});
@@ -390,20 +444,28 @@ class Switchboard {
   Future<TalkChannel> openTalk(ServiceAddress address, {int? shard, Uint8List? payload, TalkOptions? options});
   Future<MuxChannel> openChannelAt(Uri endpoint, ChannelAddress address);                       // explicit endpoint
   Future<TalkChannel> openTalkAt(Uri endpoint, ChannelAddress address, {TalkOptions? options});
-  Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp
+  Future<(ServiceRecord, MuxConnection)> selectAndConnect(ServiceAddress address, {int? shard, Resolver? resolver, bool excludeOwnEndpoints = false});
+  Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
   Stream<MuxConnection> get connections;              // every accepted or initiated connection
-  Future<void> close();                               // goAway on all connections, stop listening
+  Future<void> close();                               // stop listening, goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout) get GOAWAY at once and are waited for too
 }
 
 /// Forwards every subframe and the close between two channels. Completes when both are done.
 Future<void> pipeChannels(MuxChannel a, MuxChannel b);
 
 /// A catch-all handler that resolves through [switchboard.resolver], rewrites the header
-/// (strips host, fills instance) and pipes. [allow] filters by address; null allows all.
-ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddress)? allow});
+/// (strips host, fills instance) and pipes. [allow] filters by address; the default refuses
+/// reserved types (pass an explicit allow to proxy `_ns`). Never connects to the node's own
+/// listeners (records or host hints pointing back: UNAVAILABLE, logged). No resolver or a
+/// closing node is UNAVAILABLE to the client too. At most
+/// [maxChannelsPerConnection] channels (0 = no limit) are forwarded at a time per client
+/// connection; beyond: RESOURCE_EXHAUSTED.
+ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddress)? allow, Resolver? resolver, int maxChannelsPerConnection = 256});
 ```
 
-Dispatch order is as in the wiki "Addressing" page. Resolution: `resolver.resolve(type)`, filter by instance if non-zero, pick by shard (`sorted[s % n]`) or round robin, connect to `endpoints.first` (try next on failure), OPEN with header `{type, selectedInstance, shard, payload}`.
+Rejections sent to peers by the node and the proxy (policy refusals, no handler, resolution and connection failures, per-client limit) carry the status code and a generic reason only (`'permission denied'`, `'not found'`, `'unavailable'`, ...); the details (instance ids, endpoints, resolver state) are logged locally at FINE or INFO. Statuses a backend sends pass through the proxy unchanged; a lost connection on one side reaches the other as `UNAVAILABLE` `'connection lost'`.
+
+Dispatch order is as in the wiki "Addressing" page, after the listener policy. Resolution: `resolver.resolve(type)`, filter by instance if non-zero, pick by shard (`sorted[s % n]`) or round robin, connect to `endpoints.first` (try next on failure), OPEN with header `{type, selectedInstance, shard, payload}`.
 
 ## Naming service
 

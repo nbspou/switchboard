@@ -29,6 +29,7 @@ export 'src/naming/naming_resolver.dart';
 export 'src/naming/naming_service.dart';
 export 'src/status.dart';
 export 'src/status_closable.dart';
+export 'src/switchboard/channel_policy.dart';
 export 'src/switchboard/incoming_channel.dart';
 export 'src/switchboard/resolver.dart';
 export 'src/talk/talk_channel.dart';

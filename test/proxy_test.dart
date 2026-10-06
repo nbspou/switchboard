@@ -23,6 +23,25 @@ Matcher hasCode(StatusCode code) =>
 Matcher throwsCode(StatusCode code) =>
     throwsA(isA<SwitchboardException>().having((e) => e.code, 'code', code));
 
+/// A node whose next [connect] hands out the connection only after
+/// [beforeReturn] ran on it, to make a backend's GOAWAY arrive between
+/// connect() and the OPEN.
+class RacingSwitchboard extends Switchboard {
+  RacingSwitchboard() : super(muxOptions: fast);
+
+  /// Runs once, on the next connection [connect] returns.
+  Future<void> Function(MuxConnection connection)? beforeReturn;
+
+  @override
+  Future<MuxConnection> connect(Uri endpoint) async {
+    final connection = await super.connect(endpoint);
+    final hook = beforeReturn;
+    beforeReturn = null;
+    await hook?.call(connection);
+    return connection;
+  }
+}
+
 /// Two mux connections over an in-memory transport, closed after the test.
 (MuxConnection, MuxConnection) muxPair({MuxOptions acceptor = fast}) {
   final (a, b) = MemoryTransport.pair();
@@ -205,6 +224,29 @@ void main() {
       expect(await (await atBackend).done, hasCode(StatusCode.internal));
     });
 
+    test('a far end that cancels its subscription without closing keeps the '
+        'pipe waiting for done', () async {
+      final p = await piped();
+      // Cancelling drops further DATA but does not close the channel.
+      await p.backend.stream.listen(null).cancel();
+      var finished = false;
+      unawaited(p.pipe.then((_) => finished = true));
+      p.client.send(bytes('dropped'));
+      await p.clientConnection.ping();
+      await p.backendConnection.ping();
+      await pumpEventQueue();
+      expect(finished, isFalse);
+      expect(p.client.state, MuxChannelState.open);
+      expect(p.backend.state, MuxChannelState.open);
+      // The other direction still flows.
+      p.backend.send(bytes('still'));
+      expect(await p.client.stream.first, bytes('still'));
+      await p.backend.close();
+      await p.pipe;
+      expect(finished, isTrue);
+      expect(await p.client.done, hasCode(StatusCode.ok));
+    });
+
     test('talk works through the pipe', () async {
       final p = await piped();
       final backend = TalkChannel(p.backend);
@@ -352,9 +394,12 @@ void main() {
       final uri = await open.listenTcp('127.0.0.1', 0);
       final channel = await client.openChannelAt(uri, ChannelAddress());
       expect(await channel.done, hasCode(StatusCode.notFound));
-      // No resolver and no host hint support.
+      // No resolver and no host hint support: the proxy cannot forward,
+      // which the client sees as UNAVAILABLE.
       final typed = await client.openChannelAt(uri, ChannelAddress(type: chat));
-      expect(await typed.done, hasCode(StatusCode.failedPrecondition));
+      final status = await typed.done;
+      expect(status, hasCode(StatusCode.unavailable));
+      expect(status.reason, 'unavailable');
     });
 
     test('backend close status reaches the client', () async {
@@ -423,6 +468,255 @@ void main() {
         ChannelAddress(type: chat, host: '127.0.0.1:$deadPort'),
       );
       expect(await dead.done, hasCode(StatusCode.unavailable));
+    });
+
+    test('rejections carry no detail about the mesh', () async {
+      final down = await client.openChannel(ServiceAddress(Name('down')));
+      final downStatus = await down.done;
+      expect(downStatus, hasCode(StatusCode.unavailable));
+      expect(downStatus.reason, 'unavailable');
+      final missing = await client.openChannel(ServiceAddress(chat, 8));
+      final missingStatus = await missing.done;
+      expect(missingStatus, hasCode(StatusCode.notFound));
+      expect(missingStatus.reason, 'not found');
+      final denied = await client.openChannel(ServiceAddress(Name('admin')));
+      expect((await denied.done).reason, 'permission denied');
+      for (final status in [downStatus, missingStatus]) {
+        expect(status.reason, isNot(contains('127.0.0.1')));
+        expect(status.reason, isNot(contains('${backendUri.port}')));
+        expect(status.reason, isNot(contains('tcp')));
+      }
+    });
+
+    test('the default allow refuses reserved types', () async {
+      final ns = Name('_ns');
+      backend.registerService(ns, (incoming) {
+        incoming.channel.send(bytes('naming'));
+        unawaited(incoming.channel.close());
+      }, instance: 1);
+      final table = StaticResolver([
+        ServiceRecord(ServiceAddress(ns, 1), endpoints: [backendUri]),
+        ServiceRecord(ServiceAddress(chat, 7), endpoints: [backendUri]),
+      ]);
+      addTearDown(table.close);
+      final open = node();
+      open.catchAll = proxyHandler(open, resolver: table);
+      final openUri = await open.listenTcp('127.0.0.1', 0);
+      final refused = await client.openChannelAt(
+        openUri,
+        ChannelAddress(type: ns),
+      );
+      expect(await refused.done, hasCode(StatusCode.permissionDenied));
+      final talk = await client.openTalkAt(openUri, ChannelAddress(type: chat));
+      expect((await talk.request('WHO', Uint8List(0))).payload, isNotEmpty);
+      await talk.close();
+      // Proxying a reserved type takes an explicit allow.
+      final explicit = node();
+      explicit.catchAll = proxyHandler(
+        explicit,
+        resolver: table,
+        allow: (address) => address.type == ns,
+      );
+      final explicitUri = await explicit.listenTcp('127.0.0.1', 0);
+      final allowed = await client.openChannelAt(
+        explicitUri,
+        ChannelAddress(type: ns),
+      );
+      expect(await allowed.stream.first, bytes('naming'));
+    });
+
+    test('a record pointing back at the proxy is refused at once', () async {
+      final table = StaticResolver();
+      addTearDown(table.close);
+      final loop = node(resolver: table);
+      var hops = 0;
+      final proxy = proxyHandler(loop, allow: (a) => a.type == chat);
+      loop.catchAll = (incoming) {
+        hops++;
+        return proxy(incoming);
+      };
+      final tcp = await loop.listenTcp(InternetAddress.loopbackIPv4, 0);
+      final ws = await loop.listenWebSocket('127.0.0.1', 0, path: '/mesh');
+      table.add(ServiceRecord(ServiceAddress(chat, 9), endpoints: [tcp]));
+      // Other spellings of the same listeners.
+      table.add(
+        ServiceRecord(
+          ServiceAddress(chat, 10),
+          endpoints: [
+            Uri.parse('tcp://localhost:${tcp.port}'),
+            Uri.parse('ws://127.0.0.1:${ws.port}/mesh/'),
+          ],
+        ),
+      );
+      final looping = node(resolver: EndpointResolver(tcp));
+      for (final instance in [9, 10]) {
+        hops = 0;
+        final watch = Stopwatch()..start();
+        final channel = await looping.openChannel(
+          ServiceAddress(chat, instance),
+        );
+        final status = await channel.done;
+        expect(status, hasCode(StatusCode.unavailable));
+        expect(status.reason, 'unavailable');
+        expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+        expect(hops, 1);
+      }
+      expect(loop.isOwnEndpoint(tcp), isTrue);
+      expect(
+        loop.isOwnEndpoint(Uri.parse('ws://localhost:${ws.port}/mesh')),
+        isTrue,
+      );
+      expect(loop.isOwnEndpoint(ws.replace(path: '/other')), isFalse);
+      expect(loop.isOwnEndpoint(backendUri), isFalse);
+    });
+
+    test('a host hint pointing at the relay itself is refused', () async {
+      final relay = node(allowHostHint: true);
+      var hops = 0;
+      final proxy = proxyHandler(relay);
+      relay.catchAll = (incoming) {
+        hops++;
+        return proxy(incoming);
+      };
+      final relayUri = await relay.listenTcp('0.0.0.0', 0);
+      expect(
+        relay.isOwnEndpoint(Uri.parse('tcp://127.0.0.1:${relayUri.port}')),
+        isTrue,
+      );
+      for (final hint in [
+        '127.0.0.1:${relayUri.port}',
+        'tcp://localhost:${relayUri.port}',
+      ]) {
+        hops = 0;
+        final channel = await client.openChannelAt(
+          Uri.parse('tcp://127.0.0.1:${relayUri.port}'),
+          ChannelAddress(type: chat, host: hint),
+        );
+        expect(await channel.done, hasCode(StatusCode.unavailable));
+        expect(hops, 1);
+      }
+    });
+
+    test('one client filling its allowance does not starve another', () async {
+      // The backend accepts 4 channels on a connection and the proxy keeps
+      // one connection to it; each client may hold 3.
+      final smallBackend = Switchboard(
+        muxOptions: fast.copyWith(maxChannels: 4),
+      );
+      addTearDown(smallBackend.close);
+      final held = <IncomingChannel>[];
+      smallBackend.registerService(Name('hold'), held.add, instance: 1);
+      final smallUri = await smallBackend.listenTcp('127.0.0.1', 0);
+      final table = StaticResolver([
+        ServiceRecord(ServiceAddress(Name('hold'), 1), endpoints: [smallUri]),
+      ]);
+      addTearDown(table.close);
+      final proxyNode = Switchboard(
+        muxOptions: fast,
+        maxConnectionsPerEndpoint: 1,
+      );
+      addTearDown(proxyNode.close);
+      proxyNode.catchAll = proxyHandler(
+        proxyNode,
+        resolver: table,
+        maxChannelsPerConnection: 3,
+      );
+      final proxyUri = await proxyNode.listenTcp('127.0.0.1', 0);
+      // Warm up the proxy's connection so that the backend's LIMITS are
+      // known.
+      final warm = await client.openChannelAt(
+        proxyUri,
+        ChannelAddress(type: Name('hold')),
+      );
+      while (held.isEmpty) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      await held.single.channel.close();
+      await warm.done;
+      held.clear();
+
+      final greedy = node();
+      final greedyChannels = [
+        for (var i = 0; i < 5; i++)
+          await greedy.openChannelAt(
+            proxyUri,
+            ChannelAddress(type: Name('hold')),
+          ),
+      ];
+      final refused = await Future.wait([
+        for (final channel in greedyChannels.skip(3)) channel.done,
+      ]);
+      expect(refused, everyElement(hasCode(StatusCode.resourceExhausted)));
+      while (held.length < 3) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      // Another client still gets through.
+      final polite = node();
+      final channel = await polite.openChannelAt(
+        proxyUri,
+        ChannelAddress(type: Name('hold')),
+      );
+      while (held.length < 4) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      held.last.channel.send(bytes('served'));
+      expect(await channel.stream.first, bytes('served'));
+      // A channel of the greedy client that ends frees its allowance, once
+      // the proxy has closed both sides of it.
+      final toBackend = await proxyNode.connect(smallUri);
+      expect(toBackend.openChannelCount, 4);
+      await greedyChannels.first.close();
+      while (toBackend.openChannelCount > 3) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      await pumpEventQueue();
+      final more = await greedy.openChannelAt(
+        proxyUri,
+        ChannelAddress(type: Name('hold')),
+      );
+      while (held.length < 5) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      held.last.channel.send(bytes('again'));
+      expect(await more.stream.first, bytes('again'));
+    });
+
+    test('a backend GOAWAY between connect and OPEN is retried once', () async {
+      final accepted = <MuxConnection>[];
+      final sub = backend.connections.listen(accepted.add);
+      addTearDown(sub.cancel);
+      final table = StaticResolver([
+        ServiceRecord(ServiceAddress(chat, 7), endpoints: [backendUri]),
+      ]);
+      addTearDown(table.close);
+      final racing = RacingSwitchboard();
+      addTearDown(racing.close);
+      racing.catchAll = proxyHandler(racing, resolver: table);
+      final racingUri = await racing.listenTcp('127.0.0.1', 0);
+      // The proxy's pooled connection to the backend.
+      final warm = await client.openTalkAt(
+        racingUri,
+        ChannelAddress(type: chat),
+      );
+      await warm.request('WHO', Uint8List(0));
+      await warm.close();
+      final pooled = await racing.connect(backendUri);
+      racing.beforeReturn = (connection) async {
+        expect(connection, same(pooled));
+        unawaited(accepted.single.goAway());
+        while (!connection.peerGoingAway) {
+          await Future<void>.delayed(const Duration(milliseconds: 1));
+        }
+      };
+      final talk = await client.openTalkAt(
+        racingUri,
+        ChannelAddress(type: chat),
+      );
+      final who = await talk.request('WHO', Uint8List(0));
+      expect(utf8.decode(who.payload), 'chat 7 null null client token');
+      expect(accepted, hasLength(2));
+      expect(racing.beforeReturn, isNull);
+      await talk.close();
     });
 
     test('without allowHostHint the hint is ignored and stripped', () async {

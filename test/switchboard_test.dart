@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:async/async.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -53,6 +54,57 @@ Future<String> tagOf(MuxChannel channel) async {
     return 'closed ${status.known?.name ?? status.code}';
   }
   return utf8.decode(frames.single);
+}
+
+/// A node whose next [connect] hands out the connection only after
+/// [beforeReturn] ran on it: used to make the peer's GOAWAY arrive between
+/// connect() and the OPEN, the race the open methods retry once.
+class RacingSwitchboard extends Switchboard {
+  RacingSwitchboard({super.resolver}) : super(muxOptions: fast);
+
+  /// Runs once, on the next connection [connect] returns.
+  Future<void> Function(MuxConnection connection)? beforeReturn;
+
+  @override
+  Future<MuxConnection> connect(Uri endpoint) async {
+    final connection = await super.connect(endpoint);
+    final hook = beforeReturn;
+    beforeReturn = null;
+    await hook?.call(connection);
+    return connection;
+  }
+}
+
+/// Makes the server side of [connection] send GOAWAY and waits until the
+/// client side has seen it.
+Future<void> peerGoesAway(
+  MuxConnection connection,
+  MuxConnection serverSide,
+) async {
+  unawaited(serverSide.goAway());
+  while (!connection.peerGoingAway) {
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+  }
+}
+
+/// The status codes of the HTTP responses read from [socket], in order.
+StreamQueue<int> httpStatuses(Socket socket) {
+  final statuses = StreamController<int>();
+  var text = '';
+  var seen = 0;
+  socket.listen(
+    (data) {
+      text += latin1.decode(data);
+      final matches = RegExp(r'HTTP/1\.1 (\d{3})').allMatches(text).toList();
+      for (final match in matches.skip(seen)) {
+        statuses.add(int.parse(match[1]!));
+      }
+      seen = matches.length;
+    },
+    onError: (Object _) {},
+    onDone: statuses.close,
+  );
+  return StreamQueue(statuses.stream);
 }
 
 /// A port nothing listens on.
@@ -136,6 +188,87 @@ void main() {
         throwsA(isA<WebSocketException>()),
       );
     });
+  });
+
+  group('WebSocket binding', () {
+    test('the mux frame limit reaches both ends', () async {
+      const limit = 4 * 1024 * 1024;
+      final options = fast.copyWith(maxFrameSize: limit);
+      final server = Switchboard(muxOptions: options);
+      addTearDown(server.close);
+      server.registerService(Name('echo'), (incoming) {
+        incoming.channel.stream.listen(
+          incoming.channel.send,
+          onDone: () => unawaited(incoming.channel.close()),
+        );
+      });
+      final uri = await server.listenWebSocket('127.0.0.1', 0);
+      final accepted = server.connections.first;
+      final client = Switchboard(muxOptions: options);
+      addTearDown(client.close);
+      final connection = await client.connect(uri);
+      final serverSide = await accepted;
+      await connection.ping();
+      await serverSide.ping();
+      expect(connection.peerLimits!.maxFrameSize, limit);
+      expect(serverSide.peerLimits!.maxFrameSize, limit);
+      // A subframe of 3 MiB passes both ways.
+      final big = Uint8List.fromList(
+        List.generate(3 * 1024 * 1024, (i) => i * 7 & 0xFF),
+      );
+      final echo = await client.openChannelAt(
+        uri,
+        ChannelAddress(type: Name('echo')),
+      );
+      echo.send(big);
+      expect(await echo.stream.first, big);
+      await echo.close();
+    });
+
+    test('no limit at the mux layer keeps the transport default', () async {
+      final options = fast.copyWith(maxFrameSize: 0);
+      final server = Switchboard(muxOptions: options);
+      addTearDown(server.close);
+      final uri = await server.listenWebSocket('127.0.0.1', 0);
+      final accepted = server.connections.first;
+      final client = Switchboard(muxOptions: options);
+      addTearDown(client.close);
+      final connection = await client.connect(uri);
+      final serverSide = await accepted;
+      await connection.ping();
+      await serverSide.ping();
+      expect(
+        connection.peerLimits!.maxFrameSize,
+        WebSocketServerTransport.defaultMaxFrameSize,
+      );
+      expect(
+        serverSide.peerLimits!.maxFrameSize,
+        WebSocketTransport.defaultMaxFrameSize,
+      );
+    });
+
+    test(
+      'the dialer offers the switchboard protocol and no compression',
+      () async {
+        final http = await HttpServer.bind('127.0.0.1', 0);
+        addTearDown(() => http.close(force: true));
+        final seen = Completer<HttpHeaders>();
+        http.listen((request) {
+          seen.complete(request.headers);
+          request.response.statusCode = HttpStatus.badRequest;
+          unawaited(request.response.close());
+        });
+        final client = node();
+        await expectLater(
+          client.connect(Uri.parse('ws://127.0.0.1:${http.port}/')),
+          throwsCode(StatusCode.unavailable),
+        );
+        final headers = await seen.future;
+        expect(headers.value('sec-websocket-protocol'), 'switchboard');
+        expect(headers.value('sec-websocket-version'), '13');
+        expect(headers['sec-websocket-extensions'], isNull);
+      },
+    );
   });
 
   group('dispatch', () {
@@ -316,6 +449,159 @@ void main() {
     });
   });
 
+  group('listener policy', () {
+    final ns = Name('_ns');
+    final secret = Name('secret');
+    late Switchboard server;
+    late Switchboard client;
+
+    setUp(() {
+      server = node();
+      server.registerService(ns, tagged('naming'), instance: 1);
+      server.registerService(svc, tagged('svc'));
+      server.registerService(secret, tagged('secret'));
+      server.catchAll = tagged('catch-all');
+      client = node();
+    });
+
+    Future<Status> statusOf(Uri uri, ChannelAddress address) async =>
+        (await client.openChannelAt(uri, address)).done;
+
+    test('a policy is applied before every handler', () async {
+      final public = await server.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: ChannelPolicies.allowTypes({svc}),
+      );
+      final internal = await server.listenTcp('127.0.0.1', 0);
+      for (final address in [
+        ChannelAddress(type: ns, instance: 1),
+        ChannelAddress(type: ns),
+        ChannelAddress(type: secret),
+        ChannelAddress(type: Name('other')),
+        ChannelAddress(),
+      ]) {
+        final status = await statusOf(public, address);
+        expect(
+          status,
+          hasCode(StatusCode.permissionDenied),
+          reason: '$address',
+        );
+        // Generic: nothing about the node or the address.
+        expect(status.reason, 'permission denied');
+      }
+      expect(
+        await tagOf(await client.openChannelAt(public, svcAddress())),
+        'svc',
+      );
+      // The internal listener has no policy: everything is reachable.
+      for (final (address, tag) in [
+        (ChannelAddress(type: ns, instance: 1), 'naming'),
+        (ChannelAddress(type: secret), 'secret'),
+        (ChannelAddress(type: Name('other')), 'catch-all'),
+        (svcAddress(), 'svc'),
+      ]) {
+        expect(await tagOf(await client.openChannelAt(internal, address)), tag);
+      }
+    });
+
+    test('denyReserved on a WebSocket listener', () async {
+      final uri = await server.listenWebSocket(
+        '127.0.0.1',
+        0,
+        policy: ChannelPolicies.denyReserved,
+      );
+      expect(
+        await statusOf(uri, ChannelAddress(type: ns, instance: 1)),
+        hasCode(StatusCode.permissionDenied),
+      );
+      expect(await tagOf(await client.openChannelAt(uri, svcAddress())), 'svc');
+      expect(
+        await tagOf(
+          await client.openChannelAt(uri, ChannelAddress(type: Name('x'))),
+        ),
+        'catch-all',
+      );
+    });
+
+    test('the policy sees the address and connection; a throwing policy '
+        'refuses', () async {
+      final seen = <(ChannelAddress, MuxConnection)>[];
+      final uri = await server.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: (address, connection) {
+          seen.add((address, connection));
+          if (address.type == secret) {
+            throw StateError('broken policy');
+          }
+          return true;
+        },
+      );
+      expect(
+        await tagOf(
+          await client.openChannelAt(uri, svcAddress(payload: bytes('t'))),
+        ),
+        'svc',
+      );
+      expect(seen.single.$1.address, ServiceAddress(svc));
+      expect(utf8.decode(seen.single.$1.payload), 't');
+      expect(seen.single.$2.isInitiator, isFalse);
+      expect(
+        await statusOf(uri, ChannelAddress(type: secret)),
+        hasCode(StatusCode.permissionDenied),
+      );
+    });
+
+    test('allowTypes with untyped channels', () async {
+      server.defaultService = tagged('default');
+      final uri = await server.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: ChannelPolicies.allowTypes({svc}, untyped: true),
+      );
+      expect(
+        await tagOf(await client.openChannelAt(uri, ChannelAddress())),
+        'default',
+      );
+      expect(
+        await statusOf(uri, ChannelAddress(type: secret)),
+        hasCode(StatusCode.permissionDenied),
+      );
+    });
+
+    test('connections initiated locally are trusted', () async {
+      // The client listens with a strict policy, yet the server reaches
+      // its reserved service over the connection the client initiated.
+      client.registerService(ns, tagged('client naming'));
+      await client.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: ChannelPolicies.allowTypes(const {}),
+      );
+      final serverUri = await server.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: ChannelPolicies.denyReserved,
+      );
+      final accepted = server.connections.first;
+      await client.connect(serverUri);
+      final back = server.openChannelOn(
+        await accepted,
+        ChannelAddress(type: ns),
+      );
+      expect(await tagOf(back), 'client naming');
+    });
+
+    test('unclaimed channels are rejected with a generic reason', () async {
+      server.catchAll = null;
+      final uri = await server.listenTcp('127.0.0.1', 0);
+      final status = await statusOf(uri, ChannelAddress(type: Name('nope')));
+      expect(status, hasCode(StatusCode.notFound));
+      expect(status.reason, 'not found');
+    });
+  });
+
   group('symmetric dispatch', () {
     test('the server opens a channel back to a client service', () async {
       final server = node();
@@ -490,6 +776,78 @@ void main() {
         client.connect(Uri.parse('ws://127.0.0.1:$port/')),
         throwsCode(StatusCode.unavailable),
       );
+    });
+
+    test('more connections when the pooled ones are full', () async {
+      final small = Switchboard(muxOptions: fast.copyWith(maxChannels: 2));
+      addTearDown(small.close);
+      final held = <IncomingChannel>[];
+      small.registerService(Name('hold'), held.add);
+      final smallUri = await small.listenTcp('127.0.0.1', 0);
+      final pooled = Switchboard(
+        muxOptions: fast,
+        maxConnectionsPerEndpoint: 3,
+      );
+      addTearDown(pooled.close);
+      final channels = <MuxChannel>[];
+      for (var i = 0; i < 6; i++) {
+        final channel = await pooled.openChannelAt(
+          smallUri,
+          ChannelAddress(type: Name('hold')),
+        );
+        // Let LIMITS arrive on a new connection before the next open.
+        await channel.connection.ping();
+        channels.add(channel);
+      }
+      final connections = channels.map((c) => c.connection).toSet();
+      expect(connections, hasLength(3));
+      for (final connection in connections) {
+        expect(connection.openChannelCount, 2);
+      }
+      expect(held, hasLength(6));
+      // At the cap and every connection is full.
+      await expectLater(
+        pooled.openChannelAt(smallUri, ChannelAddress(type: Name('hold'))),
+        throwsCode(StatusCode.resourceExhausted),
+      );
+      // A channel that ends makes room on its connection again.
+      await held.first.channel.close();
+      await channels.first.done;
+      final again = await pooled.openChannelAt(
+        smallUri,
+        ChannelAddress(type: Name('hold')),
+      );
+      expect(again.connection, same(channels.first.connection));
+    });
+
+    test('a GOAWAY between connect and OPEN is retried once', () async {
+      server.registerService(svc, tagged('one'), instance: 1);
+      final racing = RacingSwitchboard(
+        resolver: StaticResolver([
+          ServiceRecord(ServiceAddress(svc, 1), endpoints: [uri]),
+        ]),
+      );
+      addTearDown(racing.close);
+      final first = await racing.connect(uri);
+      await first.ping();
+      racing.beforeReturn = (c) async {
+        expect(c, same(first));
+        await peerGoesAway(c, accepted.last);
+      };
+      final viaAt = await racing.openChannelAt(uri, svcAddress(instance: 1));
+      expect(viaAt.connection, isNot(same(first)));
+      expect(await tagOf(viaAt), 'one');
+      // The same through the resolver.
+      final second = viaAt.connection;
+      await second.ping();
+      racing.beforeReturn = (c) async {
+        expect(c, same(second));
+        await peerGoesAway(c, accepted.last);
+      };
+      final viaResolver = await racing.openChannel(ServiceAddress(svc, 1));
+      expect(viaResolver.connection, isNot(same(second)));
+      expect(await tagOf(viaResolver), 'one');
+      expect(accepted, hasLength(3));
     });
 
     test('connections reports initiated connections', () async {
@@ -705,6 +1063,99 @@ void main() {
         throwsCode(StatusCode.failedPrecondition),
       );
       await server.close();
+    });
+
+    for (final scheme in ['tcp', 'ws']) {
+      test(
+        'a client closing right after connecting sends GOAWAY ($scheme)',
+        () async {
+          final server = node();
+          final uri = scheme == 'tcp'
+              ? await server.listenTcp('127.0.0.1', 0)
+              : await server.listenWebSocket('127.0.0.1', 0);
+          final seen = <StatusCode?>[];
+          for (var i = 0; i < 50; i++) {
+            final accepted = server.connections.first;
+            final client = Switchboard(muxOptions: fast);
+            await client.connect(uri);
+            await client.close();
+            seen.add((await (await accepted).done).known);
+          }
+          expect(seen, everyElement(StatusCode.goingAway));
+        },
+      );
+    }
+
+    test('a dial in progress gets GOAWAY, and close waits for it', () async {
+      // An endpoint that answers the upgrade only when told to.
+      final http = await HttpServer.bind('127.0.0.1', 0);
+      addTearDown(() => http.close(force: true));
+      final arrived = Completer<void>();
+      final release = Completer<void>();
+      final peer = Completer<MuxConnection>();
+      http.listen((request) async {
+        arrived.complete();
+        await release.future;
+        peer.complete(
+          MuxConnection(
+            await WebSocketServerTransport.upgrade(request),
+            isInitiator: false,
+            options: fast,
+          ),
+        );
+      });
+      final client = Switchboard(muxOptions: fast);
+      final dial = expectLater(
+        client.connect(Uri.parse('ws://127.0.0.1:${http.port}/')),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      await arrived.future;
+      var closed = false;
+      final closing = client.close().then((_) => closed = true);
+      await pumpEventQueue();
+      expect(closed, isFalse);
+      release.complete();
+      final connection = await peer.future;
+      await closing;
+      await dial;
+      // The peer was told: GOAWAY, not a dropped connection.
+      expect(await connection.done, hasCode(StatusCode.goingAway));
+    });
+
+    test('a request in progress when closing is answered, then its '
+        'connection closes', () async {
+      final server = Switchboard(
+        muxOptions: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+      );
+      final held = Completer<IncomingChannel>();
+      server.registerService(Name('hold'), held.complete);
+      final uri = await server.listenWebSocket('127.0.0.1', 0);
+      final client = node();
+      await client.openChannelAt(uri, ChannelAddress(type: Name('hold')));
+      final holding = await held.future;
+      // A plain request, then one whose body is not complete yet: the
+      // connection is busy with it when the node starts closing.
+      final raw = await Socket.connect('127.0.0.1', uri.port);
+      addTearDown(raw.destroy);
+      final statuses = httpStatuses(raw);
+      raw.write(
+        'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
+        'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nab',
+      );
+      expect(await statuses.next, HttpStatus.upgradeRequired);
+      // The held channel keeps the node closing until it is released.
+      final closing = server.close();
+      raw.write(
+        'cdGET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
+        'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n'
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
+      );
+      // The POST is answered; the pipelined request after it is not
+      // served, as the listener has stopped.
+      expect(await statuses.next, HttpStatus.upgradeRequired);
+      expect(await statuses.hasNext, isFalse);
+      await holding.channel.close();
+      await closing;
     });
 
     test('closing a client closes its pooled connections', () async {
