@@ -191,6 +191,8 @@ void main() {
     );
     peer = Peer(gate);
     addTearDown(peer.close);
+    // Closing cancels the timers of forwarding slots (forwardGrace).
+    addTearDown(gate.close);
     return gate;
   }
 

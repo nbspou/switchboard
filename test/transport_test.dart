@@ -64,6 +64,9 @@ class RawPeer {
     output = StreamQueue(
       fromTransport.stream.expand((chunk) => chunk).map((b) => b),
     );
+    // The peer goes away with the test: a transport closing its output
+    // would otherwise wait for a reader until its close timeout.
+    addTearDown(output.cancel);
   }
 
   final StreamController<List<int>> toTransport = StreamController();
@@ -247,10 +250,13 @@ void main() {
     test('one byte chunks', () async {
       final (a, b) = streamPair(transformer: rechunk(1));
       final received = b.stream.toList();
+      // Read too, so that b's output has a reader when b closes it.
+      final returned = a.stream.toList();
       final frames = [for (var i = 1; i < 40; i++) bytesOf(i, i)];
       frames.forEach(a.sink.add);
       await a.sink.close();
       expect(await received, frames);
+      expect(await returned, isEmpty);
     });
 
     test('arbitrary chunk boundaries', () async {

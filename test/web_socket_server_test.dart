@@ -320,6 +320,9 @@ void main() {
           extensions: 'permessage-deflate; client_max_window_bits',
         ),
       );
+      // Its stream is never listened to, so it never reads the client's
+      // close: it is torn down here.
+      addTearDown(server.abort);
       expect(client.headers['sec-websocket-accept'], sampleAccept);
       expect(client.headers['upgrade']?.toLowerCase(), 'websocket');
       expect(client.headers['connection']?.toLowerCase(), 'upgrade');
@@ -337,6 +340,7 @@ void main() {
       final (client, server) = await h.pair(
         RawClient.handshake(protocols: null),
       );
+      addTearDown(server.abort);
       expect(client.headers['sec-websocket-protocol'], isNull);
       expect(server.protocol, isNull);
     });
