@@ -55,5 +55,10 @@ Negative vectors (each MUST be a protocol error):
 Unknown flag bits are ignored: `6B 76 00 00 00 00 00 00 00 04 00 00 00 FE`
 decodes as SLOTSPC "kv", 1024 slots, managed, shared recovery, not lazy.
 
-`MOVED` reason text: owner `userq/1a2b` at epoch 7 is `userq/1a2b 7`; an
-unknown owner is the empty reason.
+`MOVED` status payloads (`u16` code 37, `u48` owner, `u32` epoch, then the
+optional UTF-8 reason; the owner's type is the channel's):
+
+| Case | Bytes |
+| --- | --- |
+| MOVED, owner 0x1A2B, epoch 7 | `25 00 2B 1A 00 00 00 00 07 00 00 00` |
+| MOVED, owner and epoch unknown | `25 00 00 00 00 00 00 00 00 00 00 00` |

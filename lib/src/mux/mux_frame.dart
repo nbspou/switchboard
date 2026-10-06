@@ -5,7 +5,6 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:meta/meta.dart';
@@ -338,11 +337,13 @@ void checkMuxStatus(Status status) {
 }
 
 /// [status] with its reason shortened so that its encoded payload (the
-/// `u16` code and the UTF-8 reason) is at most [maxPayload] bytes.
+/// `u16` code and the bytes after it) is at most [maxPayload] bytes.
 ///
-/// Cuts on a UTF-8 character boundary. Returns [status] itself when it
-/// fits; drops the reason entirely when [maxPayload] leaves no room for
-/// it.
+/// Cuts the encoded bytes on a UTF-8 character boundary, so that fixed
+/// fields a code places before its reason (`MOVED`, and `ABORTED` for a
+/// slot move: 10 bytes) are kept whole; when they do not fit, everything
+/// after the code is dropped. Returns [status] itself when it fits; drops
+/// the reason entirely when [maxPayload] leaves no room for it.
 @internal
 Status truncateStatus(Status status, int maxPayload) {
   if (status.reason.isEmpty) {
@@ -352,22 +353,32 @@ Status truncateStatus(Status status, int maxPayload) {
   if (room <= 0) {
     return Status(status.code);
   }
-  // A UTF-8 encoding is at most 3 bytes per UTF-16 code unit.
+  // The bytes after the code are at most 3 per UTF-16 code unit of the
+  // reason (a replaced malformed sequence is at most 3 bytes as well).
   if (status.reason.length * 3 <= room) {
     return status;
   }
-  final reason = utf8.encode(status.reason);
-  if (reason.length <= room) {
+  final encoded = status.encode();
+  if (encoded.length - 2 <= room) {
     return status;
   }
-  var cut = room;
-  // Back off continuation bytes (10xxxxxx) so the cut lands on the first
-  // byte of a character.
-  while (cut > 0 && reason[cut] & 0xC0 == 0x80) {
+  var cut = 2 + room;
+  // Back off continuation bytes (10xxxxxx), at most the 3 of the longest
+  // character, so the cut lands on the first byte of a character.
+  for (var i = 0; i < 3 && cut > 2 && encoded[cut] & 0xC0 == 0x80; i++) {
     cut--;
   }
-  return Status(status.code, utf8.decode(reason.sublist(0, cut)));
+  final code = status.known;
+  if ((code == StatusCode.moved || code == StatusCode.aborted) &&
+      cut < 2 + _slotMoveFields) {
+    return Status(status.code);
+  }
+  return Status.decode(Uint8List.sublistView(encoded, 0, cut));
 }
+
+/// Fixed fields of `MOVED` (and of `ABORTED` for a slot move) before the
+/// reason: `u48 owner`, `u32 epoch` (`MovedStatus.fieldsLength`).
+const int _slotMoveFields = 10;
 
 /// [status] shortened (see [truncateStatus]) so that a frame carrying it
 /// after [overhead] bytes of headers fits both the 1024 byte bound this

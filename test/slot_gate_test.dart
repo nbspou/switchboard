@@ -1,5 +1,5 @@
 // The slot gate state machine: queueing, forwarding, resuming and
-// revoking slots, MOVED reasons, bounds, request gating. Incoming
+// revoking slots, MOVED and ABORTED fields, bounds, request gating. Incoming
 // channels arrive over in-memory mux links; forwarding goes to a node on
 // loopback TCP.
 
@@ -30,9 +30,19 @@ String text(Uint8List data) => utf8.decode(data);
 Matcher hasCode(StatusCode code) =>
     isA<Status>().having((s) => s.known, 'code', code);
 
-Matcher isMoved(String reason) => isA<Status>()
+/// A MOVED status naming [owner] at [epoch] (0: unknown).
+Matcher isMoved([int owner = 0, int epoch = 0]) => isA<Status>()
     .having((s) => s.known, 'code', StatusCode.moved)
-    .having((s) => s.reason, 'reason', reason);
+    .having(MovedStatus.fromStatus, 'fields', fields(owner, epoch));
+
+/// An ABORTED status for a slot move, naming [owner] at [epoch].
+Matcher isAborted([int owner = 0, int epoch = 0]) => isA<Status>()
+    .having((s) => s.known, 'code', StatusCode.aborted)
+    .having(MovedStatus.fromStatus, 'fields', fields(owner, epoch));
+
+Matcher fields(int owner, int epoch) => isA<MovedStatus>()
+    .having((m) => m.owner, 'owner', owner)
+    .having((m) => m.epoch, 'epoch', epoch);
 
 Future<void> until(bool Function() condition) async {
   final deadline = DateTime.now().add(limit);
@@ -223,9 +233,9 @@ void main() {
       expect(seen, ['xfer']);
     });
 
-    test('a slot not served here: MOVED, empty reason without a mirror', () {
+    test('a slot not served here: MOVED, no owner without a mirror', () {
       newGate();
-      expect(peer.open(shard: 3).done, completion(isMoved('')));
+      expect(peer.open(shard: 3).done, completion(isMoved()));
       expect(gate.stateOf(3), isNull);
     });
 
@@ -279,7 +289,7 @@ void main() {
           ),
         ),
       );
-      expect(await queued.done, isMoved(''));
+      expect(await queued.done, isMoved());
       expect(gate.stateOf(1), isNull);
     });
 
@@ -298,7 +308,7 @@ void main() {
       await until(() => client.slotTable(kv) != null);
       newGate();
       expect(await peer.open(shard: 4).done, hasCode(StatusCode.outOfRange));
-      expect(await peer.open(shard: 3).done, isMoved(''));
+      expect(await peer.open(shard: 3).done, isMoved());
     });
 
     test('channels beyond maxQueuedChannels: UNAVAILABLE', () async {
@@ -406,7 +416,7 @@ void main() {
       expect(arrived.first.address.shard, 1);
       // Late arrivals are forwarded during the grace period.
       expect(await ask(peer.open(shard: 1, payload: 'late'), 'd'), 'to:d');
-      expect(gate.movedStatus(1), isMoved('kv/2 2'));
+      expect(gate.movedStatus(1), isMoved(2, 2));
       expect(gate.servedSlots, isEmpty);
       expect(lifecycle.log, isNot(contains('unload 1')));
     });
@@ -423,11 +433,29 @@ void main() {
       await until(() => gate.stateOf(1) == null);
       expect(lifecycle.log.last, 'unload 1');
       // The mirror knows nothing here: MOVED with an empty reason.
-      expect(await peer.open(shard: 1).done, isMoved(''));
+      expect(await peer.open(shard: 1).done, isMoved());
       // A forwarded channel keeps working after the grace period.
       expect(await answers.next.timeout(limit), 'to:a');
       queued.send(bytes('b'));
       expect(await answers.next.timeout(limit), 'to:b');
+    });
+
+    test('a served channel still open after the grace period: ABORTED naming '
+        'the new owner', () async {
+      newGate(
+        forwardGrace: const Duration(milliseconds: 30),
+        drainTimeout: const Duration(milliseconds: 20),
+      );
+      await gate.onAssign(assign(1));
+      final served = peer.open(shard: 1);
+      expect(await ask(served, 'x'), '1:x');
+      // DRAIN gives up waiting for it.
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(gate.movedTo(1), MovedStatus(owner: 2, epoch: 2));
+      expect(gate.abortedStatus(1), isAborted(2, 2));
+      expect(await served.done.timeout(limit), isAborted(2, 2));
+      expect(lifecycle.log.last, 'unload 1');
     });
 
     test('a slot coming back during the grace period is unloaded, then '
@@ -451,8 +479,8 @@ void main() {
       expect(lifecycle.log, ['load 1 e1 h0']);
     });
 
-    test('revocation refuses the queue and closes served channels with '
-        'MOVED', () async {
+    test('revocation refuses the queue with MOVED and closes served channels '
+        'with ABORTED', () async {
       newGate();
       await gate.onAssign(assign(1));
       final served = peer.open(shard: 1);
@@ -471,8 +499,8 @@ void main() {
       final queued = peer.open(shard: 1);
       await settle();
       await gate.onRevoke(kv, 1);
-      expect(await queued.done, isMoved(''));
-      expect(await served.done, isMoved(''));
+      expect(await queued.done, isMoved());
+      expect(await served.done, isAborted());
       expect(lifecycle.log.last, 'unload 1');
       expect(gate.stateOf(1), isNull);
       await drained;
@@ -508,7 +536,7 @@ void main() {
       await gate.close();
       expect(lifecycle.log.skip(2), unorderedEquals(['unload 1', 'unload 2']));
       expect(gate.onAssign(assign(3)), throwsA(isA<SwitchboardException>()));
-      expect(await peer.open(shard: 1).done, isMoved(''));
+      expect(await peer.open(shard: 1).done, isMoved());
     });
   });
 
@@ -612,7 +640,7 @@ void main() {
     });
   });
 
-  test('MOVED reasons follow the naming client mirror', () async {
+  test('MOVED fields follow the naming client mirror', () async {
     final h = Harness();
     addTearDown(h.close);
     // Instance 5 owns slot 2 of a static space.
@@ -638,14 +666,14 @@ void main() {
     await client.synced.timeout(limit);
     newGate();
     await until(() => client.slotOwner(kv, 2) != null);
-    expect(await peer.open(shard: 2).done, isMoved('kv/5 1'));
-    expect(gate.movedStatus(1), isMoved(''));
+    expect(await peer.open(shard: 2).done, isMoved(5, 1));
+    expect(gate.movedStatus(1), isMoved());
     // Release stops serving locally after the naming service.
     await ownerGate.release(2);
     expect(ownerGate.stateOf(2), isNull);
     expect(ownerLifecycle.log.last, 'unload 2');
     await until(() => client.slotOwner(kv, 2) == null);
-    expect(gate.movedStatus(2), isMoved(''));
+    expect(gate.movedStatus(2), isMoved());
   });
 
   test('SlotGates dispatches by type', () async {

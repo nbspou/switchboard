@@ -1380,80 +1380,122 @@ class SlotItem {
   String toString() => 'SLOT $type/$slot $entry';
 }
 
-/// The reason text of a `MOVED` status: the current owner's address and
-/// the slot's epoch, `userq/1a2b 7`, or empty when unknown.
+/// The fields of a `MOVED` status, which also follow the code of an
+/// `ABORTED` status sent because a slot moved after work started (wiki
+/// pages "Switchboard Status Codes" and "Switchboard Sharding", section
+/// "Routing").
 ///
-/// Reasons are for logs; this is the one documented exception, which
-/// routers use to refresh a slot (see the wiki page "Switchboard
-/// Sharding", section "Routing").
+/// The status payload is `u16 code`, `u48 owner` (the slot's current
+/// owner instance, 0 = unknown), `u32 epoch` (the slot's current epoch,
+/// 0 = unknown), then the usual optional UTF-8 reason. The owner's type is
+/// the one the channel was addressed to.
+///
+/// `MOVED` means nothing on the channel (or in the request) was
+/// processed, so it may be sent again to the owner; `ABORTED` with these
+/// fields means the slot moved while work was under way, so the work may
+/// or may not have taken effect.
 class MovedStatus {
-  /// Creates the information; both null means unknown.
-  const MovedStatus([this.owner, this.epoch]);
-
-  /// The current owner, or null if unknown.
-  final ServiceAddress? owner;
-
-  /// The slot's current epoch, or null if unknown.
-  final int? epoch;
-
-  /// The reason text: `type/hex epoch`, or empty without an owner. A
-  /// missing epoch is written as 0.
-  String get reason => format(owner, epoch);
-
-  /// A [StatusCode.moved] status carrying [reason].
-  Status toStatus() => Status.of(StatusCode.moved, reason);
-
-  /// Formats the reason text for [owner] and [epoch]: `type/hex epoch`, or
-  /// empty when [owner] is null. Throws [ArgumentError] for an owner with
-  /// instance 0.
-  static String format(ServiceAddress? owner, [int? epoch]) {
-    if (owner == null) {
-      return '';
-    }
-    if (owner.isAny) {
-      throw ArgumentError.value(owner, 'owner', 'instance must be non-zero');
-    }
-    return '$owner ${epoch ?? 0}';
+  /// Creates the fields; [owner] and [epoch] 0 mean unknown.
+  ///
+  /// Throws [RangeError] if [owner] is not a `u48` or [epoch] not a `u32`.
+  MovedStatus({this.owner = 0, this.epoch = 0, this.reason = ''}) {
+    _checkU48(owner, 'owner');
+    _checkU32(epoch, 'epoch');
   }
 
-  /// Parses a reason text. Never throws: anything that is not exactly
-  /// `type/hex epoch` (with a non-zero instance and a `u32` epoch) reads as
+  const MovedStatus._unknown() : owner = 0, epoch = 0, reason = '';
+
+  /// No owner, no epoch, no reason.
+  static const MovedStatus unknown = MovedStatus._unknown();
+
+  /// Bytes of the fixed fields after the code: `u48 owner`, `u32 epoch`.
+  static const int fieldsLength = 10;
+
+  /// The slot's current owner instance, 0 if unknown.
+  final int owner;
+
+  /// The slot's current epoch, 0 if unknown.
+  final int epoch;
+
+  /// The human readable reason after the fields, for logs; may be empty.
+  final String reason;
+
+  /// Whether the owner is known.
+  bool get hasOwner => owner != 0;
+
+  /// The owner as an address of [type] (the channel's type), or null when
   /// unknown.
-  static MovedStatus parse(String reason) {
-    final parts = reason.split(' ');
-    if (parts.length != 2 || !RegExp(r'^[0-9]{1,10}$').hasMatch(parts[1])) {
-      return const MovedStatus();
+  ServiceAddress? ownerOf(Name type) =>
+      owner == 0 ? null : ServiceAddress(type, owner);
+
+  /// The status payload: `u16` code ([StatusCode.moved], or
+  /// [StatusCode.aborted] when [aborted]), the fields and the reason.
+  Uint8List encode({bool aborted = false}) {
+    final w = ByteWriter(2 + fieldsLength + reason.length * 3)
+      ..u16(aborted ? StatusCode.aborted.code : StatusCode.moved.code)
+      ..u48(owner)
+      ..u32(epoch);
+    if (reason.isNotEmpty) {
+      w.bytes(utf8.encode(reason));
     }
-    final epoch = int.parse(parts[1]);
-    if (epoch > maxU32) {
-      return const MovedStatus();
-    }
-    final ServiceAddress owner;
-    try {
-      owner = ServiceAddress.parse(parts[0]);
-    } on FormatException {
-      return const MovedStatus();
-    }
-    if (owner.isAny || !parts[0].contains('/')) {
-      return const MovedStatus();
-    }
-    return MovedStatus(owner, epoch);
+    return w.toBytes();
   }
 
-  /// Parses the reason of [status]; unknown unless it is
-  /// [StatusCode.moved].
-  static MovedStatus fromStatus(Status status) =>
-      status.known == StatusCode.moved
-      ? parse(status.reason)
-      : const MovedStatus();
+  /// A [StatusCode.moved] status carrying the fields, or an
+  /// [StatusCode.aborted] one when [aborted].
+  Status toStatus({bool aborted = false}) =>
+      Status.decode(encode(aborted: aborted));
+
+  /// Reads the fields of a status payload. Never throws: a payload whose
+  /// code is neither `MOVED` nor `ABORTED`, or that is too short for the
+  /// fields, reads as [unknown].
+  static MovedStatus parse(Uint8List statusPayload) {
+    if (statusPayload.length < 2 + fieldsLength) {
+      return unknown;
+    }
+    final r = ByteReader(statusPayload);
+    final code = r.u16();
+    if (code != StatusCode.moved.code && code != StatusCode.aborted.code) {
+      return unknown;
+    }
+    final owner = r.u48();
+    final epoch = r.u32();
+    final rest = r.rest();
+    return MovedStatus(
+      owner: owner,
+      epoch: epoch,
+      reason: rest.isEmpty ? '' : utf8.decode(rest, allowMalformed: true),
+    );
+  }
+
+  /// Reads the fields of [status] (see [parse]): [unknown] unless it is a
+  /// `MOVED` or `ABORTED` status long enough to carry them. An `ABORTED`
+  /// status that does not come from a slot move has no fields; only read
+  /// it on a channel or request addressed to a shard slot.
+  static MovedStatus fromStatus(Status status) {
+    final code = status.known;
+    if (code != StatusCode.moved && code != StatusCode.aborted) {
+      return unknown;
+    }
+    return parse(status.encode());
+  }
 
   @override
   bool operator ==(Object other) =>
-      other is MovedStatus && other.owner == owner && other.epoch == epoch;
+      other is MovedStatus &&
+      other.owner == owner &&
+      other.epoch == epoch &&
+      other.reason == reason;
 
   @override
-  int get hashCode => Object.hash(owner, epoch);
+  int get hashCode => Object.hash(owner, epoch, reason);
 
   @override
-  String toString() => 'MovedStatus(${reason.isEmpty ? 'unknown' : reason})';
+  String toString() {
+    final where = owner == 0
+        ? 'unknown owner'
+        : 'owner ${owner.toRadixString(16)}';
+    final when = epoch == 0 ? '' : ', epoch $epoch';
+    return 'MovedStatus($where$when${reason.isEmpty ? '' : ', $reason'})';
+  }
 }

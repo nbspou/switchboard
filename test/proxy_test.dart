@@ -730,6 +730,148 @@ void main() {
     });
   });
 
+  group('proxyHandler authorize', () {
+    final chat = Name('chat');
+    late List<IncomingChannel> atBackend;
+    late StaticResolver backends;
+    late Switchboard client;
+
+    setUp(() async {
+      atBackend = [];
+      final backend = Switchboard(muxOptions: fast);
+      addTearDown(backend.close);
+      backend.registerService(chat, (incoming) {
+        atBackend.add(incoming);
+        incoming.talk().messages.listen((m) {
+          final a = incoming.address;
+          m.reply(bytes('${a.instance} ${a.shard} ${utf8.decode(a.payload)}'));
+        });
+      }, instance: 7);
+      final backendUri = await backend.listenTcp('127.0.0.1', 0);
+      backends = StaticResolver([
+        ServiceRecord(ServiceAddress(chat, 7), endpoints: [backendUri]),
+      ]);
+      addTearDown(backends.close);
+    });
+
+    /// A proxy with [authorize], and [client] connected to it.
+    Future<void> start(
+      FutureOr<ChannelAddress?> Function(IncomingChannel incoming) authorize, {
+      Duration authorizeTimeout = const Duration(seconds: 10),
+      int budget = 256,
+    }) async {
+      final proxy = Switchboard(muxOptions: fast);
+      addTearDown(proxy.close);
+      proxy.catchAll = proxyHandler(
+        proxy,
+        authorize: authorize,
+        authorizeTimeout: authorizeTimeout,
+        resolver: backends,
+        maxChannelsPerConnection: budget,
+      );
+      final uri = await proxy.listenTcp('127.0.0.1', 0);
+      client = Switchboard(
+        resolver: EndpointResolver(uri),
+        muxOptions: fast,
+        defaultPayload: bytes('token-5'),
+      );
+      addTearDown(client.close);
+    }
+
+    test('a rewritten shard and payload reach the backend; the client\'s '
+        'data waits for the verdict', () async {
+      final seen = <ChannelAddress>[];
+      await start((incoming) async {
+        seen.add(incoming.address);
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        final token = utf8.decode(incoming.address.payload);
+        final account = int.parse(token.split('-').last);
+        return incoming.address.copyWith(
+          shard: account,
+          payload: bytes('verified $token'),
+        );
+      });
+      final talk = await client.openTalk(ServiceAddress(chat));
+      // Sent at once, while the proxy is still authorizing.
+      final reply = await talk.request('WHO', Uint8List(0));
+      expect(utf8.decode(reply.payload), '7 5 verified token-5');
+      expect(seen.single.payload, bytes('token-5'));
+      expect(seen.single.shard, isNull);
+      expect(atBackend.single.address.shard, 5);
+      await talk.close();
+    });
+
+    test('null is UNAUTHENTICATED, a throw PERMISSION_DENIED', () async {
+      await start((incoming) async {
+        switch (utf8.decode(incoming.address.payload)) {
+          case 'anonymous':
+            return null;
+          case 'bad':
+            throw const FormatException('bad credential');
+          default:
+            return incoming.address;
+        }
+      });
+      Future<Status> statusWith(String payload) async {
+        final channel = await client.openChannel(
+          ServiceAddress(chat),
+          payload: bytes(payload),
+        );
+        return channel.done;
+      }
+
+      final anonymous = await statusWith('anonymous');
+      expect(anonymous, hasCode(StatusCode.unauthenticated));
+      expect(anonymous.reason, 'unauthenticated');
+      expect(await statusWith('bad'), hasCode(StatusCode.permissionDenied));
+      expect(atBackend, isEmpty);
+      // A synchronous answer works too.
+      final talk = await client.openTalk(ServiceAddress(chat));
+      final reply = await talk.request('WHO', Uint8List(0));
+      expect(utf8.decode(reply.payload), '7 null token-5');
+      await talk.close();
+    });
+
+    test('no answer within authorizeTimeout is UNAUTHENTICATED; pending '
+        'authorizations count toward the budget', () async {
+      final pending = Completer<ChannelAddress?>();
+      await start(
+        (_) => pending.future,
+        authorizeTimeout: const Duration(milliseconds: 30),
+        budget: 1,
+      );
+      final first = await client.openChannel(ServiceAddress(chat));
+      await pumpEventQueue();
+      final second = await client.openChannel(ServiceAddress(chat));
+      expect(await second.done, hasCode(StatusCode.resourceExhausted));
+      expect(await first.done, hasCode(StatusCode.unauthenticated));
+      // The late answer is ignored.
+      pending.complete(ChannelAddress(type: chat));
+      await pumpEventQueue();
+      expect(atBackend, isEmpty);
+    });
+
+    test(
+      'a channel its client closed while being authorized is dropped',
+      () async {
+        final verdict = Completer<void>();
+        final asked = Completer<void>();
+        await start((incoming) async {
+          asked.complete();
+          await verdict.future;
+          return incoming.address;
+        });
+        final channel = await client.openChannel(ServiceAddress(chat));
+        await asked.future;
+        await channel.close(Status.of(StatusCode.cancelled));
+        verdict.complete();
+        await pumpEventQueue();
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(atBackend, isEmpty);
+      },
+    );
+  });
+
   group('proxyHandler with slot tables', () {
     final zone = Name('zone');
     late Map<int, String> modes;
@@ -761,9 +903,11 @@ void main() {
     }
 
     /// A backend `zone/id` that, by its mode: greets (`<id> <shard>`) and
-    /// echoes (`<id>:<data>`); rejects with MOVED at once (`moved:<reason>`);
-    /// rejects with MOVED once data arrived (`movedAfter:<reason>`); greets,
-    /// then rejects with MOVED (`greetMoved:<reason>`).
+    /// echoes (`<id>:<data>`); rejects with MOVED at once
+    /// (`moved:<owner>:<epoch>`, `moved:` naming none); rejects with MOVED
+    /// once data arrived (`movedAfter:...`); greets, then rejects with
+    /// MOVED (`greetMoved:...`); closes with ABORTED for a slot move once
+    /// data arrived (`abortedAfter:...`).
     Future<ServiceRecord> backend(int id) async {
       final node = Switchboard(muxOptions: fast);
       addTearDown(node.close);
@@ -773,7 +917,10 @@ void main() {
         opened[id]!.add(incoming.address);
         final channel = incoming.channel;
         final [mode, ...rest] = modes[id]!.split(':');
-        final moved = Status.of(StatusCode.moved, rest.join(':'));
+        final fields = rest.length == 2
+            ? MovedStatus(owner: int.parse(rest[0]), epoch: int.parse(rest[1]))
+            : MovedStatus.unknown;
+        final moved = fields.toStatus();
         switch (mode) {
           case 'greet':
             channel.send(bytes('$id ${incoming.address.shard}'));
@@ -787,6 +934,10 @@ void main() {
           case 'greetMoved':
             channel.send(bytes('$id ${incoming.address.shard}'));
             unawaited(incoming.reject(moved));
+          case 'abortedAfter':
+            channel.stream.first
+                .then((_) => incoming.reject(fields.toStatus(aborted: true)))
+                .ignore();
         }
       }, instance: id);
       final uri = await node.listenTcp('127.0.0.1', 0);
@@ -836,7 +987,7 @@ void main() {
     test('MOVED before any data: retried once, unseen by the client', () async {
       await startProxy(budget: 1);
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
-      modes[1] = 'moved:zone/2 2';
+      modes[1] = 'moved:2:2';
       final channel = await open(4);
       final answers = StreamQueue(channel.stream);
       expect(await answers.next, bytes('2 4'));
@@ -866,19 +1017,42 @@ void main() {
 
     test('MOVED after data is forwarded to the client', () async {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
-      modes[1] = 'movedAfter:zone/2 2';
+      modes[1] = 'movedAfter:2:2';
       final channel = await open(4);
       channel.send(bytes('x'));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.moved));
-      expect(status.reason, 'zone/2 2');
+      expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
       expect(opened[2], isEmpty);
 
-      modes[1] = 'greetMoved:zone/2 2';
+      modes[1] = 'greetMoved:2:2';
       final greeted = await open(4);
       expect(await greeted.stream.toList(), [bytes('1 4')]);
       expect(await greeted.done, hasCode(StatusCode.moved));
       expect(opened[2], isEmpty);
+    });
+
+    test('ABORTED for a slot move reaches the client byte for byte', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'abortedAfter:0xFFFFFFFFFF80:0x80000000';
+      final channel = await open(4);
+      channel.send(bytes('x'));
+      final status = await channel.done;
+      expect(status, hasCode(StatusCode.aborted));
+      expect(
+        status.encode(),
+        MovedStatus(
+          owner: 0xFFFFFFFFFF80,
+          epoch: 0x80000000,
+        ).encode(aborted: true),
+      );
+      expect(opened[2], isEmpty);
+      // Not retried by a client either.
+      final slotChannel = await client.openChannelToSlot(zone, 4);
+      slotChannel.send(bytes('y'));
+      expect(await slotChannel.done, hasCode(StatusCode.aborted));
+      expect(slotChannel.retried, isFalse);
+      expect(opened[1], hasLength(2));
     });
 
     test('MOVED with nowhere else to go is forwarded', () async {
@@ -889,8 +1063,8 @@ void main() {
       expect(await channel.done, hasCode(StatusCode.moved));
       // Only once.
       modes
-        ..[1] = 'moved:zone/2 2'
-        ..[2] = 'moved:zone/1 3';
+        ..[1] = 'moved:2:2'
+        ..[2] = 'moved:1:3';
       final twice = await open(4);
       expect(await twice.done, hasCode(StatusCode.moved));
       expect(opened[2], hasLength(1));
@@ -898,14 +1072,14 @@ void main() {
 
     test('a client reopening after MOVED reaches the owner', () async {
       table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
-      modes[1] = 'movedAfter:zone/2 2';
+      modes[1] = 'movedAfter:2:2';
       final channel = await client.openChannelToSlot(zone, 6);
       channel.send(bytes('x'));
       expect(await channel.done, hasCode(StatusCode.moved));
       expect(channel.retried, isFalse);
       // The client opens again; the proxy's table is still stale, and the
       // proxy's own retry takes it to the owner the rejection names.
-      modes[1] = 'moved:zone/2 2';
+      modes[1] = 'moved:2:2';
       table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
       final again = await client.openChannelToSlot(zone, 6);
       expect(await again.stream.first, bytes('2 6'));

@@ -127,7 +127,9 @@ class WebSocketTransport {   // core, no dart:io
   /// The check runs on assembled messages, so it protects the mux but not
   /// the WebSocket implementation's own memory. Implements FrameLimited.
   static StreamChannel<Uint8List> wrap(WebSocketChannel channel, {int maxFrameSize});
-  static Future<StreamChannel<Uint8List>> connect(Uri uri, {int maxFrameSize});   // offers subprotocol 'switchboard'
+  static Future<StreamChannel<Uint8List>> connect(Uri uri, {int maxFrameSize, Duration? timeout});   // offers subprotocol 'switchboard'
+  // timeout: SwitchboardException(unavailable), a late connection is closed at once.
+  // Not OutputBufferedTransport: package:web_socket_channel gives no acceptance signal.
 }
 
 class IOWebSocketTransport {   // dart:io, exported from switchboard.dart only
@@ -212,6 +214,8 @@ class MuxConnection {
   Future<Status> get done;                  // completes when the transport is closed; status: goingAway if a GOAWAY was received, the GOAWAY status we sent if we killed it (protocolError, frameTooLarge, unsupported, resourceExhausted), connectionLost otherwise
   bool get isOpen;                          // transport open and no local close started
   bool get peerGoingAway;
+  Future<Status> get peerGoAwayStatus;      // the peer's GOAWAY status as sent (application codes as unknown); never completes without one, never fails
+  int get sentBytes; int get receivedBytes; // mux frames handed to / received from the transport, headers included
   MuxLimits? get peerLimits;
   int get openChannelCount;
   Iterable<MuxChannel> get channels;
@@ -244,7 +248,8 @@ Behaviour notes:
 * Keep-alive: timer restarted on any incoming frame; on expiry send PING; if nothing arrives within `keepAliveTimeout`, close with `connectionLost`. No probing while the mux paused reading (`receiveHighWaterMarkBytes`); while the transport throttles its input because of our output, the peer reading that output counts as hearing from it.
 * Incoming frames for channel 0 are control messages; unknown types ignored; PING answered immediately, whatever its size up to the 1024-byte control limit.
 * Statuses received in CLOSE or GOAWAY with application codes (256 and above, not allowed there) are reported as `unknown` with the original code in the reason, so they can be relayed.
-* Reasons sent in CLOSE and GOAWAY are shortened on a UTF-8 boundary so the status payload is at most 1024 bytes and the frame fits the peer's announced frame limit; `done` reports the status as given.
+* Reasons sent in CLOSE and GOAWAY are shortened on a UTF-8 boundary so the status payload is at most 1024 bytes and the frame fits the peer's announced frame limit; `done` reports the status as given. The cut is made in the encoded bytes, so fixed fields before a reason (`MOVED`) survive.
+* `Status.decode` keeps the bytes after the code as received (`reason` is their lossy UTF-8 decoding) and `encode` writes them back unchanged, so a status relayed by `pipeChannels` or `forwardMessage` (the `MOVED` fields, an `ABORTED` for a slot move) reaches the far side byte for byte. `Status` itself does not interpret fields; `MovedStatus` does.
 * Channel streams and `incoming` are fed from queues the mux owns and only while the listener is active and not paused, so every buffered byte and channel is accounted for.
 
 ## Resource limits
@@ -293,10 +298,11 @@ class TalkChannel {
   TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions? options});   // works over MuxChannel or any StreamChannel
   StreamChannel<Uint8List> get raw;
   Stream<TalkMessage> get messages;    // incoming plain messages and requests (not responses); a channel abort from the peer is delivered as an error event (TalkAbortException) and then the stream ends
-  void send(String procedure, Uint8List payload);                               // plain message
-  Future<TalkMessage> request(String procedure, Uint8List payload, {Duration? timeout});   // = startRequest(...).response
-  TalkRequest startRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend});
-  TalkStream streamRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend});
+  // Every method taking a String procedure also takes {Name? name}, sent instead when given (lossless, for generated stubs).
+  void send(String procedure, Uint8List payload, {Name? name});                 // plain message
+  Future<TalkMessage> request(String procedure, Uint8List payload, {Duration? timeout, Name? name});   // = startRequest(...).response
+  TalkRequest startRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend, Name? name});
+  TalkStream streamRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend, Name? name});
   void abort(Status status);           // channel abort, then close; ArgumentError for OK
   Future<void> close([Status status = Status.ok]);
   Future<Status> get done;
@@ -329,7 +335,8 @@ class TalkMessage {
   Future<void> get onCancel;           // completes when cancelled (never for non-requests)
   bool get canReply;
 
-  // Reply API; all throw SwitchboardException(failedPrecondition) if !expectsReply or already finally replied
+  // Reply API; all throw SwitchboardException(failedPrecondition) if !expectsReply or already finally replied.
+  // Each one taking {String? procedure} also takes {Name? name}, sent instead when given.
   void reply(Uint8List payload, {String? procedure});
   Future<TalkMessage> replyRequest(Uint8List payload, {String? procedure, Duration? timeout});   // chained; = startReplyRequest(...).response
   TalkRequest startReplyRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});
@@ -338,6 +345,9 @@ class TalkMessage {
   Future<TalkMessage> replyItemRequest(Uint8List payload, {String? procedure, Duration? timeout});   // item that expects a reply
   TalkRequest startReplyItemRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});
   TalkStream replyItemStreamRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});   // item that is a stream request
+  Future<void> replyStream(Stream<Uint8List> items, {Uint8List? trailer, String? procedure, Name? name});
+    // replyItem per item, then reply(trailer ?? empty); a stream error: replyAbort(its status if SwitchboardException, else INTERNAL);
+    // onCancel cancels the subscription; never fails; throws synchronously like replyItem
   void replyAbort(Status status);      // ArgumentError for OK
   void extend();
   void setReplyTimeout(Duration? timeout);   // per-request responder timeout: null = channel default, zero = none
@@ -418,9 +428,10 @@ class AssignRequest { Name type; int slot; int epoch; int holder; bool shared; }
 class DrainRequest / ForwardRequest { Name type; int slot; int epoch; int to; }  class ResumeRequest { Name type; int slot; int epoch; }
 class SlotEntry { SlotState state; int owner /* from while migrating */; int to; int holder; int epoch; bool isFree; bool isEmpty; static unassigned; .free/.owned/.migrating }
 class SlotItem { Name type; int slot; SlotEntry entry; }               // SLOT item
-class MovedStatus { ServiceAddress? owner; int? epoch; String reason; Status toStatus();
-  static String format(ServiceAddress? owner, [int? epoch]);          // 'userq/1a2b 7', '' when unknown
-  static MovedStatus parse(String reason); static MovedStatus fromStatus(Status); }   // never throws; malformed = unknown
+class MovedStatus { MovedStatus({int owner = 0, int epoch = 0, String reason = ''}); static const unknown; static const fieldsLength = 10;
+  int owner; int epoch; String reason; bool hasOwner; ServiceAddress? ownerOf(Name type);
+  Uint8List encode({bool aborted = false}); Status toStatus({bool aborted = false});   // u16 MOVED (or ABORTED), u48 owner, u32 epoch, reason
+  static MovedStatus parse(Uint8List statusPayload); static MovedStatus fromStatus(Status); }   // never throw; other codes or short = unknown
 ```
 
 Sharding decoders throw `ProtocolException` on truncation, an unknown mode, state or phase, and a slot list longer than the payload; trailing bytes are ignored. Encoders throw `RangeError` for values outside `u32`/`u48`. Vectors: `doc/sharding-vectors.md`, `test/vectors/sharding_vectors_test.dart`.
@@ -510,7 +521,13 @@ Future<void> pipeChannels(MuxChannel a, MuxChannel b);
 /// connection; beyond: RESOURCE_EXHAUSTED. Slot routing as selectAndConnect; for a slot
 /// routed by a table, a backend CLOSE MOVED before any subframe was piped is retried once
 /// at the new owner, unseen by the client (the retry counts as the same channel).
-ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddress)? allow, Resolver? resolver, int maxChannelsPerConnection = 256});
+/// allow throwing: PERMISSION_DENIED. authorize (after allow and the budget, before
+/// resolution; the channel is not read meanwhile): the address to forward (rewritten shard,
+/// payload, ...), null = UNAUTHENTICATED, throw = PERMISSION_DENIED, no answer within
+/// authorizeTimeout (zero = none) = UNAUTHENTICATED; a channel the client closed meanwhile is dropped.
+ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddress)? allow,
+    FutureOr<ChannelAddress?> Function(IncomingChannel)? authorize, Duration authorizeTimeout = 10 s,
+    Resolver? resolver, int maxChannelsPerConnection = 256});
 
 /// slot_channel.dart: a StreamChannel<Uint8List> and StatusClosable forwarding to the current MuxChannel.
 class SlotChannel { Name type; int slot; MuxChannel get channel; bool get retried; bool get canSend;
@@ -624,7 +641,7 @@ class SlotGate implements SlotHandler {
       int maxQueuedRequests = 1024, bool trackChannels = true, ChannelHandler? noSlotHandler, int instance = 0});
   ChannelHandler get handler; ChannelHandler? noSlotHandler; int instance;
   Map<int, int> get servedSlots; SlotGateState? stateOf(int slot); bool serves(int slot);
-  Status movedStatus(int slot); void detach(IncomingChannel channel);
+  MovedStatus movedTo(int slot); Status movedStatus(int slot); Status abortedStatus(int slot); void detach(IncomingChannel channel);
   Future<void> serveRequest(TalkMessage message, int slot, FutureOr<void> Function(TalkMessage) handler);
   Future<int> claim(int slot, {bool holding = false}); Future<void> release(int slot, {bool keepStorage = false});
   Future<void> close();
@@ -658,12 +675,12 @@ Behaviour notes (wiki "Switchboard Sharding"):
 
 Routing and the instance side (stage B):
 
-* Slot routing in `selectAndConnect`: only when the address names any instance, a shard is given and the resolver is a `SlotResolver` with a table for the type. Owner from the table (`from` while migrating); no owner: managed space `locateSlot`, static space `UNAVAILABLE`; a slot outside the space `OUT_OF_RANGE`; the owner missing from the service table or unreachable `UNAVAILABLE`, never another instance. The header carries the owner's id. `proxyHandler` gets slot routing through `selectAndConnect`. For a channel routed by a slot table it pipes the client to a `SlotChannel` (below), so a backend's CLOSE `MOVED` before any subframe was piped either way is retried once at the new owner without the client noticing, the re-resolution being the same as `openChannelToSlot`'s (`reopenAtSlotOwner`, with the proxy's resolver, never towards the node's own listeners); after the first subframe the `MOVED` is forwarded to the client, which retries itself. The retry counts as the same channel for `maxChannelsPerConnection`.
-* `openChannelToSlot` / `openTalkToSlot`: a mux OPEN has no acknowledgement, so the retry is decided on the channel's end. A `SlotChannel` forwards to the current `MuxChannel`; when it ends with `MOVED` and nothing was sent on it or received from it, it is replaced once: to the owner the reason names, unless the table has an entry with a higher epoch; with no owner named, through `locateSlot` (bounded by `slotRefreshTimeout`), in either mode; through a resolver without tables, the same address again. Nowhere else to go: the channel ends with the `MOVED`. Subframes sent while the replacement opens are held and sent on it. After the first subframe either way, `MOVED` is surfaced: an instance that loses a slot closes the channels it was serving with `MOVED`, possibly after acting on what they carried, so a replay could apply it twice. Server-first protocols (greeting, snapshot) therefore always get the retry; a Talk client sending at once retries at its level.
-* `SlotGate`, per sharded type per node, is the client's `SlotHandler` (through `SlotGates` when a client serves several types) and the type's `ChannelHandler`. Per slot: `loading` (ASSIGN running; channels queue), `serving`, `locked` (DRAIN; channels queue), `forwarding` (after FORWARD for `forwardGrace`; channels piped to the new owner, requests forwarded). Not held: `MOVED` naming the mirror's owner (the new owner while forwarding; empty when the mirror names this instance or nobody). No shard: `noSlotHandler` (state transfer between instances), else `INVALID_ARGUMENT`; outside the space: `OUT_OF_RANGE`. Queued channels are never read (the mux buffers them), at most `maxQueuedChannels` over all slots (`UNAVAILABLE` beyond).
+* Slot routing in `selectAndConnect`: only when the address names any instance, a shard is given and the resolver is a `SlotResolver` with a table for the type. Owner from the table (`from` while migrating); no owner: managed space `locateSlot`, static space `UNAVAILABLE`; a slot outside the space `OUT_OF_RANGE`; the owner missing from the service table or unreachable `UNAVAILABLE`, never another instance. The header carries the owner's id. `proxyHandler` gets slot routing through `selectAndConnect`. For a channel routed by a slot table it pipes the client to a `SlotChannel` (below), so a backend's CLOSE `MOVED` before any subframe was piped either way is retried once at the new owner without the client noticing, the re-resolution being the same as `openChannelToSlot`'s (`reopenAtSlotOwner`, with the proxy's resolver, never towards the node's own listeners); after the first subframe the `MOVED` is forwarded to the client, which retries itself; an `ABORTED` is always forwarded. The retry counts as the same channel for `maxChannelsPerConnection`.
+* `openChannelToSlot` / `openTalkToSlot`: a mux OPEN has no acknowledgement, so the retry is decided on the channel's end. A `SlotChannel` forwards to the current `MuxChannel`; when it ends with `MOVED` and nothing was sent on it or received from it, it is replaced once: to the owner the status names (`MovedStatus`), unless the table has an entry with a higher epoch; with no owner named, through `locateSlot` (bounded by `slotRefreshTimeout`), in either mode; through a resolver without tables, the same address again. Nowhere else to go: the channel ends with the `MOVED`. Subframes sent while the replacement opens are held and sent on it. After the first subframe either way, `MOVED` is surfaced, since the subframes already sent went with the old channel; `MOVED` means nothing was processed, so the application may open again and resend. An `ABORTED` for a slot move (the owner was serving the channel, its work may have taken effect) is never retried. Server-first protocols (greeting, snapshot) always get the retry; a Talk client sending at once retries at its level.
+* `SlotGate`, per sharded type per node, is the client's `SlotHandler` (through `SlotGates` when a client serves several types) and the type's `ChannelHandler`. Per slot: `loading` (ASSIGN running; channels queue), `serving`, `locked` (DRAIN; channels queue), `forwarding` (after FORWARD for `forwardGrace`; channels piped to the new owner, requests forwarded). Not held: `MOVED` naming the mirror's owner and epoch (the new owner while forwarding; owner 0 when the mirror names this instance or nobody). No shard: `noSlotHandler` (state transfer between instances), else `INVALID_ARGUMENT`; outside the space: `OUT_OF_RANGE`. Queued channels are never read (the mux buffers them), at most `maxQueuedChannels` over all slots (`UNAVAILABLE` beyond).
 * Work in flight: with `trackChannels` (default) a served channel counts until it ends, unless `detach`ed (a long-lived channel); requests run through `serveRequest` count until their handler completes. DRAIN locks, waits until the slot has no work in flight (at most `drainTimeout`, then logs and goes on), then calls `lifecycle.drain`. A DRAIN for a slot not served is `FAILED_PRECONDITION`.
-* FORWARD: queued channels are piped to the new owner in arrival order (each OPEN sent after the previous one, later arrivals too), with the open payload unchanged except the instance (set to the new owner, so its dispatch is exact; host hint stripped); queued requests are forwarded with `forwardMessage` over one channel per slot that the gate opens to `(type, to, shard)` with the node's default payload. The reply to FORWARD is sent once the queued channels are opened. After `forwardGrace`: `lifecycle.unload`, the forwarding channel closed once its requests are answered, tracked channels still open closed with `MOVED`; detached channels are left to the application (their requests get `ABORT MOVED` through `serveRequest`). An ASSIGN of the same slot during the grace period (it comes back) ends the forwarding, unloads, then loads.
-* RESUME (or the loss of the naming service while locked): the queue is served here. Revocation, `release` and `close`: the queue is refused with `MOVED`, tracked channels are closed with `MOVED`, `unload`. An ASSIGN for a slot already served (a re-claim after a naming service restart) changes the epoch only and answers as the first time.
+* FORWARD: queued channels are piped to the new owner in arrival order (each OPEN sent after the previous one, later arrivals too), with the open payload unchanged except the instance (set to the new owner, so its dispatch is exact; host hint stripped); queued requests are forwarded with `forwardMessage` over one channel per slot that the gate opens to `(type, to, shard)` with the node's default payload. The reply to FORWARD is sent once the queued channels are opened. After `forwardGrace`: `lifecycle.unload`, the forwarding channel closed once its requests are answered, tracked channels still open closed with `ABORTED` carrying the `MOVED` fields (they were served); detached channels are left to the application (their requests get `ABORT MOVED` through `serveRequest`). An ASSIGN of the same slot during the grace period (it comes back) ends the forwarding, unloads, then loads.
+* RESUME (or the loss of the naming service while locked): the queue is served here. Revocation, `release` and `close`: the queue is refused with `MOVED` (never read), tracked channels are closed with `ABORTED` and the `MOVED` fields (served), `unload`. `MOVED` always means nothing was processed. An ASSIGN for a slot already served (a re-claim after a naming service restart) changes the epoch only and answers as the first time.
 * `MeshNode.publishSharded`: installs `gates` as the client's slot handler (fails if another handler is set), creates the gate before registering (an ASSIGN may follow `SLOTS` at once), registers with the gate's handler, sends `SLOTS`, then `HOLDING` if given and passes the discard list to `lifecycle.discard`; on failure unregisters. `leave`: while connected, per sharded type `SLOTS` with capacity 0 (managed spaces, so that the allocator does not hand the slots back) and `RELEASE` keeping storage of every served slot, bounded by `leaveTimeout`; then every gate is closed. A node that will come back with its storage should not leave (its holder-only slots would be reassigned with a fetch from it).
 
 ### Deviations from the wiki and proposed amendments
@@ -675,7 +692,7 @@ The first four were adopted by the wiki since.
 * `maxSlotCount` defaults to 65536, the `userq` use case, although the wiki asks to keep `N` at or below 16384.
 * Lazy shared spaces do not reassign slots of a down instance at once: lazy spaces assign only on `LOCATE`.
 * FORWARD: the wiki says the open payload of a queued channel is re-sent unchanged; the gate sets the instance to the new owner's (as a proxy does, per "Proxying"), since the router had filled in the old owner's id and the new owner dispatches exactly. The application payload is unchanged.
-* A router that sees `MOVED` retries once (wiki "Routing"): `openChannelToSlot` at the end client and `proxyHandler` at a frontend, both only before the first subframe (see above); after it the `MOVED` reaches the caller (or the proxy's client).
+* A router that sees `MOVED` retries once (wiki "Routing"): `openChannelToSlot` at the end client and `proxyHandler` at a frontend, both only before the first subframe (see above); after it the `MOVED` reaches the caller (or the proxy's client), which may resend since nothing was processed.
 * DRAIN waits for the work in flight at most `drainTimeout` (the wiki has no bound), then drains anyway.
 
 ## Tests

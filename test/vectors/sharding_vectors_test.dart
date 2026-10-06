@@ -471,58 +471,89 @@ void main() {
     });
   });
 
-  group('MOVED reason', () {
-    test('format', () {
-      final owner = ServiceAddress(userq, 0x1A2B);
-      expect(MovedStatus.format(owner, 7), 'userq/1a2b 7');
-      expect(MovedStatus.format(null), '');
-      expect(MovedStatus(owner, 7).reason, 'userq/1a2b 7');
-      expect(const MovedStatus().reason, '');
+  group('MOVED status', () {
+    test('owner and epoch', () {
+      final moved = MovedStatus(owner: 0x1A2B, epoch: 7);
+      expect(hexString(moved.encode()), '25 00 2B 1A 00 00 00 00 07 00 00 00');
       expect(
-        MovedStatus(owner, 0xFFFFFFFF).toStatus(),
-        Status.of(StatusCode.moved, 'userq/1a2b 4294967295'),
+        MovedStatus.parse(hexBytes('25 00 2B 1A 00 00 00 00 07 00 00 00')),
+        moved,
+      );
+      expect(moved.hasOwner, isTrue);
+      expect(moved.ownerOf(userq), ServiceAddress(userq, 0x1A2B));
+    });
+
+    test('unknown', () {
+      expect(
+        hexString(MovedStatus.unknown.encode()),
+        '25 00 00 00 00 00 00 00 00 00 00 00',
+      );
+      expect(MovedStatus(), MovedStatus.unknown);
+      expect(
+        MovedStatus.parse(hexBytes('25 00 00 00 00 00 00 00 00 00 00 00')),
+        MovedStatus.unknown,
+      );
+      expect(MovedStatus.unknown.hasOwner, isFalse);
+      expect(MovedStatus.unknown.ownerOf(userq), isNull);
+    });
+
+    test('largest values, a reason, and ABORTED', () {
+      final moved = MovedStatus(owner: maxInstance, epoch: maxU32, reason: 'é');
+      const hex = 'FF FF FF FF FF FF FF FF FF FF C3 A9';
+      expect(hexString(moved.encode()), '25 00 $hex');
+      expect(hexString(moved.encode(aborted: true)), '0A 00 $hex');
+      expect(MovedStatus.parse(hexBytes('25 00 $hex')), moved);
+      expect(MovedStatus.parse(hexBytes('0A 00 $hex')), moved);
+      expect(
+        () => MovedStatus(owner: maxInstance + 1),
+        throwsA(isA<RangeError>()),
+      );
+      expect(() => MovedStatus(epoch: maxU32 + 1), throwsA(isA<RangeError>()));
+    });
+
+    test('through Status, losslessly', () {
+      final moved = MovedStatus(owner: 0xFEDCBA987654, epoch: 0x80000001);
+      for (final aborted in [false, true]) {
+        final status = moved.toStatus(aborted: aborted);
+        expect(status.known, aborted ? StatusCode.aborted : StatusCode.moved);
+        expect(status.encode(), moved.encode(aborted: aborted));
+        expect(MovedStatus.fromStatus(status), moved);
+        // A status decoded from the wire re-encodes byte for byte.
+        final relayed = Status.decode(status.encode());
+        expect(relayed.encode(), moved.encode(aborted: aborted));
+        expect(relayed, status);
+        expect(MovedStatus.fromStatus(relayed), moved);
+      }
+      expect(
+        MovedStatus.fromStatus(Status.of(StatusCode.moved)),
+        MovedStatus.unknown,
       );
       expect(
-        () => MovedStatus.format(ServiceAddress(userq), 1),
-        throwsArgumentError,
+        MovedStatus.fromStatus(
+          Status.decode(moved.encode()..[0] = StatusCode.unavailable.code),
+        ),
+        MovedStatus.unknown,
       );
     });
 
-    test('parse', () {
-      expect(
-        MovedStatus.parse('userq/1a2b 7'),
-        MovedStatus(ServiceAddress(userq, 0x1A2B), 7),
-      );
-      expect(
-        MovedStatus.parse('x/ffffffffffff 4294967295'),
-        MovedStatus(ServiceAddress(Name('x'), maxInstance), 0xFFFFFFFF),
-      );
-      for (final unknown in [
+    test('hostile input never throws', () {
+      for (final hex in [
         '',
-        'userq/1a2b',
-        'userq 7',
-        'userq/0 7',
-        'userq/1a2b 4294967296',
-        'userq/1a2b  7',
-        'userq/1a2b -7',
-        'userq/1a2b 7 ',
-        'userq/zz 7',
-        '/1 7',
-        'waytoolongname/1 7',
+        '25',
+        '25 00',
+        '25 00 2B 1A 00 00 00 00 07 00 00',
+        '0E 00 2B 1A 00 00 00 00 07 00 00 00',
+        '25 01 2B 1A 00 00 00 00 07 00 00 00',
       ]) {
         expect(
-          MovedStatus.parse(unknown),
-          const MovedStatus(),
-          reason: unknown,
+          MovedStatus.parse(hexBytes(hex)),
+          MovedStatus.unknown,
+          reason: hex,
         );
       }
       expect(
-        MovedStatus.fromStatus(Status.of(StatusCode.moved, 'kv/2 8')),
-        MovedStatus(ServiceAddress(kv, 2), 8),
-      );
-      expect(
-        MovedStatus.fromStatus(Status.of(StatusCode.unavailable, 'kv/2 8')),
-        const MovedStatus(),
+        MovedStatus.parse(hexBytes('25 00 2B 1A 00 00 00 00 07 00 00 00 FF')),
+        MovedStatus(owner: 0x1A2B, epoch: 7, reason: '\uFFFD'),
       );
     });
   });

@@ -20,6 +20,18 @@ final Logger _log = Logger('Switchboard.Transport');
 /// The WebSocket binding of the transport layer: one mux frame per binary
 /// WebSocket message.
 ///
+/// The channels of this class, which work on every platform including the
+/// web, implement `FrameLimited` only. They do not implement
+/// `OutputBufferedTransport`: `package:web_socket_channel` gives no signal
+/// of when the connection accepted a message, so output waiting in the
+/// WebSocket implementation (the browser's `bufferedAmount`) cannot be
+/// observed, nor does it slow the sender. An application that streams a
+/// lot to a slow peer bounds what it has in flight at its own level (for
+/// example one request at a time, or a window of acknowledged items);
+/// `MuxConnection.sentBytes` and `receivedBytes` count the frames, not
+/// what the network has carried. On `dart:io`, `WebSocketServerTransport`
+/// does observe its output.
+///
 /// See the wiki page "Switchboard Transport", section "WebSocket binding".
 abstract final class WebSocketTransport {
   /// The WebSocket subprotocol name.
@@ -62,19 +74,37 @@ abstract final class WebSocketTransport {
   /// [wrap].
   ///
   /// Throws whatever the WebSocket implementation reports if the
-  /// connection cannot be established.
+  /// connection cannot be established. With a [timeout], fails with a
+  /// [SwitchboardException] carrying [StatusCode.unavailable] if the
+  /// connection is not established in time; a connection completed later
+  /// is closed at once.
   static Future<StreamChannel<Uint8List>> connect(
     Uri uri, {
     int maxFrameSize = defaultMaxFrameSize,
+    Duration? timeout,
   }) async {
     final channel = WebSocketChannel.connect(
       uri,
       protocols: const [subprotocol],
     );
     try {
-      await channel.ready;
+      var ready = channel.ready;
+      if (timeout != null) {
+        ready = ready.timeout(
+          timeout,
+          onTimeout: () => throw SwitchboardException.of(
+            StatusCode.unavailable,
+            'WebSocket connection to $uri not established within $timeout',
+          ),
+        );
+      }
+      await ready;
     } on Object {
-      unawaited(channel.sink.close().then((_) {}, onError: (_) {}));
+      // Closing the sink before the connection is established closes it
+      // as soon as it is.
+      unawaited(
+        channel.sink.close(normalClosure).then((_) {}, onError: (_) {}),
+      );
       rethrow;
     }
     return wrap(channel, maxFrameSize: maxFrameSize);

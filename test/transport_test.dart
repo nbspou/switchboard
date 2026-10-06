@@ -641,6 +641,61 @@ void main() {
       await serverDrained;
     });
 
+    test('connect timeout: UNAVAILABLE when the handshake stalls', () async {
+      final silent = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final held = <Socket>[];
+      silent.listen(held.add);
+      addTearDown(() async {
+        for (final socket in held) {
+          socket.destroy();
+        }
+        await silent.close();
+      });
+      await expectLater(
+        WebSocketTransport.connect(
+          Uri.parse('ws://127.0.0.1:${silent.port}/'),
+          timeout: const Duration(milliseconds: 50),
+        ),
+        throwsA(isStatusError(StatusCode.unavailable)),
+      );
+    });
+
+    test('connect timeout: a connection completed late is closed', () async {
+      final slow = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => slow.close(force: true));
+      final upgraded = Completer<WebSocket>();
+      slow.listen((request) async {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        upgraded.complete(
+          await WebSocketTransformer.upgrade(
+            request,
+            protocolSelector: (protocols) => WebSocketTransport.subprotocol,
+          ),
+        );
+      });
+      await expectLater(
+        WebSocketTransport.connect(
+          Uri.parse('ws://127.0.0.1:${slow.port}/'),
+          timeout: const Duration(milliseconds: 20),
+        ),
+        throwsA(isStatusError(StatusCode.unavailable)),
+      );
+      final ws = await upgraded.future.timeout(const Duration(seconds: 5));
+      await ws.drain<void>().timeout(const Duration(seconds: 5));
+      expect(ws.closeCode, WebSocketTransport.normalClosure);
+    });
+
+    test('connect with a timeout in time works as without', () async {
+      final client = await WebSocketTransport.connect(
+        uri,
+        timeout: const Duration(seconds: 5),
+      );
+      final ws = await accepted.next;
+      final serverDrained = ws.drain<void>();
+      await client.sink.close();
+      await serverDrained;
+    });
+
     test('connect failure throws', () async {
       final port = server.port;
       await server.close(force: true);

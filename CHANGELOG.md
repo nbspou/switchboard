@@ -10,18 +10,21 @@ The protocol specification lives in the project wiki (section
 - Transport: the `StreamChannel<Uint8List>` frame contract; the stream
   binding (preamble, `u32` length prefix) over TCP or any byte stream, with
   output backpressure, close timeout and linger; the WebSocket binding
-  (subprotocol `switchboard`) for clients on every platform and on
-  `dart:io`; `WebSocketServerTransport`, a server side that bounds whole
+  (subprotocol `switchboard`) for clients on every platform, with a
+  connect timeout, and on `dart:io`; `WebSocketServerTransport`, a server side that bounds whole
   messages before buffering them and never negotiates compression; an
   in-memory pair; the optional capabilities `FrameLimited`,
   `AbortableTransport` and `OutputBufferedTransport`.
 - Mux: channels opened by either side, short and long ids reused after
   mutual close, reserved ids, a control channel with PING, PONG, GOAWAY and
-  LIMITS, status payloads in CLOSE, keep-alive, graceful shutdown.
+  LIMITS, status payloads in CLOSE, keep-alive, graceful shutdown, the
+  peer's GOAWAY status and byte counters for clients.
 - Talk: plain messages, requests, stream requests, chained responses and
   item requests to any depth, aborts with status codes, channel aborts,
   `EXTEND`, cancellation, requester and responder timeouts, request limits,
-  and `forwardMessage` for message chain proxying.
+  and `forwardMessage` for message chain proxying; for generated stubs, a
+  `Name` parameter beside every procedure string and
+  `TalkMessage.replyStream`.
 - Addressing: `ServiceAddress` and `ChannelAddress` (the OPEN payload with
   service type, instance, shard slot, host hint and application payload).
 - `Switchboard` node: TCP and WebSocket listeners, pooled outgoing
@@ -34,14 +37,18 @@ The protocol specification lives in the project wiki (section
   (re-registration on reconnect, mirrored table served while stale),
   `NamingResolver`, and `MeshNode` to join a node to a mesh.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
-  host hint relays, routing by shard slot with a one-shot retry on `MOVED`.
+  host hint relays, routing by shard slot with a one-shot retry on `MOVED`,
+  and an asynchronous `authorize` hook that may rewrite the address.
 - Sharding: slot spaces per service type in the naming service (`SLOTS`,
   `HOLDING`, `CLAIM`, `RELEASE`, `LOCATE`, `MIGRATE`, `SLOTSPC` and `SLOT`
   table items), managed and static modes, lazy and shared-recovery flags,
   holder tracking for reboot, the allocator, and the `DRAIN`, `ASSIGN`,
   `FORWARD`, `RESUME` hand-over; on the node, slot-aware routing,
   `openChannelToSlot`, `SlotGate` and `SlotLifecycle`, and
-  `MeshNode.publishSharded`; the `MOVED` status; use case integration tests
+  `MeshNode.publishSharded`; the `MOVED` status with the owner and epoch
+  as fixed fields (nothing was processed), and `ABORTED` with the same
+  fields for served channels; statuses relay byte for byte; use case
+  integration tests
   (key-value store, Discord frontends, per-user workers, zone servers, chat
   rooms, job partitions).
 - Security and resource limits: listener policies, with ready-made ones
