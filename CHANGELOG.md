@@ -1,10 +1,51 @@
 ## 3.0.0-dev.1
 
-- Restart of the project on Dart 3.13 with a completed protocol design.
-- New wire format details: control channel, status codes, cancellation,
-  channel id reuse, service addressing header, naming service protocol,
-  stream transport binding. Not compatible with 2.x, which was never deployed.
-- Protocol specification lives in the project wiki (`switchboard/` section).
+Rewrite from scratch on Dart 3.13 with a completed protocol design. The
+wire format is new and not compatible with 2.x, which was never deployed.
+The protocol specification lives in the project wiki (section
+"Switchboard").
+
+- Libraries: `core.dart` without `dart:io` (compiles for the web) and
+  `switchboard.dart` with the `dart:io` parts.
+- Transport: the `StreamChannel<Uint8List>` frame contract; the stream
+  binding (preamble, `u32` length prefix) over TCP or any byte stream, with
+  output backpressure, close timeout and linger; the WebSocket binding
+  (subprotocol `switchboard`) for clients on every platform and on
+  `dart:io`; `WebSocketServerTransport`, a server side that bounds whole
+  messages before buffering them and never negotiates compression; an
+  in-memory pair; the optional capabilities `FrameLimited`,
+  `AbortableTransport` and `OutputBufferedTransport`.
+- Mux: channels opened by either side, short and long ids reused after
+  mutual close, reserved ids, a control channel with PING, PONG, GOAWAY and
+  LIMITS, status payloads in CLOSE, keep-alive, graceful shutdown.
+- Talk: plain messages, requests, stream requests, chained responses and
+  item requests to any depth, aborts with status codes, channel aborts,
+  `EXTEND`, cancellation, requester and responder timeouts, request limits,
+  and `forwardMessage` for message chain proxying.
+- Addressing: `ServiceAddress` and `ChannelAddress` (the OPEN payload with
+  service type, instance, shard slot, host hint and application payload).
+- `Switchboard` node: TCP and WebSocket listeners, pooled outgoing
+  connections, dispatch by `(type, instance)` with a default service and a
+  catch-all, dispatch on initiated connections too, static, endpoint and
+  naming resolvers, round robin and shard slot selection, a default
+  application payload per node.
+- Naming service: `NamingService` (`REGISTER`, `UNREGSTR`, `WATCH`,
+  `LOOKUP`, heartbeat, assignment hold after a restart), `NamingClient`
+  (re-registration on reconnect, mirrored table served while stale),
+  `NamingResolver`, and `MeshNode` to join a node to a mesh.
+- Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
+  host hint relays.
+- Security and resource limits: listener policies, with ready-made ones
+  that refuse the reserved types, generic rejection reasons, frame limits checked before
+  allocation, per-channel and per-connection receive buffers, a budget for
+  held OPEN payloads, a cap on unconfirmed CLOSEs, output high-water marks,
+  a per-client limit on proxied channels, and host hint relaying only on
+  request.
+- Tests: 667 tests, including the wiki test vectors (the codec tests also
+  run on Node.js with `dart test -P node`) and integration tests over TCP
+  and WebSocket.
+- Documentation: README with quick start programs (`example/`), and the
+  wiki page "Switchboard Dart Reference Implementation".
 
 ## 2.1.7
 

@@ -1,5 +1,7 @@
 # Dart reference implementation: design and API contract
 
+> This is the design record used while building the package: the contract between the layers, kept for the reasoning behind them. It is not the user guide. For using the package, read the README and the wiki page "Switchboard Dart Reference Implementation". Where this file and the code disagree, the code (and its doc comments) wins.
+
 This file is the contract between the layers of the Dart package while it is
 being built. The protocol itself is specified in the wiki
 (`sway/wiki/switchboard/*.md`); when this file and the wiki disagree, the wiki
@@ -22,8 +24,8 @@ lib/src/transport/stream_transport.dart     StreamTransport, StreamTransportChan
 lib/src/transport/web_socket_transport.dart wraps package:web_socket_channel (binary only)
 lib/src/transport/web_socket_transport_io.dart  IOWebSocketTransport: server upgrade and connect on dart:io (exported from switchboard.dart only)
 lib/src/transport/web_socket_server.dart    WebSocketServerTransport, WebSocketServerChannel: own RFC 6455 server side (dart:io, exported from switchboard.dart only)
-lib/src/mux/mux_frame.dart     MuxFrame codec, MuxCommand, control message codecs
-lib/src/mux/mux_connection.dart MuxConnection, MuxOptions, MuxLimits
+lib/src/mux/mux_frame.dart     MuxFrame codec, MuxCommand, control message codecs, MuxLimits
+lib/src/mux/mux_connection.dart MuxConnection, MuxOptions
 lib/src/mux/mux_channel.dart   MuxChannel, MuxChannelState
 lib/src/talk/talk_frame.dart   TalkFrame codec, TalkKind
 lib/src/talk/talk_channel.dart TalkChannel, TalkOptions, TalkAbortException
@@ -37,17 +39,19 @@ lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGS
 lib/src/naming/naming_service.dart     NamingService (server side handler)
 lib/src/naming/naming_client.dart      NamingClient (register, watch, mirrored table)
 lib/src/naming/naming_client_io.dart   namingClientFor: a NamingClient connecting through a Switchboard (dart:io)
-lib/src/switchboard/resolver.dart      Resolver, StaticResolver, EndpointResolver, NamingResolver
+lib/src/naming/naming_resolver.dart    NamingResolver (resolves through a NamingClient's mirrored table)
+lib/src/switchboard/resolver.dart      Resolver, StaticResolver, EndpointResolver
 lib/src/switchboard/channel_policy.dart  ChannelPolicy, ChannelPolicies (listener policies)
 lib/src/switchboard/generic_status.dart  genericStatus: rejection statuses for peers (internal, not exported)
-lib/src/switchboard/switchboard.dart   Switchboard (dart:io), IncomingChannel, handlers
-lib/src/switchboard/proxy.dart         pipeChannels, ProxyHandler
+lib/src/switchboard/incoming_channel.dart  IncomingChannel, ChannelHandler (core)
+lib/src/switchboard/switchboard.dart   Switchboard (dart:io)
+lib/src/switchboard/proxy.dart         pipeChannels, proxyHandler
 lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a naming service (dart:io)
 ```
 
 Rules:
 
-* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. Everything else must compile for the web.
+* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. `proxy.dart`, `mesh.dart` and `naming_client_io.dart` build on `Switchboard` and are exported from `switchboard.dart` only. Everything else must compile for the web.
 * The wire codecs must be correct when compiled to JavaScript, where bitwise operations are 32-bit: use `ByteReader`/`ByteWriter` (or the same split arithmetic) for `u32` and `u48`. `dart test -P node` runs the codec tests on Node.js (see `dart_test.yaml`).
 * All wire codecs are pure functions over `Uint8List` and are unit tested against the wiki test vectors.
 * Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`.
@@ -279,7 +283,7 @@ class TalkAbortException extends SwitchboardException {   // the peer sent ABORT
 }
 
 class TalkChannel {
-  TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions options});   // works over MuxChannel or any StreamChannel
+  TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions? options});   // works over MuxChannel or any StreamChannel
   StreamChannel<Uint8List> get raw;
   Stream<TalkMessage> get messages;    // incoming plain messages and requests (not responses); a channel abort from the peer is delivered as an error event (TalkAbortException) and then the stream ends
   void send(String procedure, Uint8List payload);                               // plain message
@@ -360,7 +364,7 @@ Behaviour notes:
 
 ```dart
 class ServiceAddress {
-  const ServiceAddress(this.type, [this.instance = 0]);
+  ServiceAddress(this.type, [this.instance = 0]);   // RangeError outside u48
   final Name type; final int instance;   // instance u48, 0 = any
   bool get isAny;
   String toString();                     // 'npc/1a2b', 'npc' when any
@@ -369,7 +373,7 @@ class ServiceAddress {
 }
 
 class ChannelAddress {
-  const ChannelAddress({this.type, this.instance = 0, this.shard, this.host, this.payload});
+  ChannelAddress({this.type, this.instance = 0, this.shard, this.host, Uint8List? payload});   // RangeError for instance or shard out of range, ArgumentError for a host over 255 bytes
   final Name? type; final int instance; final int? shard; final String? host; final Uint8List payload;
   ServiceAddress? get address;          // null when type is null
   Uint8List encode();
@@ -394,7 +398,7 @@ Procedure names: Procedures.register ('REGISTER'), unregister ('UNREGSTR'), watc
 ## Switchboard (dart:io)
 
 ```dart
-typedef ChannelHandler = void Function(IncomingChannel channel);
+typedef ChannelHandler = FutureOr<void> Function(IncomingChannel channel);   // a throw or a failed future closes the channel with INTERNAL
 
 /// Listener policy (channel_policy.dart, core): evaluated for every channel on a connection
 /// accepted by the listener, after the header is parsed and before any handler (local service,
@@ -412,14 +416,15 @@ class IncomingChannel {
   Future<void> reject(Status status);
 }
 
-abstract class Resolver {
+abstract interface class Resolver {
   Future<List<ServiceRecord>> resolve(Name type);  // all known live instances of type
   Stream<ServiceEvent> get events;
   Future<void> get ready;                          // completes once the table has been usable at least once (immediately for static); a later loss does not reset it
+  Future<void> close();
 }
-class StaticResolver implements Resolver { StaticResolver(List<ServiceRecord>); add/remove }
+class StaticResolver implements Resolver { StaticResolver([Iterable<ServiceRecord> records]); add/remove }
 class EndpointResolver implements Resolver { EndpointResolver(Uri endpoint); }   // every type resolves to [ServiceRecord(type/0, [endpoint])]
-class NamingResolver implements Resolver { NamingResolver(NamingClient); }
+class NamingResolver implements Resolver { NamingResolver(NamingClient client, {Duration resolveTimeout = 5 s}); }   // naming_resolver.dart
 
 class Switchboard {
   Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions,
@@ -430,8 +435,8 @@ class Switchboard {
   // compression offered), both with maxFrameSize = muxOptions.maxFrameSize (0: the 1 MiB transport default).
   // policy: null allows everything (internal listeners only); internet-facing listeners MUST set one
   // that refuses reserved types. Connections this node initiates (connect) have no policy.
-  Future<Uri> listenWebSocket(dynamic address, int port, {String path = '/', ChannelPolicy? policy});   // returns the bound ws:// uri (port resolved)
-  Future<Uri> listenTcp(dynamic address, int port, {ChannelPolicy? policy});                              // returns tcp:// uri
+  Future<Uri> listenWebSocket(Object address, int port, {String path = '/', ChannelPolicy? policy});   // returns the bound ws:// uri (port resolved)
+  Future<Uri> listenTcp(Object address, int port, {ChannelPolicy? policy});                              // returns tcp:// uri
   List<Uri> get listeningEndpoints;
   bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses
 

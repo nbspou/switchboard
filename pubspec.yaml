@@ -2,6 +2,12 @@ name: switchboard
 description: Microservice mesh protocol. Multiplexed channels, message chains, service addressing and a naming service over WebSocket or TCP.
 version: 3.0.0-dev.1
 repository: https://github.com/kaetemi/switchboard
+topics:
+  - networking
+  - rpc
+  - websocket
+  - microservices
+  - protocol
 
 environment:
   sdk: ^3.13.0
