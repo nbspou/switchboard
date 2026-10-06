@@ -1,7 +1,9 @@
-// Test vectors from the wiki page "Switchboard Test Vectors", sections
-// "Transport, stream binding" and "Mux frames", plus the stream binding
-// rules stated on the "Switchboard Transport" page.
+// Test vectors from the wiki page "Switchboard Test Vectors", section
+// "Mux frames", plus the decoding rules of the "Switchboard Mux" page.
+// Platform independent: runs on the VM and, compiled to JavaScript, with
+// `dart test -p node test/vectors/`, which checks the 48-bit channel ids.
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -10,116 +12,9 @@ import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
 import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/transport/memory_transport.dart';
-import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
 
-/// Decodes [bytes] (preamble included) and returns the frames.
-List<Uint8List> decodeStream(Uint8List bytes, {int? maxFrameSize}) {
-  final decoder = StreamFrameDecoder(
-    maxFrameSize: maxFrameSize ?? StreamTransport.defaultMaxFrameSize,
-  );
-  final frames = <Uint8List>[];
-  decoder.add(bytes, frames.add);
-  return frames;
-}
-
-Matcher throwsStatus(StatusCode code) =>
-    throwsA(isA<SwitchboardException>().having((e) => e.code, 'code', code));
-
 void main() {
-  const preamble = '53 57 42 44 01 00 00 00';
-
-  group('transport, stream binding', () {
-    test('preamble, version 1', () {
-      expect(hexString(StreamTransport.encodePreamble()), preamble);
-      final decoder = StreamFrameDecoder();
-      decoder.add(hexBytes(preamble), (_) => fail('no frame expected'));
-      expect(decoder.preambleReceived, isTrue);
-      expect(decoder.bufferedBytes, 0);
-    });
-
-    test('frame carrying body 02 02 00 AA', () {
-      expect(
-        hexString(StreamTransport.encodeFrame(hexBytes('02 02 00 AA'))),
-        '04 00 00 00 02 02 00 AA',
-      );
-      final frames = decodeStream(
-        hexBytes('$preamble 04 00 00 00 02 02 00 AA'),
-      );
-      expect(frames.map(hexString), ['02 02 00 AA']);
-    });
-
-    test('embedded profile round trip framing', () {
-      // From the embedded profile page: transport length 12, mux OPEN ch 2.
-      final open = hexBytes('12 02 00 01 64 65 76 00 00 00 00 00');
-      expect(
-        hexString(StreamTransport.encodeFrame(open)),
-        '0C 00 00 00 12 02 00 01 64 65 76 00 00 00 00 00',
-      );
-      expect(MuxFrame.decode(open).command, MuxCommand.open);
-    });
-
-    test('preamble flags are ignored', () {
-      final frames = decodeStream(
-        hexBytes('53 57 42 44 01 00 FF FF 01 00 00 00 02'),
-      );
-      expect(frames.map(hexString), ['02']);
-    });
-
-    test('wrong magic is a protocol error', () {
-      expect(
-        () => decodeStream(hexBytes('53 57 42 45 01 00 00 00')),
-        throwsA(isA<ProtocolException>()),
-      );
-    });
-
-    test('unsupported version is a protocol error', () {
-      expect(
-        () => decodeStream(hexBytes('53 57 42 44 02 00 00 00')),
-        throwsA(isA<ProtocolException>()),
-      );
-    });
-
-    test('length 0 is a protocol error', () {
-      expect(
-        () => decodeStream(hexBytes('$preamble 00 00 00 00')),
-        throwsA(isA<ProtocolException>()),
-      );
-      expect(
-        () => StreamTransport.encodeFrame(Uint8List(0)),
-        throwsArgumentError,
-      );
-    });
-
-    test('length over the limit is FRAME_TOO_LARGE without the body', () {
-      // Only the length is present; the body is never needed.
-      expect(
-        () => decodeStream(hexBytes('$preamble 05 00 00 00'), maxFrameSize: 4),
-        throwsStatus(StatusCode.frameTooLarge),
-      );
-      expect(
-        decodeStream(
-          hexBytes('$preamble 04 00 00 00 02 02 00 AA'),
-          maxFrameSize: 4,
-        ),
-        hasLength(1),
-      );
-    });
-
-    test('frames before an error are delivered first', () {
-      final decoder = StreamFrameDecoder();
-      final frames = <Uint8List>[];
-      expect(
-        () => decoder.add(
-          hexBytes('$preamble 01 00 00 00 02 00 00 00 00'),
-          frames.add,
-        ),
-        throwsA(isA<ProtocolException>()),
-      );
-      expect(frames.map(hexString), ['02']);
-    });
-  });
-
   group('mux frames', () {
     void vector(String name, MuxFrame frame, String hex) {
       test(name, () {
@@ -264,6 +159,27 @@ void main() {
       expect(MuxFrame.decode(hexBytes('02 02 00 AA')).longForm, isFalse);
     });
 
+    test('ids above 32 bits do not alias short ids', () {
+      // Bitwise operations are 32-bit when compiled to JavaScript; these
+      // ids must survive the round trip there too.
+      for (final (id, hex) in [
+        (0x100000002, '00 02 00 00 00 01 00'),
+        (0x1234567890AB, '00 AB 90 78 56 34 12'),
+        (0xFFFF00000002, '00 02 00 00 00 FF FF'),
+        (0xFFFFFFFFFFFE, '00 FE FF FF FF FF FF'),
+        (0x80000000, '00 00 00 00 80 00 00'),
+      ]) {
+        expect(hexString(MuxFrame.data(id, Uint8List(0)).encode()), hex);
+        final decoded = MuxFrame.decode(hexBytes(hex));
+        expect(decoded.channelId, id, reason: hex);
+        expect(decoded.longForm, isTrue);
+      }
+      expect(
+        MuxFrame.decode(hexBytes('00 02 00 00 00 01 00')).channelId,
+        isNot(2),
+      );
+    });
+
     test('compatible reserved bits are ignored', () {
       final frame = MuxFrame.decode(hexBytes('42 02 00 01'));
       expect(frame.command, MuxCommand.data);
@@ -293,6 +209,10 @@ void main() {
     ('DATA on reserved id 0xFFFF', '02 FF FF'),
     ('DATA on reserved id 0xFFFF00000000', '00 00 00 00 00 FF FF'),
     ('DATA on reserved id 0xFFFFFFFFFFFF', '00 FF FF FF FF FF FF'),
+    (
+      'DATA with payload on reserved 0xFFFF00000000',
+      '00 00 00 00 00 FF FF 01 DE AD',
+    ),
     ('Empty frame', ''),
   ];
 
@@ -357,6 +277,38 @@ void main() {
         expect(mux.isOpen, isFalse);
       });
     }
+
+    test('a long id above 32 bits addresses its own channel', () async {
+      final (local, remote) = MemoryTransport.pair();
+      final mux = MuxConnection(
+        local,
+        isInitiator: true,
+        options: const MuxOptions(
+          keepAliveInterval: null,
+          announceLimits: false,
+        ),
+      );
+      final queue = StreamQueue(remote.stream);
+      // OPEN 0x100000003 and OPEN 3, then DATA on each.
+      remote.sink
+        ..add(hexBytes('10 03 00 00 00 01 00'))
+        ..add(hexBytes('12 03 00'))
+        ..add(hexBytes('00 03 00 00 00 01 00 AA'))
+        ..add(hexBytes('02 03 00 BB'));
+      final channels = StreamQueue(mux.incoming);
+      final long = await channels.next;
+      final short = await channels.next;
+      expect(long.id, 0x100000003);
+      expect(short.id, 3);
+      expect(hexString(await long.stream.first), 'AA');
+      expect(hexString(await short.stream.first), 'BB');
+      // Our CLOSE uses the long form for the long id.
+      unawaited(long.close());
+      expect(hexString(await queue.next), '20 03 00 00 00 01 00');
+      await mux.close();
+      await queue.cancel();
+      await channels.cancel();
+    });
 
     test('compatible reserved bits are ignored by a connection', () async {
       final (local, remote) = MemoryTransport.pair();

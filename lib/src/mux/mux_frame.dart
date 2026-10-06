@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:meta/meta.dart';
@@ -140,13 +141,20 @@ class MuxFrame {
     final headerSize = short ? shortHeaderSize : longHeaderSize;
     final out = Uint8List(headerSize + payload.length);
     out[0] = (command.code << commandShift) | (short ? flagShort : 0);
-    out[1] = channelId & 0xFF;
-    out[2] = (channelId >> 8) & 0xFF;
-    if (!short) {
-      out[3] = (channelId >> 16) & 0xFF;
-      out[4] = (channelId >> 24) & 0xFF;
-      out[5] = (channelId >> 32) & 0xFF;
-      out[6] = (channelId >> 40) & 0xFF;
+    if (short) {
+      out[1] = channelId & 0xFF;
+      out[2] = (channelId >> 8) & 0xFF;
+    } else {
+      // Split as ByteWriter.u48 does: shifts past 32 bits are wrong when
+      // compiled to JavaScript.
+      final hi = channelId ~/ 0x100000000;
+      final lo = channelId - hi * 0x100000000;
+      out[1] = lo & 0xFF;
+      out[2] = (lo >> 8) & 0xFF;
+      out[3] = (lo >> 16) & 0xFF;
+      out[4] = (lo >> 24) & 0xFF;
+      out[5] = hi & 0xFF;
+      out[6] = (hi >> 8) & 0xFF;
     }
     out.setRange(headerSize, out.length, payload);
     return out;
@@ -250,8 +258,14 @@ class MuxControlMessage {
     : this(MuxControlType.pong.code, payload);
 
   /// GOAWAY carrying [status].
+  ///
+  /// The reason is shortened, on a UTF-8 character boundary, so that the
+  /// payload stays within [maxControlPayload] bytes.
   MuxControlMessage.goAway(Status status)
-    : this(MuxControlType.goAway.code, status.encode());
+    : this(
+        MuxControlType.goAway.code,
+        truncateStatus(status, maxControlPayload).encode(),
+      );
 
   /// LIMITS carrying [limits].
   MuxControlMessage.limits(MuxLimits limits)
@@ -322,6 +336,60 @@ void checkMuxStatus(Status status) {
     );
   }
 }
+
+/// [status] with its reason shortened so that its encoded payload (the
+/// `u16` code and the UTF-8 reason) is at most [maxPayload] bytes.
+///
+/// Cuts on a UTF-8 character boundary. Returns [status] itself when it
+/// fits; drops the reason entirely when [maxPayload] leaves no room for
+/// it.
+@internal
+Status truncateStatus(Status status, int maxPayload) {
+  if (status.reason.isEmpty) {
+    return status;
+  }
+  final room = maxPayload - 2;
+  if (room <= 0) {
+    return Status(status.code);
+  }
+  // A UTF-8 encoding is at most 3 bytes per UTF-16 code unit.
+  if (status.reason.length * 3 <= room) {
+    return status;
+  }
+  final reason = utf8.encode(status.reason);
+  if (reason.length <= room) {
+    return status;
+  }
+  var cut = room;
+  // Back off continuation bytes (10xxxxxx) so the cut lands on the first
+  // byte of a character.
+  while (cut > 0 && reason[cut] & 0xC0 == 0x80) {
+    cut--;
+  }
+  return Status(status.code, utf8.decode(reason.sublist(0, cut)));
+}
+
+/// [status] shortened (see [truncateStatus]) so that a frame carrying it
+/// after [overhead] bytes of headers fits both the 1024 byte bound this
+/// implementation keeps every CLOSE and GOAWAY status payload within and
+/// the peer's announced frame limit [peerMaxFrameSize] (0 when unknown).
+@internal
+Status fitStatus(Status status, int overhead, int peerMaxFrameSize) {
+  var max = MuxControlMessage.maxControlPayload;
+  if (peerMaxFrameSize > 0 && peerMaxFrameSize - overhead < max) {
+    max = peerMaxFrameSize - overhead;
+  }
+  return truncateStatus(status, max);
+}
+
+/// Maps a status received in CLOSE or GOAWAY for local use: application
+/// codes (256 and above), which the peer must not send there, become
+/// [StatusCode.unknown] with the original code kept in the reason, so the
+/// status can be relayed in a CLOSE of our own.
+@internal
+Status statusFromWire(Status status) => status.isApplicationCode
+    ? Status.of(StatusCode.unknown, status.toString())
+    : status;
 
 /// Decodes a status payload carried by CLOSE or GOAWAY, mapping malformed
 /// payloads to [ProtocolException]. [what] names the carrier for the error.

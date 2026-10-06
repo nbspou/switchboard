@@ -6,8 +6,9 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 /// Platform independent core of Switchboard: status codes, names, byte
-/// helpers, the in-memory and WebSocket transports, the mux and talk layers,
-/// addressing, the naming service and client, and resolvers.
+/// helpers, the in-memory and WebSocket transports, the stream binding's
+/// wire format, the mux and talk layers, addressing, the naming service and
+/// client, and resolvers.
 ///
 /// Nothing in this library imports `dart:io`. Use
 /// `package:switchboard/switchboard.dart` for the full library including the
@@ -33,4 +34,6 @@ export 'src/talk/talk_frame.dart';
 export 'src/talk/talk_message.dart';
 export 'src/talk/talk_stream.dart';
 export 'src/transport/memory_transport.dart';
+export 'src/transport/stream_framing.dart';
+export 'src/transport/transport_capabilities.dart';
 export 'src/transport/web_socket_transport.dart';

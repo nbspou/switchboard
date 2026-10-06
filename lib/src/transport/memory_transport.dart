@@ -12,6 +12,7 @@ import 'package:logging/logging.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../status.dart';
+import 'transport_capabilities.dart';
 
 final Logger _log = Logger('Switchboard.Transport');
 
@@ -24,8 +25,12 @@ abstract final class MemoryTransport {
   /// buffer. With [delay], every frame (and the close) is delivered that
   /// much later, in order. With [maxFrameSize], a frame longer than that
   /// fails the receiving side's stream with a [SwitchboardException]
-  /// carrying [StatusCode.frameTooLarge] and closes the pair, mimicking
-  /// what the stream binding does.
+  /// carrying [StatusCode.frameTooLarge] and ends it, mimicking what the
+  /// stream binding does: the receiving side's sink stays writable until
+  /// it is closed, or until its listener has seen the error and the end
+  /// of the stream, so a mux layer can still send GOAWAY to the sender.
+  /// Frames sent to the failed side are dropped. Both transports then
+  /// implement [FrameLimited].
   ///
   /// Closing one side's sink ends both streams. Errors added to a sink
   /// close the pair and complete that sink's `done` with the error.
@@ -88,7 +93,9 @@ class _MemoryLink {
   }
 }
 
-class _MemoryEndpoint with StreamChannelMixin<Uint8List> {
+class _MemoryEndpoint
+    with StreamChannelMixin<Uint8List>
+    implements FrameLimited {
   _MemoryEndpoint(this.link, this.label) {
     _sink = _MemorySink(this);
   }
@@ -104,6 +111,9 @@ class _MemoryEndpoint with StreamChannelMixin<Uint8List> {
 
   @override
   Stream<Uint8List> get stream => _incoming.stream;
+
+  @override
+  int get maxFrameSize => link.maxFrameSize ?? 0;
 
   @override
   StreamSink<Uint8List> get sink => _sink;
@@ -123,17 +133,35 @@ class _MemoryEndpoint with StreamChannelMixin<Uint8List> {
           'memory transport $label: frame of ${copy.length} bytes exceeds '
           '$max',
         );
-        peer._incoming.addError(
+        peer.failIncoming(
           SwitchboardException.of(
             StatusCode.frameTooLarge,
             'frame of ${copy.length} bytes exceeds $max',
           ),
         );
-        link.close(peer, immediate: true);
         return;
       }
       peer._incoming.add(copy);
     });
+  }
+
+  /// Ends this side's stream with [error]. The pair stays open so that
+  /// this side can still answer; it closes on this side's behalf once the
+  /// listener has seen the error and the end.
+  void failIncoming(Object error) {
+    if (_incoming.isClosed) {
+      return;
+    }
+    final listened = _incoming.hasListener;
+    _incoming.addError(error);
+    final closed = _incoming.close();
+    if (listened) {
+      closed.then((_) => link.close(this), onError: (_) {});
+    } else {
+      // Nobody to react: close at once, as the stream binding does.
+      closed.ignore();
+      link.close(this);
+    }
   }
 
   void finish() {

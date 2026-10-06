@@ -6,6 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -13,6 +14,7 @@ import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../status.dart';
+import '../transport/transport_capabilities.dart';
 import 'mux_channel.dart';
 import 'mux_frame.dart';
 
@@ -29,6 +31,10 @@ class MuxOptions {
     this.keepAliveTimeout = const Duration(seconds: 10),
     this.goAwayGrace = const Duration(seconds: 10),
     this.announceLimits = true,
+    this.maxPendingRejections = defaultMaxPendingRejections,
+    this.maxChannelBufferBytes = defaultMaxChannelBufferBytes,
+    this.receiveHighWaterMarkBytes = defaultReceiveHighWaterMarkBytes,
+    this.closeConfirmTimeout = const Duration(seconds: 30),
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -37,10 +43,24 @@ class MuxOptions {
   /// Default [maxChannels].
   static const int defaultMaxChannels = 65536;
 
+  /// Default [maxPendingRejections].
+  static const int defaultMaxPendingRejections = 1024;
+
+  /// Default [maxChannelBufferBytes]: 4 MiB.
+  static const int defaultMaxChannelBufferBytes = 4 * 1024 * 1024;
+
+  /// Default [receiveHighWaterMarkBytes]: 16 MiB.
+  static const int defaultReceiveHighWaterMarkBytes = 16 * 1024 * 1024;
+
   /// Largest incoming mux frame, header included, that we accept; a larger
   /// one ends the connection with GOAWAY `FRAME_TOO_LARGE`. Announced with
   /// LIMITS. 0 means no limit at the mux layer (the transport may still
   /// enforce one).
+  ///
+  /// Should agree with the transport's own limit (for example
+  /// `StreamTransport.wrap`'s `maxFrameSize`). If the transport implements
+  /// [FrameLimited] with a smaller limit, the connection logs a warning and
+  /// announces the transport's limit instead.
   final int maxFrameSize;
 
   /// Largest number of simultaneously open channels (in both directions)
@@ -57,7 +77,12 @@ class MuxOptions {
 
   /// How long to wait for any frame after a keep-alive PING before the
   /// connection is closed with `CONNECTION_LOST`. Also bounds how long
-  /// [MuxConnection.close] waits for the transport to close.
+  /// [MuxConnection.close] waits for the transport to close; after that
+  /// the transport is aborted if it implements [AbortableTransport].
+  ///
+  /// While a transport implementing [OutputBufferedTransport] has stopped
+  /// reading because of our unsent output, the peer reading that output
+  /// counts as hearing from it.
   final Duration keepAliveTimeout;
 
   /// How long [MuxConnection.goAway] waits for open channels to finish.
@@ -65,6 +90,42 @@ class MuxOptions {
 
   /// Whether LIMITS is sent when the connection starts.
   final bool announceLimits;
+
+  /// Largest number of channel ids for which we sent CLOSE without keeping
+  /// a channel and still wait for the peer's CLOSE: peer OPENs we rejected
+  /// (beyond [maxChannels], after GOAWAY, or with nobody listening to
+  /// [MuxConnection.incoming]) and channels whose close confirmation timed
+  /// out ([closeConfirmTimeout]). Each costs only its id; beyond the cap
+  /// the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. 0 means
+  /// unlimited.
+  final int maxPendingRejections;
+
+  /// Largest number of bytes buffered for one channel while nobody listens
+  /// to its stream or the subscription is paused. Each subframe counts as
+  /// its length plus 32 bytes. Beyond it the channel is closed with CLOSE
+  /// `RESOURCE_EXHAUSTED` and its buffer dropped; the connection is not
+  /// affected. 0 means unlimited.
+  final int maxChannelBufferBytes;
+
+  /// Bytes buffered over all channels (counted as for
+  /// [maxChannelBufferBytes]) above which the connection stops reading the
+  /// transport, which pushes back on the peer through the transport's own
+  /// flow control. Reading resumes once the buffers drain to half of it.
+  /// Keep-alive does not probe while reading is paused. 0 means never
+  /// pause.
+  final int receiveHighWaterMarkBytes;
+
+  /// How long [MuxChannel.close] waits for the peer's confirming CLOSE.
+  ///
+  /// On expiry the channel is considered closed locally: [MuxChannel.done]
+  /// completes with the first status sent or received and the channel no
+  /// longer counts as open. Nothing is sent. The id stays reserved until
+  /// the peer's CLOSE arrives after all, or until the connection ends,
+  /// because reusing it while the peer may still consider the channel open
+  /// would let the peer's late frames for the old channel land on a new
+  /// one. Such ids count toward [maxPendingRejections].
+  /// [Duration.zero] waits forever.
+  final Duration closeConfirmTimeout;
 
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
@@ -77,6 +138,10 @@ class MuxOptions {
     Duration? keepAliveTimeout,
     Duration? goAwayGrace,
     bool? announceLimits,
+    int? maxPendingRejections,
+    int? maxChannelBufferBytes,
+    int? receiveHighWaterMarkBytes,
+    Duration? closeConfirmTimeout,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -87,6 +152,11 @@ class MuxOptions {
     keepAliveTimeout: keepAliveTimeout ?? this.keepAliveTimeout,
     goAwayGrace: goAwayGrace ?? this.goAwayGrace,
     announceLimits: announceLimits ?? this.announceLimits,
+    maxPendingRejections: maxPendingRejections ?? this.maxPendingRejections,
+    maxChannelBufferBytes: maxChannelBufferBytes ?? this.maxChannelBufferBytes,
+    receiveHighWaterMarkBytes:
+        receiveHighWaterMarkBytes ?? this.receiveHighWaterMarkBytes,
+    closeConfirmTimeout: closeConfirmTimeout ?? this.closeConfirmTimeout,
   );
 }
 
@@ -99,7 +169,10 @@ class MuxConnection {
   /// frame per event. [isInitiator] is true on the side that established
   /// the connection; it allocates even channel ids, the acceptor odd ones.
   ///
-  /// Sends LIMITS at once if [MuxOptions.announceLimits] is set.
+  /// Sends LIMITS at once if [MuxOptions.announceLimits] is set. If the
+  /// transport implements [FrameLimited] with a limit below
+  /// [MuxOptions.maxFrameSize], logs a warning and announces the
+  /// transport's limit.
   MuxConnection(
     StreamChannel<Uint8List> transport, {
     required this.isInitiator,
@@ -109,9 +182,27 @@ class MuxConnection {
        _maxId = options.shortIdsOnly ? MuxFrame.maxShortId : MuxFrame.maxId {
     _nextId = _firstId;
     _host = _Host(this);
+    // Synchronous, fed from [_undelivered] only while the listener is
+    // active, so the connection knows which channels the application has.
     _incoming = StreamController<MuxChannel>(
-      onCancel: () => _incomingCancelled = true,
+      sync: true,
+      onListen: _scheduleIncomingDrain,
+      onResume: _scheduleIncomingDrain,
+      onCancel: _onIncomingCancel,
     );
+    var receiveLimit = options.maxFrameSize;
+    if (transport is FrameLimited) {
+      final transportLimit = (transport as FrameLimited).maxFrameSize;
+      if (transportLimit > 0 &&
+          (receiveLimit <= 0 || transportLimit < receiveLimit)) {
+        _log.warning(
+          '$this: the transport accepts frames of at most $transportLimit '
+          'bytes, less than MuxOptions.maxFrameSize $receiveLimit; '
+          'announcing $transportLimit',
+        );
+        receiveLimit = transportLimit;
+      }
+    }
     _subscription = transport.stream.listen(
       _onFrame,
       onError: _onTransportError,
@@ -121,7 +212,7 @@ class MuxConnection {
       _sendFrame(
         MuxControlMessage.limits(
           MuxLimits(
-            maxFrameSize: _clampU32(options.maxFrameSize),
+            maxFrameSize: _clampU32(receiveLimit),
             maxChannels: _clampU32(options.maxChannels),
           ),
         ).toFrame(),
@@ -140,7 +231,10 @@ class MuxConnection {
   late final StreamSubscription<Uint8List> _subscription;
   late final _Host _host;
   late final StreamController<MuxChannel> _incoming;
+  final Queue<MuxChannelLink> _undelivered = Queue<MuxChannelLink>();
   final Map<int, MuxChannelLink> _links = {};
+  // Ids we sent CLOSE for, without a channel, awaiting the peer's CLOSE.
+  final Set<int> _awaitingClose = {};
   final Completer<Status> _done = Completer<Status>();
   final List<_PendingPing> _pings = [];
   final int _firstId;
@@ -148,7 +242,11 @@ class MuxConnection {
   late int _nextId;
   int _openCount = 0;
   int _pingCounter = 0;
+  int _bufferedBytes = 0;
   bool _incomingCancelled = false;
+  bool _incomingEndRequested = false;
+  bool _incomingDrainScheduled = false;
+  bool _receivePaused = false;
   bool _closing = false;
   bool _writable = true;
   bool _goAwaySent = false;
@@ -160,11 +258,14 @@ class MuxConnection {
   Timer? _keepAliveTimer;
   final Stopwatch _sinceReceive = Stopwatch()..start();
   bool _keepAliveProbing = false;
+  int _lastAcceptedOutput = -1;
 
   /// Channels opened by the peer, single subscription. Buffered until
-  /// listened to; ends when the connection ends. Cancelling the
-  /// subscription makes the connection reject further peer OPENs with
-  /// CLOSE `UNAVAILABLE`.
+  /// listened to; ends when the connection ends.
+  ///
+  /// Cancelling the subscription makes the connection reject further peer
+  /// OPENs with CLOSE `UNAVAILABLE`, and closes the channels it had
+  /// buffered but not delivered yet the same way.
   Stream<MuxChannel> get incoming => _incoming.stream;
 
   /// Completes when the connection has ended, never with an error.
@@ -172,8 +273,9 @@ class MuxConnection {
   /// The status is `GOING_AWAY` if the peer sent GOAWAY (the peer's status
   /// is in the reason if it was not `GOING_AWAY`); the status sent with our
   /// GOAWAY if we ended the connection because the peer broke the protocol
-  /// (`PROTOCOL_ERROR`, `FRAME_TOO_LARGE` or `UNSUPPORTED`); otherwise
-  /// `CONNECTION_LOST`.
+  /// (`PROTOCOL_ERROR`, `FRAME_TOO_LARGE` or `UNSUPPORTED`) or left too
+  /// many CLOSEs unconfirmed (`RESOURCE_EXHAUSTED`, see
+  /// [MuxOptions.maxPendingRejections]); otherwise `CONNECTION_LOST`.
   Future<Status> get done => _done.future;
 
   /// Whether the transport is open and no local close (including
@@ -187,14 +289,27 @@ class MuxConnection {
   MuxLimits? get peerLimits => _peerLimits;
 
   /// Number of channels not yet mutually closed, in both directions.
-  /// Incoming channels rejected by the connection itself are not counted.
+  /// Incoming channels rejected by the connection itself, and channels
+  /// whose close confirmation timed out, are not counted.
   int get openChannelCount => _openCount;
 
   /// The channels counted by [openChannelCount], as a snapshot.
   Iterable<MuxChannel> get channels => [
-    for (final link in _links.values)
-      if (link.surfaced) link.channel,
+    for (final link in _links.values) link.channel,
   ];
+
+  /// Bytes buffered in the receive queues of all channels, counted as for
+  /// [MuxOptions.maxChannelBufferBytes].
+  int get bufferedBytes => _bufferedBytes;
+
+  /// Whether reading the transport is paused because more than
+  /// [MuxOptions.receiveHighWaterMarkBytes] are buffered.
+  bool get isReceivePaused => _receivePaused && !_closing;
+
+  /// Number of channel ids we sent CLOSE for without keeping a channel and
+  /// for which the peer's CLOSE has not arrived yet; bounded by
+  /// [MuxOptions.maxPendingRejections].
+  int get unconfirmedCloseCount => _awaitingClose.length;
 
   /// Opens a channel carrying [openPayload] in its OPEN frame.
   ///
@@ -240,7 +355,6 @@ class MuxConnection {
       id,
       isLocallyOpened: true,
       openPayload: payload,
-      surfaced: true,
     );
     _links[id] = link;
     _openCount++;
@@ -276,6 +390,10 @@ class MuxConnection {
   /// `GOING_AWAY`), waits up to [MuxOptions.goAwayGrace] for the open
   /// channels to finish, then [close]s.
   ///
+  /// The reason is shortened on the wire if needed, on a UTF-8 character
+  /// boundary, so that the GOAWAY payload stays within 1024 bytes and the
+  /// frame fits the peer's announced frame limit.
+  ///
   /// Throws [ArgumentError] synchronously for application status codes.
   Future<void> goAway([Status status = const Status(33)]) {
     checkMuxStatus(status);
@@ -285,7 +403,7 @@ class MuxConnection {
     if (!_goAwaySent) {
       _goAwaySent = true;
       _log.fine('$this: sending GOAWAY $status');
-      _sendFrame(MuxControlMessage.goAway(status).toFrame());
+      _sendGoAway(status);
     }
     return _goAwayWait();
   }
@@ -309,7 +427,8 @@ class MuxConnection {
   /// (or `GOING_AWAY` if the peer sent GOAWAY) and [done] completes.
   ///
   /// Completes once the transport has closed, waiting at most
-  /// [MuxOptions.keepAliveTimeout] for it. Never throws.
+  /// [MuxOptions.keepAliveTimeout] for it; a transport still open then is
+  /// aborted if it implements [AbortableTransport]. Never throws.
   Future<void> close() => _shutdown(_lostStatus(), null);
 
   @override
@@ -333,7 +452,9 @@ class MuxConnection {
       }
       final candidate = id;
       id += 2;
-      if (MuxFrame.isReservedId(candidate) || _links.containsKey(candidate)) {
+      if (MuxFrame.isReservedId(candidate) ||
+          _links.containsKey(candidate) ||
+          _awaitingClose.contains(candidate)) {
         continue;
       }
       _nextId = id;
@@ -359,8 +480,19 @@ class MuxConnection {
     }
   }
 
+  /// Sends GOAWAY with [status] shortened to fit the peer's frame limit.
+  void _sendGoAway(Status status) {
+    // Header and control type byte.
+    const overhead = MuxFrame.shortHeaderSize + 1;
+    final fitted = fitStatus(status, overhead, _peerMaxFrameSize);
+    _sendFrame(MuxControlMessage.goAway(fitted).toFrame());
+  }
+
+  int get _peerMaxFrameSize => _peerLimits?.maxFrameSize ?? 0;
+
   Uint8List _nextPingPayload() {
-    final n = _pingCounter++;
+    final n = _pingCounter;
+    _pingCounter = (n + 1) & 0x7FFFFFFF;
     return Uint8List.fromList([
       n & 0xFF,
       (n >> 8) & 0xFF,
@@ -411,16 +543,26 @@ class MuxConnection {
         _handleOpen(id, frame.payload);
       case MuxCommand.data:
         final link = _links[id];
-        if (link == null || link.closeReceived) {
+        if (link != null && !link.closeReceived) {
+          link.receiveData(frame.payload);
+        } else if (link == null && _awaitingClose.contains(id)) {
+          // In flight before the peer saw our CLOSE: dropped.
+        } else {
           throw ProtocolException('DATA on channel $id which is not open');
         }
-        link.receiveData(frame.payload);
       case MuxCommand.close:
+        final status = statusFromWire(
+          decodeStatusPayload(frame.payload, 'CLOSE'),
+        );
         final link = _links[id];
-        if (link == null || link.closeReceived) {
+        if (link != null && !link.closeReceived) {
+          link.receiveClose(status);
+        } else if (link == null && _awaitingClose.remove(id)) {
+          // The confirmation of a CLOSE we sent without a channel: the id
+          // is mutually closed and free again.
+        } else {
           throw ProtocolException('CLOSE on channel $id which is not open');
         }
-        link.receiveClose(decodeStatusPayload(frame.payload, 'CLOSE'));
     }
   }
 
@@ -429,7 +571,7 @@ class MuxConnection {
     if (id.isOdd != isInitiator) {
       throw ProtocolException('OPEN on channel $id with the wrong parity');
     }
-    if (_links.containsKey(id)) {
+    if (_links.containsKey(id) || _awaitingClose.contains(id)) {
       throw ProtocolException('OPEN on channel $id which is in use');
     }
     Status? rejection;
@@ -443,22 +585,41 @@ class MuxConnection {
         'at most ${options.maxChannels} channels',
       );
     }
+    if (rejection != null) {
+      _reject(id, rejection);
+      return;
+    }
     final link = MuxChannelLink(
       _host,
       this,
       id,
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
-      surfaced: rejection == null,
     );
     _links[id] = link;
-    if (rejection != null) {
-      _log.fine('$this: rejecting channel $id: $rejection');
-      link.reject(rejection);
-      return;
-    }
     _openCount++;
-    _incoming.add(link.channel);
+    _undelivered.add(link);
+    _scheduleIncomingDrain();
+  }
+
+  /// Rejects a peer OPEN with CLOSE carrying [status], remembering only
+  /// the id until the peer confirms.
+  void _reject(int id, Status status) {
+    final cap = options.maxPendingRejections;
+    if (cap > 0 && _awaitingClose.length >= cap) {
+      throw SwitchboardException.of(
+        StatusCode.resourceExhausted,
+        'peer left $cap rejected channels unconfirmed',
+      );
+    }
+    _log.fine('$this: rejecting channel $id: $status');
+    _awaitingClose.add(id);
+    _sendFrame(
+      MuxFrame.close(
+        id,
+        fitStatus(status, MuxFrame.headerSizeFor(id), _peerMaxFrameSize),
+      ),
+    );
   }
 
   void _handleControl(Uint8List payload) {
@@ -469,7 +630,7 @@ class MuxConnection {
       case MuxControlType.pong:
         _completePing(message.payload);
       case MuxControlType.goAway:
-        final status = message.goAwayStatus;
+        final status = statusFromWire(message.goAwayStatus);
         if (_peerGoAway != null) {
           return;
         }
@@ -527,6 +688,45 @@ class MuxConnection {
     unawaited(_shutdown(_lostStatus(), null));
   }
 
+  // Incoming channel delivery --------------------------------------------
+
+  void _scheduleIncomingDrain() {
+    if (_incomingDrainScheduled) {
+      return;
+    }
+    _incomingDrainScheduled = true;
+    scheduleMicrotask(_drainIncoming);
+  }
+
+  void _drainIncoming() {
+    _incomingDrainScheduled = false;
+    while (_undelivered.isNotEmpty &&
+        _incoming.hasListener &&
+        !_incoming.isPaused) {
+      _incoming.add(_undelivered.removeFirst().channel);
+    }
+    if (_incomingEndRequested && _undelivered.isEmpty && !_incoming.isClosed) {
+      unawaited(_incoming.close());
+    }
+  }
+
+  void _onIncomingCancel() {
+    _incomingCancelled = true;
+    if (_undelivered.isEmpty) {
+      return;
+    }
+    final links = List.of(_undelivered);
+    _undelivered.clear();
+    _log.fine(
+      '$this: incoming cancelled, closing ${links.length} undelivered '
+      'channels',
+    );
+    final status = Status.of(StatusCode.unavailable, 'not accepting channels');
+    for (final link in links) {
+      link.closeUndelivered(status);
+    }
+  }
+
   // Channel bookkeeping --------------------------------------------------
 
   void _release(MuxChannelLink link) {
@@ -534,12 +734,34 @@ class MuxConnection {
       return;
     }
     _links.remove(link.id);
-    if (link.surfaced) {
-      _openCount--;
-    }
+    _openCount--;
     // Deferred so that the channel finishes sending its confirming CLOSE
     // before an idle connection is closed.
     scheduleMicrotask(_checkIdle);
+  }
+
+  void _abandon(MuxChannelLink link) {
+    if (_closing || !identical(_links[link.id], link)) {
+      return;
+    }
+    _log.fine(
+      '$this: channel ${link.id}: no CLOSE confirmation within '
+      '${options.closeConfirmTimeout}',
+    );
+    _links.remove(link.id);
+    _openCount--;
+    _awaitingClose.add(link.id);
+    link.abandoned();
+    scheduleMicrotask(_checkIdle);
+    final cap = options.maxPendingRejections;
+    if (cap > 0 && _awaitingClose.length > cap) {
+      _fail(
+        Status.of(
+          StatusCode.resourceExhausted,
+          'peer left more than $cap CLOSEs unconfirmed',
+        ),
+      );
+    }
   }
 
   void _checkIdle() {
@@ -554,6 +776,29 @@ class MuxConnection {
     if (_peerGoAway != null) {
       _log.fine('$this: idle after peer GOAWAY, closing');
       unawaited(close());
+    }
+  }
+
+  /// Tracks bytes buffered in channel queues; pauses reading the transport
+  /// above the high-water mark and resumes at half of it.
+  void _noteBuffered(int delta) {
+    _bufferedBytes += delta;
+    final mark = options.receiveHighWaterMarkBytes;
+    if (mark <= 0 || _closing) {
+      return;
+    }
+    if (!_receivePaused) {
+      if (_bufferedBytes > mark) {
+        _receivePaused = true;
+        _log.fine('$this: $_bufferedBytes bytes buffered, pausing input');
+        _subscription.pause();
+      }
+    } else if (_bufferedBytes <= mark ~/ 2) {
+      _receivePaused = false;
+      _log.fine('$this: buffers drained, resuming input');
+      // The silence while paused was our own doing.
+      _sinceReceive.reset();
+      _subscription.resume();
     }
   }
 
@@ -581,6 +826,15 @@ class MuxConnection {
     if (_closing || interval == null) {
       return;
     }
+    if (_receivePaused || _outputProgressed()) {
+      // We are not reading, so silence says nothing about the peer; or the
+      // transport stopped reading because of our output, which the peer
+      // is still consuming.
+      _sinceReceive.reset();
+      _keepAliveProbing = false;
+      _keepAliveTimer = Timer(interval, _onKeepAliveTimer);
+      return;
+    }
     if (_keepAliveProbing) {
       _log.info('$this: no answer to keep-alive PING, closing');
       unawaited(_shutdown(_lostStatus('keep-alive timeout'), null));
@@ -594,6 +848,21 @@ class MuxConnection {
     _keepAliveProbing = true;
     _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
     _keepAliveTimer = Timer(options.keepAliveTimeout, _onKeepAliveTimer);
+  }
+
+  /// Whether the transport is throttled by its output and the peer has
+  /// read some of it since the last check.
+  bool _outputProgressed() {
+    final transport = _transport;
+    if (transport is! OutputBufferedTransport) {
+      return false;
+    }
+    final output = transport as OutputBufferedTransport;
+    final accepted = output.acceptedOutputBytes;
+    final progressed =
+        output.isInputThrottled && accepted != _lastAcceptedOutput;
+    _lastAcceptedOutput = accepted;
+    return progressed;
   }
 
   // Shutdown ------------------------------------------------------------
@@ -610,7 +879,7 @@ class MuxConnection {
       return;
     }
     _log.warning('$this: closing with $status');
-    _sendFrame(MuxControlMessage.goAway(status).toFrame());
+    _sendGoAway(status);
     unawaited(_shutdown(status, _lostStatus()));
   }
 
@@ -629,6 +898,14 @@ class MuxConnection {
         _subscription.cancel(),
         _transport.sink.close().then<void>((_) {}),
       ]).timeout(options.keepAliveTimeout);
+    } on TimeoutException {
+      final transport = _transport;
+      if (transport is AbortableTransport) {
+        _log.fine('$this: transport not closed in time, aborting it');
+        (transport as AbortableTransport).abort();
+      } else {
+        _log.fine('$this: transport not closed in time');
+      }
     } on Object catch (e) {
       _log.fine('$this: transport close: $e');
     }
@@ -639,6 +916,7 @@ class MuxConnection {
     _keepAliveTimer = null;
     final links = _links.values.toList();
     _links.clear();
+    _awaitingClose.clear();
     _openCount = 0;
     for (final link in links) {
       try {
@@ -657,7 +935,8 @@ class MuxConnection {
     if (idle != null && !idle.isCompleted) {
       idle.complete();
     }
-    unawaited(_incoming.close());
+    _incomingEndRequested = true;
+    _scheduleIncomingDrain();
     if (!_done.isCompleted) {
       _done.complete(status);
     }
@@ -670,13 +949,22 @@ class _Host implements MuxChannelHost {
   final MuxConnection _connection;
 
   @override
+  MuxOptions get options => _connection.options;
+
+  @override
   void sendFrame(MuxFrame frame) => _connection._sendFrame(frame);
 
   @override
   void release(MuxChannelLink link) => _connection._release(link);
 
   @override
-  int get peerMaxFrameSize => _connection._peerLimits?.maxFrameSize ?? 0;
+  void abandon(MuxChannelLink link) => _connection._abandon(link);
+
+  @override
+  void noteBuffered(int delta) => _connection._noteBuffered(delta);
+
+  @override
+  int get peerMaxFrameSize => _connection._peerMaxFrameSize;
 }
 
 class _PendingPing {
