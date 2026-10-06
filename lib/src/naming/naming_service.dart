@@ -7,6 +7,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -18,7 +19,11 @@ import '../status.dart';
 import '../switchboard/incoming_channel.dart';
 import '../talk/talk_channel.dart';
 import '../talk/talk_message.dart';
+import '../talk/talk_request.dart';
 import 'naming_protocol.dart';
+import 'slot_table.dart';
+
+part 'naming_service_slots.dart';
 
 final Logger _log = Logger('Switchboard.Naming');
 
@@ -32,9 +37,25 @@ final Logger _log = Logger('Switchboard.Naming');
 /// published for each. This is the only liveness mechanism.
 ///
 /// Procedures: `REGISTER`, `UNREGSTR` (requests), `WATCH`, `LOOKUP` (stream
-/// requests). Requests for any other procedure are answered with
-/// `ABORT UNIMPLEMENTED`; plain messages are ignored. Malformed payloads are
-/// answered with `ABORT INVALID_ARGUMENT`.
+/// requests), and for sharding `SLOTS`, `HOLDING`, `CLAIM`, `RELEASE`,
+/// `LOCATE` (requests) and `MIGRATE` (stream request). Requests for any
+/// other procedure are answered with `ABORT UNIMPLEMENTED`; plain messages
+/// are ignored. Malformed payloads are answered with
+/// `ABORT INVALID_ARGUMENT`.
+///
+/// Sharding (wiki page "Switchboard Sharding"): the service keeps a slot
+/// table per sharded type ([slotTables]), publishes it to watchers as
+/// `SLOTSPC` and `SLOT` items, assigns the slots of managed spaces, and
+/// orchestrates hand-overs by sending `ASSIGN`, `DRAIN`, `FORWARD` and
+/// `RESUME` to instances over their registration channels. The instance
+/// serving the slots of a type on a channel is the channel's registration
+/// of that type; a channel registering several instances of a sharded type
+/// cannot use the slot procedures for it. During [assignmentHold] slot
+/// assignment waits too: `CLAIM`s are collected and resolved when the hold
+/// ends (higher claimed epoch first, then the earlier claim), `HOLDING`
+/// declarations are answered after them, and `LOCATE` of a free slot, the
+/// allocator and migrations wait. After a restart this lets the instances
+/// that were serving slots reclaim them before anything else is decided.
 ///
 /// The service registers nothing by itself. The wiki registers the naming
 /// service in its own table as `_ns/1`; the host does that with
@@ -74,21 +95,41 @@ class NamingService {
   /// and everything else are served at once. Held requests are kept alive
   /// with `EXTEND` every [heartbeat]. [Duration.zero] disables the hold.
   ///
-  /// Throws [ArgumentError] if [heartbeat] is not positive or
-  /// [assignmentHold] is negative.
+  /// [holderGrace] is how long a free slot of a holder-only managed space
+  /// waits for its holder to come back after the holder went down; then the
+  /// slot is reassigned with its holder cleared (it starts fresh).
+  ///
+  /// [handoverTimeout] is the requester timeout of the requests the service
+  /// sends to instances (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`); every
+  /// `EXTEND` from the instance restarts it. [Duration.zero] disables it.
+  ///
+  /// [maxSlotCount] bounds the slot count of a space; `SLOTS` with more is
+  /// refused with `OUT_OF_RANGE`.
+  ///
+  /// Throws [ArgumentError] if [heartbeat] is not positive, if
+  /// [assignmentHold], [holderGrace] or [handoverTimeout] is negative, or if
+  /// [maxSlotCount] is not positive.
   NamingService({
     this.heartbeat = const Duration(seconds: 4),
     this.assignmentHold = const Duration(seconds: 2),
+    this.holderGrace = const Duration(minutes: 5),
+    this.handoverTimeout = const Duration(seconds: 60),
+    this.maxSlotCount = 65536,
   }) {
     if (heartbeat <= Duration.zero) {
       throw ArgumentError.value(heartbeat, 'heartbeat', 'must be positive');
     }
-    if (assignmentHold < Duration.zero) {
-      throw ArgumentError.value(
-        assignmentHold,
-        'assignmentHold',
-        'must not be negative',
-      );
+    for (final (name, value) in [
+      ('assignmentHold', assignmentHold),
+      ('holderGrace', holderGrace),
+      ('handoverTimeout', handoverTimeout),
+    ]) {
+      if (value < Duration.zero) {
+        throw ArgumentError.value(value, name, 'must not be negative');
+      }
+    }
+    if (maxSlotCount < 1 || maxSlotCount > maxU32) {
+      throw ArgumentError.value(maxSlotCount, 'maxSlotCount', 'out of range');
     }
     if (assignmentHold > Duration.zero) {
       _holdTimer = Timer(assignmentHold, _endHold);
@@ -98,8 +139,20 @@ class NamingService {
   /// Interval at which an idle watch is sent `EXTEND`.
   final Duration heartbeat;
 
-  /// How long after construction `REGISTER` requests for any id are held.
+  /// How long after construction `REGISTER` requests for any id are held,
+  /// and slot assignment waits for claims.
   final Duration assignmentHold;
+
+  /// How long a holder-only slot waits for its holder to return.
+  final Duration holderGrace;
+
+  /// Requester timeout of the requests sent to instances.
+  final Duration handoverTimeout;
+
+  /// Largest slot count of a space.
+  final int maxSlotCount;
+
+  late final _SlotManager _slots = _SlotManager(this);
 
   final Map<ServiceAddress, ServiceRecord> _table = {};
   final Map<int, _Registration> _instances = {};
@@ -129,6 +182,19 @@ class NamingService {
 
   /// Number of outstanding `WATCH` requests over all channels.
   int get watchCount => _watches.length;
+
+  /// Read-only live view of the slot tables, by type. A redefinition of a
+  /// space replaces its [SlotTable].
+  late final Map<Name, SlotTable> slotTables = UnmodifiableMapView(
+    _slots.views,
+  );
+
+  /// The slot table of [type], or null if it has no slot space.
+  SlotTable? slotTable(Name type) => _slots.views[type];
+
+  /// Every `SLOT` item the service publishes, in order. Broadcast stream;
+  /// it ends when the service is closed.
+  Stream<SlotItem> get slotEvents => _slots.events.stream;
 
   /// Number of channels currently served.
   int get channelCount => _sessions.length;
@@ -258,6 +324,7 @@ class NamingService {
   Future<void> _close() async {
     _closed = true;
     final goingAway = Status.of(StatusCode.goingAway, 'naming service closed');
+    _slots.close();
     _holdTimer?.cancel();
     _holdTimer = null;
     _heldHeartbeat?.cancel();
@@ -281,6 +348,7 @@ class NamingService {
       for (final session in sessions) session.channel.close(goingAway),
     ]);
     await _events.close();
+    await _slots.events.close();
   }
 
   // ---------------------------------------------------------------------
@@ -303,6 +371,18 @@ class NamingService {
       _onWatch(session, message);
     } else if (procedure == Procedures.lookup) {
       _onLookup(message);
+    } else if (procedure == Procedures.slots) {
+      _slots.onSlots(session, message);
+    } else if (procedure == Procedures.holding) {
+      _slots.onHolding(session, message);
+    } else if (procedure == Procedures.claim) {
+      _slots.onClaim(session, message);
+    } else if (procedure == Procedures.release) {
+      _slots.onRelease(session, message);
+    } else if (procedure == Procedures.locate) {
+      _slots.onLocate(message);
+    } else if (procedure == Procedures.migrate) {
+      _slots.onMigrate(message);
     } else {
       _log.fine('unknown procedure ${message.procedureName}');
       _abort(
@@ -402,6 +482,11 @@ class NamingService {
         return;
       }
     }
+    for (final (procedure, payload) in _slots.snapshot(watch.matches)) {
+      if (!watch.send(procedure, payload)) {
+        return;
+      }
+    }
     if (!watch.send(Procedures.synced, Uint8List(0))) {
       return;
     }
@@ -457,6 +542,9 @@ class NamingService {
           );
         }
       }
+      for (final (procedure, payload) in _slots.snapshot((t) => t == type)) {
+        message.replyItem(payload, procedure: procedure.toString());
+      }
       message.reply(Uint8List(0));
     } on SwitchboardException catch (e) {
       _log.fine('LOOKUP reply failed: $e');
@@ -509,6 +597,7 @@ class NamingService {
         _register(h.session, h.message, h.request);
       }
     }
+    _slots.onHoldEnded();
   }
 
   // ---------------------------------------------------------------------
@@ -621,8 +710,19 @@ class NamingService {
     _instances.remove(address.instance);
     _table.remove(address);
     registration.owner?.owned.remove(registration);
+    registration.removed = true;
     _log.info('unregistered $address');
     _publish(ServiceEvent(up: false, record: ServiceRecord(address)));
+    _slots.onDown(registration);
+  }
+
+  /// Sends a watch item about [type] to every watch of it.
+  void _publishItem(Name type, Name procedure, Uint8List payload) {
+    for (final watch in _watches.toList()) {
+      if (watch.matches(type)) {
+        watch.send(procedure, payload);
+      }
+    }
   }
 
   void _publish(ServiceEvent event) {
@@ -717,6 +817,24 @@ class _Registration {
 
   final ServiceAddress address;
   final _Session? owner;
+
+  /// Share weight in the slot space of its type, from `SLOTS`: 0 takes no
+  /// slots, null until the instance sent `SLOTS`.
+  int? capacity;
+
+  /// [capacity], 0 when not declared.
+  int get weight => capacity ?? 0;
+
+  /// Removed from the table.
+  bool removed = false;
+
+  /// Called once when the registration is removed.
+  final Set<void Function()> onGone = {};
+
+  int get instance => address.instance;
+
+  /// Registered on a channel that is still served.
+  bool get up => !removed && (owner?.active ?? false);
 }
 
 /// One outstanding `WATCH` request.

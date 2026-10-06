@@ -7,6 +7,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 
@@ -17,6 +18,9 @@ import '../talk/talk_channel.dart';
 import '../talk/talk_message.dart';
 import '../talk/talk_stream.dart';
 import 'naming_protocol.dart';
+import 'slot_table.dart';
+
+part 'naming_client_slots.dart';
 
 final Logger _log = Logger('Switchboard.Naming');
 
@@ -39,6 +43,19 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// registers the remembered set again. Neither a phantom record nor an
 /// untracked one is left behind.
 ///
+/// Sharding (wiki page "Switchboard Sharding"): the client mirrors the slot
+/// tables too ([slotTables], [slotEvents]), and a sharded instance uses
+/// [defineSlots], [declareHolding], [claim], [release], [locate] and
+/// [migrate], and sets [slotHandler] to serve the `ASSIGN`, `DRAIN`,
+/// `FORWARD` and `RESUME` requests the naming service sends over this
+/// client's channel. The client serves the slots of a type for the one
+/// instance of that type it registers. It remembers the slot space
+/// definitions, the declared storage and the slots it serves; after a
+/// reconnect it registers again, then re-sends `SLOTS` and `HOLDING` and
+/// claims every slot it was serving with its last epoch. When the channel
+/// is lost, every slot locked by `DRAIN` is unlocked through
+/// [SlotHandler.onResume].
+///
 /// See the wiki page "Switchboard Naming Service", section "Mirror
 /// behaviour".
 class NamingClient {
@@ -50,12 +67,26 @@ class NamingClient {
   /// request (default 15 s): if nothing, not even a heartbeat `EXTEND`,
   /// arrives for that long the naming service is considered lost. It must be
   /// longer than the service's heartbeat.
+  ///
+  /// [slotExtendInterval] is how often a request from the naming service
+  /// (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`) is answered with `EXTEND`
+  /// while the [slotHandler] works on it; it must be shorter than the
+  /// service's `handoverTimeout` (60 s by default).
   NamingClient(
     TalkConnector connect, {
     this.reconnectDelay = const Duration(seconds: 1),
     Duration? watchTimeout,
+    this.slotExtendInterval = const Duration(seconds: 4),
   }) : _connect = connect,
-       watchTimeout = watchTimeout ?? const Duration(seconds: 15);
+       watchTimeout = watchTimeout ?? const Duration(seconds: 15) {
+    if (slotExtendInterval <= Duration.zero) {
+      throw ArgumentError.value(
+        slotExtendInterval,
+        'slotExtendInterval',
+        'must be positive',
+      );
+    }
+  }
 
   final TalkConnector _connect;
 
@@ -64,6 +95,11 @@ class NamingClient {
 
   /// Requester timeout of the `WATCH` request.
   final Duration watchTimeout;
+
+  /// Interval of `EXTEND` while a [slotHandler] call runs.
+  final Duration slotExtendInterval;
+
+  late final _ClientSlots _slots = _ClientSlots(this);
 
   final Map<ServiceAddress, ServiceRecord> _table = {};
   final StreamController<ServiceEvent> _events =
@@ -125,6 +161,204 @@ class NamingClient {
   /// previous one never completed, in which case it is the same one).
   /// Fails with [StatusCode.cancelled] if [close] is called first.
   Future<void> get synced => _synced.future;
+
+  // ---------------------------------------------------------------------
+  // Sharding
+
+  /// Serves the requests the naming service sends to this instance. Without
+  /// one, they are answered `ABORT UNIMPLEMENTED`.
+  SlotHandler? get slotHandler => _slots.handler;
+
+  set slotHandler(SlotHandler? handler) => _slots.handler = handler;
+
+  /// Read-only live view of the mirrored slot tables, by type. Like
+  /// [table], incomplete before the first `SYNCED` and stale while not
+  /// [isSynced]. A redefinition of a space replaces its [SlotTable].
+  late final Map<Name, SlotTable> slotTables = UnmodifiableMapView(
+    _slots.views,
+  );
+
+  /// The mirrored slot table of [type], or null if it has no slot space.
+  SlotTable? slotTable(Name type) => _slots.views[type];
+
+  /// The mirrored entry of [slot] of [type] if traffic for it has somewhere
+  /// to go: owned, or migrating (route to [SlotEntry.owner], the old
+  /// owner). Null when the slot is free, out of range, or the type has no
+  /// slot space.
+  SlotEntry? slotOwner(Name type, int slot) => _slots.slotOwner(type, slot);
+
+  /// The distinct instances the slots of [type] are routed to (owners, and
+  /// the old owner of a migrating slot), from the mirror. A new set, exact
+  /// when read; empty without a slot space.
+  Set<int> slotOwners(Name type) => _slots.views[type]?.owners ?? <int>{};
+
+  /// Changes of the mirrored slot tables, including slots found gone when a
+  /// new snapshot arrives after a reconnect. Broadcast stream; it ends on
+  /// [close].
+  Stream<SlotEvent> get slotEvents => _slots.events.stream;
+
+  /// The slots of [type] this instance serves (confirmed `ASSIGN`s, until
+  /// `FORWARD`, [release] or a revocation), with their epochs. A snapshot.
+  Map<int, int> servedSlots(Name type) => _slots.servedSlots(type);
+
+  /// Defines or confirms the slot space of [type] (`SLOTS`) and offers
+  /// [capacity] as this instance's share weight. [capacity] 0 takes no
+  /// slots: the call only defines or confirms the space, as a router or an
+  /// operator tool does; 1 or more makes this instance a candidate for the
+  /// allocator of a managed space.
+  ///
+  /// Remembered and sent again after every reconnect, once the
+  /// registration of [type] made through this client is back (right away
+  /// if this client registers no instance of [type]). Calling it again for
+  /// the same type replaces the remembered definition. While disconnected,
+  /// or before the registration of [type] completes, the future completes
+  /// when the definition is sent.
+  ///
+  /// Fails with the naming service's [SwitchboardException]
+  /// ([StatusCode.failedPrecondition] for a definition that conflicts with
+  /// the existing space, [StatusCode.outOfRange] for too many slots), and
+  /// the definition is then forgotten; with [StatusCode.invalidArgument]
+  /// for an empty type, [StatusCode.failedPrecondition] after [close],
+  /// [StatusCode.cancelled] on [close]; [RangeError] for a count or
+  /// capacity outside `u32`, or a count of 0.
+  Future<void> defineSlots(
+    Name type, {
+    required int count,
+    SlotMode mode = SlotMode.managed,
+    bool lazy = false,
+    bool shared = false,
+    int capacity = 1,
+  }) {
+    try {
+      _checkSlotType(type);
+      RangeError.checkValueInInterval(count, 1, maxU32, 'count');
+      RangeError.checkValueInInterval(capacity, 0, maxU32, 'capacity');
+    } catch (e, st) {
+      return Future.error(e, st);
+    }
+    return _slots.defineSlots(
+      SlotsRequest(
+        SlotSpace(type, count: count, mode: mode, lazy: lazy, shared: shared),
+        capacity: capacity,
+      ),
+    );
+  }
+
+  /// Declares that this instance holds the storage of [slots] of [type]
+  /// (`HOLDING`) and returns the slots among them whose holder is no longer
+  /// this instance; their local storage should be discarded. Free slots it
+  /// holds are given back to it first (managed mode).
+  ///
+  /// The declaration is remembered (minus the slots to discard) and sent
+  /// again after every reconnect. While disconnected, or before the
+  /// registration of [type] made through this client is back, the future
+  /// completes when the declaration is sent. Fails with the naming
+  /// service's [SwitchboardException] ([StatusCode.notFound] without a slot
+  /// space, [StatusCode.failedPrecondition] without a registration of
+  /// [type] on the channel); those slots are then forgotten. Fails with
+  /// [StatusCode.cancelled] on [close].
+  Future<List<int>> declareHolding(Name type, List<int> slots) {
+    try {
+      _checkSlotType(type);
+      for (final slot in slots) {
+        RangeError.checkValueInInterval(slot, 0, maxU32, 'slot');
+      }
+    } catch (e, st) {
+      return Future.error(e, st);
+    }
+    return _slots.declareHolding(type, List.of(slots));
+  }
+
+  /// Takes the free [slot] of [type] (`CLAIM`) and returns its epoch. The
+  /// naming service confirms it through `ASSIGN` to [slotHandler] before
+  /// answering. [holding] says this instance holds the slot's storage.
+  /// Claiming a slot this instance owns returns the current epoch.
+  ///
+  /// Fails with the naming service's [SwitchboardException]:
+  /// [StatusCode.alreadyExists] if another instance owns it,
+  /// [StatusCode.failedPrecondition] while it migrates,
+  /// [StatusCode.notFound] without such a space or slot,
+  /// [StatusCode.unavailable] if the `ASSIGN` failed. Fails with
+  /// [StatusCode.unavailable] while disconnected.
+  Future<int> claim(Name type, int slot, {bool holding = false}) =>
+      _slotCall(type, slot, () => _slots.claim(type, slot, holding: holding));
+
+  /// Gives up [slot] of [type] (`RELEASE`). With [keepStorage] this
+  /// instance stays its holder (and keeps declaring it after reconnects).
+  ///
+  /// Fails with [StatusCode.permissionDenied] if this instance does not own
+  /// it, [StatusCode.failedPrecondition] while it migrates, and
+  /// [StatusCode.unavailable] while disconnected.
+  Future<void> release(Name type, int slot, {bool keepStorage = false}) =>
+      _slotCall(
+        type,
+        slot,
+        () => _slots.release(type, slot, keepStorage: keepStorage),
+      );
+
+  /// Finds the owner of [slot] of [type] (`LOCATE`). In a managed space a
+  /// free slot is assigned first, and the answer comes once its new owner
+  /// confirmed. A free slot answers [SlotState.free] with owner 0.
+  ///
+  /// Fails with [StatusCode.notFound] without such a space or slot,
+  /// [StatusCode.unavailable] if the assignment failed or while
+  /// disconnected.
+  Future<LocateResponse> locate(Name type, int slot) =>
+      _slotCall(type, slot, () => _slots.locate(type, slot));
+
+  /// Moves [slot] of [type] to instance [to] (0 lets the allocator choose)
+  /// through the hand-over (`MIGRATE`). The stream reports each
+  /// [PhaseItem] and ends when the migration is done; at most one
+  /// migration per space runs at a time, others queue.
+  ///
+  /// Errors: [StatusCode.notFound], [StatusCode.failedPrecondition]
+  /// (already migrating, [to] is the owner or not registered),
+  /// [StatusCode.unavailable] (rolled back, after a
+  /// [MigrationPhase.rolledBack] item; or disconnected). Cancelling the
+  /// subscription cancels the request; a migration already running
+  /// completes anyway.
+  Stream<PhaseItem> migrate(Name type, int slot, {int to = 0}) {
+    try {
+      _checkSlotType(type);
+      RangeError.checkValueInInterval(slot, 0, maxU32, 'slot');
+      RangeError.checkValueInInterval(to, 0, maxInstance, 'to');
+    } catch (e, st) {
+      return Stream.error(e, st);
+    }
+    return _slots.migrate(type, slot, to);
+  }
+
+  Future<T> _slotCall<T>(Name type, int slot, Future<T> Function() call) {
+    try {
+      _checkSlotType(type);
+      RangeError.checkValueInInterval(slot, 0, maxU32, 'slot');
+      return call();
+    } catch (e, st) {
+      return Future.error(e, st);
+    }
+  }
+
+  void _checkSlotType(Name type) {
+    if (_closed) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'naming client closed',
+      );
+    }
+    if (type.isEmpty) {
+      throw SwitchboardException.of(
+        StatusCode.invalidArgument,
+        'empty service type',
+      );
+    }
+  }
+
+  /// Whether this client registers an instance of [type].
+  bool _registers(Name type) => _entries.any((e) => e.type == type);
+
+  /// Whether an instance of [type] is registered on [session].
+  bool _registeredOn(_Session session, Name type) =>
+      _entries.any((e) => e.type == type && identical(e.session, session));
 
   /// Starts the connection loop: connects, re-registers remembered
   /// registrations, starts `WATCH`. Completes once the first connection is
@@ -328,6 +562,7 @@ class NamingClient {
       _firstSynced.completeError(cancelled);
     }
     await _events.close();
+    await _slots.close();
   }
 
   // ---------------------------------------------------------------------
@@ -384,7 +619,7 @@ class NamingClient {
       _started.complete();
     }
     session.messages = channel.messages.listen(
-      _onServerMessage,
+      (message) => _onServerMessage(session, message),
       onError: (Object e) => session.lose(Status.ok, 'channel aborted: $e'),
       onDone: () => session.lose(Status.ok, 'channel closed'),
     );
@@ -412,6 +647,9 @@ class NamingClient {
     }
     await Future.wait(known);
     if (session.alive) {
+      // SLOTS, HOLDING and the claims of served slots, for every type not
+      // restored yet when its registration came back.
+      _slots.restoreAll(session);
       _startWatch(session);
     }
     await session.lost;
@@ -428,10 +666,18 @@ class NamingClient {
     if (_synced.isCompleted && !_closed) {
       _synced = _newSynced();
     }
+    _slots.onLost();
   }
 
-  void _onServerMessage(TalkMessage message) {
-    // The naming service sends no requests of its own.
+  void _onServerMessage(_Session session, TalkMessage message) {
+    if (message.canReply &&
+        _ClientSlots.procedures.contains(message.procedure)) {
+      if (session.alive) {
+        _slots.serve(session, message);
+      }
+      return;
+    }
+    // The naming service sends no other requests.
     if (message.canReply) {
       try {
         message.replyAbort(
@@ -545,6 +791,7 @@ class NamingClient {
     if (!entry.completer.isCompleted) {
       entry.completer.complete(assigned);
     }
+    _slots.restore(session, entry.type);
   }
 
   Future<void> _onRegisterFailed(
@@ -754,6 +1001,10 @@ class NamingClient {
         _applyDown(address);
       } else if (procedure == Procedures.synced) {
         _onSynced(session);
+      } else if (procedure == Procedures.slotSpace) {
+        _slots.onSpaceItem(session, SlotSpace.decode(item.payload));
+      } else if (procedure == Procedures.slot) {
+        _slots.onSlotItem(session, SlotItem.decode(item.payload));
       } else {
         _log.fine('ignoring watch item ${item.procedureName}');
       }
@@ -776,6 +1027,7 @@ class NamingClient {
     for (final address in gone) {
       _applyDown(address);
     }
+    _slots.onSynced(session);
     _isSynced = true;
     _hasSynced = true;
     _log.info('naming table synced, ${_table.length} records');
@@ -853,6 +1105,18 @@ class _Session {
   /// Before `SYNCED`: addresses seen in the snapshot.
   bool syncing = true;
   final Set<ServiceAddress> seen = {};
+
+  /// Before `SYNCED`: slot spaces and slots seen in the snapshot.
+  final Set<Name> seenSpaces = {};
+  final Set<(Name, int)> seenSlots = {};
+
+  /// Types whose slot state was sent on this channel: true once with the
+  /// registration of the type, false when sent without one.
+  final Map<Name, bool> restored = {};
+
+  /// Claims of served slots waiting to be sent, and the number in flight.
+  final Queue<(Name, int, _Served)> reclaims = Queue();
+  int reclaiming = 0;
 
   bool get alive => !_lost.isCompleted;
 

@@ -14,6 +14,7 @@ import '../status.dart';
 import '../switchboard/resolver.dart';
 import 'naming_client.dart';
 import 'naming_protocol.dart';
+import 'slot_table.dart';
 
 /// Resolves through the table a [NamingClient] mirrors from the naming
 /// service. The normal backend resolver.
@@ -84,6 +85,22 @@ class NamingResolver implements Resolver {
   /// The client's [NamingClient.events].
   @override
   Stream<ServiceEvent> get events => client.events;
+
+  /// The client's mirrored slot table of [type]
+  /// ([NamingClient.slotTable]), or null without a slot space.
+  SlotTable? slotTable(Name type) => client.slotTable(type);
+
+  /// Where traffic for [slot] of [type] goes, from the client's mirror
+  /// ([NamingClient.slotOwner]): the entry if the slot is owned or
+  /// migrating (route to [SlotEntry.owner]), null otherwise.
+  SlotEntry? slotOwner(Name type, int slot) => client.slotOwner(type, slot);
+
+  /// The distinct instances the slots of [type] are routed to
+  /// ([NamingClient.slotOwners]).
+  Set<int> slotOwners(Name type) => client.slotOwners(type);
+
+  /// The client's [NamingClient.slotEvents].
+  Stream<SlotEvent> get slotEvents => client.slotEvents;
 
   /// The client's [NamingClient.firstSynced]: completes once the table has
   /// been synced at least once, and stays complete through later losses of

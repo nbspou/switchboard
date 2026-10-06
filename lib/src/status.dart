@@ -35,7 +35,8 @@ enum StatusCode {
   goingAway(33),
   connectionLost(34),
   frameTooLarge(35),
-  unsupported(36);
+  unsupported(36),
+  moved(37);
 
   const StatusCode(this.code);
 

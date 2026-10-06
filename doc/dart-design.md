@@ -35,9 +35,12 @@ lib/src/talk/talk_request.dart TalkRequest (handle for an outgoing single-respon
 lib/src/talk/talk_stream.dart  TalkStream (handle for an outgoing stream request)
 lib/src/address/service_address.dart   ServiceAddress
 lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
-lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGSTR/WATCH/LOOKUP/UP/DOWN/SYNCED
+lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGSTR/WATCH/LOOKUP/UP/DOWN/SYNCED and the sharding payloads, MovedStatus
 lib/src/naming/naming_service.dart     NamingService (server side handler)
+lib/src/naming/naming_service_slots.dart  part of naming_service.dart: slot tables, slot procedures, hand-over, allocator
 lib/src/naming/naming_client.dart      NamingClient (register, watch, mirrored table)
+lib/src/naming/naming_client_slots.dart   part of naming_client.dart: SlotHandler, AssignResult, instance side of sharding, slot mirror
+lib/src/naming/slot_table.dart         SlotTable (read-only slot table view), SlotEvent
 lib/src/naming/naming_client_io.dart   namingClientFor: a NamingClient connecting through a Switchboard (dart:io)
 lib/src/naming/naming_resolver.dart    NamingResolver (resolves through a NamingClient's mirrored table)
 lib/src/switchboard/resolver.dart      Resolver, StaticResolver, EndpointResolver
@@ -393,7 +396,30 @@ class UnregisterRequest { Name type; int instance; encode/decode }   // same lay
 class WatchRequest { Name? type; encode/decode }                      // empty payload or all-zero name = all
 class ServiceEvent { final bool up; final ServiceRecord record; }    // UP carries full record, DOWN only address
 Procedure names: Procedures.register ('REGISTER'), unregister ('UNREGSTR'), watch ('WATCH'), lookup ('LOOKUP'), up ('UP'), down ('DOWN'), synced ('SYNCED'). Service type: Services.naming (Name('_ns')).
+
+// Sharding (wiki "Switchboard Sharding"); every class has encode() and static decode(Uint8List)
+Procedures.slots ('SLOTS'), holding ('HOLDING'), claim ('CLAIM'), release ('RELEASE'), locate ('LOCATE'), migrate ('MIGRATE'), phase ('PHASE'),
+  assign ('ASSIGN'), drain ('DRAIN'), forward ('FORWARD'), resume ('RESUME'), slotSpace ('SLOTSPC'), slot ('SLOT')
+const int maxU32;
+enum SlotMode { managed(0), static(1) }  enum SlotState { free(0), owned(1), migrating(2) }
+enum MigrationPhase { draining(1), assigning(2), forwarding(3), done(4), rolledBack(5) }
+class SlotSpace { Name type; int count; SlotMode mode; bool lazy; bool shared; int get flags; }   // SLOTSPC item; unknown flag bits ignored
+class SlotsRequest { SlotSpace space; int capacity; }                 // SLOTSPC layout + u32 capacity (0 = takes no slots)
+class HoldingRequest { Name type; List<int> slots; }  class HoldingResponse { List<int> discard; }
+class ClaimRequest { Name type; int slot; bool holding; int epoch; }   // u32 epoch after the flags: see "Deviations"
+class ClaimResponse { int epoch; }  class ReleaseRequest { Name type; int slot; bool keepStorage; }
+class LocateRequest { Name type; int slot; }  class LocateResponse { SlotState state; int owner; int epoch; }
+class MigrateRequest { Name type; int slot; int to; }  class PhaseItem { MigrationPhase phase; }
+class AssignRequest { Name type; int slot; int epoch; int holder; bool shared; }  class AssignResponse { bool notHolding; }   // empty = holding
+class DrainRequest / ForwardRequest { Name type; int slot; int epoch; int to; }  class ResumeRequest { Name type; int slot; int epoch; }
+class SlotEntry { SlotState state; int owner /* from while migrating */; int to; int holder; int epoch; bool isFree; bool isEmpty; static unassigned; .free/.owned/.migrating }
+class SlotItem { Name type; int slot; SlotEntry entry; }               // SLOT item
+class MovedStatus { ServiceAddress? owner; int? epoch; String reason; Status toStatus();
+  static String format(ServiceAddress? owner, [int? epoch]);          // 'userq/1a2b 7', '' when unknown
+  static MovedStatus parse(String reason); static MovedStatus fromStatus(Status); }   // never throws; malformed = unknown
 ```
+
+Sharding decoders throw `ProtocolException` on truncation, an unknown mode, state or phase, and a slot list longer than the payload; trailing bytes are ignored. Encoders throw `RangeError` for values outside `u32`/`u48`. Vectors: `doc/sharding-vectors.md`, `test/vectors/sharding_vectors_test.dart`.
 
 ## Switchboard (dart:io)
 
@@ -476,15 +502,25 @@ Dispatch order is as in the wiki "Addressing" page, after the listener policy. R
 
 ```dart
 class NamingService {
-  NamingService({Duration heartbeat, Duration assignmentHold});
+  NamingService({Duration heartbeat, Duration assignmentHold, Duration holderGrace, Duration handoverTimeout, int maxSlotCount});
   ChannelHandler get handler;                       // register with switchboard.registerService(Services.naming, ns.handler, instance: 1)
   void serve(TalkChannel channel);                  // StateError (and nothing kept) if its messages are already listened to
   Map<ServiceAddress, ServiceRecord> get table;
   Stream<ServiceEvent> get events;
   Duration heartbeat;                               // EXTEND interval on idle watches, default 4 s (see below)
-  Duration assignmentHold;                          // REGISTER for any id held this long after construction, default 2 s
+  Duration assignmentHold;                          // REGISTER for any id held this long after construction, default 2 s; slot assignment waits too
+  Duration holderGrace;                             // holder-only slot waits this long for its holder, default 5 min
+  Duration handoverTimeout;                         // requester timeout of ASSIGN/DRAIN/FORWARD/RESUME, EXTEND restarts it, default 60 s
+  int maxSlotCount;                                 // larger SLOTS refused with OUT_OF_RANGE, default 65536
   bool get isHoldingAssignments;
+  Map<Name, SlotTable> get slotTables;              // read-only, live
+  SlotTable? slotTable(Name type);
+  Stream<SlotItem> get slotEvents;                  // every SLOT item published, in order
 }
+
+class SlotTable { SlotSpace space; Map<int, SlotEntry> entries; Name type; int count;
+  SlotEntry operator [](int slot); Set<int> get owners; List<int> slotsOf(int instance); }
+class SlotEvent { Name type; int slot; SlotEntry entry; SlotEntry previous; }
 
 class NamingClient {
   NamingClient(TalkConnector connect, {Duration reconnectDelay, Duration? watchTimeout});   // transport independent
@@ -499,7 +535,31 @@ class NamingClient {
   Stream<ServiceEvent> get events;
   bool get isConnected;
   Future<void> close();
+
+  // Sharding (constructor also takes Duration slotExtendInterval, default 4 s)
+  SlotHandler? slotHandler;
+  Future<void> defineSlots(Name type, {required int count, SlotMode mode, bool lazy, bool shared, int capacity = 1});   // remembered
+  Future<List<int>> declareHolding(Name type, List<int> slots);   // remembered; returns slots to discard
+  Future<int> claim(Name type, int slot, {bool holding = false});
+  Future<void> release(Name type, int slot, {bool keepStorage = false});
+  Future<LocateResponse> locate(Name type, int slot);
+  Stream<PhaseItem> migrate(Name type, int slot, {int to = 0});
+  Map<Name, SlotTable> get slotTables; SlotTable? slotTable(Name type);
+  SlotEntry? slotOwner(Name type, int slot);         // owned or migrating (route to entry.owner), else null
+  Set<int> slotOwners(Name type);                   // distinct owners, `from` while migrating
+  Stream<SlotEvent> get slotEvents;
+  Map<int, int> servedSlots(Name type);             // slot -> epoch this instance serves
 }
+
+enum AssignResult { holding, notHolding }
+abstract class SlotHandler {
+  Future<AssignResult> onAssign(AssignRequest request);
+  Future<void> onDrain(DrainRequest request);
+  Future<void> onForward(ForwardRequest request);
+  Future<void> onResume(ResumeRequest request);
+  Future<void> onRevoke(Name type, int slot) async {}   // stop serving: re-claim refused, or ASSIGN not confirmed
+}
+// NamingResolver: SlotTable? slotTable(type); SlotEntry? slotOwner(type, slot); Set<int> slotOwners(type); Stream<SlotEvent> slotEvents
 
 // dart:io glue
 NamingClient namingClientFor(Switchboard switchboard, Uri namingEndpoint, {Duration reconnectDelay, Duration? watchTimeout, TalkOptions? talkOptions});   // openTalkAt(endpoint, _ns)
@@ -524,6 +584,27 @@ Behaviour notes:
 * A re-registration refused on a healthy channel (anything but `ALREADY_EXISTS`, which moves to a new id) is retried on the same channel every `reconnectDelay`, without disturbing the client's other registrations.
 * At most one remembered registration per `type/instance`: registering an explicit id again supersedes the earlier registration whether or not it completed (its future completes like the new one's; its late answer is ignored), and `unregister` removes every match.
 * Ids after a naming service restart: the new service starts assigning at 1 again and knows nothing of the old ids. Surviving clients reconnect and ask for the ids they had (those first, before fresh registrations), but a fresh registration that reaches the new service first can be assigned one of them; the survivor then gets `ALREADY_EXISTS`, takes a new id and reports it through `onAssigned` (`MeshNode` moves its local dispatch), while addresses other services kept for the old id now resolve to the newcomer (same type) or to nothing. Mitigation: for `assignmentHold` after construction (default 2 s) the service answers `REGISTER` with instance 0 only once the hold is over (in arrival order, kept alive with `EXTEND` every `heartbeat`; one the requester cancels meanwhile is answered `CANCELLED` and never registered); requests for a given id, `registerLocal` and everything else are served at once. The client does not wait for held registrations before starting its `WATCH`. Survivors that take longer than the hold to come back can still lose their ids.
+
+## Sharding
+
+Behaviour notes (wiki "Switchboard Sharding"):
+
+* Identity: the instance serving the slots of a type on a channel is that channel's registration of the type. A channel with several registrations of a sharded type gets `FAILED_PRECONDITION` for the slot procedures (the requests to instances carry no instance id). `SLOTS` without any registration of the type defines or confirms the space only (a router or operator tool).
+* Capacity: `null` until the instance sends `SLOTS`, 0 takes no slots, 1 or more makes it a candidate of the allocator and of `LOCATE`. `CLAIM` works whatever the capacity, in both modes. Slots owned by instances without capacity are left out of rebalancing.
+* Epochs increase only when an owner is assigned (`ASSIGN`, by claim, locate, allocator or migration), wrapping to 1. Release and loss keep the epoch; the next owner gets epoch + 1. `RESUME` carries the unchanged epoch.
+* Holder of an assigned slot: the new owner, unless it answers "not holding", which keeps the previous holder. A claim with the holding flag on a free slot with holder 0 makes the claimant the holder; a known holder wins over the flag.
+* `RELEASE` of a slot being assigned to the caller waits for that `ASSIGN`; a migrating slot is `FAILED_PRECONDITION`. `PERMISSION_DENIED` otherwise unless the caller owns it.
+* Allocator (managed spaces), run in a microtask after every change: (1) free slots whose holder is a candidate go back to it; (2) eager spaces assign the other free slots to the candidate with the most spare share (`capacity * (assigned + 1) - load * totalCapacity`, ties to the lower id), at most 16 `ASSIGN`s in flight per space; a holder that is registered with capacity 0 has its slots assigned elsewhere with `holder` set to it; a holder that is down (or registered but has not sent `SLOTS`) makes a holder-only slot wait for `holderGrace`, then the holder is cleared; shared spaces reassign at once with `holder` and the shared flag; (3) when nothing is in flight, one rebalancing migration from the most over-share candidate to the most under-share one, if that one is short by a full slot, lowest slot first. Lazy spaces assign only on `LOCATE` (and give slots back to their holders), but still rebalance.
+* Hand-over: as in the wiki step by step; DRAIN and FORWARD go to `from`, ASSIGN to `to` with `holder` = the slot's holder (normally `from`). Requests to an instance fail at once when its registration goes away. One migration per space at a time; the allocator's go through the same queue. A queued `MIGRATE` is validated again when it starts; one whose requester cancelled is dropped; a running one completes regardless. `MIGRATE` has no responder timeout; it is kept alive with `EXTEND` every heartbeat, like every request waiting on an `ASSIGN` or the hold.
+* Assignment hold: `CLAIM`s are collected and resolved when it ends, in order of claimed epoch (descending) then arrival: the first claim of a slot proceeds, the others then see it owned (`ALREADY_EXISTS`) unless its `ASSIGN` failed. `HOLDING` is answered after the claims; `LOCATE` of a free managed slot, the allocator and migrations wait.
+* Client: `ASSIGN`/`DRAIN`/`FORWARD`/`RESUME` handler calls run with the responder timeout off and `EXTEND` every `slotExtendInterval`. A served slot is recorded before the `ASSIGN` reply; if the reply cannot be sent, `onRevoke` (unless it was already served). After a reconnect, per type once its registration is back: `SLOTS`, `HOLDING` (declared slots plus served slots it holds), then `CLAIM` of every served slot with the holding flag and last epoch, at most 256 in flight. A refused re-claim on a live channel calls `onRevoke`. When the channel is lost, every slot locked by `DRAIN` gets `onResume` once its `onDrain` is done.
+
+### Deviations from the wiki and proposed amendments
+
+* `CLAIM` carries `u32 epoch` after the flags (the claimant's last known epoch, 0 if none), so that a restarted naming service can resolve conflicting claims "in favour of the higher epoch".
+* A `HOLDING` slot outside the space is listed as to discard; `HOLDING` in a static space records holders but assigns nothing (static spaces are claimed).
+* `maxSlotCount` defaults to 65536, the `userq` use case, although the wiki asks to keep `N` at or below 16384.
+* Lazy shared spaces do not reassign slots of a down instance at once: lazy spaces assign only on `LOCATE`.
 
 ## Tests
 

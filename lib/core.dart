@@ -27,6 +27,7 @@ export 'src/naming/naming_client.dart';
 export 'src/naming/naming_protocol.dart';
 export 'src/naming/naming_resolver.dart';
 export 'src/naming/naming_service.dart';
+export 'src/naming/slot_table.dart';
 export 'src/status.dart';
 export 'src/status_closable.dart';
 export 'src/switchboard/channel_policy.dart';
