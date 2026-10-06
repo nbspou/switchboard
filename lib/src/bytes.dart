@@ -57,20 +57,22 @@ class ByteReader {
         (bytes[offset + 2] << 16) |
         (bytes[offset + 3] << 24);
     offset += 4;
-    return v;
+    // Bitwise operations are 32-bit signed when compiled to JavaScript.
+    return v < 0 ? v + 0x100000000 : v;
   }
 
+  /// Assembled without shifting past 32 bits, so that it is correct when
+  /// compiled to JavaScript as well as on the VM.
   int u48([String what = 'u48']) {
     _need(6, what);
-    final v =
+    final lo =
         bytes[offset] |
         (bytes[offset + 1] << 8) |
         (bytes[offset + 2] << 16) |
-        (bytes[offset + 3] << 24) |
-        (bytes[offset + 4] << 32) |
-        (bytes[offset + 5] << 40);
+        (bytes[offset + 3] << 24);
+    final hi = bytes[offset + 4] | (bytes[offset + 5] << 8);
     offset += 6;
-    return v;
+    return (lo < 0 ? lo + 0x100000000 : lo) + hi * 0x100000000;
   }
 
   Name name([String what = 'name']) {
@@ -163,15 +165,19 @@ class ByteWriter {
     _buf[_len++] = (v >> 24) & 0xFF;
   }
 
+  /// Split without shifting past 32 bits, so that it is correct when
+  /// compiled to JavaScript as well as on the VM.
   void u48(int v) {
     assert(v >= 0 && v <= 0xFFFFFFFFFFFF);
     _ensure(6);
-    _buf[_len++] = v & 0xFF;
-    _buf[_len++] = (v >> 8) & 0xFF;
-    _buf[_len++] = (v >> 16) & 0xFF;
-    _buf[_len++] = (v >> 24) & 0xFF;
-    _buf[_len++] = (v >> 32) & 0xFF;
-    _buf[_len++] = (v >> 40) & 0xFF;
+    final hi = v ~/ 0x100000000;
+    final lo = v - hi * 0x100000000;
+    _buf[_len++] = lo & 0xFF;
+    _buf[_len++] = (lo >> 8) & 0xFF;
+    _buf[_len++] = (lo >> 16) & 0xFF;
+    _buf[_len++] = (lo >> 24) & 0xFF;
+    _buf[_len++] = hi & 0xFF;
+    _buf[_len++] = (hi >> 8) & 0xFF;
   }
 
   void name(Name n) {

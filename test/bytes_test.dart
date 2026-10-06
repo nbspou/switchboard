@@ -44,4 +44,21 @@ void main() {
     expect(hexBytes('0a 0B0c'), [10, 11, 12]);
     expect(() => hexBytes('abc'), throwsFormatException);
   });
+
+  test('u32 and u48 high values survive 32-bit arithmetic', () {
+    final w = ByteWriter()
+      ..u32(0xFFFFFFFF)
+      ..u48(0xFFFFFFFFFFFF)
+      ..u48(0x100000002)
+      ..u48(0xFFFF00000000);
+    expect(
+      hexString(w.toBytes()),
+      'FF FF FF FF FF FF FF FF FF FF 02 00 00 00 01 00 00 00 00 00 FF FF',
+    );
+    final r = ByteReader(w.toBytes());
+    expect(r.u32(), 0xFFFFFFFF);
+    expect(r.u48(), 0xFFFFFFFFFFFF);
+    expect(r.u48(), 0x100000002);
+    expect(r.u48(), 0xFFFF00000000);
+  });
 }
