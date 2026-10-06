@@ -14,4 +14,6 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 library;
 
 export 'core.dart';
+export 'src/switchboard/proxy.dart';
+export 'src/switchboard/switchboard.dart';
 export 'src/transport/stream_transport.dart';
