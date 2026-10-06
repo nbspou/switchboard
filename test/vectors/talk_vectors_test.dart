@@ -163,8 +163,12 @@ void main() {
         TalkFrame.decode(hexBytes('20 10 00')).status.known,
         StatusCode.unauthenticated,
       );
-      // An empty abort payload is OK, like everywhere else.
-      expect(TalkFrame.decode(hexBytes('24 01 00 00')).status, Status.ok);
+      // An empty abort payload means UNKNOWN (talk.md, ABORT).
+      expect(
+        TalkFrame.decode(hexBytes('24 01 00 00')).status,
+        Status.of(StatusCode.unknown),
+      );
+      expect(TalkFrame.decode(hexBytes('20')).status.known, StatusCode.unknown);
     });
   });
 

@@ -6,6 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:typed_data';
 
 import 'package:async/async.dart' show DelegatingStreamSubscription;
@@ -15,25 +16,17 @@ import 'package:stream_channel/stream_channel.dart';
 
 import '../name.dart';
 import '../status.dart';
+import '../status_closable.dart';
 import 'talk_frame.dart';
 import 'talk_message.dart';
+import 'talk_request.dart';
 import 'talk_stream.dart';
 
+export '../status_closable.dart';
+
+part 'talk_forward.dart';
+
 final Logger _log = Logger('Switchboard.Talk');
-
-/// Implemented by channels that can be closed with a status (the mux
-/// channel).
-///
-/// When the raw channel of a [TalkChannel] implements this, the talk
-/// channel closes it with the talk-level status and takes its end status
-/// from [done].
-abstract interface class StatusClosable {
-  /// Closes the channel, reporting [status] to the peer.
-  Future<void> close([Status status]);
-
-  /// The channel's end status, once it is closed.
-  Future<Status> get done;
-}
 
 /// Per-channel Talk policy.
 class TalkOptions {
@@ -53,7 +46,8 @@ class TalkOptions {
   /// Responder side: how long the application has to call a reply method,
   /// restarted by [TalkMessage.replyItem] and [TalkMessage.extend]. On
   /// expiry the channel sends `ABORT DEADLINE_EXCEEDED` on the
-  /// application's behalf. [Duration.zero] disables the timeout.
+  /// application's behalf. Overridable per request with
+  /// [TalkMessage.setReplyTimeout]. [Duration.zero] disables the timeout.
   final Duration replyTimeout;
 
   /// Outstanding incoming requests beyond which a new request is answered
@@ -66,9 +60,33 @@ class TalkOptions {
   final int maxOutgoingRequests;
 }
 
+/// A failure caused by the peer sending `ABORT`: an abort response to one
+/// of our requests, or a channel abort. [status] is the peer's status (an
+/// abort carrying OK or nothing reads as [StatusCode.unknown]).
+///
+/// Every other failure reported by [TalkChannel] is a plain
+/// [SwitchboardException]: our own requester timeout, our own cancel, loss
+/// or closing of the channel, a protocol error, a local limit. The
+/// distinction matters to intermediaries, which pass on only what the peer
+/// said (see [forwardMessage]).
+class TalkAbortException extends SwitchboardException {
+  /// Creates the exception for an abort carrying [status].
+  TalkAbortException(super.status, {this.isChannelAbort = false});
+
+  /// True when the peer aborted the whole channel rather than answering
+  /// one request with an abort.
+  final bool isChannelAbort;
+
+  @override
+  String toString() =>
+      'TalkAbortException: ${isChannelAbort ? 'channel abort, ' : ''}'
+      '$status';
+}
+
 /// Talk message chains over one channel: plain messages, requests,
 /// responses, stream responses, aborts, timeout extension and
-/// cancellation. See the wiki page "Switchboard Talk".
+/// cancellation. See the wiki page "Switchboard Talk". [forwardMessage]
+/// forwards message chains between channels.
 ///
 /// Works over a mux channel or any `StreamChannel<Uint8List>` whose events
 /// are whole Talk messages.
@@ -79,10 +97,14 @@ class TalkOptions {
 ///   closes the channel with [StatusCode.protocolError]; outstanding
 ///   requests fail with it.
 /// * A channel abort from the peer closes the channel with the peer's
-///   status; [messages] emits it as an error, then ends.
+///   status; [messages] emits it as a [TalkAbortException], then ends, and
+///   outstanding requests fail with the same exception.
 /// * When the raw stream ends, outstanding requests fail with the raw
 ///   channel's end status ([StatusClosable.done]) if it is not OK, else
 ///   with [StatusCode.connectionLost].
+/// * [StatusCode.connectionLost] is local only: wherever it would be sent
+///   (an abort, a cancel, the close of a [StatusClosable] raw channel) it
+///   goes on the wire as [StatusCode.unavailable].
 /// * Exceptions thrown by application listeners never affect the channel.
 ///   If a listener of [messages] or [TalkStream.items] throws synchronously
 ///   while handling a request it has not yet answered, the exception is
@@ -90,6 +112,9 @@ class TalkOptions {
 ///   in asynchronous code (for example the body of an `await for`) cannot
 ///   be seen by the channel; such a request is answered by the responder
 ///   timeout.
+/// * Error events on [messages] and [TalkStream.items] whose listener has
+///   no `onError` handler are logged, never reported as unhandled. Futures
+///   returned by the request API never report unhandled errors either.
 class TalkChannel {
   /// Wraps [channel]. Starts listening to its stream immediately. A null
   /// [options] means the defaults.
@@ -112,20 +137,27 @@ class TalkChannel {
   late final StreamSubscription<Uint8List> _subscription;
 
   late final StreamController<TalkMessage> _messages =
-      StreamController<TalkMessage>(onCancel: () => _messagesCancelled = true);
+      StreamController<TalkMessage>(onCancel: _onMessagesCancelled);
+
+  /// Requests added to [_messages] and not yet handed to its listener.
+  final Queue<_Message> _undeliveredRequests = Queue<_Message>();
 
   /// Incoming plain messages and requests, in arrival order. Responses
   /// never appear here. Single subscription; buffered until listened.
   ///
   /// A channel abort from the peer is delivered as an error event (a
-  /// [SwitchboardException] carrying its status) and then the stream ends;
-  /// listen with an `onError` handler. The stream also ends, without an
-  /// error, when the channel closes for any other reason; [done] has the
-  /// status.
+  /// [TalkAbortException] carrying its status) and then the stream ends;
+  /// without an `onError` handler the error is only logged. The stream also
+  /// ends, without an error, when the channel closes for any other reason;
+  /// [done] has the status.
   ///
-  /// If the subscription is cancelled, later requests are answered with
+  /// If the subscription is cancelled, buffered requests that were never
+  /// delivered and every later request are answered with
   /// `ABORT UNIMPLEMENTED`.
-  late final Stream<TalkMessage> messages = _GuardedStream(_messages.stream);
+  late final Stream<TalkMessage> messages = _GuardedStream(
+    _messages.stream,
+    _undeliveredRequests,
+  );
 
   final Map<int, _Outgoing> _outgoing = {};
   final Map<int, _Message> _incoming = {};
@@ -139,6 +171,7 @@ class TalkChannel {
   bool _finishing = false;
   Status? _endStatus;
   Future<void>? _closeFuture;
+  Future<void>? _peerEndedFuture;
   final Completer<Status> _done = Completer<Status>();
 
   /// True until the channel starts closing, for any reason.
@@ -175,77 +208,106 @@ class TalkChannel {
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
   /// the channel is closed, and [ArgumentError] if [procedure] is not a
   /// valid name.
-  void send(String procedure, Uint8List payload) {
+  void send(String procedure, Uint8List payload) =>
+      _send(Name(procedure), payload);
+
+  void _send(Name procedure, Uint8List payload) {
     _sendChecked(
-      TalkFrame(
-        kind: TalkKind.message,
-        procedure: Name(procedure),
-        payload: payload,
-      ),
+      TalkFrame(kind: TalkKind.message, procedure: procedure, payload: payload),
     );
   }
 
-  /// Sends a request and returns the final response.
+  /// Sends a request and returns the final response. Shorthand for
+  /// [startRequest] followed by [TalkRequest.response].
   ///
-  /// The future fails with [SwitchboardException] carrying the peer's abort
-  /// status, [StatusCode.deadlineExceeded] if nothing arrives within
-  /// [timeout] (a cancel is then sent to the peer), or the channel's failure
-  /// status. [timeout] defaults to [TalkOptions.requestTimeout];
-  /// [Duration.zero] disables it.
+  /// The future fails like [TalkRequest.response]: with a
+  /// [TalkAbortException] carrying the peer's abort status, or with a plain
+  /// [SwitchboardException] carrying [StatusCode.deadlineExceeded] if
+  /// nothing arrives within [timeout] (a cancel is then sent to the peer)
+  /// or the channel's failure status. It never reports an unhandled error,
+  /// so it may be dropped.
   ///
-  /// Throws synchronously, sending nothing, with
-  /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
-  /// reached and with [StatusCode.failedPrecondition] if the channel is
-  /// closed.
+  /// Throws synchronously like [startRequest].
   Future<TalkMessage> request(
     String procedure,
     Uint8List payload, {
     Duration? timeout,
+  }) => startRequest(procedure, payload, timeout: timeout).response;
+
+  /// Sends a request and returns its handle, through which the response
+  /// arrives and the request can be cancelled.
+  ///
+  /// [timeout] is the requester timeout, restarted by every `EXTEND`; it
+  /// defaults to [TalkOptions.requestTimeout] and [Duration.zero] disables
+  /// it. [onExtend] is called synchronously each time the peer sends
+  /// `EXTEND` for the request; exceptions it throws are logged.
+  ///
+  /// Throws synchronously, sending nothing, with
+  /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
+  /// reached, with [StatusCode.failedPrecondition] if the channel is
+  /// closed, and [ArgumentError] if [procedure] is not a valid name.
+  TalkRequest startRequest(
+    String procedure,
+    Uint8List payload, {
+    Duration? timeout,
+    void Function()? onExtend,
   }) {
     final name = Name(procedure);
-    return _startRequest(
-      stream: false,
-      timeout: timeout,
-      build: (id) => TalkFrame(
-        kind: TalkKind.message,
-        procedure: name,
-        requestId: id,
-        payload: payload,
+    return _TalkRequest(
+      _startRequest(
+        stream: false,
+        timeout: timeout,
+        onExtend: onExtend,
+        build: (id) => TalkFrame(
+          kind: TalkKind.message,
+          procedure: name,
+          requestId: id,
+          payload: payload,
+        ),
       ),
-    ).completer.future;
+    );
   }
 
   /// Sends a stream request. Items and the final response arrive through
-  /// the returned [TalkStream]. Throws like [request].
+  /// the returned [TalkStream]. Takes and throws like [startRequest]; the
+  /// requester timeout is also restarted by every item.
   TalkStream streamRequest(
     String procedure,
     Uint8List payload, {
     Duration? timeout,
+    void Function()? onExtend,
   }) {
     final name = Name(procedure);
-    final pending = _startRequest(
-      stream: true,
-      timeout: timeout,
-      build: (id) => TalkFrame(
-        kind: TalkKind.message,
-        procedure: name,
-        requestId: id,
+    return _TalkStream(
+      _startRequest(
         stream: true,
-        payload: payload,
+        timeout: timeout,
+        onExtend: onExtend,
+        build: (id) => TalkFrame(
+          kind: TalkKind.message,
+          procedure: name,
+          requestId: id,
+          stream: true,
+          payload: payload,
+        ),
       ),
     );
-    return _TalkStream(this, pending);
   }
 
   /// Sends a channel abort carrying [status], then closes the channel with
   /// it. Application codes are allowed in the abort; on a [StatusClosable]
   /// channel they are reported as [StatusCode.unknown] in the close, since
-  /// mux CLOSE must not carry them. Does nothing if already closing.
+  /// mux CLOSE must not carry them. [StatusCode.connectionLost] goes on the
+  /// wire as [StatusCode.unavailable]. Does nothing if already closing.
+  ///
+  /// Throws [ArgumentError] if [status] is OK: an abort cannot report
+  /// success; use [close] instead.
   void abort(Status status) {
+    _checkAbortStatus(status);
     if (_closing) {
       return;
     }
-    final payload = status.encode();
+    final payload = _wireAbortStatus(status).encode();
     _trySend(TalkFrame(kind: TalkKind.abort, payload: payload));
     unawaited(close(status));
   }
@@ -256,17 +318,31 @@ class TalkChannel {
   /// [StatusClosable] raw channel is closed with [status], any other raw
   /// channel by closing its sink.
   ///
+  /// If the raw channel had already ended, nothing is sent and the raw
+  /// channel's end status applies instead of [status].
+  ///
   /// Completes when [done] completes. Calling it again returns the same
   /// future.
   Future<void> close([Status status = Status.ok]) =>
       _closeFuture ??= _close(status);
 
   Future<void> _close(Status status) async {
+    final peerEnded = _peerEndedFuture;
+    if (peerEnded != null) {
+      // The raw stream ended first; its end status is what outstanding
+      // requests fail with, once known.
+      await peerEnded;
+      return _finish();
+    }
     if (!status.isOk) {
       _endStatus ??= status;
     }
     _terminate(
-      status.isOk ? Status.of(StatusCode.cancelled, 'channel closed') : status,
+      SwitchboardException(
+        status.isOk
+            ? Status.of(StatusCode.cancelled, 'channel closed')
+            : status,
+      ),
     );
     if (!_rawEnded && !_rawClosed) {
       _rawClosed = true;
@@ -323,13 +399,13 @@ class TalkChannel {
   }
 
   /// Answers the peer's request [requestId] with an abort, without any
-  /// local state (the request was never accepted).
+  /// local state.
   void _rejectRequest(int requestId, Status status) {
     _trySend(
       TalkFrame(
         kind: TalkKind.abort,
         responseId: requestId,
-        payload: status.encode(),
+        payload: _wireAbortStatus(status).encode(),
       ),
     );
   }
@@ -338,6 +414,8 @@ class TalkChannel {
     required bool stream,
     required Duration? timeout,
     required TalkFrame Function(int id) build,
+    void Function()? onExtend,
+    _ResponseSink? sink,
   }) {
     if (_closing) {
       throw SwitchboardException.of(
@@ -357,25 +435,40 @@ class TalkChannel {
     while (_outgoing.containsKey(id)) {
       id = id >= TalkFrame.maxId ? 1 : id + 1;
     }
-    _sendChecked(build(id));
-    _nextRequestId = id >= TalkFrame.maxId ? 1 : id + 1;
+    final frame = build(id);
     final pending = _Outgoing(
+      this,
       id,
       timeout ?? options.requestTimeout,
       stream: stream,
+      onExtend: onExtend,
+      sink: sink,
     );
+    // Registered before sending: over a synchronous transport the response
+    // can arrive while the request is still being sent.
     _outgoing[id] = pending;
+    _nextRequestId = id >= TalkFrame.maxId ? 1 : id + 1;
     _armRequestTimer(pending);
+    try {
+      _sendChecked(frame);
+    } catch (_) {
+      if (identical(_outgoing[id], pending)) {
+        _outgoing.remove(id);
+      }
+      pending.stopTimer();
+      rethrow;
+    }
     return pending;
   }
 
   // ---------------------------------------------------------------------
   // Requester side
 
-  void _armRequestTimer(_Outgoing pending) {
+  void _armRequestTimer(_Outgoing pending, [Duration? timeout]) {
     pending.stopTimer();
-    if (pending.timeout > Duration.zero) {
-      pending.timer = Timer(pending.timeout, () => _onRequestTimeout(pending));
+    final duration = timeout ?? pending.timeout;
+    if (duration > Duration.zero) {
+      pending.timer = Timer(duration, () => _onRequestTimeout(pending));
     }
   }
 
@@ -409,14 +502,29 @@ class TalkChannel {
     if (!identical(_outgoing[pending.id], pending) || pending.abandoned) {
       return;
     }
-    final payload = status.encode();
     pending.abandoned = true;
     _trySend(
-      TalkFrame(kind: TalkKind.abort, requestId: pending.id, payload: payload),
+      TalkFrame(
+        kind: TalkKind.abort,
+        requestId: pending.id,
+        payload: _wireAbortStatus(status).encode(),
+      ),
     );
     pending.fail(SwitchboardException(status));
+    if (!identical(_outgoing[pending.id], pending)) {
+      // Over a synchronous transport the final can arrive during the send.
+      return;
+    }
     // Keep the id until the peer's final response arrives, or on timeout.
-    _armRequestTimer(pending);
+    // A request without a timeout of its own falls back to the channel
+    // default here, so a peer that never answers the cancel cannot hold the
+    // id for ever.
+    _armRequestTimer(
+      pending,
+      pending.timeout > Duration.zero
+          ? pending.timeout
+          : options.requestTimeout,
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -469,7 +577,21 @@ class TalkChannel {
       );
       return;
     }
+    if (message.expectsReply) {
+      _undeliveredRequests.add(message);
+    }
     _messages.add(message);
+  }
+
+  void _onMessagesCancelled() {
+    _messagesCancelled = true;
+    final undelivered = _undeliveredRequests.toList();
+    _undeliveredRequests.clear();
+    for (final message in undelivered) {
+      message._abortQuietly(
+        Status.of(StatusCode.unimplemented, 'no message listener'),
+      );
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -554,13 +676,7 @@ class TalkChannel {
     if (frame.hasRequest) {
       _register(message);
     }
-    if (pending.itemsCancelled) {
-      message._abortQuietly(
-        Status.of(StatusCode.cancelled, 'stream items not listened'),
-      );
-      return;
-    }
-    pending.items!.add(message);
+    pending.addItem(message);
   }
 
   void _onAbort(TalkFrame frame) {
@@ -572,7 +688,7 @@ class TalkChannel {
       }
       pending.stopTimer();
       if (!pending.abandoned) {
-        pending.fail(SwitchboardException(frame.status));
+        pending.fail(TalkAbortException(_abortStatus(frame)));
       }
     } else if (frame.hasRequest) {
       final message = _incoming[frame.requestId];
@@ -580,12 +696,13 @@ class TalkChannel {
         _log.fine('cancel for unknown request ${frame.requestId} ignored');
         return;
       }
-      message._markCancelled();
+      message._cancelledByPeer(frame.status);
     } else {
-      final status = frame.status;
+      final status = _abortStatus(frame);
       _log.info('peer aborted the channel: $status');
       _endStatus ??= status;
-      _terminate(status, messagesError: SwitchboardException(status));
+      final error = TalkAbortException(status, isChannelAbort: true);
+      _terminate(error, reportOnMessages: true);
       unawaited(close(status));
     }
   }
@@ -596,6 +713,7 @@ class TalkChannel {
       return;
     }
     _armRequestTimer(pending);
+    pending.extended();
   }
 
   void _unknownResponse(TalkFrame frame) {
@@ -633,7 +751,7 @@ class TalkChannel {
       return;
     }
     _closing = true;
-    unawaited(_peerEnded());
+    _peerEndedFuture = _peerEnded();
   }
 
   Future<void> _peerEnded() async {
@@ -651,23 +769,22 @@ class TalkChannel {
     } else {
       r.sink.close().ignore();
     }
-    _terminate(status);
+    _terminate(SwitchboardException(status));
     await _finish();
   }
 
   // ---------------------------------------------------------------------
   // Shutdown
 
-  /// Stops all timers, fails outstanding outgoing requests with
-  /// [failStatus], abandons outstanding incoming requests, and ends
-  /// [messages]. Idempotent.
-  void _terminate(Status failStatus, {SwitchboardException? messagesError}) {
+  /// Stops all timers, fails outstanding outgoing requests with [error],
+  /// abandons outstanding incoming requests, and ends [messages], after
+  /// emitting [error] on it if [reportOnMessages]. Idempotent.
+  void _terminate(SwitchboardException error, {bool reportOnMessages = false}) {
     _closing = true;
     if (_terminated) {
       return;
     }
     _terminated = true;
-    final error = SwitchboardException(failStatus);
     final outgoing = _outgoing.values.toList();
     _outgoing.clear();
     for (final pending in outgoing) {
@@ -679,11 +796,12 @@ class TalkChannel {
     }
     final incoming = _incoming.values.toList();
     _incoming.clear();
+    _undeliveredRequests.clear();
     for (final message in incoming) {
       message._abandon();
     }
-    if (messagesError != null) {
-      _messages.addError(messagesError);
+    if (reportOnMessages) {
+      _messages.addError(error);
     }
     _messages.close().ignore();
   }
@@ -713,10 +831,38 @@ class TalkChannel {
     _done.complete(status);
   }
 
-  /// Mux CLOSE must not carry application codes.
+  /// The status of a received abort; an abort cannot report success, so OK
+  /// reads as UNKNOWN.
+  static Status _abortStatus(TalkFrame frame) {
+    final status = frame.status;
+    return status.isOk
+        ? Status(StatusCode.unknown.code, status.reason)
+        : status;
+  }
+
+  static void _checkAbortStatus(Status status) {
+    if (status.isOk) {
+      throw ArgumentError.value(
+        status,
+        'status',
+        'an abort cannot report success',
+      );
+    }
+  }
+
+  /// CONNECTION_LOST is local only; on the wire it is UNAVAILABLE.
+  static Status _wireAbortStatus(Status status) {
+    if (status.code != StatusCode.connectionLost.code) {
+      return status;
+    }
+    final reason = status.reason.isEmpty ? '' : ': ${status.reason}';
+    return Status.of(StatusCode.unavailable, 'connection lost$reason');
+  }
+
+  /// Mux CLOSE must not carry application codes, nor CONNECTION_LOST.
   static Status _wireStatus(Status status) {
     if (!status.isApplicationCode) {
-      return status;
+      return _wireAbortStatus(status);
     }
     final reason = status.reason.isEmpty ? '' : ': ${status.reason}';
     return Status.of(
@@ -726,42 +872,94 @@ class TalkChannel {
   }
 }
 
+/// Receives the responses to an outgoing request synchronously, in wire
+/// order, instead of through a [TalkStream] or future. Used by forwarding.
+abstract interface class _ResponseSink {
+  /// A stream item arrived.
+  void item(_Message item);
+
+  /// The final response arrived.
+  void complete(_Message message);
+
+  /// The request failed, for any reason.
+  void fail(SwitchboardException error);
+
+  /// The peer sent `EXTEND`.
+  void extended();
+}
+
 /// One of our outstanding requests.
 class _Outgoing {
-  _Outgoing(this.id, this.timeout, {required bool stream})
-    : items = stream ? StreamController<TalkMessage>() : null {
-    if (stream) {
-      items!.onCancel = () => itemsCancelled = true;
-      // TalkStream.done may legitimately go unobserved.
-      completer.future.ignore();
-    }
+  _Outgoing(
+    this.channel,
+    this.id,
+    this.timeout, {
+    required bool stream,
+    this.onExtend,
+    this.sink,
+  }) : isStream = stream,
+       items = stream && sink == null ? StreamController<TalkMessage>() : null {
+    items?.onCancel = _onItemsCancelled;
+    // A dropped request future must never surface as an unhandled error.
+    completer.future.ignore();
   }
 
+  final TalkChannel channel;
   final int id;
   final Duration timeout;
+  final bool isStream;
+  final void Function()? onExtend;
+  final _ResponseSink? sink;
   final StreamController<TalkMessage>? items;
+
+  /// Item requests added to [items] and not yet handed to its listener.
+  final Queue<_Message> undeliveredItems = Queue<_Message>();
   final Completer<TalkMessage> completer = Completer<TalkMessage>();
   Timer? timer;
 
   /// Cancelled locally; the id stays reserved until the final arrives.
   bool abandoned = false;
-  bool itemsCancelled = false;
-
-  bool get isStream => items != null;
+  bool _failed = false;
 
   void stopTimer() {
     timer?.cancel();
     timer = null;
   }
 
-  void complete(TalkMessage message) {
+  void addItem(_Message message) {
+    final sink = this.sink;
+    if (sink != null) {
+      _guard(() => sink.item(message), 'forwarding an item');
+      return;
+    }
+    if (message.expectsReply) {
+      undeliveredItems.add(message);
+    }
+    items!.add(message);
+  }
+
+  void complete(_Message message) {
     stopTimer();
+    final sink = this.sink;
+    if (sink != null) {
+      _guard(() => sink.complete(message), 'forwarding a response');
+      return;
+    }
     items?.close().ignore();
     completer.complete(message);
   }
 
   void fail(SwitchboardException error) {
     stopTimer();
+    if (_failed) {
+      return;
+    }
+    _failed = true;
+    final sink = this.sink;
+    if (sink != null) {
+      _guard(() => sink.fail(error), 'forwarding a failure');
+      return;
+    }
     if (!completer.isCompleted) {
       completer.completeError(error);
     }
@@ -771,13 +969,66 @@ class _Outgoing {
       items.close().ignore();
     }
   }
+
+  void extended() {
+    final sink = this.sink;
+    if (sink != null) {
+      _guard(sink.extended, 'forwarding EXTEND');
+      return;
+    }
+    final callback = onExtend;
+    if (callback != null) {
+      _guard(callback, 'onExtend callback of request $id');
+    }
+  }
+
+  /// The [items] subscription was cancelled, or ended. Undelivered item
+  /// requests are refused, and the request is cancelled if outstanding.
+  void _onItemsCancelled() {
+    final undelivered = undeliveredItems.toList();
+    undeliveredItems.clear();
+    for (final message in undelivered) {
+      message._abortQuietly(
+        Status.of(StatusCode.cancelled, 'stream items not listened'),
+      );
+    }
+    channel._cancelOutgoing(
+      this,
+      Status.of(StatusCode.cancelled, 'items subscription cancelled'),
+    );
+  }
+
+  static void _guard(void Function() action, String what) {
+    try {
+      action();
+    } catch (e, st) {
+      _log.severe('$what failed', e, st);
+    }
+  }
+}
+
+class _TalkRequest extends TalkRequest {
+  _TalkRequest(this._pending);
+
+  final _Outgoing _pending;
+
+  @override
+  int get requestId => _pending.id;
+
+  @override
+  Future<TalkMessage> get response => _pending.completer.future;
+
+  @override
+  void cancel([Status? status]) => _pending.channel._cancelOutgoing(
+    _pending,
+    status ?? Status.of(StatusCode.cancelled),
+  );
 }
 
 class _TalkStream extends TalkStream {
-  _TalkStream(this._channel, this._pending)
-    : items = _GuardedStream(_pending.items!.stream);
+  _TalkStream(this._pending)
+    : items = _GuardedStream(_pending.items!.stream, _pending.undeliveredItems);
 
-  final TalkChannel _channel;
   final _Outgoing _pending;
 
   @override
@@ -790,7 +1041,7 @@ class _TalkStream extends TalkStream {
   Future<TalkMessage> get done => _pending.completer.future;
 
   @override
-  void cancel([Status? status]) => _channel._cancelOutgoing(
+  void cancel([Status? status]) => _pending.channel._cancelOutgoing(
     _pending,
     status ?? Status.of(StatusCode.cancelled),
   );
@@ -810,6 +1061,18 @@ class _Message extends TalkMessage {
   bool _cancelled = false;
   Completer<void>? _cancelCompleter;
   Timer? _timer;
+
+  /// Responder timeout override; null means the channel default.
+  Duration? _replyTimeout;
+
+  /// The status of the peer's cancel, if the peer cancelled.
+  Status? _cancelStatus;
+
+  /// Called synchronously once when the request is cancelled.
+  void Function()? _cancelHook;
+
+  /// [forwardMessage] took this request over.
+  bool _forwarded = false;
 
   @override
   bool get isCancelled => _cancelled;
@@ -851,12 +1114,15 @@ class _Message extends TalkMessage {
       procedure == null ? null : Name(procedure);
 
   @override
-  void reply(Uint8List payload, {String? procedure}) {
+  void reply(Uint8List payload, {String? procedure}) =>
+      _reply(payload, _name(procedure));
+
+  void _reply(Uint8List payload, Name? procedure) {
     _check();
     channel._sendChecked(
       TalkFrame(
         kind: TalkKind.message,
-        procedure: _name(procedure),
+        procedure: procedure,
         responseId: requestId,
         payload: payload,
       ),
@@ -869,55 +1135,81 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-  }) {
-    _check();
-    final name = _name(procedure);
-    final pending = channel._startRequest(
+  }) => startReplyRequest(
+    payload,
+    procedure: procedure,
+    timeout: timeout,
+  ).response;
+
+  @override
+  TalkRequest startReplyRequest(
+    Uint8List payload, {
+    String? procedure,
+    Duration? timeout,
+    void Function()? onExtend,
+  }) => _TalkRequest(
+    _startReplyRequest(
+      payload,
+      _name(procedure),
       stream: false,
       timeout: timeout,
-      build: (id) => TalkFrame(
-        kind: TalkKind.message,
-        procedure: name,
-        requestId: id,
-        responseId: requestId,
-        payload: payload,
-      ),
-    );
-    _finish();
-    return pending.completer.future;
-  }
+      onExtend: onExtend,
+    ),
+  );
 
   @override
   TalkStream replyStreamRequest(
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-  }) {
-    _check();
-    final name = _name(procedure);
-    final pending = channel._startRequest(
+    void Function()? onExtend,
+  }) => _TalkStream(
+    _startReplyRequest(
+      payload,
+      _name(procedure),
       stream: true,
       timeout: timeout,
+      onExtend: onExtend,
+    ),
+  );
+
+  _Outgoing _startReplyRequest(
+    Uint8List payload,
+    Name? procedure, {
+    required bool stream,
+    required Duration? timeout,
+    void Function()? onExtend,
+    _ResponseSink? sink,
+  }) {
+    _check();
+    final pending = channel._startRequest(
+      stream: stream,
+      timeout: timeout,
+      onExtend: onExtend,
+      sink: sink,
       build: (id) => TalkFrame(
         kind: TalkKind.message,
-        procedure: name,
+        procedure: procedure,
         requestId: id,
         responseId: requestId,
-        stream: true,
+        stream: stream,
         payload: payload,
       ),
     );
     _finish();
-    return _TalkStream(channel, pending);
+    return pending;
   }
 
   @override
-  void replyItem(Uint8List payload, {String? procedure}) {
+  void replyItem(Uint8List payload, {String? procedure}) =>
+      _replyItem(payload, _name(procedure));
+
+  void _replyItem(Uint8List payload, Name? procedure) {
     _check(item: true);
     channel._sendChecked(
       TalkFrame(
         kind: TalkKind.streamItem,
-        procedure: _name(procedure),
+        procedure: procedure,
         responseId: requestId,
         payload: payload,
       ),
@@ -930,32 +1222,84 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-  }) {
-    _check(item: true);
-    final name = _name(procedure);
-    final pending = channel._startRequest(
+  }) => startReplyItemRequest(
+    payload,
+    procedure: procedure,
+    timeout: timeout,
+  ).response;
+
+  @override
+  TalkRequest startReplyItemRequest(
+    Uint8List payload, {
+    String? procedure,
+    Duration? timeout,
+    void Function()? onExtend,
+  }) => _TalkRequest(
+    _startItemRequest(
+      payload,
+      _name(procedure),
       stream: false,
       timeout: timeout,
+      onExtend: onExtend,
+    ),
+  );
+
+  @override
+  TalkStream replyItemStreamRequest(
+    Uint8List payload, {
+    String? procedure,
+    Duration? timeout,
+    void Function()? onExtend,
+  }) => _TalkStream(
+    _startItemRequest(
+      payload,
+      _name(procedure),
+      stream: true,
+      timeout: timeout,
+      onExtend: onExtend,
+    ),
+  );
+
+  _Outgoing _startItemRequest(
+    Uint8List payload,
+    Name? procedure, {
+    required bool stream,
+    required Duration? timeout,
+    void Function()? onExtend,
+    _ResponseSink? sink,
+  }) {
+    _check(item: true);
+    final pending = channel._startRequest(
+      stream: stream,
+      timeout: timeout,
+      onExtend: onExtend,
+      sink: sink,
       build: (id) => TalkFrame(
         kind: TalkKind.streamItem,
-        procedure: name,
+        procedure: procedure,
         requestId: id,
         responseId: requestId,
+        stream: stream,
         payload: payload,
       ),
     );
     _restartTimer();
-    return pending.completer.future;
+    return pending;
   }
 
   @override
   void replyAbort(Status status) {
+    TalkChannel._checkAbortStatus(status);
+    _replyAbort(status);
+  }
+
+  void _replyAbort(Status status) {
     _check();
     channel._sendChecked(
       TalkFrame(
         kind: TalkKind.abort,
         responseId: requestId,
-        payload: status.encode(),
+        payload: TalkChannel._wireAbortStatus(status).encode(),
       ),
     );
     _finish();
@@ -970,10 +1314,18 @@ class _Message extends TalkMessage {
     _restartTimer();
   }
 
+  @override
+  void setReplyTimeout(Duration? timeout) {
+    _replyTimeout = timeout;
+    if (!_finished) {
+      _restartTimer();
+    }
+  }
+
   void _restartTimer() {
     _timer?.cancel();
     _timer = null;
-    final timeout = channel.options.replyTimeout;
+    final timeout = _replyTimeout ?? channel.options.replyTimeout;
     if (timeout > Duration.zero) {
       _timer = Timer(timeout, _onTimeout);
     }
@@ -998,6 +1350,13 @@ class _Message extends TalkMessage {
     _finish();
   }
 
+  /// The peer cancelled the request: answer it with the final the protocol
+  /// requires, then tell the application.
+  void _cancelledByPeer(Status status) {
+    _abortQuietly(Status.of(StatusCode.cancelled, 'cancelled by requester'));
+    _markCancelled(status);
+  }
+
   void _finish() {
     _finished = true;
     _timer?.cancel();
@@ -1005,12 +1364,22 @@ class _Message extends TalkMessage {
     channel._release(this);
   }
 
-  void _markCancelled() {
+  void _markCancelled([Status? status]) {
     if (_cancelled) {
       return;
     }
     _cancelled = true;
+    _cancelStatus = status;
     (_cancelCompleter ??= Completer<void>()).complete();
+    final hook = _cancelHook;
+    _cancelHook = null;
+    if (hook != null) {
+      try {
+        hook();
+      } catch (e, st) {
+        _log.severe('cancel handling of request $requestId failed', e, st);
+      }
+    }
   }
 
   /// The request can no longer be answered (channel closed or id reused).
@@ -1024,11 +1393,14 @@ class _Message extends TalkMessage {
 
 /// A message stream whose direct listener is guarded: a synchronous
 /// exception in `onData` is logged and an unanswered request is aborted
-/// with `INTERNAL`.
+/// with `INTERNAL`; an error event without an `onError` handler is logged
+/// instead of being reported as unhandled. Keeps the queue of undelivered
+/// requests up to date as events reach the listener.
 class _GuardedStream extends Stream<TalkMessage> {
-  _GuardedStream(this._source);
+  _GuardedStream(this._source, this._undelivered);
 
   final Stream<TalkMessage> _source;
+  final Queue<_Message> _undelivered;
 
   @override
   StreamSubscription<TalkMessage> listen(
@@ -1038,26 +1410,29 @@ class _GuardedStream extends Stream<TalkMessage> {
     bool? cancelOnError,
   }) {
     return _GuardedSubscription(
-      _source.listen(
-        null,
-        onError: onError,
-        onDone: onDone,
-        cancelOnError: cancelOnError,
-      ),
-    )..onData(onData);
+        _source.listen(null, onDone: onDone, cancelOnError: cancelOnError),
+        _undelivered,
+      )
+      ..onData(onData)
+      ..onError(onError);
   }
 }
 
 class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
-  _GuardedSubscription(super.sourceSubscription);
+  _GuardedSubscription(super.sourceSubscription, this._undelivered);
+
+  final Queue<_Message> _undelivered;
 
   @override
   void onData(void Function(TalkMessage data)? handleData) {
-    if (handleData == null) {
-      super.onData(null);
-      return;
-    }
     super.onData((message) {
+      // Requests are queued, and delivered, in arrival order.
+      if (_undelivered.isNotEmpty && identical(_undelivered.first, message)) {
+        _undelivered.removeFirst();
+      }
+      if (handleData == null) {
+        return;
+      }
       try {
         handleData(message);
       } catch (e, st) {
@@ -1069,5 +1444,15 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
         }
       }
     });
+  }
+
+  @override
+  void onError(Function? handleError) {
+    super.onError(handleError ?? _logError);
+  }
+
+  static void _logError(Object error, StackTrace stackTrace) {
+    // A remote abort is a normal event; the status is also on `done`.
+    _log.fine('talk stream error without onError handler: $error');
   }
 }

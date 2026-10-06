@@ -103,11 +103,14 @@ class TalkFrame {
 
   /// The status carried by an [TalkKind.abort] frame.
   ///
-  /// An empty payload decodes as [Status.ok]. Throws [StateError] for other
-  /// kinds.
+  /// An empty payload means [StatusCode.unknown] (unlike a mux CLOSE, where
+  /// it means OK). Throws [StateError] for other kinds.
   Status get status {
     if (kind != TalkKind.abort) {
       throw StateError('only abort frames carry a status');
+    }
+    if (payload.isEmpty) {
+      return Status.of(StatusCode.unknown);
     }
     return Status.decode(payload);
   }

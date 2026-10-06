@@ -11,6 +11,7 @@ wins and this file is wrong.
 lib/core.dart                  platform independent exports (no dart:io)
 lib/switchboard.dart           everything, including dart:io transports and Switchboard
 lib/src/status.dart            StatusCode, Status, SwitchboardException, ProtocolException   (done)
+lib/src/status_closable.dart   StatusClosable (channels closable with a status; MuxChannel)
 lib/src/name.dart              Name                                                           (done)
 lib/src/bytes.dart             ByteReader, ByteWriter, hexBytes, hexString                    (done)
 lib/src/transport/memory_transport.dart     in-memory StreamChannel<Uint8List> pair
@@ -20,8 +21,10 @@ lib/src/mux/mux_frame.dart     MuxFrame codec, MuxCommand, control message codec
 lib/src/mux/mux_connection.dart MuxConnection, MuxOptions, MuxLimits
 lib/src/mux/mux_channel.dart   MuxChannel, MuxChannelState
 lib/src/talk/talk_frame.dart   TalkFrame codec, TalkKind
-lib/src/talk/talk_channel.dart TalkChannel, TalkOptions
+lib/src/talk/talk_channel.dart TalkChannel, TalkOptions, TalkAbortException
+lib/src/talk/talk_forward.dart forwardMessage (message chain proxying; part of talk_channel.dart)
 lib/src/talk/talk_message.dart TalkMessage (incoming message with reply API)
+lib/src/talk/talk_request.dart TalkRequest (handle for an outgoing single-response request)
 lib/src/talk/talk_stream.dart  TalkStream (handle for an outgoing stream request)
 lib/src/address/service_address.dart   ServiceAddress
 lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
@@ -139,6 +142,7 @@ enum TalkKind { message, streamItem, abort, extend }
 
 class TalkFrame {
   final TalkKind kind; final Name? procedure; final int requestId; final int responseId; final bool stream; final Uint8List payload;
+  Status get status;                    // abort frames only; an empty payload is UNKNOWN
   Uint8List encode();
   static TalkFrame decode(Uint8List);   // throws ProtocolException for every negative vector in the wiki
 }
@@ -150,58 +154,91 @@ class TalkOptions {
   final int maxOutgoingRequests;       // default 1024; beyond: throws resourceExhausted locally
 }
 
+abstract interface class StatusClosable {   // lib/src/status_closable.dart; implemented by MuxChannel
+  Future<void> close([Status status]); Future<Status> get done;
+}
+
+class TalkAbortException extends SwitchboardException {   // the peer sent ABORT
+  final bool isChannelAbort;           // channel abort rather than an abort response
+}
+
 class TalkChannel {
   TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions options});   // works over MuxChannel or any StreamChannel
   StreamChannel<Uint8List> get raw;
-  Stream<TalkMessage> get messages;    // incoming plain messages and requests (not responses); a channel abort from the peer is delivered as an error event (SwitchboardException with its status) and then the stream ends
+  Stream<TalkMessage> get messages;    // incoming plain messages and requests (not responses); a channel abort from the peer is delivered as an error event (TalkAbortException) and then the stream ends
   void send(String procedure, Uint8List payload);                               // plain message
-  Future<TalkMessage> request(String procedure, Uint8List payload, {Duration? timeout});
-  TalkStream streamRequest(String procedure, Uint8List payload, {Duration? timeout});
-  void abort(Status status);           // channel abort, then close
+  Future<TalkMessage> request(String procedure, Uint8List payload, {Duration? timeout});   // = startRequest(...).response
+  TalkRequest startRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend});
+  TalkStream streamRequest(String procedure, Uint8List payload, {Duration? timeout, void Function()? onExtend});
+  void abort(Status status);           // channel abort, then close; ArgumentError for OK
   Future<void> close([Status status = Status.ok]);
   Future<Status> get done;
   bool get isOpen;
+  int get outgoingRequestCount; int get incomingRequestCount;
+}
+
+class TalkRequest {                    // handle for a request with a single final response
+  int get requestId;
+  Future<TalkMessage> get response;    // never reports an unhandled error
+  void cancel([Status status]);
 }
 
 class TalkStream {
-  Stream<TalkMessage> get items;       // STREAM_ITEMs; errors with SwitchboardException on abort/timeout
+  int get requestId;
+  Stream<TalkMessage> get items;       // STREAM_ITEMs; errors on abort/timeout/cancel; cancelling the subscription cancels the request
   Future<TalkMessage> get done;        // the final response (may carry payload and may itself be a request)
   void cancel([Status status]);        // sends cancel; items ends with cancelled error
 }
 
 class TalkMessage {
-  TalkChannel get channel; TalkKind get kind;
-  Name get procedure; String get procedureName;
+  TalkChannel get channel; TalkFrame get frame; TalkKind get kind;
+  Name get procedure; String get procedureName;   // procedureName is lossy for non-UTF-8 names
   Uint8List get payload;
   int get requestId;                   // 0 if the peer expects no reply
   int get responseId;                  // 0 if not a response
   bool get expectsReply;               // requestId != 0
   bool get expectsStream;              // STREAM flag
-  bool get isCancelled;                // peer sent cancel for requestId
+  bool get isCancelled;                // peer cancelled, responder timeout expired, channel closed, or id reused
   Future<void> get onCancel;           // completes when cancelled (never for non-requests)
+  bool get canReply;
 
   // Reply API; all throw SwitchboardException(failedPrecondition) if !expectsReply or already finally replied
   void reply(Uint8List payload, {String? procedure});
-  Future<TalkMessage> replyRequest(Uint8List payload, {String? procedure, Duration? timeout});   // chained
-  TalkStream replyStreamRequest(Uint8List payload, {String? procedure, Duration? timeout});
+  Future<TalkMessage> replyRequest(Uint8List payload, {String? procedure, Duration? timeout});   // chained; = startReplyRequest(...).response
+  TalkRequest startReplyRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});
+  TalkStream replyStreamRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});
   void replyItem(Uint8List payload, {String? procedure});       // throws if !expectsStream
   Future<TalkMessage> replyItemRequest(Uint8List payload, {String? procedure, Duration? timeout});   // item that expects a reply
-  void replyAbort(Status status);
+  TalkRequest startReplyItemRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});
+  TalkStream replyItemStreamRequest(Uint8List payload, {String? procedure, Duration? timeout, void Function()? onExtend});   // item that is a stream request
+  void replyAbort(Status status);      // ArgumentError for OK
   void extend();
+  void setReplyTimeout(Duration? timeout);   // per-request responder timeout: null = channel default, zero = none
 }
+
+/// Message chain proxying (wiki "Switchboard Proxying"). Completes when the exchange,
+/// including requests forwarded on its behalf, has ended; never fails.
+Future<void> forwardMessage(TalkMessage incoming, TalkChannel target);
 ```
 
 Behaviour notes:
 
-* Responses (including chained ones and stream items) are routed to the requester's `Future`/`TalkStream`, never to `messages`.
+* Responses (including chained ones and stream items) are routed to the requester's `Future`/`TalkRequest`/`TalkStream`, never to `messages`.
 * A response for an unknown response id is ignored unless it has `HAS_REQUEST`; then reply ABORT `notFound`.
 * Unknown procedure is the application's concern: the application calls `replyAbort(Status.of(StatusCode.unimplemented))`. The channel itself does not know the procedure table.
-* Responder timeout: if the application has not called any reply method within `replyTimeout`, send ABORT `deadlineExceeded`, mark replied. `extend()` and `replyItem()` restart it.
-* Requester timeout: restarted by items and extends; on expiry fail locally with `deadlineExceeded`, send cancel.
-* `request()` returns a Future that errors with `SwitchboardException` carrying the abort status.
+* Responder timeout: if the application has not called any reply method within `replyTimeout` (or the per-request `setReplyTimeout` value), send ABORT `deadlineExceeded`, mark replied and cancelled. `extend()` and `replyItem()` restart it.
+* Requester timeout: restarted by items and extends; on expiry fail locally with `deadlineExceeded`, send cancel. `onExtend` is called synchronously for every EXTEND.
+* Failures carry a `TalkAbortException` when the peer sent ABORT (abort response or channel abort), a plain `SwitchboardException` for local causes (own timeout, own cancel, channel lost or closed, protocol error, local limit). An empty or OK abort status reads as `unknown`.
+* Error events on `messages` and `TalkStream.items` without an `onError` handler are logged at FINE, never reported as unhandled; futures from `request`, `replyRequest`, `replyItemRequest` and `TalkRequest.response` are pre-ignored.
+* Peer cancel: the channel sends ABORT `cancelled` at once, the request is finished (later reply calls throw `failedPrecondition`), then `isCancelled`/`onCancel` fire.
+* Our cancel: the id stays reserved until the peer's final arrives or the requester timeout expires (the channel default if the request has none). Cancelling the `items` subscription of an outstanding `TalkStream` cancels the request.
+* Requests buffered in `messages` and never delivered when its subscription is cancelled are answered ABORT `unimplemented`; item requests buffered in `items` are answered ABORT `cancelled`.
+* Outgoing requests are registered (and their timer armed) before the frame is sent, and rolled back if the send throws, so a synchronous transport cannot lose a synchronous response.
+* `connectionLost` is never sent: aborts, cancels and the close of a `StatusClosable` raw channel carry `unavailable` instead.
 * Any ProtocolException while decoding or on kind rule violation: close the channel with CLOSE `protocolError` (via `raw.sink` if it is a MuxChannel, else just close) and fail outstanding requests with `protocolError`.
-* When `raw.stream` ends: fail outstanding requests with `connectionLost` (or the MuxChannel's done status if available), close `messages`.
+* When `raw.stream` ends: fail outstanding requests with `connectionLost` (or the MuxChannel's done status if available), close `messages`. A `close()` racing the end waits for that status.
 * Chaining: a reply method on a `TalkMessage` that is a stream item or a final response (received through `TalkStream`/`request`) works the same way, since those carry a requestId when the peer asked for a reply.
+* Forwarding: `forwardMessage` sends a plain message as a plain message and a request as a new request on `target` (same procedure, payload, STREAM flag), then relays items, EXTEND, the final, and aborts back. Items or finals that are themselves requests are forwarded the other way and their answers relayed back, recursively. A remote abort passes through with its status; any local failure of the forwarded request (including a channel abort) is answered `unavailable`. A cancel of the incoming request, or loss of its channel, cancels the forwarded one. Procedure names pass through as `Name`s (lossless); the proxy disables its responder timeout for forwarded requests and sets no requester timeout, so the real peers' timeouts apply end to end.
 
 ## Addressing
 
