@@ -14,9 +14,12 @@ lib/src/status.dart            StatusCode, Status, SwitchboardException, Protoco
 lib/src/status_closable.dart   StatusClosable (channels closable with a status; MuxChannel)
 lib/src/name.dart              Name                                                           (done)
 lib/src/bytes.dart             ByteReader, ByteWriter, hexBytes, hexString                    (done)
+lib/src/transport/transport_capabilities.dart  FrameLimited, AbortableTransport, OutputBufferedTransport (optional transport capabilities)
 lib/src/transport/memory_transport.dart     in-memory StreamChannel<Uint8List> pair
-lib/src/transport/stream_transport.dart     preamble + u32 length framing over byte streams; TCP helpers (dart:io)
+lib/src/transport/stream_framing.dart       stream binding wire format: StreamFraming, StreamFrameDecoder (no dart:io)
+lib/src/transport/stream_transport.dart     StreamTransport, StreamTransportChannel over byte streams; TCP helpers (dart:io)
 lib/src/transport/web_socket_transport.dart wraps package:web_socket_channel (binary only)
+lib/src/transport/web_socket_transport_io.dart  IOWebSocketTransport: server upgrade and connect on dart:io (exported from switchboard.dart only)
 lib/src/mux/mux_frame.dart     MuxFrame codec, MuxCommand, control message codecs
 lib/src/mux/mux_connection.dart MuxConnection, MuxOptions, MuxLimits
 lib/src/mux/mux_channel.dart   MuxChannel, MuxChannelState
@@ -40,7 +43,8 @@ lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a namin
 
 Rules:
 
-* `dart:io` only in `stream_transport.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. Everything else must compile for the web.
+* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. Everything else must compile for the web.
+* The wire codecs must be correct when compiled to JavaScript, where bitwise operations are 32-bit: use `ByteReader`/`ByteWriter` (or the same split arithmetic) for `u32` and `u48`. `dart test -P node` runs the codec tests on Node.js (see `dart_test.yaml`).
 * All wire codecs are pure functions over `Uint8List` and are unit tested against the wiki test vectors.
 * Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`.
 * No `print`. No fixed ports in tests (bind to port 0). No multi-second sleeps in tests; timeouts under test are configured in tens of milliseconds through options.
@@ -49,31 +53,78 @@ Rules:
 
 ## Transports
 
-A transport is a `StreamChannel<Uint8List>` whose stream yields one mux frame per event and whose sink takes one mux frame per `add`. Closing the sink closes the transport. The stream ends when the transport is closed by either side; errors on the stream mean the transport failed.
+A transport is a `StreamChannel<Uint8List>` whose stream yields one mux frame per event and whose sink takes one mux frame per `add`. Closing the sink closes the transport. The stream ends when the transport is closed by either side; errors on the stream mean the transport failed. After a stream error the sink stays writable until the listener has seen the error and the end of the stream, so the mux can still send GOAWAY.
+
+Optional capabilities, discovered by the mux with type tests (`transport_capabilities.dart`, exported from `core.dart`):
+
+```dart
+abstract interface class FrameLimited { int get maxFrameSize; }   // incoming limit, 0 = none; the mux warns and announces it if below MuxOptions.maxFrameSize
+abstract interface class AbortableTransport { void abort(); }      // destroy now; the mux calls it when close() exceeds keepAliveTimeout
+abstract interface class OutputBufferedTransport {
+  int get bufferedOutputBytes;   // written, not yet accepted by the connection
+  int get acceptedOutputBytes;   // total accepted; grows while the peer reads (keep-alive counts it as life while throttled)
+  bool get isInputThrottled;     // input paused because too much output waits
+}
+```
 
 ```dart
 class MemoryTransport {
   /// Two connected transports. Frames added to one appear on the other.
   /// Optional [delay] and [maxFrameSize] for tests. Closing one side
-  /// ends the other side's stream.
-  static (StreamChannel<Uint8List>, StreamChannel<Uint8List>) pair({Duration? delay});
+  /// ends the other side's stream. With maxFrameSize, an oversized frame
+  /// fails only the receiving side's stream; that side stays writable
+  /// until it closes (or its listener saw the end), so GOAWAY reaches the
+  /// sender. Both ends implement FrameLimited.
+  static (StreamChannel<Uint8List>, StreamChannel<Uint8List>) pair({Duration? delay, int? maxFrameSize});
 }
 
-class StreamTransport {
-  /// Wraps a byte stream pair: writes the preamble, frames outgoing frames
-  /// with the u32 length prefix, parses incoming bytes into frames.
-  /// Enforces [maxFrameSize] (default 1 MiB): a larger length fails the
-  /// stream with ProtocolException(frameTooLarge) and closes.
-  static StreamChannel<Uint8List> wrap(Stream<List<int>> input, StreamSink<List<int>> output, {int maxFrameSize});
-  static Future<StreamChannel<Uint8List>> connectTcp(dynamic host, int port, {int maxFrameSize});   // dart:io
-  static StreamChannel<Uint8List> fromSocket(Socket socket, {int maxFrameSize});                    // dart:io
+/// Wire format of the stream binding, no dart:io (stream_framing.dart).
+class StreamFraming { defaultMaxFrameSize; version; preambleLength; lengthPrefixSize; magic; encodePreamble(); encodeFrame(); }
+class StreamFrameDecoder { StreamFrameDecoder({int maxFrameSize}); void add(List<int> chunk, void Function(Uint8List) onFrame); }
+  // wrong magic, zero length: ProtocolException; preamble version != 1: SwitchboardException(unsupported);
+  // length > maxFrameSize: SwitchboardException(frameTooLarge), without reading the body
+
+class StreamTransport {   // dart:io; re-exports stream_framing.dart; the static codec members delegate to StreamFraming
+  /// Writes the preamble, frames outgoing frames with the u32 length prefix,
+  /// parses incoming bytes into frames. Output is fed to [output] with
+  /// addStream, so a sink that cannot keep up pauses the transport instead
+  /// of buffering inside dart:io; bytes not accepted yet wait in the
+  /// transport, and above [outputHighWaterMark] (default 16 MiB, 0 = never)
+  /// the transport stops reading [input] until they drain to half. A close
+  /// that cannot write its buffered output within [closeTimeout] (default
+  /// 10 s) calls [abort].
+  static StreamTransportChannel wrap(Stream<List<int>> input, StreamSink<List<int>> output,
+      {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout, void Function()? abort});
+  static Future<StreamTransportChannel> connectTcp(dynamic host, int port, {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout});
+  static StreamTransportChannel fromSocket(Socket socket, {int maxFrameSize, int outputHighWaterMark, Duration closeTimeout});   // abort = socket.destroy
 }
 
-class WebSocketTransport {
-  static StreamChannel<Uint8List> wrap(WebSocketChannel channel);  // binary frames only; text is a protocol error
-  static Future<StreamChannel<Uint8List>> connect(Uri uri);        // offers subprotocol 'switchboard'
+final class StreamTransportChannel implements StreamChannel<Uint8List>, FrameLimited, AbortableTransport, OutputBufferedTransport {
+  int get maxFrameSize; int get outputHighWaterMark; Duration get closeTimeout;
+  int get bufferedOutputBytes; int get acceptedOutputBytes; bool get isInputThrottled;
+  void abort();
+}
+
+class WebSocketTransport {   // core, no dart:io
+  static const int defaultMaxFrameSize = 1 MiB;
+  /// Binary frames only; a text message is a protocol error; a message
+  /// over maxFrameSize (0 = none) fails the stream with frameTooLarge.
+  /// The check runs on assembled messages, so it protects the mux but not
+  /// the WebSocket implementation's own memory. Implements FrameLimited.
+  static StreamChannel<Uint8List> wrap(WebSocketChannel channel, {int maxFrameSize});
+  static Future<StreamChannel<Uint8List>> connect(Uri uri, {int maxFrameSize});   // offers subprotocol 'switchboard'
+}
+
+class IOWebSocketTransport {   // dart:io, exported from switchboard.dart only
+  /// Selects 'switchboard' when offered, accepts clients offering none,
+  /// refuses clients offering only others. Compression off by default: a
+  /// compressed message can inflate far beyond its wire size.
+  static Future<StreamChannel<Uint8List>> upgrade(HttpRequest request, {int maxFrameSize, bool compression = false});
+  static Future<StreamChannel<Uint8List>> connect(Uri uri, {int maxFrameSize, bool compression = false});
 }
 ```
+
+`IOWebSocketTransport` is a separate class rather than a static `WebSocketTransport.upgrade` because Dart has no static extension members and `WebSocketTransport` must stay free of `dart:io`. The transport limits (`maxFrameSize` of the stream and WebSocket transports) and `MuxOptions.maxFrameSize` should agree; with the defaults they are all 1 MiB.
 
 ## Mux
 
@@ -82,37 +133,45 @@ enum MuxCommand { data, open, close }
 
 class MuxFrame {
   final MuxCommand command; final int channelId; final Uint8List payload;
-  Uint8List encode();                 // short form whenever channelId < 0x10000
+  Uint8List encode();                 // short form whenever channelId < 0x10000; u48 ids correct on the web
   static MuxFrame decode(Uint8List);  // throws ProtocolException on reserved bits, command 3, truncation
 }
 
 enum MuxControlType { ping(1), pong(2), goAway(3), limits(4) }
 class MuxLimits { final int maxFrameSize; final int maxChannels; encode/decode }
+// MuxControlMessage.goAway(status) shortens the reason (UTF-8 safe) so the payload stays within 1024 bytes.
 
 class MuxOptions {
-  final int maxFrameSize;          // what we accept, announced with LIMITS; default 1 MiB
+  final int maxFrameSize;          // what we accept, announced with LIMITS; default 1 MiB (a smaller FrameLimited transport limit is announced instead)
   final int maxChannels;           // what we accept; default 65536 (0 = unlimited)
   final bool shortIdsOnly;         // embedded style peer: refuse long ids; default false
   final Duration? keepAliveInterval;   // PING after this much silence; default 10 s; null disables
-  final Duration keepAliveTimeout;     // close if nothing arrives after PING; default 10 s
+  final Duration keepAliveTimeout;     // close if nothing arrives after PING; default 10 s; also bounds close(), then the transport is aborted
   final Duration goAwayGrace;          // how long goAway() waits for channels; default 10 s
   final bool announceLimits;           // send LIMITS on start; default true
+  final int maxPendingRejections;      // ids awaiting the peer's CLOSE without a channel; default 1024 (0 = unlimited); beyond: GOAWAY resourceExhausted
+  final int maxChannelBufferBytes;     // per channel receive buffer while unread or paused; default 4 MiB (0 = unlimited); beyond: CLOSE resourceExhausted
+  final int receiveHighWaterMarkBytes; // all channel buffers; default 16 MiB (0 = never); above: stop reading the transport until half
+  final Duration closeConfirmTimeout;  // MuxChannel.close() wait for the peer's CLOSE; default 30 s (Duration.zero = forever)
 }
 
 class MuxConnection {
   MuxConnection(StreamChannel<Uint8List> transport, {required bool isInitiator, MuxOptions options});
   bool get isInitiator;
-  Stream<MuxChannel> get incoming;     // channels opened by the peer, single subscription, buffered until listened
+  Stream<MuxChannel> get incoming;     // channels opened by the peer, single subscription, buffered until listened; cancelling closes undelivered ones with UNAVAILABLE
   MuxChannel open(Uint8List openPayload);   // throws SwitchboardException(resourceExhausted) if no id free or peer limit hit; (failedPrecondition) if closed or peer sent GOAWAY
   Future<Duration> ping([Uint8List? payload]);
   Future<void> goAway([Status status]);     // send GOAWAY, wait for open channels up to grace, then close()
   Future<void> close();                     // close transport now; all channels end with connectionLost
-  Future<Status> get done;                  // completes when the transport is closed; status: goingAway if a GOAWAY was received, protocolError if we killed it, connectionLost otherwise
+  Future<Status> get done;                  // completes when the transport is closed; status: goingAway if a GOAWAY was received, the GOAWAY status we sent if we killed it (protocolError, frameTooLarge, unsupported, resourceExhausted), connectionLost otherwise
   bool get isOpen;                          // transport open and no local close started
   bool get peerGoingAway;
   MuxLimits? get peerLimits;
   int get openChannelCount;
   Iterable<MuxChannel> get channels;
+  int get bufferedBytes;                    // bytes in all channel receive buffers
+  bool get isReceivePaused;                 // transport reading paused by receiveHighWaterMarkBytes
+  int get unconfirmedCloseCount;            // ids awaiting the peer's CLOSE without a channel
 }
 
 enum MuxChannelState { open, halfClosedLocal, closed }
@@ -124,18 +183,35 @@ class MuxChannel implements StreamChannel<Uint8List> {
   Stream<Uint8List> get stream;             // incoming DATA subframes; ends when the peer's CLOSE arrives or the connection drops
   StreamSink<Uint8List> get sink;           // add = DATA; close() = close(Status.ok)
   void send(Uint8List subframe);            // throws SwitchboardException(failedPrecondition) if !canSend
-  Future<void> close([Status status = Status.ok]);  // send CLOSE; completes when mutually closed or connection lost
+  Future<void> close([Status status = Status.ok]);  // send CLOSE; completes when mutually closed, connection lost, or closeConfirmTimeout
   Future<Status> get done;                  // end status: first non-OK status sent or received, else OK; connectionLost/goingAway if connection dropped
+  int get bufferedBytes;                    // received, not yet delivered to the stream's listener
 }
 ```
 
 Behaviour notes:
 
-* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels`, reply CLOSE `resourceExhausted` instead (channel never surfaces).
-* Protocol errors: send GOAWAY `protocolError` with reason, close transport, `done` completes with `protocolError`.
-* Ids: allocate incrementally from 2 or 3, step 2, skipping reserved ids and ids in use, wrapping at 0xFFFFFFFFFFFF (or 0xFFFF if `shortIdsOnly`).
-* Keep-alive: timer restarted on any incoming frame; on expiry send PING; if nothing arrives within `keepAliveTimeout`, close with `connectionLost`.
-* Incoming frames for channel 0 are control messages; unknown types ignored; PING answered immediately.
+* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels`, after our GOAWAY, or once `incoming` was cancelled, reply CLOSE (`resourceExhausted`, `goingAway`, `unavailable`) instead; the channel never surfaces and only its id is kept until the peer confirms. A second OPEN on such an id before the confirmation is a protocol error, as is OPEN on any id that is open or half closed.
+* Protocol errors: send GOAWAY `protocolError` with reason, close transport, `done` completes with `protocolError`. A stream binding preamble with another version gives GOAWAY `unsupported`; a frame over the transport limit gives GOAWAY `frameTooLarge`.
+* Ids: allocate incrementally from 2 or 3, step 2, skipping reserved ids, ids in use and ids awaiting a CLOSE confirmation, wrapping at 0xFFFFFFFFFFFF (or 0xFFFF if `shortIdsOnly`).
+* Keep-alive: timer restarted on any incoming frame; on expiry send PING; if nothing arrives within `keepAliveTimeout`, close with `connectionLost`. No probing while the mux paused reading (`receiveHighWaterMarkBytes`); while the transport throttles its input because of our output, the peer reading that output counts as hearing from it.
+* Incoming frames for channel 0 are control messages; unknown types ignored; PING answered immediately, whatever its size up to the 1024-byte control limit.
+* Statuses received in CLOSE or GOAWAY with application codes (256 and above, not allowed there) are reported as `unknown` with the original code in the reason, so they can be relayed.
+* Reasons sent in CLOSE and GOAWAY are shortened on a UTF-8 boundary so the status payload is at most 1024 bytes and the frame fits the peer's announced frame limit; `done` reports the status as given.
+* Channel streams and `incoming` are fed from queues the mux owns and only while the listener is active and not paused, so every buffered byte and channel is accounted for.
+
+## Resource limits
+
+Text for the integrator, suitable for the "Switchboard Mux" wiki page:
+
+> **Resource limits (reference implementation).** The protocol has no flow control of its own, so an implementation bounds what a peer can make it hold. The Dart reference implementation does the following; other implementations SHOULD do something equivalent.
+>
+> * **Per-channel receive buffer.** Data received on a channel that the application is not reading (no listener yet, or paused) is buffered up to a cap (default 4 MiB, each subframe counted as its length plus a small overhead so floods of empty subframes count too). Beyond it the channel is closed with CLOSE `RESOURCE_EXHAUSTED` and its buffer dropped. This is a channel error, not a connection error; DATA still in flight is dropped until the peer confirms.
+> * **Connection receive high-water mark.** When the buffers of all channels together exceed a mark (default 16 MiB), the implementation stops reading the transport, which pushes back on the peer through TCP (or the WebSocket's) flow control, and resumes at half the mark. Keep-alive does not probe while reading is paused, since the silence is local.
+> * **Rejected OPENs.** A rejected OPEN (over the channel cap, after GOAWAY, or when no longer accepting channels) costs only its id until the peer's confirming CLOSE arrives; no channel state or open payload is kept. If more than a cap of such ids (default 1024) are unconfirmed, the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. A second OPEN on a rejected id before its confirmation is a protocol error.
+> * **Reason truncation.** Reasons in CLOSE and GOAWAY are shortened at a UTF-8 character boundary so that the status payload is at most 1024 bytes and the frame fits the limit the peer announced with LIMITS (GOAWAY must anyway, as a control payload over 1024 bytes is a protocol error).
+> * **Close confirmation timeout.** If the peer does not confirm a CLOSE within a timeout (default 30 s), the channel is reported closed locally with its first status. Nothing is sent; the id stays reserved until the peer's CLOSE arrives after all or the connection ends, because the peer may still consider the channel open and its late frames must not land on a new channel with the same id. Such ids count toward the rejected-OPEN cap.
+> * **Output.** A transport queues output the connection has not accepted (a peer that does not read). Above a high-water mark (default 16 MiB) it stops reading input, so a peer that sends PINGs without reading cannot make it produce unbounded PONGs; reading resumes once half has drained. While throttled this way, the peer reading our output counts as liveness for keep-alive. A close that cannot drain within the keep-alive timeout destroys the connection.
 
 ## Talk
 
@@ -367,6 +443,6 @@ class MeshNode {
 
 ## Tests
 
-* `test/vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs.
+* `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`.
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).

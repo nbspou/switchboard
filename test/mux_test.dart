@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
-import 'package:stream_channel/stream_channel.dart';
+import 'package:logging/logging.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
@@ -12,83 +12,11 @@ import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/transport/memory_transport.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:switchboard/src/transport/web_socket_transport.dart';
+import 'package:switchboard/src/transport/web_socket_transport_io.dart';
 import 'package:test/test.dart';
 import 'package:web_socket_channel/io.dart';
 
-/// Keep-alive off so that tests only see the frames they cause.
-const quiet = MuxOptions(
-  keepAliveInterval: null,
-  goAwayGrace: Duration(seconds: 2),
-);
-
-/// Additionally no LIMITS, for byte exact raw peer tests.
-const rawOptions = MuxOptions(keepAliveInterval: null, announceLimits: false);
-
-final empty = Uint8List(0);
-
-Matcher throwsStatus(StatusCode code) =>
-    throwsA(isA<SwitchboardException>().having((e) => e.code, 'code', code));
-
-Matcher hasCode(StatusCode code) =>
-    isA<Status>().having((s) => s.known, 'known', code);
-
-(MuxConnection, MuxConnection) muxPair({
-  MuxOptions initiator = quiet,
-  MuxOptions acceptor = quiet,
-}) {
-  final (a, b) = MemoryTransport.pair();
-  return (
-    MuxConnection(a, isInitiator: true, options: initiator),
-    MuxConnection(b, isInitiator: false, options: acceptor),
-  );
-}
-
-/// The far side of a transport, driven with raw frames.
-class RawPeer {
-  RawPeer(this.transport) : frames = StreamQueue(transport.stream);
-
-  final StreamChannel<Uint8List> transport;
-  final StreamQueue<Uint8List> frames;
-
-  void send(String hex) => transport.sink.add(hexBytes(hex));
-
-  Future<String> nextHex() async => hexString(await frames.next);
-
-  Future<MuxFrame> next() async => MuxFrame.decode(await frames.next);
-
-  /// Skips frames until a control message of [type] and returns it.
-  Future<MuxControlMessage> nextControl(MuxControlType type) async {
-    while (true) {
-      final frame = await next();
-      if (frame.channelId == 0) {
-        final message = MuxControlMessage.decode(frame.payload);
-        if (message.knownType == type) {
-          return message;
-        }
-      }
-    }
-  }
-
-  /// Every frame until the transport closes.
-  Future<List<MuxFrame>> rest() async => [
-    for (final bytes in await frames.rest.toList()) MuxFrame.decode(bytes),
-  ];
-}
-
-(MuxConnection, RawPeer) rawPair({
-  bool muxIsInitiator = true,
-  MuxOptions options = rawOptions,
-}) {
-  final (a, b) = MemoryTransport.pair();
-  return (
-    MuxConnection(a, isInitiator: muxIsInitiator, options: options),
-    RawPeer(b),
-  );
-}
-
-bool isControl(MuxFrame frame, MuxControlType type) =>
-    frame.channelId == 0 &&
-    MuxControlMessage.decode(frame.payload).knownType == type;
+import 'mux_harness.dart';
 
 void main() {
   group('channels', () {
@@ -536,6 +464,21 @@ void main() {
       await mux.close();
     });
 
+    test('a long form id addresses a channel opened in short form', () async {
+      final (mux, raw) = rawPair();
+      raw.send('12 03 00');
+      final channel = await mux.incoming.first;
+      final data = StreamQueue(channel.stream);
+      raw.send('00 03 00 00 00 00 00 77');
+      expect(hexString(await data.next), '77');
+      // CLOSE in the long form too.
+      raw.send('20 03 00 00 00 00 00');
+      expect(await raw.nextHex(), '22 03 00');
+      expect(await channel.done, Status.ok);
+      expect(await data.hasNext, isFalse);
+      await mux.close();
+    });
+
     test('shortIdsOnly refuses long form frames with UNSUPPORTED', () async {
       final (mux, raw) = rawPair(
         options: rawOptions.copyWith(shortIdsOnly: true),
@@ -602,6 +545,21 @@ void main() {
       expect(await mux.done, hasCode(StatusCode.protocolError));
     });
 
+    test('OPEN on a locally half-closed id', () async {
+      final (mux, raw) = rawPair();
+      raw.send('12 03 00');
+      final channel = await mux.incoming.first;
+      unawaited(channel.close());
+      expect(await raw.nextHex(), '22 03 00');
+      // DATA in flight after our CLOSE is fine.
+      raw.send('02 03 00 01');
+      raw.send('12 03 00');
+      final goAway = await raw.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus.known, StatusCode.protocolError);
+      expect(await mux.done, hasCode(StatusCode.protocolError));
+      expect(await channel.done, hasCode(StatusCode.connectionLost));
+    });
+
     test('a broken channel handler does not affect the connection', () async {
       final (a, b) = muxPair();
       final bIncoming = StreamQueue(b.incoming);
@@ -661,6 +619,26 @@ void main() {
       raw.send('02 00 00 02 00');
       raw.send('02 00 00 02 BE EF');
       expect(await pong, isA<Duration>());
+      await mux.close();
+    });
+
+    test('PINGs with 126 to 1024 byte payloads are answered', () async {
+      final (mux, raw) = rawPair();
+      for (final size in [126, 1000, 1024]) {
+        final payload = Uint8List.fromList(
+          List.generate(size, (i) => i & 0xFF),
+        );
+        raw.transport.sink.add(
+          MuxControlMessage(
+            MuxControlType.ping.code,
+            payload,
+          ).toFrame().encode(),
+        );
+        final pong = MuxControlMessage.decode((await raw.next()).payload);
+        expect(pong.knownType, MuxControlType.pong);
+        expect(pong.payload, payload);
+      }
+      expect(mux.isOpen, isTrue);
       await mux.close();
     });
 
@@ -834,6 +812,26 @@ void main() {
       expect(rest.where((f) => isControl(f, MuxControlType.ping)), isEmpty);
     });
 
+    test('any frame during the probe window cancels the timeout', () async {
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(
+          keepAliveInterval: const Duration(milliseconds: 30),
+          keepAliveTimeout: const Duration(milliseconds: 100),
+        ),
+      );
+      final watch = Stopwatch()..start();
+      // Longer than the probe window: without the rule the first probe
+      // would end the connection.
+      while (watch.elapsed < const Duration(milliseconds: 250)) {
+        await raw.nextControl(MuxControlType.ping);
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        // An unknown control type, not a PONG.
+        raw.send('02 00 00 7F');
+      }
+      expect(mux.isOpen, isTrue);
+      await mux.close();
+    });
+
     test('a dead peer leads to CONNECTION_LOST', () async {
       final (mux, raw) = rawPair(
         options: rawOptions.copyWith(
@@ -944,6 +942,151 @@ void main() {
       expect(await channel.done, isA<Status>());
       expect(await a.done, hasCode(StatusCode.connectionLost));
     });
+  });
+
+  group('transport failures end to end', () {
+    /// Runs a mux over a byte pipe fed with [input]; returns its end status
+    /// and the control messages it sent.
+    Future<(Status, List<MuxControlMessage>)> overBytes(Uint8List input) async {
+      final toMux = StreamController<List<int>>();
+      // Closed through the transport.
+      // ignore: close_sinks
+      final fromMux = StreamController<List<int>>();
+      final output = fromMux.stream.toList();
+      final mux = MuxConnection(
+        StreamTransport.wrap(toMux.stream, fromMux.sink),
+        isInitiator: false,
+        options: rawOptions,
+      );
+      toMux.add(input);
+      final status = await mux.done;
+      final frames = <Uint8List>[];
+      StreamFrameDecoder().add([
+        for (final chunk in await output) ...chunk,
+      ], frames.add);
+      await toMux.close();
+      return (
+        status,
+        [
+          for (final frame in frames)
+            MuxControlMessage.decode(MuxFrame.decode(frame).payload),
+        ],
+      );
+    }
+
+    test('wrong preamble magic: GOAWAY PROTOCOL_ERROR', () async {
+      final (status, sent) = await overBytes(
+        hexBytes('53 57 42 58 01 00 00 00'),
+      );
+      expect(status, hasCode(StatusCode.protocolError));
+      expect(sent.single.knownType, MuxControlType.goAway);
+      expect(sent.single.goAwayStatus.known, StatusCode.protocolError);
+    });
+
+    test('unsupported preamble version: GOAWAY UNSUPPORTED', () async {
+      final (status, sent) = await overBytes(
+        StreamTransport.encodePreamble(version: 2),
+      );
+      expect(status, hasCode(StatusCode.unsupported));
+      expect(sent.single.knownType, MuxControlType.goAway);
+      expect(sent.single.goAwayStatus.known, StatusCode.unsupported);
+    });
+
+    group('WebSocket', () {
+      late HttpServer http;
+      late StreamController<MuxConnection> servers;
+      // Closed by the server.
+      // ignore: close_sinks
+      late WebSocket ws;
+
+      setUp(() async {
+        http = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        servers = StreamController<MuxConnection>();
+        http.listen((request) async {
+          servers.add(
+            MuxConnection(
+              await IOWebSocketTransport.upgrade(request, maxFrameSize: 64),
+              isInitiator: false,
+              options: rawOptions,
+            ),
+          );
+        });
+        ws = await WebSocket.connect(
+          'ws://127.0.0.1:${http.port}/',
+          protocols: [WebSocketTransport.subprotocol],
+        );
+      });
+
+      tearDown(() async {
+        await servers.close();
+        await http.close(force: true);
+      });
+
+      Future<void> expectGoAway(StatusCode code) async {
+        final received = ws.toList();
+        final server = await servers.stream.first;
+        expect(await server.done, hasCode(code));
+        final messages = await received;
+        final goAway = MuxControlMessage.decode(
+          MuxFrame.decode(messages.single as Uint8List).payload,
+        );
+        expect(goAway.knownType, MuxControlType.goAway);
+        expect(goAway.goAwayStatus.known, code);
+        expect(ws.closeCode, WebSocketTransport.normalClosure);
+      }
+
+      test('a text message: GOAWAY PROTOCOL_ERROR', () async {
+        ws.add('hello');
+        await expectGoAway(StatusCode.protocolError);
+      });
+
+      test('a message over the limit: GOAWAY FRAME_TOO_LARGE', () async {
+        ws.add(Uint8List(65));
+        await expectGoAway(StatusCode.frameTooLarge);
+      });
+    });
+
+    test(
+      'memory transport limit: the sender sees GOAWAY FRAME_TOO_LARGE',
+      () async {
+        final (ta, tb) = MemoryTransport.pair(maxFrameSize: 64);
+        final mux = MuxConnection(tb, isInitiator: false, options: rawOptions);
+        final raw = RawPeer(ta);
+        raw.send('02 02 00 ${'00 ' * 67}');
+        expect(await mux.done, hasCode(StatusCode.frameTooLarge));
+        final rest = await raw.rest();
+        expect(rest, hasLength(1));
+        final goAway = MuxControlMessage.decode(rest.single.payload);
+        expect(goAway.knownType, MuxControlType.goAway);
+        expect(goAway.goAwayStatus.known, StatusCode.frameTooLarge);
+      },
+    );
+
+    test(
+      'a transport limit below maxFrameSize: warned about and announced',
+      () async {
+        final records = <LogRecord>[];
+        final logs = Logger.root.onRecord.listen(records.add);
+        final (ta, tb) = MemoryTransport.pair(maxFrameSize: 512);
+        final a = MuxConnection(ta, isInitiator: true, options: quiet);
+        final b = MuxConnection(tb, isInitiator: false, options: quiet);
+        await a.ping();
+        expect(a.peerLimits?.maxFrameSize, 512);
+        expect(b.peerLimits?.maxFrameSize, 512);
+        expect(
+          records.where(
+            (r) =>
+                r.level == Level.WARNING &&
+                r.loggerName == 'Switchboard.Mux' &&
+                r.message.contains('512'),
+          ),
+          hasLength(2),
+        );
+        await logs.cancel();
+        await a.close();
+        await b.done;
+      },
+    );
   });
 
   group('real transports', () {

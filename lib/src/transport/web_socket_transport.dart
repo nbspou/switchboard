@@ -13,6 +13,7 @@ import 'package:stream_channel/stream_channel.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../status.dart';
+import 'transport_capabilities.dart';
 
 final Logger _log = Logger('Switchboard.Transport');
 
@@ -29,21 +30,42 @@ abstract final class WebSocketTransport {
   /// allow 1000 and 3000 to 4999 anyway.
   static const int normalClosure = 1000;
 
+  /// Default upper limit on an incoming message: 1 MiB, the same as
+  /// `MuxOptions.defaultMaxFrameSize`.
+  static const int defaultMaxFrameSize = 1024 * 1024;
+
   /// Wraps an established (or connecting) WebSocket as a transport.
   ///
   /// Binary messages become frames. A text message is a protocol error:
   /// the stream fails with a [ProtocolException], ends, and the WebSocket
   /// is closed once the listener has seen the error (so a mux layer can
-  /// still send GOAWAY). The WebSocket is always closed with code 1000.
-  static StreamChannel<Uint8List> wrap(WebSocketChannel channel) =>
-      _WebSocketTransportChannel(channel);
+  /// still send GOAWAY). A binary message longer than [maxFrameSize]
+  /// (0 for no limit) fails the stream the same way with a
+  /// [SwitchboardException] carrying [StatusCode.frameTooLarge]. The
+  /// WebSocket is always closed with code 1000.
+  ///
+  /// [maxFrameSize] should agree with `MuxOptions.maxFrameSize`. The
+  /// check runs on complete messages: the WebSocket implementation has
+  /// already assembled the message in memory, so this limit protects the
+  /// layers above but does not bound the memory a peer can make the
+  /// WebSocket implementation use. On servers, accept connections with
+  /// `IOWebSocketTransport.upgrade`, which also turns compression off, or
+  /// put a proxy with a message size limit in front.
+  static StreamChannel<Uint8List> wrap(
+    WebSocketChannel channel, {
+    int maxFrameSize = defaultMaxFrameSize,
+  }) => _WebSocketTransportChannel(channel, maxFrameSize);
 
   /// Connects to [uri] (`ws://` or `wss://`), offering the `switchboard`
-  /// subprotocol, and wraps the connection.
+  /// subprotocol, and wraps the connection with [maxFrameSize] as in
+  /// [wrap].
   ///
   /// Throws whatever the WebSocket implementation reports if the
   /// connection cannot be established.
-  static Future<StreamChannel<Uint8List>> connect(Uri uri) async {
+  static Future<StreamChannel<Uint8List>> connect(
+    Uri uri, {
+    int maxFrameSize = defaultMaxFrameSize,
+  }) async {
     final channel = WebSocketChannel.connect(
       uri,
       protocols: const [subprotocol],
@@ -54,12 +76,14 @@ abstract final class WebSocketTransport {
       unawaited(channel.sink.close().then((_) {}, onError: (_) {}));
       rethrow;
     }
-    return wrap(channel);
+    return wrap(channel, maxFrameSize: maxFrameSize);
   }
 }
 
-class _WebSocketTransportChannel with StreamChannelMixin<Uint8List> {
-  _WebSocketTransportChannel(this._ws) {
+class _WebSocketTransportChannel
+    with StreamChannelMixin<Uint8List>
+    implements FrameLimited {
+  _WebSocketTransportChannel(this._ws, this.maxFrameSize) {
     _controller = StreamController<Uint8List>(
       onListen: _onListen,
       onPause: () => _wsSub?.pause(),
@@ -73,6 +97,10 @@ class _WebSocketTransportChannel with StreamChannelMixin<Uint8List> {
   }
 
   final WebSocketChannel _ws;
+
+  @override
+  final int maxFrameSize;
+
   late final StreamController<Uint8List> _controller;
   // The sink is handed to the user, who closes it.
   // ignore: close_sinks
@@ -107,6 +135,19 @@ class _WebSocketTransportChannel with StreamChannelMixin<Uint8List> {
     } else {
       _log.warning('WebSocket transport: text message received');
       _fail(ProtocolException('text WebSocket message'));
+      return;
+    }
+    if (maxFrameSize > 0 && frame.length > maxFrameSize) {
+      _log.warning(
+        'WebSocket transport: message of ${frame.length} bytes exceeds '
+        '$maxFrameSize',
+      );
+      _fail(
+        SwitchboardException.of(
+          StatusCode.frameTooLarge,
+          'message of ${frame.length} bytes exceeds limit of $maxFrameSize',
+        ),
+      );
       return;
     }
     if (!_listenerGone) {

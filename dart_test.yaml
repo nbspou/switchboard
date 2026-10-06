@@ -1,0 +1,11 @@
+# `dart test` runs everything on the VM.
+#
+# `dart test -P node` (or `dart test -p node test/vectors/`) runs the
+# platform independent codec tests compiled to JavaScript on Node.js, which
+# checks the 32 and 48-bit arithmetic of the wire codecs on the web.
+presets:
+  node:
+    platforms: [node]
+    paths:
+      - test/vectors
+      - test/bytes_test.dart
