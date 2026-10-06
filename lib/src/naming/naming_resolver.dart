@@ -18,22 +18,15 @@ import 'naming_protocol.dart';
 /// Resolves through the table a [NamingClient] mirrors from the naming
 /// service. The normal backend resolver.
 ///
-/// Resolution waits until the client is synced, at most [resolveTimeout];
-/// see [resolve]. The resolver does not start the client.
+/// Resolution waits until the client has been synced once, at most
+/// [resolveTimeout]; see [resolve]. The resolver does not start the client.
 class NamingResolver implements Resolver {
-  /// Creates a resolver over [client].
+  /// Creates a resolver over [client], which may be in any state: whether
+  /// the stale table is served depends only on [NamingClient.hasSynced].
   NamingResolver(
     this.client, {
     this.resolveTimeout = const Duration(seconds: 5),
-  }) {
-    // Remember the first sync even if nothing is resolved before the naming
-    // service goes away, so that the stale table is served from then on.
-    if (client.isSynced) {
-      _everSynced = true;
-    } else {
-      client.synced.then<void>((_) => _everSynced = true, onError: (_) {});
-    }
-  }
+  });
 
   /// The client whose table this resolver reads.
   final NamingClient client;
@@ -44,23 +37,24 @@ class NamingResolver implements Resolver {
   static final Logger _log = Logger('Switchboard.Naming');
 
   bool _closed = false;
-  bool _everSynced = false;
 
   /// All instances of [type] in the client's table.
   ///
-  /// Before the first `SYNCED` this waits for [NamingClient.synced], at most
-  /// [resolveTimeout], and then fails with [SwitchboardException]
-  /// [StatusCode.unavailable]. Once the client has been synced once, a later
-  /// loss of the naming service does not block resolution: the mirrored
-  /// table is served as it was (stale) until the client resynchronizes.
-  /// Fails with [StatusCode.failedPrecondition] after [close] and with
-  /// [StatusCode.cancelled] if the client is closed while waiting.
+  /// Before the client's first `SYNCED` ([NamingClient.hasSynced]) this
+  /// waits for [NamingClient.firstSynced], at most [resolveTimeout], and
+  /// then fails with [SwitchboardException] [StatusCode.unavailable]. Once
+  /// the client has been synced once, a later loss of the naming service
+  /// does not block resolution, whether or not anything was resolved
+  /// before: the mirrored table is served as it was (stale) until the
+  /// client resynchronizes. Fails with [StatusCode.failedPrecondition]
+  /// after [close] and with [StatusCode.cancelled] if the client is closed
+  /// while waiting.
   @override
   Future<List<ServiceRecord>> resolve(Name type) async {
     _checkOpen();
-    if (!client.isSynced && !_everSynced) {
+    if (!client.hasSynced) {
       try {
-        await client.synced.timeout(resolveTimeout);
+        await client.firstSynced.timeout(resolveTimeout);
       } on TimeoutException {
         throw SwitchboardException.of(
           StatusCode.unavailable,
@@ -69,9 +63,7 @@ class NamingResolver implements Resolver {
       }
       _checkOpen();
     }
-    if (client.isSynced) {
-      _everSynced = true;
-    } else {
+    if (!client.isSynced) {
       _log.fine('serving stale table for $type while resynchronizing');
     }
     return [
@@ -93,9 +85,13 @@ class NamingResolver implements Resolver {
   @override
   Stream<ServiceEvent> get events => client.events;
 
-  /// The client's [NamingClient.synced] of the current session.
+  /// The client's [NamingClient.firstSynced]: completes once the table has
+  /// been synced at least once, and stays complete through later losses of
+  /// the naming service (the stale table is served meanwhile). Fails with
+  /// [StatusCode.cancelled] if the client is closed before its first
+  /// `SYNCED`.
   @override
-  Future<void> get ready => client.synced;
+  Future<void> get ready => client.firstSynced;
 
   /// Closes the resolver and its client: the client stops reconnecting and
   /// its registrations are dropped by the naming service.

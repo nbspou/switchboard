@@ -58,16 +58,48 @@ class NamingService {
   /// It must be shorter than the [TalkOptions.replyTimeout] of every channel
   /// passed to [serve] (10 s by default), otherwise the responder timeout of
   /// the channel aborts the watch with `DEADLINE_EXCEEDED`; it must also be
-  /// shorter than the watcher's request timeout. The wiki requires at most
-  /// 5 s, the default. Throws [ArgumentError] if it is not positive.
-  NamingService({this.heartbeat = const Duration(seconds: 5)}) {
+  /// shorter than the watcher's request timeout. The wiki requires `EXTEND`
+  /// at least every 5 s on an idle watch. A timer never fires early but
+  /// often fires late (event loop latency, load), so a 5 s heartbeat would
+  /// regularly overshoot that bound; the default of 4 s leaves a second of
+  /// margin.
+  ///
+  /// [assignmentHold] is how long, counted from construction, a `REGISTER`
+  /// that asks for any id (instance 0) waits before it is answered. After a
+  /// naming service restart ids are assigned from 1 again, while surviving
+  /// services reconnect asking for the ids they had; holding assignments
+  /// for a moment lets them reclaim those ids before a fresh registration
+  /// can take one (which would move the surviving service to a new id, see
+  /// `NamingClient.register`). Requests for a specific id, [registerLocal]
+  /// and everything else are served at once. Held requests are kept alive
+  /// with `EXTEND` every [heartbeat]. [Duration.zero] disables the hold.
+  ///
+  /// Throws [ArgumentError] if [heartbeat] is not positive or
+  /// [assignmentHold] is negative.
+  NamingService({
+    this.heartbeat = const Duration(seconds: 4),
+    this.assignmentHold = const Duration(seconds: 2),
+  }) {
     if (heartbeat <= Duration.zero) {
       throw ArgumentError.value(heartbeat, 'heartbeat', 'must be positive');
+    }
+    if (assignmentHold < Duration.zero) {
+      throw ArgumentError.value(
+        assignmentHold,
+        'assignmentHold',
+        'must not be negative',
+      );
+    }
+    if (assignmentHold > Duration.zero) {
+      _holdTimer = Timer(assignmentHold, _endHold);
     }
   }
 
   /// Interval at which an idle watch is sent `EXTEND`.
   final Duration heartbeat;
+
+  /// How long after construction `REGISTER` requests for any id are held.
+  final Duration assignmentHold;
 
   final Map<ServiceAddress, ServiceRecord> _table = {};
   final Map<int, _Registration> _instances = {};
@@ -78,6 +110,13 @@ class NamingService {
   int _nextInstance = 1;
   bool _closed = false;
   Future<void>? _closeFuture;
+
+  /// Runs while assignments are held.
+  Timer? _holdTimer;
+
+  /// Extends the held requests while there are any.
+  Timer? _heldHeartbeat;
+  final List<_Held> _held = [];
 
   /// Read-only live view of the table: every registered record by address.
   late final Map<ServiceAddress, ServiceRecord> table = UnmodifiableMapView(
@@ -93,6 +132,10 @@ class NamingService {
 
   /// Number of channels currently served.
   int get channelCount => _sessions.length;
+
+  /// True while `REGISTER` requests for any id are held; see
+  /// [assignmentHold].
+  bool get isHoldingAssignments => _holdTimer != null;
 
   /// The id the next assignment tries first. Ids in use are skipped.
   @visibleForTesting
@@ -130,9 +173,11 @@ class NamingService {
   /// on this channel are removed, with `DOWN` events, when it closes.
   ///
   /// Takes over [TalkChannel.messages], so each channel can be served only
-  /// once. The channel keeps its own options; see [heartbeat] for the
-  /// constraint on [TalkOptions.replyTimeout]. After [close] the channel is
-  /// closed immediately with [StatusCode.goingAway].
+  /// once: throws [StateError] if its messages are already listened to, in
+  /// which case the service keeps nothing of it. The channel keeps its own
+  /// options; see [heartbeat] for the constraint on
+  /// [TalkOptions.replyTimeout]. After [close] the channel is closed
+  /// immediately with [StatusCode.goingAway].
   void serve(TalkChannel channel) {
     if (_closed) {
       unawaited(
@@ -148,13 +193,15 @@ class NamingService {
       );
     }
     final session = _Session(channel);
-    _sessions.add(session);
+    // Listen before keeping the session: if the stream is taken already,
+    // this throws and nothing is left behind.
     session.subscription = channel.messages.listen(
       (message) => _onMessage(session, message),
       onError: (Object error) =>
           _log.fine('naming client channel failed: $error'),
       onDone: () => _drop(session),
     );
+    _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
   }
 
@@ -163,14 +210,15 @@ class NamingService {
   /// until [unregisterLocal]; registering the same address locally again
   /// replaces its endpoints.
   ///
-  /// [instance] 0 assigns an id. Returns the instance id. Throws
-  /// [SwitchboardException] with [StatusCode.invalidArgument] for an empty
-  /// type, [StatusCode.alreadyExists] if [instance] is in use by another
+  /// [instance] 0 assigns an id, at once ([assignmentHold] does not apply).
+  /// Returns the instance id. Throws [SwitchboardException] with
+  /// [StatusCode.invalidArgument] for an empty type,
+  /// [StatusCode.alreadyExists] if [instance] is in use by another
   /// registration, [StatusCode.resourceExhausted] if no id is left, and
   /// [StatusCode.failedPrecondition] after [close]; also
   /// [StatusCode.invalidArgument] for more than 255 endpoints or an endpoint
-  /// longer than 255 bytes. Throws [RangeError] for an instance outside the
-  /// `u48` range.
+  /// that [ServiceRecord.checkEndpoint] refuses. Throws [RangeError] for an
+  /// instance outside the `u48` range.
   int registerLocal(Name type, List<Uri> endpoints, {int instance = 0}) {
     if (_closed) {
       throw SwitchboardException.of(
@@ -200,16 +248,27 @@ class NamingService {
     _remove(registration);
   }
 
-  /// Aborts every watch with [StatusCode.goingAway], removes the records of
-  /// every channel (publishing `DOWN`), closes the channels with
-  /// [StatusCode.goingAway], and ends [events]. Records made with
-  /// [registerLocal] stay in [table]. Calling it again returns the same
-  /// future.
+  /// Aborts every watch and every held `REGISTER` with
+  /// [StatusCode.goingAway], removes the records of every channel
+  /// (publishing `DOWN`), closes the channels with [StatusCode.goingAway],
+  /// and ends [events]. Records made with [registerLocal] stay in [table].
+  /// No timer is left running. Calling it again returns the same future.
   Future<void> close() => _closeFuture ??= _close();
 
   Future<void> _close() async {
     _closed = true;
     final goingAway = Status.of(StatusCode.goingAway, 'naming service closed');
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _heldHeartbeat?.cancel();
+    _heldHeartbeat = null;
+    final held = List.of(_held);
+    _held.clear();
+    for (final h in held) {
+      if (h.message.canReply) {
+        _abort(h.message, goingAway);
+      }
+    }
     for (final watch in _watches.toList()) {
       watch.end(goingAway);
     }
@@ -260,10 +319,26 @@ class NamingService {
     final RegisterRequest request;
     try {
       request = RegisterRequest.decode(message.payload);
+      _check(request.type, request.endpoints);
     } on ProtocolException catch (e) {
       _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
       return;
+    } on SwitchboardException catch (e) {
+      _abort(message, e.status);
+      return;
     }
+    if (request.requestedInstance == 0 && _holdTimer != null) {
+      _hold(session, message, request);
+      return;
+    }
+    _register(session, message, request);
+  }
+
+  void _register(
+    _Session session,
+    TalkMessage message,
+    RegisterRequest request,
+  ) {
     final int instance;
     try {
       instance = _add(
@@ -389,28 +464,89 @@ class NamingService {
   }
 
   // ---------------------------------------------------------------------
+  // Assignment hold
+
+  /// Keeps a `REGISTER` for any id until the hold ends. If the requester
+  /// cancels it meanwhile, it is answered `CANCELLED` and never registered.
+  void _hold(_Session session, TalkMessage message, RegisterRequest request) {
+    final held = _Held(session, message, request);
+    _held.add(held);
+    _log.fine(
+      'holding REGISTER ${request.type} until the assignment hold ends',
+    );
+    unawaited(
+      message.onCancel.then((_) {
+        if (_held.remove(held)) {
+          _abort(message, Status.of(StatusCode.cancelled, 'cancelled'));
+        }
+      }),
+    );
+    _heldHeartbeat ??= Timer.periodic(heartbeat, (_) {
+      for (final h in _held) {
+        if (h.message.canReply) {
+          try {
+            h.message.extend();
+          } on SwitchboardException catch (e) {
+            _log.fine('held REGISTER not extended: $e');
+          }
+        }
+      }
+    });
+  }
+
+  /// Answers the held requests, in arrival order.
+  void _endHold() {
+    _holdTimer = null;
+    _heldHeartbeat?.cancel();
+    _heldHeartbeat = null;
+    final held = List.of(_held);
+    _held.clear();
+    if (held.isNotEmpty) {
+      _log.info('assignment hold over, assigning ${held.length} held ids');
+    }
+    for (final h in held) {
+      if (h.session.active && h.message.canReply && !h.message.isCancelled) {
+        _register(h.session, h.message, h.request);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------
   // Table
 
-  /// Adds or replaces a registration and publishes `UP`. [owner] null is a
-  /// local registration.
-  int _add(Name type, int requested, List<Uri> endpoints, _Session? owner) {
+  /// Throws [SwitchboardException] with [StatusCode.invalidArgument] unless
+  /// a record of [type] with [endpoints] can be stored and published: every
+  /// watcher must be able to decode what the service accepts, or every
+  /// later snapshot would fail.
+  static void _check(Name type, List<Uri> endpoints) {
     if (type.isEmpty) {
       throw SwitchboardException.of(
         StatusCode.invalidArgument,
         'empty service type',
       );
     }
-    // A decoded endpoint can re-encode longer than it arrived (Uri
-    // normalisation); a record that cannot be encoded must never reach the
-    // table, or every later snapshot would fail.
-    try {
-      ServiceRecord(ServiceAddress(type, 1), endpoints: endpoints).encode();
-    } on ArgumentError catch (e) {
+    if (endpoints.length > 255) {
       throw SwitchboardException.of(
         StatusCode.invalidArgument,
-        'endpoints not encodable: ${e.message}',
+        'more than 255 endpoints',
       );
     }
+    for (final endpoint in endpoints) {
+      try {
+        ServiceRecord.checkEndpoint(endpoint);
+      } on ArgumentError catch (e) {
+        throw SwitchboardException.of(
+          StatusCode.invalidArgument,
+          'invalid endpoint: ${e.message}',
+        );
+      }
+    }
+  }
+
+  /// Adds or replaces a registration and publishes `UP`. [owner] null is a
+  /// local registration.
+  int _add(Name type, int requested, List<Uri> endpoints, _Session? owner) {
+    _check(type, endpoints);
     final ServiceAddress address;
     if (requested != 0) {
       final existing = _instances[requested];
@@ -509,6 +645,11 @@ class NamingService {
       return;
     }
     session.active = false;
+    _held.removeWhere((h) => identical(h.session, session));
+    if (_held.isEmpty) {
+      _heldHeartbeat?.cancel();
+      _heldHeartbeat = null;
+    }
     for (final watch in session.watches) {
       _watches.remove(watch);
       watch.stop();
@@ -559,6 +700,15 @@ class _Session {
     subscription?.cancel().ignore();
     subscription = null;
   }
+}
+
+/// A `REGISTER` for any id waiting for the assignment hold to end.
+class _Held {
+  _Held(this.session, this.message, this.request);
+
+  final _Session session;
+  final TalkMessage message;
+  final RegisterRequest request;
 }
 
 /// A record in the table and the channel that owns it (null: local).

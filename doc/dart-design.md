@@ -230,7 +230,8 @@ class ChannelAddress {
 ## Naming protocol codecs
 
 ```dart
-class ServiceRecord { final ServiceAddress address; final List<Uri> endpoints; encode(); decode(); }
+class ServiceRecord { final ServiceAddress address; final List<Uri> endpoints; encode(); decode();
+  static void checkEndpoint(Uri endpoint); }                          // ArgumentError unless it has a scheme, fits 255 bytes, and reparses to an equal Uri
 class RegisterRequest { Name type; int requestedInstance; List<Uri> endpoints; encode/decode }
 class RegisterResponse { int instance; encode/decode }
 class UnregisterRequest { Name type; int instance; encode/decode }   // same layout as DownEvent
@@ -253,7 +254,7 @@ class IncomingChannel {
 abstract class Resolver {
   Future<List<ServiceRecord>> resolve(Name type);  // all known live instances of type
   Stream<ServiceEvent> get events;
-  Future<void> get ready;                          // completes when the table is usable (immediately for static)
+  Future<void> get ready;                          // completes once the table has been usable at least once (immediately for static); a later loss does not reset it
 }
 class StaticResolver implements Resolver { StaticResolver(List<ServiceRecord>); add/remove }
 class EndpointResolver implements Resolver { EndpointResolver(Uri endpoint); }   // every type resolves to [ServiceRecord(type/0, [endpoint])]
@@ -295,11 +296,14 @@ Dispatch order is as in the wiki "Addressing" page. Resolution: `resolver.resolv
 
 ```dart
 class NamingService {
-  NamingService();
+  NamingService({Duration heartbeat, Duration assignmentHold});
   ChannelHandler get handler;                       // register with switchboard.registerService(Services.naming, ns.handler, instance: 1)
+  void serve(TalkChannel channel);                  // StateError (and nothing kept) if its messages are already listened to
   Map<ServiceAddress, ServiceRecord> get table;
   Stream<ServiceEvent> get events;
-  Duration heartbeat;                               // EXTEND interval on idle watches, default 5 s
+  Duration heartbeat;                               // EXTEND interval on idle watches, default 4 s (see below)
+  Duration assignmentHold;                          // REGISTER for any id held this long after construction, default 2 s
+  bool get isHoldingAssignments;
 }
 
 class NamingClient {
@@ -307,7 +311,10 @@ class NamingClient {
   Future<void> start();
   Future<int> register(Name type, List<Uri> endpoints, {int instance = 0, void Function(int)? onAssigned});   // remembered for re-registration on reconnect; onAssigned on every new id
   Future<void> unregister(Name type, int instance);
-  Future<void> get synced;                          // first SYNCED after (re)connect
+  Future<void> get synced;                          // SYNCED of the current session; replaced after a loss
+  bool get isSynced;                                // SYNCED on the current session
+  bool get hasSynced;                               // SYNCED on any session so far; never reset
+  Future<void> get firstSynced;                     // one-shot: the first SYNCED ever; fails with CANCELLED on close
   Map<ServiceAddress, ServiceRecord> get table;
   Stream<ServiceEvent> get events;
   bool get isConnected;
@@ -327,6 +334,16 @@ class MeshNode {
   Future<void> leave();                             // close resolver and client, unregister local handlers; call before switchboard.close()
 }
 ```
+
+Behaviour notes:
+
+* What the service accepts, every watcher can decode. Endpoints are checked with `ServiceRecord.checkEndpoint` by the decoders (`ProtocolException`), by the service for `REGISTER` and `registerLocal` (`INVALID_ARGUMENT`) and by `NamingClient.register` (`ArgumentError`): a scheme, at most 255 bytes once normalised, and the normalised text parses back to an equal `Uri` (checked both ways: `Uri ==` compares text or components depending on the representation, so it is not symmetric).
+* Heartbeat: the wiki asks for `EXTEND` at least every 5 s. Timers fire late, never early, so the default is 4 s, not 5 s.
+* Resolution (`NamingResolver`) depends on `client.hasSynced` only: before the first `SYNCED` ever, `resolve` waits for `firstSynced`, bounded by `resolveTimeout`, then fails `UNAVAILABLE`; after it, the table is served even while stale, whether or not anything was resolved before the loss and whenever the resolver was created. `ready` is `client.firstSynced`: it completes once the table has been synced at least once, does not reset on a loss, and fails with `CANCELLED` if the client is closed first. `Switchboard.selectAndConnect` calls `resolve` only, never `ready`, because `ready` has no bound.
+* Indeterminate outcomes: a `REGISTER` or `UNREGSTR` that times out (`DEADLINE_EXCEEDED`) or gets an unreadable answer may or may not have taken effect. The client fails the caller's future and drops the channel, so the naming service discards everything owned by it, and the reconnect registers the remembered set again. A refused `UNREGSTR` (other than `NOT_FOUND`) drops the channel too. A channel lost while a request is in flight is not indeterminate: the record died with the channel, and the registration is made again after the reconnect (its future completes then).
+* A re-registration refused on a healthy channel (anything but `ALREADY_EXISTS`, which moves to a new id) is retried on the same channel every `reconnectDelay`, without disturbing the client's other registrations.
+* At most one remembered registration per `type/instance`: registering an explicit id again supersedes the earlier registration whether or not it completed (its future completes like the new one's; its late answer is ignored), and `unregister` removes every match.
+* Ids after a naming service restart: the new service starts assigning at 1 again and knows nothing of the old ids. Surviving clients reconnect and ask for the ids they had (those first, before fresh registrations), but a fresh registration that reaches the new service first can be assigned one of them; the survivor then gets `ALREADY_EXISTS`, takes a new id and reports it through `onAssigned` (`MeshNode` moves its local dispatch), while addresses other services kept for the old id now resolve to the newcomer (same type) or to nothing. Mitigation: for `assignmentHold` after construction (default 2 s) the service answers `REGISTER` with instance 0 only once the hold is over (in arrival order, kept alive with `EXTEND` every `heartbeat`; one the requester cancels meanwhile is answered `CANCELLED` and never registered); requests for a given id, `registerLocal` and everything else are served at once. The client does not wait for held registrations before starting its `WATCH`. Survivors that take longer than the hold to come back can still lose their ids.
 
 ## Tests
 

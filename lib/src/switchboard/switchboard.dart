@@ -590,10 +590,9 @@ class Switchboard {
     if (shard != null) {
       RangeError.checkValueInInterval(shard, 0, 0xFFFFFFFF, 'shard');
     }
-    // Not `await r.ready`: resolve() waits for the table itself, bounded,
-    // and a naming resolver that has been synced once serves its stale
-    // table while the naming service is away, whereas `ready` then waits
-    // for the next SYNCED without a bound.
+    // Not `await r.ready`: resolve() waits for the table itself, bounded
+    // (a naming resolver fails with UNAVAILABLE after its resolve timeout
+    // if it was never synced), whereas `ready` has no bound.
     final known = await r.resolve(address.type);
     final candidates = [
       for (final record in known)

@@ -88,13 +88,64 @@ void main() {
     await client.start();
     await client.register(Name('npc'), [uriA]);
     await client.synced.timeout(timeout);
-    await pump();
     connector.down = true;
     await connector.servers.last.close();
     await until(() => !client.isSynced);
     // Nothing was resolved before the loss; the table was synced, so it is
     // served without waiting for the resolve timeout.
     expect(await resolver.resolve(Name('npc')).timeout(ms10 * 4), hasLength(1));
+  });
+
+  test('a resolver made after a loss serves the stale table', () async {
+    await client.start();
+    await client.register(Name('npc'), [uriA]);
+    await client.synced.timeout(timeout);
+    connector.down = true;
+    await connector.servers.last.close();
+    await until(() => !client.isSynced);
+    final afterLoss = NamingResolver(client, resolveTimeout: timeout);
+    expect(
+      await afterLoss.resolve(Name('npc')).timeout(ms10 * 4),
+      hasLength(1),
+    );
+    await afterLoss.ready.timeout(ms10 * 4);
+  });
+
+  test('before any sync: waits, bounded, then UNAVAILABLE', () async {
+    connector.down = true;
+    unawaited(client.start());
+    final watch = Stopwatch()..start();
+    await expectLater(
+      resolver.resolve(Name('npc')),
+      throwsStatus(StatusCode.unavailable),
+    );
+    expect(watch.elapsed, greaterThanOrEqualTo(ms50));
+    expect(watch.elapsed, lessThan(timeout));
+  });
+
+  test('ready completes on the first sync and stays complete', () async {
+    var ready = false;
+    unawaited(resolver.ready.then((_) => ready = true));
+    await pump();
+    expect(ready, isFalse);
+    await client.start();
+    await client.synced.timeout(timeout);
+    await pump();
+    expect(ready, isTrue);
+    connector.down = true;
+    await connector.servers.last.close();
+    await until(() => !client.isSynced);
+    // The stale table is served; ready does not wait for the next SYNCED.
+    await resolver.ready.timeout(ms10 * 4);
+  });
+
+  test('ready fails with CANCELLED if closed before the first sync', () async {
+    connector.down = true;
+    unawaited(client.start());
+    final ready = resolver.ready;
+    await until(() => connector.calls >= 2);
+    await resolver.close();
+    await expectLater(ready, throwsStatus(StatusCode.cancelled));
   });
 
   test('events pass through', () async {

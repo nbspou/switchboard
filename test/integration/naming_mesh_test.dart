@@ -91,14 +91,19 @@ class NamingNode {
 
   /// Starts on [port], retrying the bind for a while (a port just released
   /// by a previous naming node). [taken] ids are registered locally as
-  /// `squat/<id>` before anyone can connect.
+  /// `squat/<id>` before anyone can connect. No assignment hold unless
+  /// asked for.
   static Future<NamingNode> start(
     String scheme, {
     int port = 0,
     List<int> taken = const [],
+    Duration assignmentHold = Duration.zero,
   }) async {
     final node = newNode();
-    final service = NamingService(heartbeat: heartbeat);
+    final service = NamingService(
+      heartbeat: heartbeat,
+      assignmentHold: assignmentHold,
+    );
     addTearDown(service.close);
     node.registerService(Services.naming, service.handler, instance: 1);
     for (final id in taken) {
@@ -485,6 +490,43 @@ void main() {
           throwsCode(StatusCode.notFound),
         );
         await stale.close();
+      });
+
+      test('after a restart, newcomers do not get surviving ids', () async {
+        final survivors = {...b1.ids.values, ...b2.ids.values};
+        final port = naming.uri.port;
+        await naming.stop();
+        await until(
+          () => !b1.mesh.client.isSynced && !b2.mesh.client.isSynced,
+          'loss noticed',
+        );
+        // Ids are assigned from 1 again, but only after the hold: the
+        // survivors reconnect within it and reclaim theirs.
+        naming = await NamingNode.start(
+          scheme,
+          port: port,
+          assignmentHold: const Duration(milliseconds: 500),
+        );
+        final b3 = await Backend.start('b3', scheme, naming.uri, [npc, chat]);
+        expect(b3.ids.values.toSet().intersection(survivors), isEmpty);
+        expect(naming.service.isHoldingAssignments, isFalse);
+        await until(
+          () => naming.service.table.length == 6,
+          'everyone registered',
+        );
+        for (final backend in [b1, b2]) {
+          expect(
+            backend.mesh.published.map((a) => a.instance).toSet(),
+            backend.ids.values.toSet(),
+          );
+        }
+        for (final b in [b1, b2, b3]) {
+          for (final MapEntry(key: type, value: id) in b.ids.entries) {
+            expect(naming.service.table[ServiceAddress(type, id)]?.endpoints, [
+              b.uri,
+            ]);
+          }
+        }
       });
 
       test('an unreachable naming service fails opens, bounded', () async {

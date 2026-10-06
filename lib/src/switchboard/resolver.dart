@@ -19,14 +19,18 @@ import '../naming/naming_protocol.dart';
 abstract interface class Resolver {
   /// All known live instances of [type], in no particular order.
   ///
-  /// Returns an empty list when nothing is known. Waits for [ready] first.
+  /// Returns an empty list when nothing is known. Waits for [ready] first;
+  /// a resolver may bound that wait (a naming resolver fails with
+  /// `UNAVAILABLE` after its resolve timeout).
   Future<List<ServiceRecord>> resolve(Name type);
 
   /// Up and down events as the table changes. Broadcast stream.
   Stream<ServiceEvent> get events;
 
-  /// Completes once the table is usable. Completes immediately for static
-  /// resolvers; for a naming resolver, after the current session's `SYNCED`.
+  /// Completes once the table has been usable at least once; a later loss
+  /// of the source does not reset it. Completes immediately for static
+  /// resolvers; for a naming resolver, after the first `SYNCED` (it fails if
+  /// the resolver is closed before that).
   Future<void> get ready;
 
   /// Releases resources. [resolve] fails afterwards.
