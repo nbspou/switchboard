@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:switchboard/src/address/channel_address.dart';
@@ -171,5 +172,25 @@ void _copyWithClear() {
     expect(b.shard, isNull);
     expect(b.instance, 9);
     expect(b.type, Name('api'));
+  });
+
+  test('decode only ever throws ProtocolException on hostile input', () {
+    // A host hint of invalid UTF-8 expands past 255 bytes once decoded.
+    final hostile = Uint8List.fromList([0x08, 0x56, ...List.filled(86, 0xFF)]);
+    expect(
+      () => ChannelAddress.decode(hostile),
+      throwsA(isA<ProtocolException>()),
+    );
+    final random = Random(7);
+    for (var i = 0; i < 20000; i++) {
+      final bytes = Uint8List.fromList(
+        List.generate(random.nextInt(40), (_) => random.nextInt(256)),
+      );
+      try {
+        ChannelAddress.decode(bytes);
+      } on ProtocolException {
+        // expected
+      }
+    }
   });
 }

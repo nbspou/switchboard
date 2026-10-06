@@ -128,6 +128,10 @@ class ChannelAddress {
       );
     } on FormatException catch (e) {
       throw ProtocolException('bad open payload: ${e.message}');
+    } on ArgumentError catch (e) {
+      // A malformed host hint can decode (with replacement characters) to
+      // more than 255 bytes and be refused by the constructor.
+      throw ProtocolException('bad open payload: ${e.message}');
     }
   }
 
