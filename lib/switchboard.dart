@@ -8,12 +8,15 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 /// Switchboard: microservice mesh protocol.
 ///
 /// Everything in `package:switchboard/core.dart` plus the `dart:io` parts:
-/// the TCP stream transport and the `Switchboard` mesh node.
+/// the TCP stream transport, the `Switchboard` mesh node, `MeshNode` (a
+/// node joined to a naming service) and `namingClientFor`.
 ///
 /// See the wiki section "Switchboard" for the protocol specification.
 library;
 
 export 'core.dart';
+export 'src/naming/naming_client_io.dart';
+export 'src/switchboard/mesh.dart';
 export 'src/switchboard/proxy.dart';
 export 'src/switchboard/switchboard.dart';
 export 'src/transport/stream_transport.dart';

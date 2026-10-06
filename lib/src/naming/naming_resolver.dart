@@ -25,7 +25,15 @@ class NamingResolver implements Resolver {
   NamingResolver(
     this.client, {
     this.resolveTimeout = const Duration(seconds: 5),
-  });
+  }) {
+    // Remember the first sync even if nothing is resolved before the naming
+    // service goes away, so that the stale table is served from then on.
+    if (client.isSynced) {
+      _everSynced = true;
+    } else {
+      client.synced.then<void>((_) => _everSynced = true, onError: (_) {});
+    }
+  }
 
   /// The client whose table this resolver reads.
   final NamingClient client;
@@ -44,9 +52,9 @@ class NamingResolver implements Resolver {
   /// [resolveTimeout], and then fails with [SwitchboardException]
   /// [StatusCode.unavailable]. Once the client has been synced once, a later
   /// loss of the naming service does not block resolution: the mirrored
-  /// table is served as it was (stale) until the client resynchronizes. Fails with [StatusCode.failedPrecondition]
-  /// after [close] and with [StatusCode.cancelled] if the client is closed
-  /// while waiting.
+  /// table is served as it was (stale) until the client resynchronizes.
+  /// Fails with [StatusCode.failedPrecondition] after [close] and with
+  /// [StatusCode.cancelled] if the client is closed while waiting.
   @override
   Future<List<ServiceRecord>> resolve(Name type) async {
     _checkOpen();

@@ -28,9 +28,11 @@ lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
 lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGSTR/WATCH/LOOKUP/UP/DOWN/SYNCED
 lib/src/naming/naming_service.dart     NamingService (server side handler)
 lib/src/naming/naming_client.dart      NamingClient (register, watch, mirrored table)
+lib/src/naming/naming_client_io.dart   namingClientFor: a NamingClient connecting through a Switchboard (dart:io)
 lib/src/switchboard/resolver.dart      Resolver, StaticResolver, EndpointResolver, NamingResolver
 lib/src/switchboard/switchboard.dart   Switchboard (dart:io), IncomingChannel, handlers
 lib/src/switchboard/proxy.dart         pipeChannels, ProxyHandler
+lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a naming service (dart:io)
 ```
 
 Rules:
@@ -301,14 +303,28 @@ class NamingService {
 }
 
 class NamingClient {
-  NamingClient(Switchboard switchboard, Uri namingEndpoint, {Duration? reconnectDelay});
-  Future<int> register(Name type, List<Uri> endpoints, {int instance = 0});   // remembered for re-registration on reconnect
+  NamingClient(TalkConnector connect, {Duration reconnectDelay, Duration? watchTimeout});   // transport independent
+  Future<void> start();
+  Future<int> register(Name type, List<Uri> endpoints, {int instance = 0, void Function(int)? onAssigned});   // remembered for re-registration on reconnect; onAssigned on every new id
   Future<void> unregister(Name type, int instance);
   Future<void> get synced;                          // first SYNCED after (re)connect
   Map<ServiceAddress, ServiceRecord> get table;
   Stream<ServiceEvent> get events;
   bool get isConnected;
   Future<void> close();
+}
+
+// dart:io glue
+NamingClient namingClientFor(Switchboard switchboard, Uri namingEndpoint, {Duration reconnectDelay, Duration? watchTimeout, TalkOptions? talkOptions});   // openTalkAt(endpoint, _ns)
+
+class MeshNode {
+  factory MeshNode.join(Switchboard switchboard, Uri namingEndpoint, {Duration reconnectDelay, Duration? watchTimeout, Duration resolveTimeout, TalkOptions? talkOptions});   // sets switchboard.resolver = NamingResolver(client), starts the client
+  Switchboard switchboard; NamingClient client; NamingResolver resolver;
+  Future<void> get synced;
+  Iterable<ServiceAddress> get published;
+  Future<int> publish(Name type, ChannelHandler handler, {int instance = 0, List<Uri>? endpoints});   // register, then registerService(type, handler, instance: assigned); follows id changes
+  Future<void> unpublish(Name type, int instance);
+  Future<void> leave();                             // close resolver and client, unregister local handlers; call before switchboard.close()
 }
 ```
 

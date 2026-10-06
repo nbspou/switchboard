@@ -15,6 +15,7 @@ import 'package:meta/meta.dart';
 import '../address/service_address.dart';
 import '../name.dart';
 import '../status.dart';
+import '../switchboard/incoming_channel.dart';
 import '../talk/talk_channel.dart';
 import '../talk/talk_message.dart';
 import 'naming_protocol.dart';
@@ -37,7 +38,19 @@ final Logger _log = Logger('Switchboard.Naming');
 ///
 /// The service registers nothing by itself. The wiki registers the naming
 /// service in its own table as `_ns/1`; the host does that with
-/// [registerLocal] once it knows its listening endpoints.
+/// [registerLocal] once it knows its listening endpoints. Hosting it on a
+/// `Switchboard` node:
+///
+/// ```dart
+/// final ns = NamingService();
+/// switchboard.registerService(Services.naming, ns.handler, instance: 1);
+/// await switchboard.listenTcp(address, port);
+/// ns.registerLocal(
+///   Services.naming,
+///   switchboard.listeningEndpoints,
+///   instance: 1,
+/// );
+/// ```
 class NamingService {
   /// Creates an empty service.
   ///
@@ -92,6 +105,26 @@ class NamingService {
     }
     _nextInstance = id;
   }
+
+  /// A [ChannelHandler] that serves every incoming channel: it wraps the
+  /// channel with [IncomingChannel.talk] (the node's talk options) and
+  /// passes it to [serve].
+  ///
+  /// Register it for `_ns/1` on the hosting node, together with the
+  /// matching local record (see the class documentation):
+  ///
+  /// ```dart
+  /// switchboard.registerService(Services.naming, ns.handler, instance: 1);
+  /// ns.registerLocal(Services.naming, endpoints, instance: 1);
+  /// ```
+  ///
+  /// Channels addressed to `_ns` with any instance (0), as
+  /// `namingClientFor` opens them, reach it too: it is the first registered
+  /// instance of the type. Mind the [heartbeat] constraint on the node's
+  /// [TalkOptions.replyTimeout].
+  ChannelHandler get handler => _handle;
+
+  void _handle(IncomingChannel incoming) => serve(incoming.talk());
 
   /// Serves one client over [channel] until it closes. Registrations made
   /// on this channel are removed, with `DOWN` events, when it closes.
