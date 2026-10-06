@@ -6,6 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 
@@ -18,6 +19,8 @@ import '../status.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'resolver.dart';
+import 'slot_channel.dart';
+import 'slot_reopen.dart';
 import 'switchboard.dart';
 
 final Logger _log = Logger('Switchboard.Router');
@@ -40,7 +43,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// throws and never completes with an error.
 ///
 /// See the wiki page "Switchboard Proxying", section "Channel proxying".
-Future<void> pipeChannels(MuxChannel a, MuxChannel b) {
+Future<void> pipeChannels(MuxChannel a, MuxChannel b) =>
+    _pipe(_MuxEnd(a), _MuxEnd(b));
+
+Future<void> _pipe(_End a, _End b) {
   try {
     _forward(a, b);
     _forward(b, a);
@@ -53,7 +59,56 @@ Future<void> pipeChannels(MuxChannel a, MuxChannel b) {
   return Future.wait<Status>([a.done, b.done]).then<void>((_) {});
 }
 
-void _forward(MuxChannel from, MuxChannel to) {
+/// One side of a pipe: a mux channel, or a [SlotChannel] (which may
+/// replace its mux channel once).
+abstract interface class _End {
+  Stream<Uint8List> get stream;
+  bool get canSend;
+  void send(Uint8List subframe);
+  Future<void> close(Status status);
+  Future<Status> get done;
+  int get id;
+}
+
+class _MuxEnd implements _End {
+  _MuxEnd(this.channel);
+
+  final MuxChannel channel;
+
+  @override
+  Stream<Uint8List> get stream => channel.stream;
+  @override
+  bool get canSend => channel.canSend;
+  @override
+  void send(Uint8List subframe) => channel.send(subframe);
+  @override
+  Future<void> close(Status status) => channel.close(status);
+  @override
+  Future<Status> get done => channel.done;
+  @override
+  int get id => channel.id;
+}
+
+class _SlotEnd implements _End {
+  _SlotEnd(this.channel);
+
+  final SlotChannel channel;
+
+  @override
+  Stream<Uint8List> get stream => channel.stream;
+  @override
+  bool get canSend => channel.canSend;
+  @override
+  void send(Uint8List subframe) => channel.send(subframe);
+  @override
+  Future<void> close(Status status) => channel.close(status);
+  @override
+  Future<Status> get done => channel.done;
+  @override
+  int get id => channel.channel.id;
+}
+
+void _forward(_End from, _End to) {
   from.stream.listen(
     (subframe) {
       if (!to.canSend) {
@@ -126,11 +181,24 @@ Status _closeStatusFor(Status status) {
 ///    forward to itself without end. A failure rejects the channel with
 ///    its status code (`NOT_FOUND`, `UNAVAILABLE`, ...); a missing
 ///    resolver or a closing node is `UNAVAILABLE`.
+///    A channel with a shard slot whose type has a slot table in the
+///    resolver goes to the slot's owner (the old owner while the slot
+///    migrates; see [Switchboard.selectAndConnect]).
 /// 4. A channel is opened to the destination with the same open payload,
 ///    except that the host hint is removed and the instance is set to the
 ///    selected one. The application payload is forwarded unchanged; the
 ///    proxy's own [Switchboard.defaultPayload] is not applied.
-/// 5. The two channels are joined with [pipeChannels].
+/// 5. The two channels are joined with [pipeChannels]. For a slot routed
+///    by a slot table, if the owner rejects the channel with CLOSE `MOVED`
+///    before any subframe has been piped either way, the proxy opens it
+///    once more at the new owner (named by the rejection, or a newer table
+///    entry, or found with [SlotResolver.locateSlot] within
+///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
+///    instance set to the new owner's, and the client does not notice.
+///    After the first subframe, or when no other owner is found, the
+///    `MOVED` is forwarded to the client, which retries itself (see
+///    `Switchboard.openChannelToSlot`). The retry counts as the same
+///    channel for [maxChannelsPerConnection].
 ///
 /// Rejections carry the status code and a generic reason only; the
 /// details (instance ids, endpoints, resolver state) are logged locally.
@@ -186,7 +254,7 @@ ChannelHandler proxyHandler(
     }
     forwarding[client] = count + 1;
     try {
-      final MuxChannel backend;
+      final _Backend backend;
       try {
         backend = await _openBackend(switchboard, address, type, resolver);
       } on SwitchboardException catch (e) {
@@ -194,11 +262,37 @@ ChannelHandler proxyHandler(
         await incoming.reject(genericStatus(e.code ?? StatusCode.unavailable));
         return;
       }
+      final channel = backend.channel;
       _log.fine(
-        'proxy: $incoming piped to channel ${backend.id} of '
-        '${backend.connection}',
+        'proxy: $incoming piped to channel ${channel.id} of '
+        '${channel.connection}',
       );
-      await pipeChannels(incoming.channel, backend);
+      final header = backend.header;
+      final r = resolver ?? switchboard.resolver;
+      final shard = header.shard;
+      if (!backend.relayed &&
+          shard != null &&
+          r is SlotResolver &&
+          r.slotTable(type) != null) {
+        // The owner may have moved since the table was read: one retry
+        // while nothing has been piped.
+        final slotChannel = SlotChannel(
+          type,
+          shard,
+          channel,
+          (moved) => reopenAtSlotOwner(
+            switchboard,
+            header,
+            header.instance,
+            moved,
+            resolver: r,
+            excludeOwnEndpoints: true,
+          ),
+        );
+        await _pipe(_MuxEnd(incoming.channel), _SlotEnd(slotChannel));
+        return;
+      }
+      await pipeChannels(incoming.channel, channel);
     } finally {
       final left = (forwarding[client] ?? 1) - 1;
       forwarding[client] = left > 0 ? left : null;
@@ -209,10 +303,15 @@ ChannelHandler proxyHandler(
 bool _notReserved(ChannelAddress address) =>
     !(address.type?.isReserved ?? false);
 
+/// The outgoing channel of a proxied channel, the header it was opened
+/// with, and whether it went to a host hint rather than through the
+/// resolver.
+typedef _Backend = ({MuxChannel channel, ChannelAddress header, bool relayed});
+
 /// Opens the outgoing channel. A missing resolver or a closing node
 /// (`FAILED_PRECONDITION` locally) is reported as `UNAVAILABLE`: to the
 /// client, the proxy is simply unable to forward.
-Future<MuxChannel> _openBackend(
+Future<_Backend> _openBackend(
   Switchboard switchboard,
   ChannelAddress address,
   Name type,
@@ -228,7 +327,7 @@ Future<MuxChannel> _openBackend(
   }
 }
 
-Future<MuxChannel> _openBackendChannel(
+Future<_Backend> _openBackendChannel(
   Switchboard switchboard,
   ChannelAddress address,
   Name type,
@@ -238,7 +337,8 @@ Future<MuxChannel> _openBackendChannel(
   for (var attempt = 0; ; attempt++) {
     final MuxConnection connection;
     final ChannelAddress header;
-    if (host != null && switchboard.allowHostHint) {
+    final relayed = host != null && switchboard.allowHostHint;
+    if (relayed) {
       final endpoint = _hostHintEndpoint(host);
       if (switchboard.isOwnEndpoint(endpoint)) {
         _log.warning('proxy: host hint $host points at this node itself');
@@ -263,7 +363,11 @@ Future<MuxChannel> _openBackendChannel(
       );
     }
     try {
-      return connection.open(header.encode());
+      return (
+        channel: connection.open(header.encode()),
+        header: header,
+        relayed: relayed,
+      );
     } on SwitchboardException catch (e) {
       // A pooled connection may have received GOAWAY, or filled up to the
       // peer's channel limit, in the meantime; one retry replaces it.

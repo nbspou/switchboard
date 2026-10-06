@@ -10,7 +10,7 @@ Channels are opened to a service address `(type, instance)`, and each channel ca
 
 ## Status
 
-Version 3.0.0-dev: a rewrite on Dart 3.13 with a new wire format, not compatible with 2.x. It is not deployed yet. The protocol is specified in the project wiki (see [Specification](#specification)). This package implements all of it except sharding, which is in progress. The wire format may still change before 3.0.0.
+Version 3.0.0-dev: a rewrite on Dart 3.13 with a new wire format, not compatible with 2.x. It is not deployed yet. The protocol is specified in the project wiki (see [Specification](#specification)). This package implements all of it, sharding included. The wire format may still change before 3.0.0.
 
 ## Install
 
@@ -317,7 +317,7 @@ Every limit is an option. The wiki page "Switchboard Dart Reference Implementati
 ## Platforms
 
 * `package:switchboard/core.dart` does not import `dart:io` and compiles for the web. It has the status codes, names, the in-memory and WebSocket client transports, the stream binding wire format, the mux and Talk layers, addressing, the naming service and client, and the resolvers.
-* `package:switchboard/switchboard.dart` adds the `dart:io` parts: the TCP transport, the WebSocket server transports, `Switchboard`, `MeshNode`, `proxyHandler` and `namingClientFor`.
+* `package:switchboard/switchboard.dart` adds the `dart:io` parts: the TCP transport, the WebSocket server transports, `Switchboard`, `MeshNode`, `proxyHandler`, `namingClientFor`, and the instance side of sharding (`SlotGate`, `SlotLifecycle`).
 * `dart test` runs the whole suite on the VM. `dart test -P node` runs the codec and test vector tests compiled to JavaScript on Node.js, which checks the 32 and 48-bit arithmetic of the wire codecs.
 
 ## Specification
@@ -332,13 +332,58 @@ The protocol is specified in the project wiki, section "Switchboard". Where this
 * Switchboard Talk
 * Switchboard Addressing and Dispatch
 * Switchboard Naming Service
-* Switchboard Sharding (not implemented in this package yet)
+* Switchboard Sharding: slot spaces, ownership and migration
 * Switchboard Proxying
 * Switchboard Embedded Profile: the subset a minimal C peer implements
 * Switchboard Test Vectors
 * Switchboard Dart Reference Implementation: the API guide for this package
 
 `doc/dart-design.md` is the design record kept while the package was built.
+
+## Sharding
+
+A sharded type splits its work over its instances by slot: a key hashes to a slot, the naming service gives every slot one owner, and moves slots between instances (when one joins, or on request) without losing or reordering the requests in flight. Each instance publishes the type with a `SlotLifecycle`: `load` a slot when it is assigned (from local storage, from the instance that holds it, or from shared storage), `drain` it when it moves away, `unload` it, and `serve` the channels addressed to it. The `SlotGate` that `publishSharded` installs queues a slot's channels while it is loaded or locked for a move, pipes them to the new owner afterwards, and answers `MOVED` for slots served elsewhere. Any node reaches a slot's owner through its table:
+
+```dart
+final kv = Name('kv');
+const slots = 1024;
+
+/// A key-value store: one map per slot. A real store loads a moved slot
+/// from its holder (`holder`), here it starts empty.
+class Store extends SlotLifecycle {
+  final Map<int, Map<String, String>> data = {};
+
+  @override
+  Future<AssignResult> load(int slot,
+      {required int epoch, required int holder, required bool shared}) async {
+    data.putIfAbsent(slot, () => {});
+    return AssignResult.holding;
+  }
+
+  @override
+  Future<void> unload(int slot) async => data.remove(slot);
+
+  @override
+  void serve(IncomingChannel channel, int slot) {
+    channel.talk().messages.listen((m) {
+      final [verb, key, ...value] = utf8.decode(m.payload).split(' ');
+      if (verb == 'PUT') data[slot]![key] = value.join(' ');
+      m.reply(utf8.encode(data[slot]![key] ?? ''));
+    });
+  }
+}
+
+// Each store node, with a stable instance id so that it gets its slots
+// back after a reboot:
+await mesh.publishSharded(kv, Store(), count: slots, instance: 0x11);
+
+// Any node in the mesh:
+final key = 'user:42';
+final talk = await node.openTalkToSlot(kv, slotForText(key, slots));
+await talk.request('PUT', utf8.encode('PUT $key hello'));
+```
+
+The wiki page "Switchboard Sharding" has the protocol and six worked use cases, each an integration test in `test/integration/sharding/`.
 
 ## License
 

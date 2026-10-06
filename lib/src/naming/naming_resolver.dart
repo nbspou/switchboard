@@ -21,7 +21,7 @@ import 'slot_table.dart';
 ///
 /// Resolution waits until the client has been synced once, at most
 /// [resolveTimeout]; see [resolve]. The resolver does not start the client.
-class NamingResolver implements Resolver {
+class NamingResolver implements SlotResolver {
   /// Creates a resolver over [client], which may be in any state: whether
   /// the stale table is served depends only on [NamingClient.hasSynced].
   NamingResolver(
@@ -88,19 +88,45 @@ class NamingResolver implements Resolver {
 
   /// The client's mirrored slot table of [type]
   /// ([NamingClient.slotTable]), or null without a slot space.
+  @override
   SlotTable? slotTable(Name type) => client.slotTable(type);
 
   /// Where traffic for [slot] of [type] goes, from the client's mirror
   /// ([NamingClient.slotOwner]): the entry if the slot is owned or
   /// migrating (route to [SlotEntry.owner]), null otherwise.
+  @override
   SlotEntry? slotOwner(Name type, int slot) => client.slotOwner(type, slot);
 
   /// The distinct instances the slots of [type] are routed to
   /// ([NamingClient.slotOwners]).
+  @override
   Set<int> slotOwners(Name type) => client.slotOwners(type);
 
   /// The client's [NamingClient.slotEvents].
+  @override
   Stream<SlotEvent> get slotEvents => client.slotEvents;
+
+  /// Asks the naming service for the owner of [slot] of [type]
+  /// ([NamingClient.locate]); in a managed space a free slot is assigned
+  /// first. Returns the mirrored entry if the mirror already shows an
+  /// owner at least as recent, else an entry built from the answer; null
+  /// when the slot stays free.
+  @override
+  Future<SlotEntry?> locateSlot(Name type, int slot) async {
+    final located = await client.locate(type, slot);
+    final mirrored = client.slotOwner(type, slot);
+    if (mirrored != null && mirrored.epoch >= located.epoch) {
+      return mirrored;
+    }
+    if (located.owner == 0) {
+      return null;
+    }
+    return SlotEntry(
+      state: located.state,
+      owner: located.owner,
+      epoch: located.epoch,
+    );
+  }
 
   /// The client's [NamingClient.firstSynced]: completes once the table has
   /// been synced at least once, and stays complete through later losses of

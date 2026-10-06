@@ -1,0 +1,698 @@
+// The slot gate state machine: queueing, forwarding, resuming and
+// revoking slots, MOVED reasons, bounds, request gating. Incoming
+// channels arrive over in-memory mux links; forwarding goes to a node on
+// loopback TCP.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:async/async.dart';
+import 'package:switchboard/switchboard.dart';
+import 'package:test/test.dart';
+
+import 'naming_harness.dart' show Connector, Harness;
+
+const fast = MuxOptions(
+  goAwayGrace: Duration(milliseconds: 100),
+  keepAliveInterval: null,
+);
+const quiet = MuxOptions(keepAliveInterval: null);
+const limit = Duration(seconds: 5);
+
+final kv = Name('kv');
+
+Uint8List bytes(String text) => Uint8List.fromList(utf8.encode(text));
+
+String text(Uint8List data) => utf8.decode(data);
+
+Matcher hasCode(StatusCode code) =>
+    isA<Status>().having((s) => s.known, 'code', code);
+
+Matcher isMoved(String reason) => isA<Status>()
+    .having((s) => s.known, 'code', StatusCode.moved)
+    .having((s) => s.reason, 'reason', reason);
+
+Future<void> until(bool Function() condition) async {
+  final deadline = DateTime.now().add(limit);
+  while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      fail('condition not met within $limit');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 2));
+  }
+}
+
+/// Lets pending microtasks and short timers run.
+Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 5));
+
+/// A scriptable lifecycle that records every call.
+class TestLifecycle extends SlotLifecycle {
+  final List<String> log = [];
+  Completer<void>? loadGate;
+  Completer<void>? drainGate;
+  Object? loadError;
+  AssignResult result = AssignResult.holding;
+
+  /// Served channels, by slot, in arrival order.
+  final Map<int, List<IncomingChannel>> served = {};
+
+  /// Called for every served channel; the default echoes `slot:data`.
+  void Function(IncomingChannel channel, int slot)? onServe;
+
+  @override
+  Future<AssignResult> load(
+    int slot, {
+    required int epoch,
+    required int holder,
+    required bool shared,
+  }) async {
+    log.add('load $slot e$epoch h$holder${shared ? ' shared' : ''}');
+    await loadGate?.future;
+    final error = loadError;
+    if (error != null) {
+      throw error;
+    }
+    return result;
+  }
+
+  @override
+  Future<void> drain(int slot, {required int epoch, required int to}) async {
+    log.add('drain $slot e$epoch to$to');
+    await drainGate?.future;
+  }
+
+  @override
+  Future<void> unload(int slot) async => log.add('unload $slot');
+
+  @override
+  void serve(IncomingChannel channel, int slot) {
+    log.add('serve $slot ${text(channel.address.payload)}');
+    (served[slot] ??= []).add(channel);
+    final hook = onServe;
+    if (hook != null) {
+      hook(channel, slot);
+      return;
+    }
+    channel.channel.stream.listen(
+      (data) => channel.channel.send(bytes('$slot:${text(data)}')),
+    );
+  }
+}
+
+/// A peer linked to the gate's dispatch over memory.
+class Peer {
+  Peer(this.gate) {
+    final (a, b) = MemoryTransport.pair();
+    client = MuxConnection(a, isInitiator: true, options: quiet);
+    server = MuxConnection(b, isInitiator: false, options: quiet);
+    server.incoming.listen((channel) {
+      final result = gate.handler(IncomingChannel(channel));
+      if (result is Future<void>) {
+        result.ignore();
+      }
+    });
+  }
+
+  final SlotGate gate;
+  late final MuxConnection client;
+  late final MuxConnection server;
+
+  MuxChannel open({int? shard, String payload = 'cred', int instance = 1}) =>
+      client.open(
+        ChannelAddress(
+          type: kv,
+          instance: instance,
+          shard: shard,
+          payload: bytes(payload),
+        ).encode(),
+      );
+
+  Future<void> close() async {
+    await client.close();
+    await server.close();
+  }
+}
+
+/// Sends [message] and returns the first answer.
+Future<String> ask(MuxChannel channel, String message) async {
+  final answer = channel.stream.first;
+  channel.send(bytes(message));
+  return text(await answer.timeout(limit));
+}
+
+AssignRequest assign(int slot, {int epoch = 1, int holder = 0}) =>
+    AssignRequest(kv, slot, epoch: epoch, holder: holder, shared: false);
+
+void main() {
+  late NamingClient client;
+  late Switchboard node;
+  late Switchboard target;
+  late Uri targetUri;
+  late TestLifecycle lifecycle;
+  late SlotGate gate;
+  late Peer peer;
+
+  /// Channels the target node (`kv/2`) received.
+  late List<IncomingChannel> arrived;
+
+  SlotGate newGate({
+    Duration forwardGrace = const Duration(seconds: 5),
+    Duration drainTimeout = limit,
+    int maxQueuedChannels = 1024,
+    int maxQueuedRequests = 1024,
+    bool trackChannels = true,
+    ChannelHandler? noSlotHandler,
+  }) {
+    lifecycle = TestLifecycle();
+    gate = SlotGate(
+      node,
+      client,
+      kv,
+      lifecycle: lifecycle,
+      forwardGrace: forwardGrace,
+      drainTimeout: drainTimeout,
+      maxQueuedChannels: maxQueuedChannels,
+      maxQueuedRequests: maxQueuedRequests,
+      trackChannels: trackChannels,
+      noSlotHandler: noSlotHandler,
+      instance: 1,
+    );
+    peer = Peer(gate);
+    addTearDown(peer.close);
+    return gate;
+  }
+
+  setUp(() async {
+    client = NamingClient(() async => throw StateError('not connected'));
+    target = Switchboard(muxOptions: fast);
+    arrived = [];
+    target.registerService(kv, (incoming) {
+      arrived.add(incoming);
+      incoming.channel.stream.listen(
+        (data) => incoming.channel.send(bytes('to:${text(data)}')),
+      );
+    }, instance: 2);
+    targetUri = await target.listenTcp(InternetAddress.loopbackIPv4, 0);
+    node = Switchboard(
+      muxOptions: fast,
+      resolver: StaticResolver([
+        ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+      ]),
+    );
+  });
+
+  tearDown(() async {
+    await client.close();
+    await node.close();
+    await target.close();
+  });
+
+  group('dispatch', () {
+    test('no shard: noSlotHandler, else INVALID_ARGUMENT', () async {
+      newGate();
+      final refused = peer.open();
+      expect(await refused.done, hasCode(StatusCode.invalidArgument));
+      final seen = <String>[];
+      gate.noSlotHandler = (incoming) {
+        seen.add(text(incoming.address.payload));
+        unawaited(incoming.channel.close());
+      };
+      expect(await peer.open(payload: 'xfer').done, Status.ok);
+      expect(seen, ['xfer']);
+    });
+
+    test('a slot not served here: MOVED, empty reason without a mirror', () {
+      newGate();
+      expect(peer.open(shard: 3).done, completion(isMoved('')));
+      expect(gate.stateOf(3), isNull);
+    });
+
+    test('ASSIGN loads, then channels are served', () async {
+      newGate();
+      expect(
+        await gate.onAssign(assign(3, epoch: 4, holder: 7)),
+        AssignResult.holding,
+      );
+      expect(gate.serves(3), isTrue);
+      expect(gate.servedSlots, {3: 4});
+      expect(await ask(peer.open(shard: 3), 'hi'), '3:hi');
+      expect(lifecycle.log, ['load 3 e4 h7', 'serve 3 cred']);
+    });
+
+    test('channels wait while loading, in order', () async {
+      newGate();
+      lifecycle.loadGate = Completer<void>();
+      final assigned = gate.onAssign(assign(1));
+      await settle();
+      expect(gate.stateOf(1), SlotGateState.loading);
+      final a = peer.open(shard: 1, payload: 'a');
+      final b = peer.open(shard: 1, payload: 'b');
+      a.send(bytes('x'));
+      await settle();
+      expect(lifecycle.served, isEmpty);
+      lifecycle.loadGate!.complete();
+      await assigned;
+      expect(text(await a.stream.first.timeout(limit)), '1:x');
+      expect(await ask(b, 'y'), '1:y');
+      expect(lifecycle.log, ['load 1 e1 h0', 'serve 1 a', 'serve 1 b']);
+    });
+
+    test('a failed load refuses the queue and fails ASSIGN', () async {
+      newGate();
+      lifecycle
+        ..loadGate = Completer<void>()
+        ..loadError = SwitchboardException.of(StatusCode.unavailable, 'no');
+      final assigned = gate.onAssign(assign(1));
+      await settle();
+      final queued = peer.open(shard: 1);
+      await settle();
+      lifecycle.loadGate!.complete();
+      await expectLater(
+        assigned,
+        throwsA(
+          isA<SwitchboardException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.unavailable,
+          ),
+        ),
+      );
+      expect(await queued.done, isMoved(''));
+      expect(gate.stateOf(1), isNull);
+    });
+
+    test('a slot outside the mirrored space: OUT_OF_RANGE', () async {
+      final h = Harness();
+      addTearDown(h.close);
+      client = NamingClient(Connector(h).call);
+      await client.start();
+      await client.synced.timeout(limit);
+      await client.defineSlots(
+        kv,
+        count: 4,
+        mode: SlotMode.static,
+        capacity: 0,
+      );
+      await until(() => client.slotTable(kv) != null);
+      newGate();
+      expect(await peer.open(shard: 4).done, hasCode(StatusCode.outOfRange));
+      expect(await peer.open(shard: 3).done, isMoved(''));
+    });
+
+    test('channels beyond maxQueuedChannels: UNAVAILABLE', () async {
+      newGate(maxQueuedChannels: 2);
+      lifecycle.loadGate = Completer<void>();
+      final assigned = gate.onAssign(assign(1));
+      await settle();
+      final a = peer.open(shard: 1, payload: 'a');
+      final b = peer.open(shard: 1, payload: 'b');
+      final c = peer.open(shard: 1, payload: 'c');
+      expect(await c.done, hasCode(StatusCode.unavailable));
+      // A queued channel its peer closes leaves the queue.
+      await a.close();
+      await settle();
+      final d = peer.open(shard: 1, payload: 'd');
+      lifecycle.loadGate!.complete();
+      await assigned;
+      expect(await ask(b, 'x'), '1:x');
+      expect(await ask(d, 'y'), '1:y');
+      expect(lifecycle.log, ['load 1 e1 h0', 'serve 1 b', 'serve 1 d']);
+    });
+
+    test('a throwing serve closes the channel with INTERNAL', () async {
+      newGate();
+      lifecycle.onServe = (_, _) => throw StateError('boom');
+      await gate.onAssign(assign(1));
+      expect(await peer.open(shard: 1).done, hasCode(StatusCode.internal));
+    });
+  });
+
+  group('hand-over', () {
+    test('DRAIN waits for tracked channels, then drains', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final busy = peer.open(shard: 1, payload: 'busy');
+      expect(await ask(busy, 'x'), '1:x');
+      final drained = gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await settle();
+      expect(gate.stateOf(1), SlotGateState.locked);
+      expect(lifecycle.log, isNot(contains('drain 1 e2 to2')));
+      // New channels are queued meanwhile, unread.
+      final late = peer.open(shard: 1, payload: 'late');
+      late.send(bytes('queued'));
+      await settle();
+      expect(lifecycle.served[1], hasLength(1));
+      await busy.close();
+      await drained.timeout(limit);
+      expect(lifecycle.log.last, 'drain 1 e2 to2');
+      // RESUME serves the queue here, with what it sent meanwhile.
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(gate.serves(1), isTrue);
+      expect(text(await late.stream.first.timeout(limit)), '1:queued');
+      expect(lifecycle.log.last, 'serve 1 late');
+    });
+
+    test('detached channels do not hold DRAIN', () async {
+      newGate();
+      lifecycle.onServe = (channel, slot) => gate.detach(channel);
+      await gate.onAssign(assign(1));
+      final long = peer.open(shard: 1, payload: 'long');
+      await until(() => lifecycle.served[1]?.length == 1);
+      // Held, it would wait for drainTimeout (5 s).
+      await gate
+          .onDrain(DrainRequest(kv, 1, epoch: 2, to: 2))
+          .timeout(const Duration(seconds: 2));
+      expect(lifecycle.log.last, 'drain 1 e2 to2');
+      expect(long.canSend, isTrue);
+    });
+
+    test('a tracked channel holds DRAIN at most drainTimeout', () async {
+      newGate(drainTimeout: const Duration(milliseconds: 30));
+      lifecycle.onServe = (_, _) {};
+      await gate.onAssign(assign(1));
+      final stuck = peer.open(shard: 1, payload: 'stuck');
+      await until(() => lifecycle.served[1]?.length == 1);
+      final watch = Stopwatch()..start();
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      expect(watch.elapsed, greaterThanOrEqualTo(Duration(milliseconds: 25)));
+      expect(lifecycle.log.last, 'drain 1 e2 to2');
+      expect(stuck.canSend, isTrue);
+    });
+
+    test('FORWARD pipes the queue to the new owner in order, and late '
+        'arrivals too', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final first = peer.open(shard: 1, payload: 'first');
+      final second = peer.open(shard: 1, payload: 'second');
+      first.send(bytes('a'));
+      second.send(bytes('b'));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(gate.stateOf(1), SlotGateState.forwarding);
+      expect(text(await first.stream.first.timeout(limit)), 'to:a');
+      final answers = StreamQueue(second.stream.map(text));
+      second.send(bytes('c'));
+      expect(await answers.take(2).timeout(limit), ['to:b', 'to:c']);
+      // In arrival order, with the open payload except the instance.
+      expect(
+        [for (final c in arrived) text(c.address.payload)],
+        ['first', 'second'],
+      );
+      expect(arrived.first.address.instance, 2);
+      expect(arrived.first.address.shard, 1);
+      // Late arrivals are forwarded during the grace period.
+      expect(await ask(peer.open(shard: 1, payload: 'late'), 'd'), 'to:d');
+      expect(gate.movedStatus(1), isMoved('kv/2 2'));
+      expect(gate.servedSlots, isEmpty);
+      expect(lifecycle.log, isNot(contains('unload 1')));
+    });
+
+    test('after the grace period: unload, then MOVED', () async {
+      newGate(forwardGrace: const Duration(milliseconds: 30));
+      await gate.onAssign(assign(1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = peer.open(shard: 1);
+      final answers = StreamQueue(queued.stream.map(text));
+      queued.send(bytes('a'));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      await until(() => gate.stateOf(1) == null);
+      expect(lifecycle.log.last, 'unload 1');
+      // The mirror knows nothing here: MOVED with an empty reason.
+      expect(await peer.open(shard: 1).done, isMoved(''));
+      // A forwarded channel keeps working after the grace period.
+      expect(await answers.next.timeout(limit), 'to:a');
+      queued.send(bytes('b'));
+      expect(await answers.next.timeout(limit), 'to:b');
+    });
+
+    test('a slot coming back during the grace period is unloaded, then '
+        'loaded', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      await gate.onAssign(assign(1, epoch: 3, holder: 2));
+      expect(gate.serves(1), isTrue);
+      expect(lifecycle.log.skip(2), ['unload 1', 'load 1 e3 h2']);
+      expect(await ask(peer.open(shard: 1), 'x'), '1:x');
+    });
+
+    test('ASSIGN of a slot served already only updates the epoch', () async {
+      newGate();
+      lifecycle.result = AssignResult.notHolding;
+      await gate.onAssign(assign(1));
+      expect(await gate.onAssign(assign(1, epoch: 9)), AssignResult.notHolding);
+      expect(gate.servedSlots, {1: 9});
+      expect(lifecycle.log, ['load 1 e1 h0']);
+    });
+
+    test('revocation refuses the queue and closes served channels with '
+        'MOVED', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final served = peer.open(shard: 1);
+      expect(await ask(served, 'x'), '1:x');
+      // DRAIN waits for the served channel; the revocation ends it.
+      final drained = expectLater(
+        gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2)),
+        throwsA(
+          isA<SwitchboardException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.unavailable,
+          ),
+        ),
+      );
+      final queued = peer.open(shard: 1);
+      await settle();
+      await gate.onRevoke(kv, 1);
+      expect(await queued.done, isMoved(''));
+      expect(await served.done, isMoved(''));
+      expect(lifecycle.log.last, 'unload 1');
+      expect(gate.stateOf(1), isNull);
+      await drained;
+      expect(lifecycle.log, isNot(contains('drain 1 e2 to2')));
+    });
+
+    test('DRAIN of a slot not served: FAILED_PRECONDITION', () {
+      newGate();
+      expect(
+        gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2)),
+        throwsA(
+          isA<SwitchboardException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.failedPrecondition,
+          ),
+        ),
+      );
+    });
+
+    test('RESUME and FORWARD of unknown slots do nothing', () async {
+      newGate();
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(gate.stateOf(1), isNull);
+      expect(lifecycle.log, isEmpty);
+    });
+
+    test('close stops every slot and refuses later ASSIGNs', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      await gate.onAssign(assign(2));
+      await gate.close();
+      expect(lifecycle.log.skip(2), unorderedEquals(['unload 1', 'unload 2']));
+      expect(gate.onAssign(assign(3)), throwsA(isA<SwitchboardException>()));
+      expect(await peer.open(shard: 1).done, isMoved(''));
+    });
+  });
+
+  group('requests', () {
+    late List<String> answered;
+
+    /// Serves Talk on every channel; requests go through [serveRequest]
+    /// and are answered `slot:payload` after [hold] completes.
+    void talkLifecycle({Completer<void>? hold}) {
+      answered = [];
+      lifecycle.onServe = (channel, slot) {
+        gate.detach(channel);
+        channel.talk().messages.listen(
+          (m) => gate.serveRequest(m, slot, (m) async {
+            await hold?.future;
+            answered.add(text(m.payload));
+            m.reply(bytes('$slot:${text(m.payload)}'));
+          }),
+        );
+      };
+    }
+
+    test('served, queued while locked, forwarded after FORWARD', () async {
+      newGate(trackChannels: false);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      expect(text((await talk.request('GET', bytes('a'))).payload), '1:a');
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = talk.request('GET', bytes('b'));
+      await settle();
+      expect(answered, ['a']);
+      // The target node echoes raw subframes; serve Talk there instead.
+      target.registerService(kv, (incoming) {
+        arrived.add(incoming);
+        incoming.talk().messages.listen(
+          (m) => m.reply(bytes('to:${text(m.payload)}')),
+        );
+      }, instance: 2);
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(text((await queued.timeout(limit)).payload), 'to:b');
+      expect(text((await talk.request('GET', bytes('c'))).payload), 'to:c');
+      // One forwarding channel, addressed to the slot, for both.
+      expect(arrived, hasLength(1));
+      expect(arrived.single.address.shard, 1);
+      expect(arrived.single.address.instance, 2);
+      await talk.close();
+    });
+
+    test('in-flight requests hold DRAIN; RESUME runs the queue here', () async {
+      newGate(trackChannels: false);
+      final hold = Completer<void>();
+      talkLifecycle(hold: hold);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      final first = talk.request('GET', bytes('a'));
+      await settle();
+      final drained = gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final second = talk.request('GET', bytes('b'));
+      await settle();
+      expect(lifecycle.log.last, 'serve 1 cred');
+      hold.complete();
+      await drained.timeout(limit);
+      expect(lifecycle.log.last, 'drain 1 e2 to2');
+      expect(answered, ['a']);
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(text((await first).payload), '1:a');
+      expect(text((await second.timeout(limit)).payload), '1:b');
+      expect(answered, ['a', 'b']);
+      await talk.close();
+    });
+
+    test('a slot not served: ABORT MOVED; bounded queue', () async {
+      newGate(trackChannels: false, maxQueuedRequests: 1);
+      // Requests name their slot, which need not be the channel's.
+      lifecycle.onServe = (channel, _) {
+        gate.detach(channel);
+        channel.talk().messages.listen(
+          (m) => gate.serveRequest(m, int.parse(text(m.payload)), (m) {
+            m.reply(m.payload);
+          }),
+        );
+      };
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      Future<Object> outcome(Future<TalkMessage> r) => r.then<Object>(
+        (m) => text(m.payload),
+        onError: (Object e) => (e as SwitchboardException).code!,
+      );
+      expect(await outcome(talk.request('GET', bytes('1'))), '1');
+      expect(await outcome(talk.request('GET', bytes('5'))), StatusCode.moved);
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final parked = outcome(talk.request('GET', bytes('1')));
+      expect(
+        await outcome(talk.request('GET', bytes('1'))),
+        StatusCode.unavailable,
+      );
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(await parked.timeout(limit), '1');
+      await talk.close();
+    });
+  });
+
+  test('MOVED reasons follow the naming client mirror', () async {
+    final h = Harness();
+    addTearDown(h.close);
+    // Instance 5 owns slot 2 of a static space.
+    final owner = NamingClient(Connector(h).call);
+    addTearDown(owner.close);
+    final ownerLifecycle = TestLifecycle();
+    final ownerGate = SlotGate(
+      node,
+      owner,
+      kv,
+      lifecycle: ownerLifecycle,
+      instance: 5,
+    );
+    owner.slotHandler = ownerGate;
+    await owner.start();
+    await owner.register(kv, [targetUri], instance: 5);
+    await owner.defineSlots(kv, count: 4, mode: SlotMode.static);
+    expect(await ownerGate.claim(2), 1);
+    expect(ownerGate.serves(2), isTrue);
+    expect(ownerLifecycle.log, ['load 2 e1 h0']);
+    client = NamingClient(Connector(h).call);
+    await client.start();
+    await client.synced.timeout(limit);
+    newGate();
+    await until(() => client.slotOwner(kv, 2) != null);
+    expect(await peer.open(shard: 2).done, isMoved('kv/5 1'));
+    expect(gate.movedStatus(1), isMoved(''));
+    // Release stops serving locally after the naming service.
+    await ownerGate.release(2);
+    expect(ownerGate.stateOf(2), isNull);
+    expect(ownerLifecycle.log.last, 'unload 2');
+    await until(() => client.slotOwner(kv, 2) == null);
+    expect(gate.movedStatus(2), isMoved(''));
+  });
+
+  test('SlotGates dispatches by type', () async {
+    final gates = SlotGates();
+    newGate();
+    gates.add(gate);
+    expect(() => gates.add(gate), throwsStateError);
+    expect(gates[kv], same(gate));
+    await gates.onAssign(assign(1));
+    expect(gate.serves(1), isTrue);
+    final other = AssignRequest(
+      Name('zz'),
+      1,
+      epoch: 1,
+      holder: 0,
+      shared: false,
+    );
+    await expectLater(
+      gates.onAssign(other),
+      throwsA(
+        isA<SwitchboardException>().having(
+          (e) => e.code,
+          'code',
+          StatusCode.unavailable,
+        ),
+      ),
+    );
+    await expectLater(
+      gates.onDrain(DrainRequest(Name('zz'), 1, epoch: 2, to: 2)),
+      throwsA(isA<SwitchboardException>()),
+    );
+    await gates.onForward(ForwardRequest(Name('zz'), 1, epoch: 2, to: 2));
+    await gates.onResume(ResumeRequest(Name('zz'), 1, epoch: 1));
+    await gates.onRevoke(Name('zz'), 1);
+    await gates.onRevoke(kv, 1);
+    expect(gate.stateOf(1), isNull);
+    expect(gates.remove(kv), same(gate));
+    expect(gates.gates, isEmpty);
+  });
+
+  test('a lifecycle serves one gate', () {
+    newGate();
+    expect(
+      () => SlotGate(node, client, kv, lifecycle: lifecycle),
+      throwsStateError,
+    );
+    expect(() => TestLifecycle().gate, throwsStateError);
+    expect(lifecycle.gate, same(gate));
+  });
+}

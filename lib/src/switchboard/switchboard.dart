@@ -18,6 +18,7 @@ import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
+import '../naming/slot_table.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
 import '../transport/stream_transport.dart';
@@ -27,6 +28,8 @@ import 'channel_policy.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'resolver.dart';
+import 'slot_channel.dart';
+import 'slot_reopen.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
@@ -61,6 +64,9 @@ class Switchboard {
   ///
   /// [maxConnectionsPerEndpoint] bounds the pooled connections to one
   /// endpoint; see [connect].
+  ///
+  /// [slotRefreshTimeout] bounds the refresh of a slot's owner after a
+  /// `MOVED` rejection that names no owner; see [openChannelToSlot].
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -69,6 +75,7 @@ class Switchboard {
     this.connectTimeout = const Duration(seconds: 10),
     this.allowHostHint = false,
     this.maxConnectionsPerEndpoint = 4,
+    this.slotRefreshTimeout = const Duration(seconds: 5),
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        muxOptions = muxOptions ?? const MuxOptions(),
        talkOptions = talkOptions ?? const TalkOptions() {
@@ -104,6 +111,11 @@ class Switchboard {
   /// connection is only opened when every pooled one has as many channels
   /// open as its peer announced it accepts. Default 4.
   final int maxConnectionsPerEndpoint;
+
+  /// Longest wait for the slot owner a `MOVED` rejection sends the
+  /// [openChannelToSlot] retry to, when the rejection names none and the
+  /// resolver has to ask (`LOCATE`).
+  final Duration slotRefreshTimeout;
 
   final Map<Name, Map<int, ChannelHandler>> _services = {};
 
@@ -751,6 +763,20 @@ class Switchboard {
   /// chosen instance are tried in order; if none can be connected, the
   /// following instances are tried in turn.
   ///
+  /// Slot routing (wiki page "Switchboard Sharding", section "Routing"):
+  /// when [address] names any instance, a [shard] is given and the
+  /// resolver is a [SlotResolver] with a slot table for the type, the
+  /// channel goes to the slot's owner and nowhere else: the owner from the
+  /// table ([SlotResolver.slotOwner], the old owner while the slot
+  /// migrates); if the table has none, in a managed space the owner the
+  /// resolver locates ([SlotResolver.locateSlot], which assigns a free
+  /// slot), and in a static space the open fails with
+  /// [StatusCode.unavailable]. A slot outside the space fails with
+  /// [StatusCode.outOfRange]; an owner that cannot be connected, or is
+  /// missing from the service table, with [StatusCode.unavailable]. An
+  /// explicit instance bypasses slot routing (the shard is still carried
+  /// in the header).
+  ///
   /// The returned record's instance is the one to put in the address
   /// header: the selected record's instance, or the requested instance
   /// when the record's is 0.
@@ -786,6 +812,32 @@ class Switchboard {
     // (a naming resolver fails with UNAVAILABLE after its resolve timeout
     // if it was never synced), whereas `ready` has no bound.
     final known = await r.resolve(address.type);
+    if (shard != null && address.isAny && r is SlotResolver) {
+      final table = r.slotTable(address.type);
+      if (table != null) {
+        final owner = await _slotOwner(r, table, shard, refresh: false);
+        _checkOpen();
+        final records = [
+          for (final record in known)
+            if (record.address.type == address.type &&
+                record.address.instance == owner)
+              record,
+        ];
+        if (records.isEmpty) {
+          throw SwitchboardException.of(
+            StatusCode.unavailable,
+            'owner ${ServiceAddress(address.type, owner)} of slot $shard is '
+            'not in the service table',
+          );
+        }
+        return _connectFirst(
+          ServiceAddress(address.type, owner),
+          records,
+          0,
+          excludeOwnEndpoints,
+        );
+      }
+    }
     final candidates = [
       for (final record in known)
         if (record.address.type == address.type &&
@@ -801,8 +853,19 @@ class Switchboard {
       );
     }
     candidates.sort((a, b) => a.address.instance.compareTo(b.address.instance));
+    final start = (shard ?? _nextRoundRobin(address.type)) % candidates.length;
+    return _connectFirst(address, candidates, start, excludeOwnEndpoints);
+  }
+
+  /// Connects to the first reachable of [candidates], starting at [start]
+  /// and going round.
+  Future<(ServiceRecord, MuxConnection)> _connectFirst(
+    ServiceAddress address,
+    List<ServiceRecord> candidates,
+    int start,
+    bool excludeOwnEndpoints,
+  ) async {
     final n = candidates.length;
-    final start = (shard ?? _nextRoundRobin(address.type)) % n;
     final failures = <String>[];
     for (var i = 0; i < n; i++) {
       final record = candidates[(start + i) % n];
@@ -836,6 +899,75 @@ class Switchboard {
     throw SwitchboardException.of(
       StatusCode.unavailable,
       'no reachable instance of $address (${failures.join('; ')})',
+    );
+  }
+
+  /// The owner of [slot] in [table], as routing finds it: from the table,
+  /// else (managed space, or [refresh]) through [SlotResolver.locateSlot].
+  Future<int> _slotOwner(
+    SlotResolver r,
+    SlotTable table,
+    int slot, {
+    required bool refresh,
+  }) async {
+    final type = table.type;
+    if (slot >= table.count) {
+      throw SwitchboardException.of(
+        StatusCode.outOfRange,
+        'slot $slot outside the ${table.count} slots of $type',
+      );
+    }
+    var entry = refresh ? null : r.slotOwner(type, slot);
+    if (entry == null && (refresh || table.space.mode == SlotMode.managed)) {
+      entry = await r.locateSlot(type, slot);
+    }
+    if (entry == null || entry.owner == 0) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'slot $type/$slot has no owner',
+      );
+    }
+    return entry.owner;
+  }
+
+  /// The owner of [slot] of [type] by slot routing (see
+  /// [selectAndConnect]): from the resolver's table, or located when the
+  /// table has none in a managed space. With [refresh] the resolver always
+  /// asks ([SlotResolver.locateSlot]), in either mode; this is how a
+  /// caller handling `MOVED` itself refreshes the slot.
+  ///
+  /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
+  /// the resolver is not a [SlotResolver] (or there is none, or the node is
+  /// closed), [StatusCode.notFound] if it has no slot table for [type],
+  /// [StatusCode.outOfRange] for a slot outside the space and
+  /// [StatusCode.unavailable] when the slot has no owner; also whatever
+  /// [Resolver.resolve] and [SlotResolver.locateSlot] throw.
+  Future<ServiceAddress> resolveSlotOwner(
+    Name type,
+    int slot, {
+    bool refresh = false,
+  }) async {
+    _checkOpen();
+    RangeError.checkValueInInterval(slot, 0, 0xFFFFFFFF, 'slot');
+    final r = resolver;
+    if (r is! SlotResolver) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'the resolver has no slot tables',
+      );
+    }
+    // The table is complete once the resolver is synced.
+    await r.resolve(type);
+    final table = r.slotTable(type);
+    if (table == null) {
+      throw SwitchboardException.of(
+        StatusCode.notFound,
+        'no slot space for $type',
+      );
+    }
+    return ServiceAddress(
+      type,
+      await _slotOwner(r, table, slot, refresh: refresh),
     );
   }
 
@@ -880,6 +1012,62 @@ class Switchboard {
       }
     }
   }
+
+  /// Opens a channel to the owner of [slot] of [type], with the `MOVED`
+  /// retry of the wiki page "Switchboard Sharding", section "Routing".
+  ///
+  /// The first channel is opened as [openChannel] with `shard: slot` does
+  /// (slot routing through a [SlotResolver]; through any other resolver,
+  /// such as the [EndpointResolver] of a frontend client, the endpoint
+  /// routes). If the owner rejects it with CLOSE `MOVED` before anything
+  /// was sent or received, it is retried once, with the same [payload]
+  /// (default: [defaultPayload]): to the owner the rejection names, unless
+  /// the resolver's table has a more recent one; when it names none, to
+  /// the owner the resolver finds by asking ([SlotResolver.locateSlot],
+  /// bounded by [slotRefreshTimeout]); through a resolver without slot
+  /// tables, the same address again. When the refresh finds no owner
+  /// other than the instance that rejected, or the retry fails, the
+  /// returned channel ends with the `MOVED` status. See [SlotChannel] for
+  /// why a `MOVED` after the first subframe is not retried.
+  ///
+  /// Throws like [openChannel].
+  Future<SlotChannel> openChannelToSlot(
+    Name type,
+    int slot, {
+    Uint8List? payload,
+  }) async {
+    final application = payload ?? defaultPayload;
+    final first = await openChannel(
+      ServiceAddress(type),
+      shard: slot,
+      payload: application,
+    );
+    final rejectedBy = ChannelAddress.decode(first.openPayload).instance;
+    return SlotChannel(
+      type,
+      slot,
+      first,
+      (moved) => reopenAtSlotOwner(
+        this,
+        ChannelAddress(type: type, shard: slot, payload: application),
+        rejectedBy,
+        moved,
+      ),
+    );
+  }
+
+  /// [openChannelToSlot] wrapped in a [TalkChannel] with [options]
+  /// (default: [talkOptions]). The retry applies until the first request
+  /// or message is sent; see [SlotChannel].
+  Future<TalkChannel> openTalkToSlot(
+    Name type,
+    int slot, {
+    Uint8List? payload,
+    TalkOptions? options,
+  }) async => TalkChannel(
+    await openChannelToSlot(type, slot, payload: payload),
+    options: options ?? talkOptions,
+  );
 
   /// [openChannel] wrapped in a [TalkChannel] with [options] (default:
   /// [talkOptions]).

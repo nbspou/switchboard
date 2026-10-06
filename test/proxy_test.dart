@@ -729,4 +729,200 @@ void main() {
       await talk.close();
     });
   });
+
+  group('proxyHandler with slot tables', () {
+    final zone = Name('zone');
+    late Map<int, String> modes;
+    late Map<int, List<ChannelAddress>> opened;
+    late _Locating table;
+    late Switchboard proxy;
+    late Switchboard client;
+
+    /// The proxy, with [budget] channels per client connection, and a
+    /// client of it.
+    Future<void> startProxy({int budget = 256}) async {
+      proxy = Switchboard(
+        muxOptions: fast,
+        slotRefreshTimeout: const Duration(milliseconds: 500),
+      );
+      addTearDown(proxy.close);
+      proxy.catchAll = proxyHandler(
+        proxy,
+        resolver: table,
+        maxChannelsPerConnection: budget,
+      );
+      final proxyUri = await proxy.listenTcp('127.0.0.1', 0);
+      client = Switchboard(
+        resolver: EndpointResolver(proxyUri),
+        muxOptions: fast,
+        defaultPayload: bytes('player'),
+      );
+      addTearDown(client.close);
+    }
+
+    /// A backend `zone/id` that, by its mode: greets (`<id> <shard>`) and
+    /// echoes (`<id>:<data>`); rejects with MOVED at once (`moved:<reason>`);
+    /// rejects with MOVED once data arrived (`movedAfter:<reason>`); greets,
+    /// then rejects with MOVED (`greetMoved:<reason>`).
+    Future<ServiceRecord> backend(int id) async {
+      final node = Switchboard(muxOptions: fast);
+      addTearDown(node.close);
+      opened[id] = [];
+      modes[id] = 'greet';
+      node.registerService(zone, (incoming) {
+        opened[id]!.add(incoming.address);
+        final channel = incoming.channel;
+        final [mode, ...rest] = modes[id]!.split(':');
+        final moved = Status.of(StatusCode.moved, rest.join(':'));
+        switch (mode) {
+          case 'greet':
+            channel.send(bytes('$id ${incoming.address.shard}'));
+            channel.stream.listen(
+              (d) => channel.send(bytes('$id:${utf8.decode(d)}')),
+            );
+          case 'moved':
+            unawaited(incoming.reject(moved));
+          case 'movedAfter':
+            channel.stream.first.then((_) => incoming.reject(moved)).ignore();
+          case 'greetMoved':
+            channel.send(bytes('$id ${incoming.address.shard}'));
+            unawaited(incoming.reject(moved));
+        }
+      }, instance: id);
+      final uri = await node.listenTcp('127.0.0.1', 0);
+      return ServiceRecord(ServiceAddress(zone, id), endpoints: [uri]);
+    }
+
+    setUp(() async {
+      modes = {};
+      opened = {};
+      table = _Locating([await backend(1), await backend(2)]);
+      addTearDown(table.close);
+      table.defineSlots(SlotSpace(zone, count: 8, mode: SlotMode.managed));
+      await startProxy();
+    });
+
+    /// A plain channel through the proxy: the client does not retry.
+    Future<MuxChannel> open(int slot) =>
+        client.openChannel(ServiceAddress(zone), shard: slot);
+
+    test('routes to the owner, the old owner while migrating', () async {
+      table
+        ..setSlot(zone, 2, const SlotEntry.owned(2, epoch: 1))
+        ..setSlot(zone, 3, const SlotEntry.migrating(1, 2, epoch: 4));
+      final channel = await open(2);
+      expect(await channel.stream.first, bytes('2 2'));
+      expect(opened[2]!.single.instance, 2);
+      expect(opened[2]!.single.payload, bytes('player'));
+      await channel.close();
+      final migrating = await open(3);
+      expect(await migrating.stream.first, bytes('1 3'));
+      await migrating.close();
+    });
+
+    test('a free slot: located in a managed space, UNAVAILABLE in a static '
+        'one', () async {
+      table.answer = (_) => const SlotEntry.owned(2, epoch: 1);
+      final located = await open(5);
+      expect(await located.stream.first, bytes('2 5'));
+      expect(table.located, [5]);
+      await located.close();
+      table.defineSlots(SlotSpace(zone, count: 8, mode: SlotMode.static));
+      final refused = await open(5);
+      expect(await refused.done, hasCode(StatusCode.unavailable));
+      expect(table.located, [5]);
+    });
+
+    test('MOVED before any data: retried once, unseen by the client', () async {
+      await startProxy(budget: 1);
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'moved:zone/2 2';
+      final channel = await open(4);
+      final answers = StreamQueue(channel.stream);
+      expect(await answers.next, bytes('2 4'));
+      channel.send(bytes('x'));
+      expect(await answers.next, bytes('2:x'));
+      expect(opened[1], hasLength(1));
+      // The open payload is sent again, the instance set to the new owner.
+      expect(opened[2]!.single.instance, 2);
+      expect(opened[2]!.single.shard, 4);
+      expect(opened[2]!.single.payload, bytes('player'));
+      // The retried channel is the same channel for the client's budget.
+      final second = await open(4);
+      expect(await second.done, hasCode(StatusCode.resourceExhausted));
+      await channel.close();
+      expect(await channel.done, Status.ok);
+    });
+
+    test('MOVED naming no owner: the proxy asks', () async {
+      table
+        ..setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1))
+        ..answer = (_) => const SlotEntry.owned(2, epoch: 2);
+      modes[1] = 'moved:';
+      final channel = await open(4);
+      expect(await channel.stream.first, bytes('2 4'));
+      expect(table.located, [4]);
+    });
+
+    test('MOVED after data is forwarded to the client', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'movedAfter:zone/2 2';
+      final channel = await open(4);
+      channel.send(bytes('x'));
+      final status = await channel.done;
+      expect(status, hasCode(StatusCode.moved));
+      expect(status.reason, 'zone/2 2');
+      expect(opened[2], isEmpty);
+
+      modes[1] = 'greetMoved:zone/2 2';
+      final greeted = await open(4);
+      expect(await greeted.stream.toList(), [bytes('1 4')]);
+      expect(await greeted.done, hasCode(StatusCode.moved));
+      expect(opened[2], isEmpty);
+    });
+
+    test('MOVED with nowhere else to go is forwarded', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'moved:';
+      table.answer = (_) => const SlotEntry.owned(1, epoch: 1);
+      final channel = await open(4);
+      expect(await channel.done, hasCode(StatusCode.moved));
+      // Only once.
+      modes
+        ..[1] = 'moved:zone/2 2'
+        ..[2] = 'moved:zone/1 3';
+      final twice = await open(4);
+      expect(await twice.done, hasCode(StatusCode.moved));
+      expect(opened[2], hasLength(1));
+    });
+
+    test('a client reopening after MOVED reaches the owner', () async {
+      table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'movedAfter:zone/2 2';
+      final channel = await client.openChannelToSlot(zone, 6);
+      channel.send(bytes('x'));
+      expect(await channel.done, hasCode(StatusCode.moved));
+      expect(channel.retried, isFalse);
+      // The client opens again; the proxy's table is still stale, and the
+      // proxy's own retry takes it to the owner the rejection names.
+      modes[1] = 'moved:zone/2 2';
+      table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
+      final again = await client.openChannelToSlot(zone, 6);
+      expect(await again.stream.first, bytes('2 6'));
+    });
+  });
+}
+
+/// A static resolver whose LOCATE answers are scripted.
+class _Locating extends StaticResolver {
+  _Locating(super.records);
+
+  final List<int> located = [];
+  SlotEntry? Function(int slot) answer = (_) => null;
+
+  @override
+  Future<SlotEntry?> locateSlot(Name type, int slot) async {
+    located.add(slot);
+    return answer(slot);
+  }
 }
