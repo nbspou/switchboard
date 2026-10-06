@@ -7,6 +7,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 
@@ -22,13 +23,14 @@ import '../talk/talk_message.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'proxy.dart';
+import 'slot_channel.dart';
 import 'switchboard.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
-/// How long the channel a gate forwards late requests on stays open
-/// without a request in flight before it is closed (it is opened again for
-/// the next one).
+/// How long a channel a gate forwards late requests on stays open without
+/// a request in flight before it is closed (it is opened again for the
+/// next one).
 const Duration _forwardIdle = Duration(seconds: 1);
 
 /// What a sharded service does with its slots: the application side of a
@@ -163,7 +165,8 @@ enum SlotGateState {
 ///
 /// Requests inside long-lived channels are gated with [serveRequest] the
 /// same way, at the request level: served, queued, forwarded as message
-/// chains ([forwardMessage]) or answered `ABORT MOVED`.
+/// chains ([forwardMessage]) over channels that carry the credential of the
+/// channel each request arrived on, or answered `ABORT MOVED`.
 ///
 /// `MOVED` always means that nothing was processed: the channel was
 /// refused at open, or queued and never read, or the request was never
@@ -262,6 +265,9 @@ class SlotGate implements SlotHandler {
 
   final Map<int, _GateSlot> _slots = {};
   final Expando<_GateSlot> _servedBy = Expando<_GateSlot>('slot');
+
+  /// The OPEN application payload of the channels requests arrived on.
+  final Expando<Uint8List> _payloads = Expando<Uint8List>('payload');
   int _queuedChannels = 0;
   int _queuedRequests = 0;
   bool _closed = false;
@@ -470,12 +476,24 @@ class SlotGate implements SlotHandler {
   ///   UNAVAILABLE`); run here on `RESUME`, forwarded on `FORWARD`;
   /// * handed over, during [forwardGrace]: forwarded to the new owner as a
   ///   message chain ([forwardMessage]) over a channel this gate opens to
-  ///   `(type, new owner)` with the slot and [Switchboard.defaultPayload]
-  ///   (closed after a second without a request in flight, and opened
-  ///   again for the next one); the new owner's application serves it as
-  ///   any channel to the slot;
+  ///   `(type, new owner)` with the slot and [payload] as the application
+  ///   payload, so that the new owner sees the caller's credential and
+  ///   serves the request as it would on any channel to the slot. The
+  ///   requests for the slot with the same [payload] share that channel,
+  ///   which is closed after a second without a request in flight and
+  ///   opened again for the next one;
   /// * a slot outside the space: answered `ABORT OUT_OF_RANGE`;
   /// * otherwise: answered `ABORT MOVED` ([movedStatus]).
+  ///
+  /// [payload] defaults to the application payload of the OPEN of the
+  /// channel [message] arrived on ([ChannelAddress.payload]): the
+  /// credential its peer presented, passed on unchanged (an empty one stays
+  /// empty, the node's [Switchboard.defaultPayload] is never used). For a
+  /// channel this node opened, that is the payload this node sent; for a
+  /// [TalkChannel] that is not over a mux channel, it is empty. Pass
+  /// [payload] when the request's caller is not that channel's peer: an
+  /// application that relays requests it received elsewhere, or one whose
+  /// callers authenticate inside the channel.
   ///
   /// The future completes once the request has been handled, forwarded or
   /// refused; it never completes with an error. A queued request that can
@@ -484,8 +502,9 @@ class SlotGate implements SlotHandler {
   Future<void> serveRequest(
     TalkMessage message,
     int slot,
-    FutureOr<void> Function(TalkMessage message) handler,
-  ) async {
+    FutureOr<void> Function(TalkMessage message) handler, {
+    Uint8List? payload,
+  }) async {
     final s = _slots[slot];
     switch (s?.state) {
       case null:
@@ -502,7 +521,7 @@ class SlotGate implements SlotHandler {
           _abort(message, genericStatus(StatusCode.unavailable));
           return;
         }
-        final parked = _Parked(message, handler);
+        final parked = _Parked(message, handler, payload);
         _queuedRequests++;
         s!.requests.add(parked);
         // A request that can no longer be answered leaves the queue.
@@ -521,7 +540,7 @@ class SlotGate implements SlotHandler {
       case SlotGateState.serving:
         await _run(s!, message, handler);
       case SlotGateState.forwarding:
-        await _forwardRequest(s!, slot, message);
+        await _forwardRequest(s!, slot, message, payload);
     }
   }
 
@@ -542,80 +561,130 @@ class SlotGate implements SlotHandler {
     }
   }
 
+  /// Forwards [message] to the new owner of [s] over the forwarding
+  /// channel of [payload], by default the payload of the channel [message]
+  /// arrived on.
   Future<void> _forwardRequest(
     _GateSlot s,
     int slot,
     TalkMessage message,
+    Uint8List? payload,
   ) async {
     if (message.expectsReply && !message.canReply) {
       return;
     }
-    s.forwardIdle?.cancel();
-    s.forwardIdle = null;
-    s.pendingRelays++;
+    final credential = payload ?? _arrivalPayload(message);
+    // One forwarding channel per distinct credential: the bytes as the key.
+    final key = String.fromCharCodes(credential);
+    final f = s.forwards[key] ??= _Forward(key, Uint8List.fromList(credential));
+    f.idle?.cancel();
+    f.idle = null;
+    f.pending++;
     final TalkChannel target;
     try {
-      target = await _forwardChannel(s, slot);
+      target = await _forwardChannel(s, slot, f);
     } on Object catch (e) {
       _log.info('$type gate: cannot forward a request for $slot: $e');
       _abort(message, genericStatus(StatusCode.unavailable));
-      _relayEnded(s);
+      _relayEnded(s, f);
       return;
     }
-    final relay = forwardMessage(message, target);
-    s.relays.add(relay);
-    await relay;
-    s.relays.remove(relay);
-    _relayEnded(s);
+    try {
+      await forwardMessage(message, target);
+    } on Object catch (e, st) {
+      // The application forwarded it already: nothing more to do.
+      _log.severe('$type gate: forwarding a request for $slot failed', e, st);
+    } finally {
+      _relayEnded(s, f);
+    }
   }
 
-  /// A forwarded request ended: once none is in flight for [_forwardIdle],
-  /// the forwarding channel is closed (the next request opens another).
-  void _relayEnded(_GateSlot s) {
-    s.pendingRelays--;
-    if (s.pendingRelays > 0 || s.forward == null) {
+  /// The application payload of the OPEN of the channel [message] arrived
+  /// on, decoded once per channel; empty when that is not a mux channel.
+  Uint8List _arrivalPayload(TalkMessage message) =>
+      _payloads[message.channel] ??= _openPayloadOf(message.channel.raw);
+
+  static Uint8List _openPayloadOf(Object raw) {
+    final MuxChannel mux;
+    switch (raw) {
+      case MuxChannel():
+        mux = raw;
+      case SlotChannel():
+        mux = raw.channel;
+      default:
+        return Uint8List(0);
+    }
+    try {
+      return Uint8List.fromList(ChannelAddress.decode(mux.openPayload).payload);
+    } on ProtocolException {
+      // Not a Switchboard address (a raw mux channel): no credential.
+      return Uint8List(0);
+    }
+  }
+
+  /// A forwarded request through [f] ended: once none is in flight for
+  /// [_forwardIdle], the channel is closed (the next request opens
+  /// another). Once [s] was retired, it is closed with its last request.
+  void _relayEnded(_GateSlot s, _Forward f) {
+    if (--f.pending > 0) {
       return;
     }
-    s.forwardIdle?.cancel();
-    s.forwardIdle = Timer(_forwardIdle, () {
-      s.forwardIdle = null;
-      final forward = s.forward;
-      if (s.pendingRelays > 0 || forward == null) {
+    if (!identical(s.forwards[f.key], f)) {
+      _closeForward(f);
+      return;
+    }
+    f.idle?.cancel();
+    f.idle = Timer(_forwardIdle, () {
+      f.idle = null;
+      if (f.pending > 0 || !identical(s.forwards[f.key], f)) {
         return;
       }
-      s.forward = null;
+      s.forwards.remove(f.key);
       _log.fine('$type gate: forwarding channel idle, closed');
-      unawaited(
-        forward.then((channel) => channel.close()).catchError((Object _) {}),
-      );
+      _closeForward(f);
     });
   }
 
-  /// The channel requests for [slot] are forwarded on, opened on first
-  /// use and again after it closed.
-  Future<TalkChannel> _forwardChannel(_GateSlot s, int slot) {
-    final current = s.forward;
-    if (current != null) {
-      return current.then(
-        (channel) => channel.isOpen ? channel : _openForward(s, slot),
-        // A failed open is retried by the next request.
-        onError: (Object _) => _openForward(s, slot),
+  static void _closeForward(_Forward f) {
+    final channel = f.channel;
+    f.channel = null;
+    if (channel != null) {
+      unawaited(
+        channel.then((channel) => channel.close()).catchError((Object _) {}),
       );
     }
-    return _openForward(s, slot);
   }
 
-  Future<TalkChannel> _openForward(_GateSlot s, int slot) {
+  /// The channel of [f], opened on first use and again after it closed.
+  Future<TalkChannel> _forwardChannel(_GateSlot s, int slot, _Forward f) {
+    final current = f.channel;
+    if (current == null) {
+      return _openForward(s, slot, f);
+    }
+    // Requests that find it closed together open one replacement.
+    Future<TalkChannel> again() => identical(f.channel, current)
+        ? _openForward(s, slot, f)
+        : _forwardChannel(s, slot, f);
+    return current.then(
+      (channel) => channel.isOpen ? channel : again(),
+      // A failed open is retried by the next request.
+      onError: (Object _) => again(),
+    );
+  }
+
+  /// Opens the channel of [f] to the new owner of [s], addressed to [slot]
+  /// with [f]'s credential as the application payload.
+  Future<TalkChannel> _openForward(_GateSlot s, int slot, _Forward f) {
     final opening = _open(
       s.to,
       ChannelAddress(
         type: type,
         instance: s.to,
         shard: slot,
-        payload: switchboard.defaultPayload,
+        payload: f.payload,
       ),
     ).then((channel) => TalkChannel(channel, options: switchboard.talkOptions));
-    s.forward = opening;
+    f.channel = opening;
     opening.ignore();
     return opening;
   }
@@ -829,7 +898,12 @@ class SlotGate implements SlotHandler {
     }
     for (final parked in requests) {
       unawaited(
-        _forwardRequest(s, slot, parked.message).whenComplete(parked.finish),
+        _forwardRequest(
+          s,
+          slot,
+          parked.message,
+          parked.payload,
+        ).whenComplete(parked.finish),
       );
     }
     // Answered once the queued channels are handed over.
@@ -926,13 +1000,11 @@ class SlotGate implements SlotHandler {
 
   /// Ends what is left of [s] after it stopped being served: refuses its
   /// queue with `MOVED`, closes its tracked channels, which were served,
-  /// with `RELOCATED`, closes the forwarding channel once its requests are
-  /// answered, and unloads the slot.
+  /// with `RELOCATED`, closes each forwarding channel once its requests
+  /// are answered, and unloads the slot.
   Future<void> _retire(_GateSlot s, int slot) async {
     s.grace?.cancel();
     s.grace = null;
-    s.forwardIdle?.cancel();
-    s.forwardIdle = null;
     final idle = s.idle;
     if (idle != null && !idle.isCompleted) {
       idle.complete();
@@ -946,15 +1018,15 @@ class SlotGate implements SlotHandler {
       unawaited(incoming.reject(relocated));
     }
     s.tracked.clear();
-    final forward = s.forward;
-    s.forward = null;
-    if (forward != null) {
-      unawaited(
-        Future.wait(List.of(s.relays))
-            .then((_) => forward)
-            .then((channel) => channel.close())
-            .catchError((Object _) {}),
-      );
+    // Out of the table, each closes with its last request (_relayEnded).
+    final forwards = List.of(s.forwards.values);
+    s.forwards.clear();
+    for (final f in forwards) {
+      f.idle?.cancel();
+      f.idle = null;
+      if (f.pending == 0) {
+        _closeForward(f);
+      }
     }
     if (s.loaded) {
       s.loaded = false;
@@ -1110,28 +1182,44 @@ class _GateSlot {
   /// The last forwarded channel's open, which the next one waits for.
   Future<void> opening = Future<void>.value();
 
-  /// The channel requests are forwarded on.
-  Future<TalkChannel>? forward;
-
-  /// Forwarded requests not yet ended.
-  final Set<Future<void>> relays = {};
-
-  /// Requests being forwarded, from before their channel is open until
-  /// they end.
-  int pendingRelays = 0;
-
-  /// Closes [forward] once no request was in flight for a while.
-  Timer? forwardIdle;
+  /// The channels requests are forwarded on, by credential
+  /// ([_Forward.key]).
+  final Map<String, _Forward> forwards = {};
 
   bool get isIdle => tracked.isEmpty && work == 0;
 }
 
+/// A channel a gate forwards the requests for one slot that carry one
+/// credential on, opened to the new owner with that credential.
+class _Forward {
+  _Forward(this.key, this.payload);
+
+  /// [payload] as a string, one character per byte.
+  final String key;
+
+  /// The application payload of the channel's OPEN.
+  final Uint8List payload;
+
+  /// The channel, once its open has been started.
+  Future<TalkChannel>? channel;
+
+  /// Requests being forwarded, from before the channel is open until they
+  /// end.
+  int pending = 0;
+
+  /// Closes [channel] once no request was in flight for a while.
+  Timer? idle;
+}
+
 /// A request queued by [SlotGate.serveRequest].
 class _Parked {
-  _Parked(this.message, this.handler);
+  _Parked(this.message, this.handler, this.payload);
 
   final TalkMessage message;
   final FutureOr<void> Function(TalkMessage message) handler;
+
+  /// The credential to forward it with; null for its channel's.
+  final Uint8List? payload;
   final Completer<void> done = Completer<void>();
 
   void finish() {

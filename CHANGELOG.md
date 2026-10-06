@@ -63,7 +63,10 @@ The protocol specification lives in the project wiki (section
   fields as `MOVED`) for work the slot moved away from after it started,
   replacing `ABORTED`, never retried; `MeshNode.leave()` hands each slot
   of a holder-only managed space over to another instance while the node
-  is still up, releases the rest, and returns a `LeaveReport`.
+  is still up, releases the rest, and returns a `LeaveReport`; requests a
+  `SlotGate` forwards during a hand-over carry the credential of the
+  channel they arrived on (or `serveRequest`'s `payload`), one forwarding
+  channel per credential, never the node's default payload.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for
