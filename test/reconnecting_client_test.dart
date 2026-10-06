@@ -1201,6 +1201,378 @@ void main() {
     });
   });
 
+  group('next attempt', () {
+    test('nextAttemptAt matches the backoff schedule', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final client = clientFor(
+          endpoint,
+          maxBackoff: ms(4000),
+          jitter: 0.2,
+          random: Random(3),
+        );
+        final states = <ClientState>[];
+        client.states.listen(states.add);
+        async.elapse(const Duration(seconds: 20));
+        final waits = [
+          for (final s in states)
+            if (s.phase == ClientPhase.disconnected) s,
+        ];
+        final times = endpoint.attempts;
+        expect(times.length, greaterThan(5));
+        expect(waits, hasLength(times.length));
+        for (var i = 0; i + 1 < times.length; i++) {
+          final at = waits[i].nextAttemptAt;
+          expect(at, isNotNull);
+          // The wall clock is not faked: compare the delays. On the web a
+          // DateTime holds milliseconds.
+          final scheduled = at!.difference(waits[i].since!);
+          final gap = times[i + 1] - times[i];
+          expect((scheduled - gap).inMicroseconds.abs(), lessThan(1000));
+        }
+        expect(client.nextAttemptAt, same(client.state.nextAttemptAt));
+        expect(client.nextAttemptAt, isNotNull);
+        expect([
+          for (final s in states)
+            if (s.phase != ClientPhase.disconnected) s.nextAttemptAt,
+        ], everyElement(isNull));
+        closeAndCheck(async, client);
+        expect(client.nextAttemptAt, isNull);
+      });
+    });
+
+    test('null while connecting, connected or stopped', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint);
+        expect(client.state.phase, ClientPhase.connecting);
+        expect(client.nextAttemptAt, isNull);
+        expect(client.state.retryIn, isNull);
+        async.flushMicrotasks();
+        expect(client.state.phase, ClientPhase.connected);
+        expect(client.nextAttemptAt, isNull);
+
+        // After a loss: the next attempt after the backoff.
+        final states = <ClientState>[];
+        client.states.skip(1).listen(states.add);
+        unawaited(endpoint.last.close());
+        async.flushMicrotasks();
+        final waiting = client.state;
+        expect(waiting.phase, ClientPhase.disconnected);
+        expect(waiting.nextAttemptAt, isNotNull);
+        expect(waiting.nextAttemptAt!.difference(waiting.since!), ms(500));
+        expect(
+          waiting.retryIn,
+          allOf(
+            greaterThanOrEqualTo(Duration.zero),
+            lessThanOrEqualTo(ms(500)),
+          ),
+        );
+        async.elapse(ms(500));
+        expect(client.state.phase, ClientPhase.connected);
+        expect(states.map((s) => s.phase), [
+          ClientPhase.disconnected,
+          ClientPhase.connecting,
+          ClientPhase.connected,
+        ]);
+        expect(states.map((s) => s.nextAttemptAt != null), [
+          isTrue,
+          isFalse,
+          isFalse,
+        ]);
+
+        client.stop();
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.nextAttemptAt, isNull);
+        expect(client.state.retryIn, isNull);
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('retryIn counts down to zero, never below', () {
+      final now = DateTime.now();
+      expect(const ClientState(ClientPhase.disconnected).retryIn, isNull);
+      final due = ClientState(
+        ClientPhase.disconnected,
+        since: now,
+        nextAttemptAt: now.add(const Duration(minutes: 1)),
+      );
+      expect(
+        due.retryIn,
+        allOf(
+          greaterThan(const Duration(seconds: 50)),
+          lessThanOrEqualTo(const Duration(minutes: 1)),
+        ),
+      );
+      final past = ClientState(
+        ClientPhase.disconnected,
+        since: now.subtract(const Duration(minutes: 1)),
+        nextAttemptAt: now.subtract(const Duration(seconds: 1)),
+      );
+      expect(past.retryIn, Duration.zero);
+      expect(past.toString(), contains('next attempt at'));
+    });
+  });
+
+  group('reconnectNow', () {
+    test('during the backoff: attempts at once', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final client = clientFor(endpoint);
+        final states = <ClientState>[];
+        client.states.listen(states.add);
+        async.flushMicrotasks();
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.nextAttemptAt, isNotNull);
+
+        async.elapse(ms(100));
+        client.reconnectNow();
+        expect(endpoint.attemptSeconds, [0, 0.1]);
+        expect(client.state.phase, ClientPhase.connecting);
+        expect(client.state.attempt, 2);
+        expect(client.nextAttemptAt, isNull);
+        async.flushMicrotasks();
+        // Failed again: the backoff carries on, 1 s rather than 500 ms.
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.nextAttemptAt!.difference(client.state.since!), ms(1000));
+        async.elapse(ms(999));
+        expect(endpoint.attempts, hasLength(2));
+        async.elapse(ms(1));
+        expect(endpoint.attemptSeconds, [0, 0.1, 1.1]);
+
+        // Waiting 2 s now; the endpoint is back.
+        endpoint.refuseAll = false;
+        async.elapse(ms(100));
+        expect(client.state.phase, ClientPhase.disconnected);
+        client.reconnectNow();
+        async.flushMicrotasks();
+        expect(endpoint.attemptSeconds, [0, 0.1, 1.1, 1.2]);
+        expect(client.state.phase, ClientPhase.connected);
+        expect(client.state.attempt, 4);
+        expect(states.map((s) => s.phase), [
+          ClientPhase.connecting,
+          ClientPhase.disconnected,
+          ClientPhase.connecting,
+          ClientPhase.disconnected,
+          ClientPhase.connecting,
+          ClientPhase.disconnected,
+          ClientPhase.connecting,
+          ClientPhase.connected,
+        ]);
+        expect(
+          states.map((s) => s.nextAttemptAt != null),
+          states.map((s) => s.phase == ClientPhase.disconnected),
+        );
+        // The cancelled wait does not fire.
+        async.elapse(const Duration(minutes: 5));
+        expect(endpoint.attempts, hasLength(4));
+        expect(client.state.phase, ClientPhase.connected);
+        expect(endpoint.connections, hasLength(1));
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('while connecting or connected: does nothing', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final pending = Completer<StreamChannel<Uint8List>>();
+        var calls = 0;
+        final client = clientFor(
+          endpoint,
+          connect: () {
+            calls++;
+            return pending.future;
+          },
+        );
+        final states = <ClientState>[];
+        client.states.skip(1).listen(states.add);
+        async.elapse(ms(100));
+        client.reconnectNow();
+        client.reconnectNow(force: true);
+        async.flushMicrotasks();
+        expect(calls, 1);
+        expect(client.state.phase, ClientPhase.connecting);
+        expect(client.state.attempt, 1);
+        expect(states, isEmpty);
+
+        pending.complete(endpoint.accept());
+        async.flushMicrotasks();
+        expect(client.state.phase, ClientPhase.connected);
+        final connection = client.connection;
+        client.reconnectNow();
+        async.elapse(const Duration(minutes: 1));
+        expect(calls, 1);
+        expect(client.connection, same(connection));
+        expect(endpoint.last.peerGoingAway, isFalse);
+        expect(states.map((s) => s.phase), [ClientPhase.connected]);
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('force while connected: moves to a new connection', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        var subscriptions = 0;
+        endpoint.onChannel = (incoming) {
+          if (incoming.address.type != Name('feed')) {
+            return;
+          }
+          final talk = incoming.talk();
+          talk.messages.listen((message) {
+            subscriptions++;
+            message.reply(Uint8List(0));
+          });
+        };
+        final client = clientFor(endpoint);
+        final opened = <MuxChannel>[];
+        final closed = <Status>[];
+        final persistent = client.openPersistent(
+          events,
+          opened.add,
+          onClosed: closed.add,
+        );
+        final talkClosed = <Status>[];
+        final talk = client.openPersistentTalk(
+          feed,
+          (talk) => talk.request('SUB', Uint8List(0)),
+          onClosed: talkClosed.add,
+        );
+        final own = Outcome(client.openChannel(events));
+        async.elapse(ms(1000));
+        expect(subscriptions, 1);
+        final first = client.connection!;
+        final firstConnected = client.connected;
+        final server = endpoint.last;
+        final mine = own.value!;
+        final theirs = endpoint.on(server).last.channel;
+        final states = <ClientState>[];
+        client.states.skip(1).listen(states.add);
+        final firstDone = Outcome(first.done);
+        final serverDone = Outcome(server.done);
+
+        client.reconnectNow(force: true);
+        expect(client.state.phase, ClientPhase.connecting);
+        expect(client.connection, isNull);
+        async.flushMicrotasks();
+
+        expect(endpoint.attemptSeconds, [0, 1]);
+        expect(states.map((s) => s.phase), [
+          ClientPhase.connecting,
+          ClientPhase.connected,
+        ]);
+        expect(
+          states.map((s) => s.lastStatus?.known),
+          everyElement(StatusCode.goingAway),
+        );
+        expect(states.map((s) => s.attempt), [1, 1]);
+        final second = client.connection!;
+        expect(second, isNot(same(first)));
+        expect(client.connected, isNot(same(firstConnected)));
+        // The old connection got GOAWAY; the persistent channels on it
+        // were closed with GOING_AWAY and opened again on the new one.
+        expect(server.peerGoingAway, isTrue);
+        expect(closed, [isStatus(StatusCode.goingAway)]);
+        expect(talkClosed, [isStatus(StatusCode.goingAway)]);
+        expect(opened, hasLength(2));
+        expect(opened.last.connection, same(second));
+        expect(persistent.current, same(opened.last));
+        expect(talk.current?.isOpen, isTrue);
+        expect(subscriptions, 2);
+        expect(
+          endpoint.on(endpoint.last).map((c) => c.address.type?.toString()),
+          unorderedEquals(['events', 'feed']),
+        );
+
+        // The application channel carries on over the old connection.
+        expect(firstDone.isDone, isFalse);
+        expect(mine.state, MuxChannelState.open);
+        final received = <List<int>>[];
+        mine.stream.listen(received.add);
+        theirs.send(bytes([1]));
+        async.flushMicrotasks();
+        expect(received, [
+          [1],
+        ]);
+        // Once it is done, the old connection closes, and nothing
+        // reconnects.
+        unawaited(mine.close());
+        async.flushMicrotasks();
+        expect(firstDone.value, isStatus(StatusCode.goingAway));
+        expect(serverDone.value, isStatus(StatusCode.goingAway));
+        async.elapse(const Duration(minutes: 5));
+        expect(endpoint.attempts, hasLength(2));
+        expect(client.connection, same(second));
+        expect(states, hasLength(2));
+        expect(opened, hasLength(2));
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('force: a failed attempt backs off as usual', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint);
+        final opened = <MuxChannel>[];
+        client.openPersistent(events, opened.add);
+        async.elapse(ms(1000));
+        endpoint.failures = 1;
+        client.reconnectNow(force: true);
+        async.flushMicrotasks();
+        expect(endpoint.attemptSeconds, [0, 1]);
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.state.lastStatus, isStatus(StatusCode.unavailable));
+        expect(client.nextAttemptAt!.difference(client.state.since!), ms(500));
+        async.elapse(ms(500));
+        expect(endpoint.attemptSeconds, [0, 1, 1.5]);
+        expect(client.state.phase, ClientPhase.connected);
+        expect(opened, hasLength(2));
+        expect(opened.last.connection, same(client.connection));
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('not started, stopped or closed: does nothing', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint, autoStart: false);
+        client.reconnectNow();
+        client.reconnectNow(force: true);
+        async.elapse(const Duration(seconds: 5));
+        expect(endpoint.attempts, isEmpty);
+        expect(client.isRunning, isFalse);
+
+        client.start();
+        async.flushMicrotasks();
+        expect(client.state.phase, ClientPhase.connected);
+        client.stop();
+        client.reconnectNow();
+        client.reconnectNow(force: true);
+        async.elapse(const Duration(seconds: 5));
+        expect(endpoint.attempts, hasLength(1));
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(async.pendingTimers, isEmpty);
+
+        // Closed while waiting for the next attempt.
+        endpoint.refuseAll = true;
+        client.start();
+        async.flushMicrotasks();
+        expect(client.nextAttemptAt, isNotNull);
+        closeAndCheck(async, client);
+        final states = <ClientState>[];
+        client.states.listen(states.add);
+        client.reconnectNow();
+        client.reconnectNow(force: true);
+        async.elapse(const Duration(seconds: 5));
+        expect(endpoint.attempts, hasLength(2));
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.state.lastStatus, isStatus(StatusCode.cancelled));
+        expect(client.nextAttemptAt, isNull);
+        expect(states.map((s) => s.phase), [ClientPhase.disconnected]);
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+  });
+
   group('the endpoint', () {
     test('pushed channels arrive on incoming across reconnects', () {
       fakeAsync((async) {

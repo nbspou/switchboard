@@ -39,7 +39,9 @@ The protocol specification lives in the project wiki (section
 - `ReconnectingClient` (core, web-capable) for frontend apps: backoff
   reconnect, a client state stream, persistent channels re-opened after
   every reconnect, server-pushed channels across reconnects, an immediate
-  move to a new connection on the endpoint's GOAWAY.
+  move to a new connection on the endpoint's GOAWAY, `reconnectNow` (also
+  forced) and `ClientState.nextAttemptAt` for app resume and connectivity
+  changes.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
   host hint relays, routing by shard slot with a one-shot retry on `MOVED`,
   and an asynchronous `authorize` hook that may rewrite the address.

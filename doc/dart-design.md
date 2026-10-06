@@ -408,7 +408,7 @@ A frontend (Flutter on the web or mobile) keeps one connection to its endpoint a
 ```dart
 typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();   // e.g. () => WebSocketTransport.connect(uri)
 enum ClientPhase { disconnected, connecting, connected }
-class ClientState { ClientPhase phase; int attempt; Status? lastStatus; DateTime? since; bool get isConnected; }
+class ClientState { ClientPhase phase; int attempt; Status? lastStatus; DateTime? since; DateTime? nextAttemptAt; Duration? get retryIn; bool get isConnected; }
 
 class ReconnectingClient {
   ReconnectingClient(TransportConnector connect, {MuxOptions? muxOptions, TalkOptions? talkOptions,
@@ -416,9 +416,9 @@ class ReconnectingClient {
       Duration connectTimeout = 10 s, Uint8List? defaultPayload, bool autoStart = true, Random? random});
   Uint8List defaultPayload;                        // mutable: re-opened channels carry the current value
   Stream<ClientState> get states;              // broadcast, replays the current state to each listener
-  ClientState get state; MuxConnection? get connection; Future<MuxConnection> get connected;
+  ClientState get state; DateTime? get nextAttemptAt; MuxConnection? get connection; Future<MuxConnection> get connected;
   bool get isRunning; bool get isClosed;
-  void start(); void stop(); Future<void> close();
+  void start(); void stop(); void reconnectNow({bool force = false}); Future<void> close();
   Future<MuxChannel> openChannel(ChannelAddress address, {Duration openTimeout = 30 s});
   Future<TalkChannel> openTalk(ChannelAddress address, {TalkOptions? options, Duration openTimeout = 30 s});
   PersistentChannel openPersistent(ChannelAddress address, FutureOr<void> Function(MuxChannel) onOpen, {void Function(Status)? onClosed});
@@ -436,6 +436,7 @@ Behaviour notes:
 * On loss (any status): state `disconnected` with the status first, then each persistent channel's `onClosed` with its channel's end status, then the backoff. Nothing is opened on a connection that received GOAWAY; `openChannel` waits for the next one. A peer GOAWAY `GOING_AWAY` is not waited out: the client closes the persistent channels on that connection with `GOING_AWAY`, leaves it to the application's own channels (the mux closes it once idle), and connects again at once, state `connecting` with the GOAWAY status (the backoff applies only if that attempt fails, or if the connection was itself made after a GOAWAY and did not last `maxBackoff`), so persistent channels and waiting opens move to the new connection; a GOAWAY with an error status is left to end as a loss.
 * Persistent channels: every `onOpen` is followed by exactly one `onClosed`. A channel that ends while the connection stays up (closed by the peer, or by the application through `current`) is opened again after a backoff kept per persistent channel (same schedule, reset by a channel that lived longer than `maxBackoff`), except after `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` or `NOT_FOUND`: the persistent channel then ends for good (`done` completes with that status) and the application decides. A refused OPEN: `FAILED_PRECONDITION` (GOAWAY) waits for the next connection, `RESOURCE_EXHAUSTED` backs off, anything else ends it. `onOpen` is never called synchronously from `openPersistent`.
 * `stop()`: abandons an attempt in progress (a late transport is closed), closes the persistent channels with `GOING_AWAY` (re-opened after `start()`), sends GOAWAY; state `disconnected` with `CANCELLED`. `close()` also ends the persistent channels for good, fails waiting opens and `connected` with `CANCELLED`, ends `states` and `incoming`, and completes when every connection is gone (application channels get the GOAWAY grace); no client timer remains. Neither throws.
+* `reconnectNow({force})`, for app resume or a connectivity change: while waiting for a retry it attempts at once (the backoff sequence carries on), while an attempt is in progress, when stopped or after `close()` it does nothing, and while connected it does nothing unless `force`, which leaves the connection as a peer GOAWAY `GOING_AWAY` does (state `connecting` with `GOING_AWAY`, persistent channels moved, GOAWAY sent on the old connection); the `disconnected` state emitted with a scheduled retry carries `nextAttemptAt` (null in every other state), and `retryIn` is the time left by the wall clock, clamped at zero.
 * Lifetimes are measured with timers rather than `Stopwatch`, so fake_async drives them.
 
 ## Naming protocol codecs

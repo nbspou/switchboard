@@ -37,7 +37,7 @@ typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();
 /// Phase of a [ReconnectingClient]'s connection.
 enum ClientPhase {
   /// No connection: not started, stopped, closed, or waiting for the next
-  /// attempt after a failure or a disconnect.
+  /// attempt after a failure or a disconnect ([ClientState.nextAttemptAt]).
   disconnected,
 
   /// A connection attempt is in progress.
@@ -57,6 +57,7 @@ class ClientState {
     this.attempt = 0,
     this.lastStatus,
     this.since,
+    this.nextAttemptAt,
   });
 
   /// The phase.
@@ -74,8 +75,9 @@ class ClientState {
   /// Why the last connection or connection attempt ended: the status the
   /// connection ended with ([MuxConnection.done]), the endpoint's GOAWAY
   /// status when the client left a connection after it
-  /// ([MuxConnection.peerGoAwayStatus]), the failure of the last attempt,
-  /// or [StatusCode.cancelled] when stopped or closed. Null until
+  /// ([MuxConnection.peerGoAwayStatus]), [StatusCode.goingAway] when
+  /// [ReconnectingClient.reconnectNow] left it, the failure of the last
+  /// attempt, or [StatusCode.cancelled] when stopped or closed. Null until
   /// something has ended. Kept unchanged through
   /// [ClientPhase.connecting] and [ClientPhase.connected].
   final Status? lastStatus;
@@ -83,13 +85,37 @@ class ClientState {
   /// When this phase began, by the local wall clock.
   final DateTime? since;
 
+  /// When the next connection attempt is due, by the local wall clock:
+  /// [since] plus the backoff delay. Set only while
+  /// [ClientPhase.disconnected] with an attempt scheduled (after a failed
+  /// attempt or a lost connection); null while connecting or connected,
+  /// and when stopped or closed.
+  ///
+  /// The attempt is driven by a timer, not by the clock: it can come later
+  /// than this, for example when the application was suspended (call
+  /// [ReconnectingClient.reconnectNow] on resume).
+  final DateTime? nextAttemptAt;
+
+  /// The time left until [nextAttemptAt], measured against
+  /// [DateTime.now] at each call and never negative (zero once it is due),
+  /// for a countdown; null when no attempt is scheduled.
+  Duration? get retryIn {
+    final at = nextAttemptAt;
+    if (at == null) {
+      return null;
+    }
+    final left = at.difference(DateTime.now());
+    return left.isNegative ? Duration.zero : left;
+  }
+
   /// Whether [phase] is [ClientPhase.connected].
   bool get isConnected => phase == ClientPhase.connected;
 
   @override
   String toString() =>
       'ClientState(${phase.name}, attempt $attempt'
-      '${lastStatus != null ? ', last: $lastStatus' : ''})';
+      '${lastStatus != null ? ', last: $lastStatus' : ''}'
+      '${nextAttemptAt != null ? ', next attempt at $nextAttemptAt' : ''})';
 }
 
 /// One connection to one endpoint, kept up for a frontend application:
@@ -165,6 +191,9 @@ class ClientState {
 /// [maxBackoff] by up to that fraction. A connection that ends counts as a
 /// failure unless it lasted longer than [maxBackoff], which resets the
 /// sequence: a server that accepts and drops at once is not hammered.
+/// While waiting, [ClientState.nextAttemptAt] says when the next attempt is
+/// due, and [reconnectNow] makes it at once (on app resume, or when the
+/// network comes back).
 class ReconnectingClient {
   /// Creates the client and, unless [autoStart] is false, calls [start],
   /// which calls [connect] at once.
@@ -325,6 +354,10 @@ class ReconnectingClient {
   /// The current state.
   ClientState get state => _state;
 
+  /// When the next connection attempt is due while waiting after a failure
+  /// or a disconnect, else null: [ClientState.nextAttemptAt] of [state].
+  DateTime? get nextAttemptAt => _state.nextAttemptAt;
+
   /// The current connection while [ClientPhase.connected], else null.
   ///
   /// One that receives GOAWAY with [StatusCode.goingAway] stops being
@@ -390,6 +423,50 @@ class ReconnectingClient {
     }
   }
 
+  /// Makes the next connection attempt now, for when waiting is pointless:
+  /// the application resumed, or the network came back.
+  ///
+  /// While waiting for the next attempt after a failure or a disconnect,
+  /// cancels the wait and attempts at once: the state becomes
+  /// [ClientPhase.connecting]. The backoff sequence carries on: if the
+  /// attempt fails, the next delay is the one that would have followed the
+  /// cancelled attempt ([stop] then [start] resets it).
+  ///
+  /// While an attempt is in progress, does nothing. While connected, does
+  /// nothing unless [force] is true; then the client leaves the connection
+  /// as it does after the endpoint's GOAWAY (see the class
+  /// documentation), for a connection that may be stale: the state becomes
+  /// [ClientPhase.connecting] with [StatusCode.goingAway] as
+  /// [ClientState.lastStatus], the persistent channels are closed with
+  /// [StatusCode.goingAway] and opened again on the new connection, and
+  /// the old connection gets GOAWAY, so it closes once the channels the
+  /// application opened on it are done, or after [MuxOptions.goAwayGrace].
+  /// If the new attempt fails, the backoff applies.
+  ///
+  /// Does nothing if not started, or after [close]. Never throws.
+  void reconnectNow({bool force = false}) {
+    if (_closed || !_running) {
+      return;
+    }
+    final retry = _retryTimer;
+    if (retry != null) {
+      retry.cancel();
+      _log.fine('connecting now');
+      _attemptConnect();
+      return;
+    }
+    final connection = _connection;
+    if (connection == null || !force) {
+      // An attempt is in progress, or connected.
+      return;
+    }
+    _log.info('leaving the connection, reconnecting');
+    final status = Status.of(StatusCode.goingAway, 'client reconnecting');
+    _leave(connection);
+    _retire(connection, status);
+    _attemptConnect(status);
+  }
+
   /// Stops (as [stop]), closes every persistent channel for good, fails
   /// pending [openChannel] calls and [connected] with
   /// [StatusCode.cancelled], and ends [states] and [incoming].
@@ -452,7 +529,7 @@ class ReconnectingClient {
       Status.of(StatusCode.cancelled, reason),
     );
     if (connection != null) {
-      _retire(connection);
+      _retire(connection, Status.of(StatusCode.goingAway, 'client stopping'));
     }
     for (final old in List.of(_draining)) {
       _goAway(old);
@@ -460,9 +537,9 @@ class ReconnectingClient {
     _draining.clear();
   }
 
-  /// Closes the persistent channels on [connection] and sends GOAWAY on it.
-  void _retire(MuxConnection connection) {
-    final status = Status.of(StatusCode.goingAway, 'client stopping');
+  /// Closes the persistent channels on [connection] with [status] and
+  /// sends GOAWAY on it.
+  void _retire(MuxConnection connection, Status status) {
     for (final p in List.of(_persistent)) {
       p.retire(connection, status);
     }
@@ -482,12 +559,20 @@ class ReconnectingClient {
     gone.whenComplete(() => _retiring.remove(gone)).ignore();
   }
 
-  void _setState(ClientPhase phase, Status? lastStatus, {int? attempt}) {
+  /// [retryDelay] is the delay of the attempt scheduled, if any.
+  void _setState(
+    ClientPhase phase,
+    Status? lastStatus, {
+    int? attempt,
+    Duration? retryDelay,
+  }) {
+    final now = DateTime.now();
     _state = ClientState(
       phase,
       attempt: attempt ?? _attempt,
       lastStatus: lastStatus,
-      since: DateTime.now(),
+      since: now,
+      nextAttemptAt: retryDelay == null ? null : now.add(retryDelay),
     );
     if (!_states.isClosed) {
       _states.add(_state);
@@ -571,17 +656,20 @@ class ReconnectingClient {
     } else {
       _log.fine('connection attempt $_attempt failed: $status');
     }
-    _setState(ClientPhase.disconnected, status);
-    _scheduleRetry();
+    _retryLater(status);
   }
 
-  void _scheduleRetry() {
+  /// Reports the state [ClientPhase.disconnected] with [status], and the
+  /// next attempt after the backoff.
+  void _retryLater(Status status) {
     if (!_running) {
+      _setState(ClientPhase.disconnected, status);
       return;
     }
     final delay = _backoff(_failures++);
     _log.fine('next connection attempt in $delay');
     _retryTimer = Timer(delay, _attemptConnect);
+    _setState(ClientPhase.disconnected, status, retryDelay: delay);
   }
 
   /// The delay after [failures] consecutive failures, with jitter.
@@ -649,6 +737,14 @@ class ReconnectingClient {
       // Retired by stop() or close(), or left after a GOAWAY.
       return;
     }
+    _leave(connection);
+    _log.info('disconnected: $status');
+    _retryLater(status);
+  }
+
+  /// [connection], the current one, stops being current.
+  void _leave(MuxConnection connection) {
+    assert(identical(_connection, connection));
     _connection = null;
     _lifetimeTimer?.cancel();
     _lifetimeTimer = null;
@@ -659,9 +755,6 @@ class ReconnectingClient {
     if (_connected.isCompleted) {
       _connected = _newConnected();
     }
-    _log.info('disconnected: $status');
-    _setState(ClientPhase.disconnected, status);
-    _scheduleRetry();
   }
 
   /// The endpoint sent GOAWAY on [connection]: unless it is an error, leave
@@ -677,16 +770,7 @@ class ReconnectingClient {
       _log.fine('endpoint sent GOAWAY $status');
       return;
     }
-    _connection = null;
-    _lifetimeTimer?.cancel();
-    _lifetimeTimer = null;
-    if (_livedLong) {
-      _failures = 0;
-      _restartedOnGoAway = false;
-    }
-    if (_connected.isCompleted) {
-      _connected = _newConnected();
-    }
+    _leave(connection);
     // Not closed here: the mux closes it once idle after the peer's GOAWAY.
     _draining.add(connection);
     connection.done.whenComplete(() => _draining.remove(connection)).ignore();
@@ -696,8 +780,7 @@ class ReconnectingClient {
     }
     if (_restartedOnGoAway) {
       _log.info('endpoint going away again: $status');
-      _setState(ClientPhase.disconnected, status);
-      _scheduleRetry();
+      _retryLater(status);
       return;
     }
     _restartedOnGoAway = true;
