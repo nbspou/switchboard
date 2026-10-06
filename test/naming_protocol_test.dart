@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:switchboard/src/address/service_address.dart';
@@ -6,6 +7,8 @@ import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/status.dart';
 import 'package:test/test.dart';
+
+import 'naming_harness.dart';
 
 void main() {
   final npc = Name('npc');
@@ -196,6 +199,131 @@ void main() {
     });
   });
 
+  group('endpoint validation', () {
+    // Parses, but its text form `%3E:x` has no scheme and does not parse.
+    const relative = './>:x';
+    // Has a scheme, but `tcp://%7B:` parses back without the empty port:
+    // a different uri.
+    const unstable = r'tcp:/.\\{:';
+    const schemeless = '//10.0.0.5:9101/ws';
+    // No authority and path `//`; its text form `tcp://` has an empty
+    // authority and an empty path. Equal to its reparse one way only.
+    const asymmetric = 'tcp:/../..//';
+
+    Uint8List record(String endpoint) {
+      final w = ByteWriter()
+        ..name(npc)
+        ..u48(5)
+        ..u8(1)
+        ..string8(endpoint);
+      return w.toBytes();
+    }
+
+    test('checkEndpoint accepts usual endpoints', () {
+      for (final uri in [
+        ...uris,
+        Uri.parse('wss://example.org:443/a/b?x=1#npc/2'),
+        Uri.parse('ws://[::1]:9100/'),
+        Uri.parse('ws://ü.example/ä'),
+        Uri.parse('tcp://${'a' * 249}'),
+      ]) {
+        ServiceRecord.checkEndpoint(uri);
+      }
+    });
+
+    test('checkEndpoint refuses what a watcher could not decode', () {
+      expect(Uri.parse(unstable).hasScheme, isTrue);
+      expect(
+        Uri.tryParse(Uri.parse(unstable).toString()),
+        isNot(Uri.parse(unstable)),
+      );
+      final asymmetricUri = Uri.parse(asymmetric);
+      final reparsed = Uri.parse(asymmetricUri.toString());
+      expect(reparsed == asymmetricUri, isNot(asymmetricUri == reparsed));
+      for (final text in [
+        relative,
+        unstable,
+        schemeless,
+        asymmetric,
+        'tcp://${'a' * 250}',
+      ]) {
+        expect(
+          () => ServiceRecord.checkEndpoint(Uri.parse(text)),
+          throwsArgumentError,
+          reason: text,
+        );
+      }
+    });
+
+    test('decoders refuse such endpoints', () {
+      for (final text in [relative, unstable, schemeless, asymmetric]) {
+        final bytes = record(text);
+        expect(
+          () => ServiceRecord.decode(bytes),
+          throwsA(isA<ProtocolException>()),
+          reason: text,
+        );
+        expect(
+          () => ServiceEvent.decodeUp(bytes),
+          throwsA(isA<ProtocolException>()),
+          reason: text,
+        );
+        // REGISTER has the same layout as a record.
+        expect(
+          () => RegisterRequest.decode(bytes),
+          throwsA(isA<ProtocolException>()),
+          reason: text,
+        );
+      }
+      expect(ServiceRecord.decode(record('tcp://h:1')).endpoints, [
+        Uri.parse('tcp://h:1'),
+      ]);
+    });
+  });
+
+  group('fuzz', () {
+    final decoders = <String, Object Function(Uint8List)>{
+      'ServiceRecord': ServiceRecord.decode,
+      'RegisterRequest': RegisterRequest.decode,
+      'RegisterResponse': RegisterResponse.decode,
+      'UnregisterRequest': UnregisterRequest.decode,
+      'WatchRequest': WatchRequest.decode,
+      'ServiceEvent.up': ServiceEvent.decodeUp,
+      'ServiceEvent.down': ServiceEvent.decodeDown,
+    };
+
+    var seed = 0;
+    for (final MapEntry(key: name, value: decode) in decoders.entries) {
+      final random = Random(++seed);
+      test(
+        '$name: only ProtocolException escapes; decoded values are stable',
+        () {
+          var decoded = 0;
+          for (var i = 0; i < 3000; i++) {
+            final input = fuzzInput(random, i);
+            final Object value;
+            try {
+              value = decode(input);
+            } on ProtocolException {
+              continue;
+            } catch (e) {
+              fail('$name threw ${e.runtimeType} ($e) for ${hexString(input)}');
+            }
+            decoded++;
+            // Whatever decodes encodes again, and that decodes to the same.
+            final again = encodeAny(value);
+            final back = decode(again);
+            expect(encodeAny(back), again, reason: hexString(input));
+            if (value is ServiceRecord) {
+              expect(back, value, reason: hexString(input));
+            }
+          }
+          expect(decoded, greaterThan(0));
+        },
+      );
+    }
+  });
+
   test('rejects endpoints that would not re-encode within 255 bytes', () {
     final raw = 'tcp://h/${'a b' * 80}';
     expect(raw.length, lessThanOrEqualTo(255));
@@ -210,3 +338,13 @@ void main() {
     );
   });
 }
+
+Uint8List encodeAny(Object value) => switch (value) {
+  ServiceRecord() => value.encode(),
+  RegisterRequest() => value.encode(),
+  RegisterResponse() => value.encode(),
+  UnregisterRequest() => value.encode(),
+  WatchRequest() => value.encode(),
+  ServiceEvent() => value.encode(),
+  _ => throw ArgumentError.value(value),
+};

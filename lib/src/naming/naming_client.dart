@@ -33,6 +33,12 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// out) the client marks the table stale, keeps it, and reconnects after
 /// [reconnectDelay], until [close].
 ///
+/// When a `REGISTER` or `UNREGSTR` has no clear outcome (no answer in time,
+/// or an unreadable answer) the client drops the channel itself: the naming
+/// service then discards everything registered on it, and the reconnect
+/// registers the remembered set again. Neither a phantom record nor an
+/// untracked one is left behind.
+///
 /// See the wiki page "Switchboard Naming Service", section "Mirror
 /// behaviour".
 class NamingClient {
@@ -65,6 +71,8 @@ class NamingClient {
   final Set<_Entry> _entries = {};
   final Completer<void> _started = Completer<void>();
   Completer<void> _synced = _newSynced();
+  final Completer<void> _firstSynced = _newSynced();
+  bool _hasSynced = false;
   _Session? _session;
   Future<void>? _startFuture;
   Future<void>? _closeFuture;
@@ -99,6 +107,16 @@ class NamingClient {
   /// True after `SYNCED` on the current channel; false while disconnected.
   bool get isSynced => _isSynced;
 
+  /// True once any channel has reached `SYNCED`: [table] has been complete
+  /// at least once. A later loss of the naming service does not reset it;
+  /// the table is then stale ([isSynced] is false) but still served.
+  bool get hasSynced => _hasSynced;
+
+  /// Completes on the first `SYNCED` ever, when [hasSynced] becomes true.
+  /// One-shot: unlike [synced] it is never replaced after a loss. Fails
+  /// with [StatusCode.cancelled] if [close] is called before that.
+  Future<void> get firstSynced => _firstSynced.future;
+
   /// True after [close].
   bool get isClosed => _closed;
 
@@ -127,8 +145,17 @@ class NamingClient {
   ///
   /// The registration is remembered and made again after every reconnect,
   /// asking for the same id; if that id has been taken meanwhile, a new one
-  /// is assigned (and logged). While disconnected, the returned future
-  /// completes once the registration succeeds after the next connect.
+  /// is assigned (and logged). If the naming service refuses such a
+  /// re-registration for another reason, it is retried on the same channel
+  /// every [reconnectDelay]. While disconnected, and if the channel is lost
+  /// while the request is in flight, the returned future completes once the
+  /// registration succeeds after the next connect.
+  ///
+  /// Registering a non-zero [instance] of [type] again supersedes the
+  /// earlier registration of `type/instance` made through this client,
+  /// whether or not it has completed: the naming service replaces the
+  /// endpoints, only the newest registration is remembered, and the earlier
+  /// call's future completes (or fails) like this one.
   ///
   /// [onAssigned], if given, is called synchronously with the instance id
   /// whenever the registration gets an id different from the one it had:
@@ -142,8 +169,14 @@ class NamingClient {
   /// [StatusCode.invalidArgument]), with [StatusCode.invalidArgument] for an
   /// empty type, [StatusCode.cancelled] if [unregister] or [close] is called
   /// first, and [StatusCode.failedPrecondition] after [close]. Fails with
-  /// [ArgumentError] or [RangeError] for more than 255 endpoints, an endpoint
-  /// longer than 255 bytes, or an instance outside the `u48` range.
+  /// [StatusCode.deadlineExceeded] if the naming service does not answer
+  /// within the channel's request timeout: the outcome is then unknown, so
+  /// the client also drops the channel (the naming service discards the
+  /// record, if it made one) and reconnects; the registration is not
+  /// remembered. Fails with [ArgumentError] or [RangeError] for more than
+  /// 255 endpoints, an endpoint [ServiceRecord.checkEndpoint] refuses (no
+  /// scheme, longer than 255 bytes, or not stable through its text form),
+  /// or an instance outside the `u48` range.
   Future<int> register(
     Name type,
     List<Uri> endpoints, {
@@ -170,22 +203,12 @@ class NamingClient {
       if (instance < 0 || instance > maxInstance) {
         throw RangeError.range(instance, 0, maxInstance, 'instance');
       }
-      // Validates the endpoints.
-      RegisterRequest(
-        type,
-        requestedInstance: instance,
-        endpoints: endpoints,
-      ).encode();
+      if (endpoints.length > 255) {
+        throw ArgumentError.value(endpoints.length, 'endpoints', 'over 255');
+      }
+      endpoints.forEach(ServiceRecord.checkEndpoint);
     } catch (e, st) {
       return Future.error(e, st);
-    }
-    if (instance != 0) {
-      // Registering an id again replaces its endpoints; the older entry is
-      // superseded.
-      _entries.removeWhere(
-        (e) =>
-            e.type == type && e.instance == instance && e.completer.isCompleted,
-      );
     }
     final entry = _Entry(
       type,
@@ -193,6 +216,16 @@ class NamingClient {
       instance,
       onAssigned,
     );
+    if (instance != 0) {
+      // Registering an id again replaces its endpoints: the older entry is
+      // superseded, even while its own request is still in flight.
+      for (final older in [
+        for (final e in _entries)
+          if (e.type == type && e.instance == instance) e,
+      ]) {
+        _supersede(older, entry);
+      }
+    }
     _entries.add(entry);
     final session = _session;
     if (session != null && session.alive) {
@@ -202,13 +235,19 @@ class NamingClient {
   }
 
   /// Removes the registration of `type/instance` made through this client
-  /// and stops re-registering it.
+  /// and stops re-registering it. A [register] of it still in flight fails
+  /// with [StatusCode.cancelled]; if the naming service registers it anyway,
+  /// the client unregisters it as soon as the answer arrives.
   ///
   /// While disconnected it completes immediately: the naming service already
   /// dropped the record with the channel. Fails with [StatusCode.notFound]
   /// if this client has no such registration, with the naming service's
   /// status if it refuses, and with [StatusCode.failedPrecondition] after
-  /// [close].
+  /// [close]. If the naming service refuses (other than with
+  /// [StatusCode.notFound]) or does not answer in time
+  /// ([StatusCode.deadlineExceeded]), the client also drops its channel, so
+  /// that the record goes away with it, and reconnects; either way the
+  /// registration is no longer remembered.
   Future<void> unregister(Name type, int instance) async {
     if (_closed) {
       throw SwitchboardException.of(
@@ -216,28 +255,31 @@ class NamingClient {
         'naming client closed',
       );
     }
-    _Entry? entry;
-    for (final e in _entries) {
-      if (e.type == type && e.instance == instance && instance != 0) {
-        entry = e;
-        break;
-      }
-    }
-    if (entry == null) {
+    final matching = [
+      for (final e in _entries)
+        if (e.type == type && e.instance == instance && instance != 0) e,
+    ];
+    if (matching.isEmpty) {
       throw SwitchboardException.of(
         StatusCode.notFound,
-        'no registration $type/${instance.toRadixString(16)}',
-      );
-    }
-    _entries.remove(entry);
-    if (!entry.completer.isCompleted) {
-      entry.completer.future.ignore();
-      entry.completer.completeError(
-        SwitchboardException.of(StatusCode.cancelled, 'unregistered'),
+        'no registration ${ServiceAddress(type, instance)}',
       );
     }
     final session = _session;
-    if (session == null || !session.usable || entry.session != session) {
+    var registeredHere = false;
+    for (final entry in matching) {
+      _entries.remove(entry);
+      if (!entry.completer.isCompleted) {
+        entry.completer.future.ignore();
+        entry.completer.completeError(
+          SwitchboardException.of(StatusCode.cancelled, 'unregistered'),
+        );
+      }
+      if (session != null && identical(entry.session, session)) {
+        registeredHere = true;
+      }
+    }
+    if (session == null || !session.usable || !registeredHere) {
       // Not registered on the live channel. A registration still in flight
       // removes itself when it completes.
       return;
@@ -281,6 +323,9 @@ class NamingClient {
     _isSynced = false;
     if (!_synced.isCompleted) {
       _synced.completeError(cancelled);
+    }
+    if (!_firstSynced.isCompleted) {
+      _firstSynced.completeError(cancelled);
     }
     await _events.close();
   }
@@ -349,11 +394,23 @@ class NamingClient {
       ),
     );
 
-    // Re-register first, so other services' channels to our ids stay valid
-    // where possible, then watch.
-    await Future.wait([
-      for (final entry in _entries.toList()) _registerOn(session, entry),
-    ]);
+    // Register the ids we had (or asked for) first, so other services'
+    // channels to them stay valid where possible and the snapshot already
+    // holds them, then watch. Registrations that ask for any id are sent
+    // after them (so that an assignment cannot take one of our ids), but
+    // not waited for: a freshly started naming service may hold
+    // assignments for a while (see NamingService.assignmentHold).
+    final entries = _entries.toList();
+    final known = [
+      for (final entry in entries)
+        if (entry.instance != 0) _registerOn(session, entry),
+    ];
+    for (final entry in entries) {
+      if (entry.instance == 0) {
+        unawaited(_registerOn(session, entry));
+      }
+    }
+    await Future.wait(known);
     if (session.alive) {
       _startWatch(session);
     }
@@ -407,6 +464,7 @@ class NamingClient {
     }
     entry.pending = session;
     final requested = instance ?? entry.instance;
+    final int assigned;
     try {
       final response = await session.channel.request(
         Procedures.register.toString(),
@@ -416,68 +474,178 @@ class NamingClient {
           endpoints: entry.endpoints,
         ).encode(),
       );
-      final assigned = RegisterResponse.decode(response.payload).instance;
-      if (!_entries.contains(entry)) {
-        // Unregistered while the request was in flight.
-        if (session.usable) {
-          try {
-            await _sendUnregister(session, entry.type, assigned);
-          } on SwitchboardException catch (e) {
-            _log.fine('late unregister failed: $e');
-          }
-        }
-        return;
-      }
-      if (entry.completer.isCompleted && assigned != entry.instance) {
-        _log.warning(
-          're-registered ${ServiceAddress(entry.type, entry.instance)} as '
-          '${ServiceAddress(entry.type, assigned)}',
+      assigned = RegisterResponse.decode(response.payload).instance;
+      if (assigned == 0 || (requested != 0 && assigned != requested)) {
+        throw ProtocolException(
+          'REGISTER for ${ServiceAddress(entry.type, requested)} answered '
+          'with id ${assigned.toRadixString(16)}',
         );
-      }
-      final changed =
-          !entry.completer.isCompleted || assigned != entry.instance;
-      entry.instance = assigned;
-      entry.session = session;
-      _log.fine('registered ${ServiceAddress(entry.type, assigned)}');
-      if (changed) {
-        _notifyAssigned(entry, assigned);
-      }
-      if (!entry.completer.isCompleted) {
-        entry.completer.complete(assigned);
       }
     } catch (e, st) {
-      if (!_entries.contains(entry) || !session.usable) {
-        // Gone, or the channel was lost: kept for the next connect.
-        return;
-      }
-      final remembered = entry.completer.isCompleted;
-      if (remembered &&
-          requested != 0 &&
-          e is SwitchboardException &&
-          e.code == StatusCode.alreadyExists) {
-        _log.warning(
-          '${ServiceAddress(entry.type, requested)} is taken, '
-          'asking for a new id',
-        );
-        entry.pending = null;
-        await _registerOn(session, entry, instance: 0);
-        return;
-      }
-      if (remembered) {
-        _log.severe(
-          're-registering ${ServiceAddress(entry.type, requested)} failed; '
-          'retrying after the next reconnect',
-          e,
-          st,
-        );
-        return;
-      }
-      _entries.remove(entry);
-      entry.completer.completeError(e, st);
-    } finally {
       if (identical(entry.pending, session)) {
         entry.pending = null;
       }
+      await _onRegisterFailed(session, entry, requested, e, st);
+      return;
+    }
+    if (identical(entry.pending, session)) {
+      entry.pending = null;
+    }
+    await _onRegistered(session, entry, assigned);
+  }
+
+  Future<void> _onRegistered(
+    _Session session,
+    _Entry entry,
+    int assigned,
+  ) async {
+    if (entry.superseded) {
+      // A newer registration of the same id took over; it registers the
+      // endpoints it wants on its own.
+      return;
+    }
+    if (!_entries.contains(entry)) {
+      // Unregistered while the request was in flight.
+      if (session.usable) {
+        try {
+          await _sendUnregister(session, entry.type, assigned);
+        } catch (e) {
+          _log.fine('late unregister failed: $e');
+        }
+      }
+      return;
+    }
+    if (entry.completer.isCompleted && assigned != entry.instance) {
+      _log.warning(
+        're-registered ${ServiceAddress(entry.type, entry.instance)} as '
+        '${ServiceAddress(entry.type, assigned)}',
+      );
+    }
+    final changed = !entry.completer.isCompleted || assigned != entry.instance;
+    entry.instance = assigned;
+    entry.session = session;
+    entry.refusals = 0;
+    // At most one remembered registration per address: an older one that
+    // ended up with the same id (it asked for any id and was given the one
+    // this entry asked for) is superseded by this, the later answer.
+    for (final older in [
+      for (final e in _entries)
+        if (!identical(e, entry) &&
+            e.type == entry.type &&
+            e.instance == assigned &&
+            e.completer.isCompleted)
+          e,
+    ]) {
+      _supersede(older, entry);
+    }
+    _log.fine('registered ${ServiceAddress(entry.type, assigned)}');
+    if (changed) {
+      _notifyAssigned(entry, assigned);
+    }
+    if (!entry.completer.isCompleted) {
+      entry.completer.complete(assigned);
+    }
+  }
+
+  Future<void> _onRegisterFailed(
+    _Session session,
+    _Entry entry,
+    int requested,
+    Object error,
+    StackTrace stackTrace,
+  ) async {
+    if (entry.superseded) {
+      // Its successor carries the outcome.
+      return;
+    }
+    if (!session.usable) {
+      // The channel is gone, and with it anything the request registered.
+      // A remembered or pending entry is registered again after the next
+      // connect.
+      return;
+    }
+    final address = ServiceAddress(entry.type, requested);
+    final indeterminate = _isIndeterminate(error);
+    if (!_entries.contains(entry)) {
+      // Unregistered while the request was in flight. If the naming service
+      // may have registered it after all, the record must not outlive the
+      // channel unnoticed.
+      if (indeterminate) {
+        session.lose(
+          Status.of(StatusCode.aborted, 'REGISTER outcome unknown'),
+          'REGISTER $address has no clear outcome ($error)',
+        );
+      }
+      return;
+    }
+    final remembered = entry.completer.isCompleted;
+    if (indeterminate) {
+      // The naming service may or may not hold the record. Drop the
+      // channel: it then discards everything registered on it, and the
+      // reconnect registers the remembered set again.
+      _log.warning(
+        'REGISTER $address has no clear outcome, dropping the channel',
+        error,
+      );
+      if (!remembered) {
+        _entries.remove(entry);
+        entry.completer.completeError(error, stackTrace);
+      }
+      session.lose(
+        Status.of(StatusCode.aborted, 'REGISTER outcome unknown'),
+        'REGISTER $address has no clear outcome',
+      );
+      return;
+    }
+    if (remembered &&
+        requested != 0 &&
+        error is SwitchboardException &&
+        error.code == StatusCode.alreadyExists) {
+      _log.warning('$address is taken, asking for a new id');
+      await _registerOn(session, entry, instance: 0);
+      return;
+    }
+    if (remembered) {
+      // Refused on a healthy channel: try again later on the same channel,
+      // without disturbing the other registrations.
+      entry.refusals++;
+      final message =
+          're-registering $address failed; retrying in $reconnectDelay';
+      if (entry.refusals == 1) {
+        _log.severe(message, error, stackTrace);
+      } else {
+        _log.fine('$message: $error');
+      }
+      session.later(reconnectDelay, () {
+        if (_entries.contains(entry)) {
+          unawaited(_registerOn(session, entry));
+        }
+      });
+      return;
+    }
+    _entries.remove(entry);
+    entry.completer.completeError(error, stackTrace);
+  }
+
+  /// Whether a failed request may still have taken effect: the naming
+  /// service did not answer in time, or answered something unreadable. A
+  /// refusal is an answer; a lost channel is handled separately.
+  static bool _isIndeterminate(Object error) =>
+      error is! SwitchboardException ||
+      error is ProtocolException ||
+      error.code == StatusCode.deadlineExceeded;
+
+  /// Replaces [older] by [newer], which registers the same address: [older]
+  /// is forgotten, its late answer ignored, and its pending future
+  /// completes like [newer]'s.
+  void _supersede(_Entry older, _Entry newer) {
+    _entries.remove(older);
+    older.superseded = true;
+    if (!older.completer.isCompleted) {
+      newer.completer.future.then(
+        older.completer.complete,
+        onError: older.completer.completeError,
+      );
     }
   }
 
@@ -497,6 +665,10 @@ class NamingClient {
     }
   }
 
+  /// Sends `UNREGSTR`. A lost channel counts as success: the record went
+  /// away with it. Any other failure but [StatusCode.notFound] may leave
+  /// the record registered without the client tracking it, so the channel
+  /// is dropped (taking the record with it) before the error is rethrown.
   Future<void> _sendUnregister(
     _Session session,
     Name type,
@@ -507,10 +679,16 @@ class NamingClient {
         Procedures.unregister.toString(),
         UnregisterRequest(type, instance).encode(),
       );
-    } on SwitchboardException {
+    } catch (e) {
       if (!session.usable) {
         // The record went away with the channel.
         return;
+      }
+      if (e is! SwitchboardException || e.code != StatusCode.notFound) {
+        session.lose(
+          Status.of(StatusCode.aborted, 'UNREGSTR failed'),
+          'UNREGSTR ${ServiceAddress(type, instance)} failed ($e)',
+        );
       }
       rethrow;
     }
@@ -599,9 +777,13 @@ class NamingClient {
       _applyDown(address);
     }
     _isSynced = true;
+    _hasSynced = true;
     _log.info('naming table synced, ${_table.length} records');
     if (!_synced.isCompleted) {
       _synced.complete();
+    }
+    if (!_firstSynced.isCompleted) {
+      _firstSynced.complete();
     }
   }
 
@@ -645,6 +827,12 @@ class _Entry {
   /// The session a REGISTER for this entry is in flight on.
   _Session? pending;
 
+  /// Replaced by a newer registration of the same address.
+  bool superseded = false;
+
+  /// Refusals of re-registration in a row.
+  int refusals = 0;
+
   /// Completes with the first assigned id.
   final Completer<int> completer = Completer<int>();
 }
@@ -660,6 +848,7 @@ class _Session {
   StreamSubscription<TalkMessage>? messages;
   StreamSubscription<TalkMessage>? watchItems;
   Future<void>? closeChannel;
+  final Set<Timer> _timers = {};
 
   /// Before `SYNCED`: addresses seen in the snapshot.
   bool syncing = true;
@@ -678,6 +867,21 @@ class _Session {
   /// Completes when the session is torn down and its channel closed.
   Future<void> get closed => _closed.future;
 
+  /// Runs [action] after [delay] unless the session is lost first.
+  void later(Duration delay, void Function() action) {
+    if (!alive) {
+      return;
+    }
+    late final Timer timer;
+    timer = Timer(delay, () {
+      _timers.remove(timer);
+      if (alive) {
+        action();
+      }
+    });
+    _timers.add(timer);
+  }
+
   /// Marks the session lost and closes its channel with [status].
   /// Idempotent.
   void lose(Status status, String reason) {
@@ -685,6 +889,10 @@ class _Session {
       return;
     }
     _log.info('naming service channel lost: $reason');
+    for (final timer in _timers) {
+      timer.cancel();
+    }
+    _timers.clear();
     closeChannel = channel.close(status);
     _lost.complete();
     _onLost();
@@ -693,8 +901,11 @@ class _Session {
   /// Cancels the subscriptions, waits for the channel to close and
   /// completes [closed].
   Future<void> tearDown() async {
-    await watchItems?.cancel();
-    await messages?.cancel();
+    // Nothing worth waiting for in the cancels. Cancelling a subscription
+    // to a stream that already ended returns a future of the root zone,
+    // which a fake clock (package:fake_async) never completes.
+    watchItems?.cancel().ignore();
+    messages?.cancel().ignore();
     await closeChannel;
     if (!_closed.isCompleted) {
       _closed.complete();

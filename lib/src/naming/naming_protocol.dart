@@ -73,8 +73,9 @@ List<Uri> _readEndpoints(ByteReader r) {
   return [for (var i = 0; i < count; i++) _readEndpoint(r)];
 }
 
-/// Reads one endpoint and rejects any that would not re-encode within the
-/// 255-byte limit, so that a decoded record can always be encoded again.
+/// Reads one endpoint and rejects any that [ServiceRecord.checkEndpoint]
+/// refuses, so that a decoded record can always be encoded again and the
+/// result decodes to an equal record.
 Uri _readEndpoint(ByteReader r) {
   final text = r.string8('endpoint');
   final Uri uri;
@@ -83,12 +84,34 @@ Uri _readEndpoint(ByteReader r) {
   } on FormatException catch (e) {
     throw ProtocolException('invalid endpoint uri: ${e.message}');
   }
-  if (utf8.encode(uri.toString()).length > 0xFF) {
-    throw ProtocolException(
-      'endpoint uri longer than 255 bytes once normalized',
-    );
+  final problem = _endpointProblem(uri);
+  if (problem != null) {
+    throw ProtocolException('invalid endpoint uri: $problem');
   }
   return uri;
+}
+
+/// Why [uri] cannot be carried as an endpoint, or null if it can.
+String? _endpointProblem(Uri uri) {
+  if (!uri.hasScheme) {
+    return 'no scheme';
+  }
+  final text = uri.toString();
+  if (utf8.encode(text).length > 0xFF) {
+    return 'longer than 255 bytes once normalized';
+  }
+  // Uri normalisation is not idempotent for every input: the text form of
+  // some parsed URIs parses differently, or not at all. Such an endpoint
+  // would be accepted once and then be undecodable for every watcher. Uri
+  // equality is checked both ways: depending on the representation the
+  // parser picks it compares either the text or the components, so
+  // `tcp:/../..//` (no authority, path `//`) equals its own reparse
+  // `tcp://` (empty authority, empty path) one way only.
+  final again = Uri.tryParse(text);
+  if (again == null || again != uri || uri != again) {
+    return 'text form does not parse back to the same uri';
+  }
+  return null;
 }
 
 /// A service record: address with a non-zero instance and its endpoints.
@@ -103,6 +126,22 @@ class ServiceRecord {
 
   /// URIs the instance can be reached at; may be empty.
   final List<Uri> endpoints;
+
+  /// Throws [ArgumentError] unless [endpoint] can be carried in a record:
+  /// it must have a scheme, its text form must fit in 255 bytes of UTF-8,
+  /// and parsing that text form must give the same URI again.
+  ///
+  /// The decoders refuse (with [ProtocolException]) every endpoint this
+  /// refuses, and a record whose endpoints all pass encodes to bytes that
+  /// decode to an equal record. The naming service refuses such endpoints
+  /// with [StatusCode.invalidArgument], so that whatever it accepts, its
+  /// watchers can decode.
+  static void checkEndpoint(Uri endpoint) {
+    final problem = _endpointProblem(endpoint);
+    if (problem != null) {
+      throw ArgumentError.value(endpoint, 'endpoint', problem);
+    }
+  }
 
   /// Encodes the record. Throws [ArgumentError] if the instance is 0 or
   /// there are more than 255 endpoints.
@@ -123,7 +162,8 @@ class ServiceRecord {
 
   /// Decodes a record; trailing bytes are ignored.
   ///
-  /// Throws [ProtocolException] on truncation or instance 0.
+  /// Throws [ProtocolException] on truncation, instance 0, or an endpoint
+  /// that [checkEndpoint] refuses.
   static ServiceRecord decode(Uint8List bytes) => _guard('service record', () {
     final r = ByteReader(bytes);
     final type = r.name('type');
@@ -180,6 +220,9 @@ class RegisterRequest {
   }
 
   /// Decodes the payload; trailing bytes are ignored.
+  ///
+  /// Throws [ProtocolException] on truncation or an endpoint that
+  /// [ServiceRecord.checkEndpoint] refuses.
   static RegisterRequest decode(Uint8List bytes) =>
       _guard('REGISTER request', () {
         final r = ByteReader(bytes);
