@@ -72,8 +72,10 @@ class ClientState {
   final int attempt;
 
   /// Why the last connection or connection attempt ended: the status the
-  /// connection ended with ([MuxConnection.done]), the failure of the last
-  /// attempt, or [StatusCode.cancelled] when stopped or closed. Null until
+  /// connection ended with ([MuxConnection.done]), the endpoint's GOAWAY
+  /// status when the client left a connection after it
+  /// ([MuxConnection.peerGoAwayStatus]), the failure of the last attempt,
+  /// or [StatusCode.cancelled] when stopped or closed. Null until
   /// something has ended. Kept unchanged through
   /// [ClientPhase.connecting] and [ClientPhase.connected].
   final Status? lastStatus;
@@ -136,10 +138,25 @@ class ClientState {
 /// Reconnecting: when the connection ends, for any reason, the state
 /// becomes [ClientPhase.disconnected] with the end status, every
 /// persistent channel reports its channel's end through its `onClosed`,
-/// and a new attempt is made after the backoff. A GOAWAY from the endpoint
-/// is followed the same way once the connection has ended: the endpoint
-/// closes it when its channels are done or its grace period expires;
-/// channels are not opened on it in the meantime.
+/// and a new attempt is made after the backoff.
+///
+/// GOAWAY: when the endpoint sends GOAWAY with [StatusCode.goingAway] (it
+/// is restarting or draining), the client moves to a new connection
+/// without waiting for the old one to end. The state becomes
+/// [ClientPhase.connecting] with the GOAWAY status as
+/// [ClientState.lastStatus]. The persistent channels on the old connection
+/// are closed with [StatusCode.goingAway], so that it goes idle and the
+/// endpoint can finish promptly, and are opened again on the new one once
+/// they have ended; waiting [openChannel] calls go to the new one too. A
+/// planned restart is not a failure: the attempt is made at once, and only
+/// if it fails does the backoff apply. Channels the application opened on
+/// the old connection, and channels the endpoint pushed on it, are left to
+/// finish there: the old connection closes once they are done, or when the
+/// endpoint's grace period expires. A connection made after a GOAWAY that
+/// receives GOAWAY in turn before lasting [maxBackoff] is followed by the
+/// backoff instead, so an endpoint that goes away right after accepting is
+/// not hammered. A GOAWAY carrying an error is not a restart: the endpoint
+/// ends the connection, which is handled as a loss.
 ///
 /// Backoff: the first attempt after [start] is immediate. The delay before
 /// attempt `n + 1` after `n` consecutive failures is
@@ -258,6 +275,9 @@ class ReconnectingClient {
   final Set<_PendingOpen> _pendingOpens = {};
   final List<_PersistentCore<Object>> _persistent = [];
   final Set<Future<void>> _retiring = {};
+
+  /// Connections left after the endpoint's GOAWAY that have not closed.
+  final Set<MuxConnection> _draining = {};
   bool _running = false;
   bool _closed = false;
   bool _incomingCancelled = false;
@@ -268,6 +288,10 @@ class ReconnectingClient {
   Timer? _retryTimer;
   Timer? _lifetimeTimer;
   bool _livedLong = false;
+
+  /// The last connection was made at once after a GOAWAY, and no
+  /// connection has lasted [maxBackoff] since.
+  bool _restartedOnGoAway = false;
   Future<void>? _closeFuture;
 
   /// Default for the `openTimeout` of [openChannel] and [openTalk].
@@ -303,14 +327,16 @@ class ReconnectingClient {
 
   /// The current connection while [ClientPhase.connected], else null.
   ///
-  /// It may have received GOAWAY ([MuxConnection.peerGoingAway]); it stays
+  /// One that receives GOAWAY with [StatusCode.goingAway] stops being
+  /// current as soon as the client handles it (see the class
+  /// documentation); one that receives a GOAWAY carrying an error stays
   /// current until it ends.
   MuxConnection? get connection => _connection;
 
   /// Completes with the connection once connected: at once while connected,
   /// else with the next connection. A new future replaces it after every
-  /// disconnect. Fails with [StatusCode.cancelled] when the client is
-  /// closed first.
+  /// disconnect and every GOAWAY. Fails with [StatusCode.cancelled] when
+  /// the client is closed first.
   Future<MuxConnection> get connected => _connected.future;
 
   /// Whether the client is started: connected, or connecting or waiting to.
@@ -341,6 +367,7 @@ class ReconnectingClient {
     }
     _running = true;
     _failures = 0;
+    _restartedOnGoAway = false;
     _attempt = 0;
     _log.fine('starting');
     _attemptConnect();
@@ -349,8 +376,10 @@ class ReconnectingClient {
   /// Stops reconnecting and disconnects: abandons a connection attempt in
   /// progress, closes the persistent channels with
   /// [StatusCode.goingAway] (they are opened again after [start]), and
-  /// sends GOAWAY on the connection, which then closes once the channels
-  /// the application opened are done, or after [MuxOptions.goAwayGrace].
+  /// sends GOAWAY on the connection, and on an earlier one still held open
+  /// by the application's channels after the endpoint's GOAWAY; each then
+  /// closes once the channels the application opened are done, or after
+  /// [MuxOptions.goAwayGrace].
   ///
   /// The state becomes [ClientPhase.disconnected] with
   /// [StatusCode.cancelled]. Pending [openChannel] calls keep waiting.
@@ -425,13 +454,23 @@ class ReconnectingClient {
     if (connection != null) {
       _retire(connection);
     }
+    for (final old in List.of(_draining)) {
+      _goAway(old);
+    }
+    _draining.clear();
   }
 
   /// Closes the persistent channels on [connection] and sends GOAWAY on it.
   void _retire(MuxConnection connection) {
+    final status = Status.of(StatusCode.goingAway, 'client stopping');
     for (final p in List.of(_persistent)) {
-      p.retire(connection);
+      p.retire(connection, status);
     }
+    _goAway(connection);
+  }
+
+  /// Sends GOAWAY on [connection]; [close] waits for it to close.
+  void _goAway(MuxConnection connection) {
     Future<void> gone;
     try {
       gone = connection.goAway();
@@ -457,7 +496,8 @@ class ReconnectingClient {
 
   // Connecting ------------------------------------------------------------
 
-  void _attemptConnect() {
+  /// Starts an attempt; [lastStatus] replaces [ClientState.lastStatus].
+  void _attemptConnect([Status? lastStatus]) {
     _retryTimer = null;
     if (!_running) {
       return;
@@ -465,7 +505,7 @@ class ReconnectingClient {
     _attempt++;
     final token = Object();
     _attemptToken = token;
-    _setState(ClientPhase.connecting, _state.lastStatus);
+    _setState(ClientPhase.connecting, lastStatus ?? _state.lastStatus);
     _log.fine('connecting, attempt $_attempt');
     Future<StreamChannel<Uint8List>> attempt;
     try {
@@ -586,6 +626,9 @@ class ReconnectingClient {
     connection.done
         .then((status) => _onConnectionDone(connection, status))
         .ignore();
+    connection.peerGoAwayStatus
+        .then((status) => _onPeerGoAway(connection, status))
+        .ignore();
     _log.info('connected');
     _setState(ClientPhase.connected, _state.lastStatus, attempt: attempt);
     if (!_connected.isCompleted) {
@@ -603,7 +646,7 @@ class ReconnectingClient {
 
   void _onConnectionDone(MuxConnection connection, Status status) {
     if (!identical(_connection, connection)) {
-      // Retired by stop() or close().
+      // Retired by stop() or close(), or left after a GOAWAY.
       return;
     }
     _connection = null;
@@ -611,6 +654,7 @@ class ReconnectingClient {
     _lifetimeTimer = null;
     if (_livedLong) {
       _failures = 0;
+      _restartedOnGoAway = false;
     }
     if (_connected.isCompleted) {
       _connected = _newConnected();
@@ -618,6 +662,47 @@ class ReconnectingClient {
     _log.info('disconnected: $status');
     _setState(ClientPhase.disconnected, status);
     _scheduleRetry();
+  }
+
+  /// The endpoint sent GOAWAY on [connection]: unless it is an error, leave
+  /// the connection to the application's channels on it and connect again
+  /// at once.
+  void _onPeerGoAway(MuxConnection connection, Status status) {
+    if (!identical(_connection, connection)) {
+      // Retired by stop() or close().
+      return;
+    }
+    if (status.known != StatusCode.goingAway) {
+      // The endpoint is ending the connection: a loss once it has ended.
+      _log.fine('endpoint sent GOAWAY $status');
+      return;
+    }
+    _connection = null;
+    _lifetimeTimer?.cancel();
+    _lifetimeTimer = null;
+    if (_livedLong) {
+      _failures = 0;
+      _restartedOnGoAway = false;
+    }
+    if (_connected.isCompleted) {
+      _connected = _newConnected();
+    }
+    // Not closed here: the mux closes it once idle after the peer's GOAWAY.
+    _draining.add(connection);
+    connection.done.whenComplete(() => _draining.remove(connection)).ignore();
+    final goingAway = Status.of(StatusCode.goingAway, 'endpoint going away');
+    for (final p in List.of(_persistent)) {
+      p.retire(connection, goingAway);
+    }
+    if (_restartedOnGoAway) {
+      _log.info('endpoint going away again: $status');
+      _setState(ClientPhase.disconnected, status);
+      _scheduleRetry();
+      return;
+    }
+    _restartedOnGoAway = true;
+    _log.info('endpoint going away: $status, reconnecting');
+    _attemptConnect(status);
   }
 
   /// The current connection if new channels may be opened on it.
@@ -670,8 +755,10 @@ class ReconnectingClient {
   /// waiting.
   ///
   /// The channel belongs to the caller and is not re-opened: it ends with
-  /// its connection. A rejection by the endpoint arrives as its close
-  /// status ([MuxChannel.done]). Fails like [MuxConnection.open] (for
+  /// its connection. A GOAWAY does not move it: it carries on over the old
+  /// connection until it ends there or the endpoint's grace period
+  /// expires. A rejection by the endpoint arrives as its close status
+  /// ([MuxChannel.done]). Fails like [MuxConnection.open] (for
   /// example [StatusCode.resourceExhausted]), with
   /// [StatusCode.cancelled] if the client is closed while waiting, and with
   /// [StatusCode.failedPrecondition] after [close].

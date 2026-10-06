@@ -27,6 +27,9 @@ bool _isTerminal(Status status) => switch (status.known) {
 ///
 /// * The connection ends: the channel is opened again on the next
 ///   connection.
+/// * The endpoint sends GOAWAY: the channel is closed with `GOING_AWAY`
+///   and, once it has ended, opened again on the next connection, which
+///   the client makes at once.
 /// * The channel ends while the connection stays up (the endpoint closed
 ///   it, or the application closed [current] itself): it is opened again
 ///   after a backoff following the client's schedule, kept per persistent
@@ -192,15 +195,16 @@ class _PersistentCore<T extends Object> {
     _openOn(connection);
   }
 
-  /// The client stopped: close the channel on [connection]; it is opened
-  /// again on the next connection.
-  void retire(MuxConnection connection) {
+  /// The client leaves [connection] (it stopped, or the endpoint sent
+  /// GOAWAY): close the channel on it with [status]; it is opened again on
+  /// the next connection.
+  void retire(MuxConnection connection, Status status) {
     _cancelRetry();
     final value = current;
     if (value == null || !identical(_channel?.connection, connection)) {
       return;
     }
-    _closeQuietly(value, Status.of(StatusCode.goingAway, 'client stopping'));
+    _closeQuietly(value, status);
   }
 
   Future<void> close() {

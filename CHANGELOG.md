@@ -38,7 +38,8 @@ The protocol specification lives in the project wiki (section
   `NamingResolver`, and `MeshNode` to join a node to a mesh.
 - `ReconnectingClient` (core, web-capable) for frontend apps: backoff
   reconnect, a client state stream, persistent channels re-opened after
-  every reconnect, server-pushed channels across reconnects.
+  every reconnect, server-pushed channels across reconnects, an immediate
+  move to a new connection on the endpoint's GOAWAY.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
   host hint relays, routing by shard slot with a one-shot retry on `MOVED`,
   and an asynchronous `authorize` hook that may rewrite the address.

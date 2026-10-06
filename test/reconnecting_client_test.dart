@@ -33,9 +33,12 @@ final feed = ChannelAddress(type: Name('feed'));
 /// The endpoint side: every transport the connector creates is accepted by
 /// a mux connection here, unless the endpoint is told to refuse.
 class FakeEndpoint {
-  FakeEndpoint(this.async);
+  FakeEndpoint(this.async, {this.options = quiet});
 
   final FakeAsync async;
+
+  /// Mux configuration of the endpoint's connections.
+  final MuxOptions options;
   final List<MuxConnection> connections = [];
   final List<IncomingChannel> channels = [];
 
@@ -67,7 +70,7 @@ class FakeEndpoint {
     final connection = MuxConnection(
       server,
       isInitiator: false,
-      options: quiet,
+      options: options,
     );
     connections.add(connection);
     connection.incoming.listen((channel) {
@@ -862,59 +865,343 @@ void main() {
     });
   });
 
-  group('the endpoint', () {
-    test('GOAWAY: reconnects once the connection has ended', () {
+  group('GOAWAY from the endpoint', () {
+    test('persistent channels move to a new connection at once', () {
       fakeAsync((async) {
         final endpoint = FakeEndpoint(async);
+        var subscriptions = 0;
+        endpoint.onChannel = (incoming) {
+          if (incoming.address.type != Name('feed')) {
+            return;
+          }
+          final talk = incoming.talk();
+          talk.messages.listen((message) {
+            subscriptions++;
+            message.reply(Uint8List(0));
+          });
+        };
         final client = clientFor(endpoint);
         final opened = <MuxChannel>[];
         final closed = <Status>[];
-        client.openPersistent(events, opened.add, onClosed: closed.add);
-        async.flushMicrotasks();
+        final persistent = client.openPersistent(
+          events,
+          opened.add,
+          onClosed: closed.add,
+        );
+        final talkClosed = <Status>[];
+        final talk = client.openPersistentTalk(
+          feed,
+          (talk) => talk.request('SUB', Uint8List(0)),
+          onClosed: talkClosed.add,
+        );
+        async.elapse(ms(1000));
+        expect(subscriptions, 1);
         final first = client.connection!;
-        unawaited(endpoint.last.goAway());
+        final server = endpoint.last;
+        final states = <ClientState>[];
+        client.states.skip(1).listen(states.add);
+        // What the client is doing when the old connection ends.
+        ClientState? stateAtOldEnd;
+        MuxConnection? connectionAtOldEnd;
+        final firstDone = Outcome(
+          first.done.then((status) {
+            stateAtOldEnd = client.state;
+            connectionAtOldEnd = client.connection;
+            return status;
+          }),
+        );
+        final serverDone = Outcome(server.done);
+        unawaited(server.goAway());
         async.flushMicrotasks();
-        expect(first.peerGoingAway, isTrue);
-        // Still connected while the endpoint finishes its channels, but
-        // nothing new is opened on it.
-        expect(client.state.phase, ClientPhase.connected);
-        final waiting = Outcome(client.openChannel(feed));
-        async.elapse(ms(1999));
-        expect(waiting.isDone, isFalse);
-        expect(endpoint.on(endpoint.last), hasLength(1));
-        // The endpoint's grace expires and it closes.
-        async.elapse(ms(1));
-        expect(client.state.phase, ClientPhase.disconnected);
-        expect(client.state.lastStatus, isStatus(StatusCode.goingAway));
+
+        // A new attempt at once, reported with the GOAWAY status.
+        expect(endpoint.attemptSeconds, [0, 1]);
+        expect(states.map((s) => s.phase), [
+          ClientPhase.connecting,
+          ClientPhase.connected,
+        ]);
+        expect(
+          states.map((s) => s.lastStatus?.known),
+          everyElement(StatusCode.goingAway),
+        );
+        expect(states.map((s) => s.attempt), [1, 1]);
+        final second = client.connection!;
+        expect(second, isNot(same(first)));
+        // The persistent channels were closed with GOING_AWAY, so the old
+        // connection went idle and ended, after the new one was up.
         expect(closed, [isStatus(StatusCode.goingAway)]);
-        async.elapse(ms(500));
-        expect(endpoint.connections, hasLength(2));
-        expect(client.connection, isNot(same(first)));
+        expect(talkClosed, [isStatus(StatusCode.goingAway)]);
+        expect(
+          endpoint.on(server).map((c) => c.channel.state),
+          everyElement(MuxChannelState.closed),
+        );
+        expect(firstDone.value, isStatus(StatusCode.goingAway));
+        expect(stateAtOldEnd?.phase, ClientPhase.connected);
+        expect(connectionAtOldEnd, same(second));
+        expect(
+          serverDone.value,
+          isStatus(StatusCode.goingAway),
+          reason: 'the endpoint did not wait for its grace',
+        );
+        // Opened again on the new connection.
         expect(opened, hasLength(2));
-        expect(waiting.value?.connection, same(client.connection));
+        expect(opened.last.connection, same(second));
+        expect(persistent.current, same(opened.last));
+        expect(talk.current?.isOpen, isTrue);
+        expect(subscriptions, 2);
         expect(
           endpoint.on(endpoint.last).map((c) => c.address.type?.toString()),
-          ['events', 'feed'],
+          unorderedEquals(['events', 'feed']),
         );
-        closeAndCheck(async, client, appChannels: true);
+
+        // The end of the old connection causes no second reconnect.
+        async.elapse(const Duration(minutes: 5));
+        expect(endpoint.attempts, hasLength(2));
+        expect(client.connection, same(second));
+        expect(states, hasLength(2));
+        expect(opened, hasLength(2));
+        closeAndCheck(async, client);
       });
     });
 
-    test('GOAWAY on an idle connection: the client closes it itself', () {
+    test('on an idle connection: reconnects at once', () {
       fakeAsync((async) {
         final endpoint = FakeEndpoint(async);
         final client = clientFor(endpoint);
         async.flushMicrotasks();
+        final first = client.connection!;
+        final firstConnected = client.connected;
+        final states = <ClientState>[];
+        client.states.skip(1).listen(states.add);
+        final firstDone = Outcome(first.done);
         unawaited(endpoint.last.goAway());
         async.flushMicrotasks();
-        expect(client.state.phase, ClientPhase.disconnected);
-        expect(client.state.lastStatus, isStatus(StatusCode.goingAway));
-        async.elapse(ms(500));
+        expect(endpoint.attemptSeconds, [0, 0]);
+        expect(states.map((s) => s.phase), [
+          ClientPhase.connecting,
+          ClientPhase.connected,
+        ]);
+        expect(states.first.lastStatus, isStatus(StatusCode.goingAway));
+        expect(client.connection, isNot(same(first)));
+        expect(client.connected, isNot(same(firstConnected)));
+        expect(firstDone.value, isStatus(StatusCode.goingAway));
+        async.elapse(const Duration(minutes: 5));
+        expect(endpoint.attempts, hasLength(2));
         expect(client.state.phase, ClientPhase.connected);
         closeAndCheck(async, client);
       });
     });
 
+    test('an application channel carries on over the old connection', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint);
+        final own = Outcome(client.openChannel(feed));
+        async.flushMicrotasks();
+        final first = client.connection!;
+        final server = endpoint.last;
+        final mine = own.value!;
+        final theirs = endpoint.on(server).single.channel;
+        final firstDone = Outcome(first.done);
+        final serverDone = Outcome(server.done);
+        unawaited(server.goAway());
+        async.flushMicrotasks();
+        // Connected again at once; the old connection stays up for it.
+        expect(endpoint.attempts, hasLength(2));
+        expect(client.state.phase, ClientPhase.connected);
+        expect(client.connection, isNot(same(first)));
+        expect(firstDone.isDone, isFalse);
+        expect(mine.state, MuxChannelState.open);
+
+        final received = <List<int>>[];
+        final sent = <List<int>>[];
+        mine.stream.listen(received.add);
+        theirs.stream.listen(sent.add);
+        async.elapse(ms(1000));
+        theirs.send(bytes([1]));
+        mine.send(bytes([2]));
+        async.flushMicrotasks();
+        expect(received, [
+          [1],
+        ]);
+        expect(sent, [
+          [2],
+        ]);
+        // New channels go to the new connection.
+        final next = Outcome(client.openChannel(events));
+        async.flushMicrotasks();
+        expect(next.value?.connection, same(client.connection));
+
+        // Once the application is done, the old connection closes, before
+        // the endpoint's grace expires, and nothing reconnects.
+        unawaited(mine.close());
+        async.flushMicrotasks();
+        expect(firstDone.value, isStatus(StatusCode.goingAway));
+        expect(serverDone.value, isStatus(StatusCode.goingAway));
+        async.elapse(const Duration(minutes: 5));
+        expect(endpoint.attempts, hasLength(2));
+        expect(client.state.phase, ClientPhase.connected);
+        expect(next.value?.state, MuxChannelState.open);
+        closeAndCheck(async, client, appChannels: true);
+      });
+    });
+
+    test('close() bounds an old connection held by the application', () {
+      fakeAsync((async) {
+        // The endpoint would wait long; close() waits the client's grace.
+        final endpoint = FakeEndpoint(
+          async,
+          options: quiet.copyWith(goAwayGrace: const Duration(minutes: 10)),
+        );
+        final client = clientFor(endpoint);
+        final own = Outcome(client.openChannel(feed));
+        async.flushMicrotasks();
+        final first = client.connection!;
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(client.connection, isNot(same(first)));
+        final firstDone = Outcome(first.done);
+        closeAndCheck(async, client, appChannels: true);
+        expect(firstDone.value, isStatus(StatusCode.goingAway));
+        expect(own.value?.state, MuxChannelState.closed);
+      });
+    });
+
+    for (final how in ['stop', 'close']) {
+      test('arriving during $how(): no reconnect', () {
+        fakeAsync((async) {
+          final endpoint = FakeEndpoint(async);
+          final client = clientFor(endpoint);
+          final closed = <Status>[];
+          client.openPersistent(events, (_) {}, onClosed: closed.add);
+          async.flushMicrotasks();
+          final server = endpoint.last;
+          final serverDone = Outcome(server.done);
+          // Both sides send GOAWAY in the same turn.
+          unawaited(server.goAway());
+          final Outcome<void>? closing;
+          if (how == 'stop') {
+            client.stop();
+            closing = null;
+          } else {
+            closing = Outcome(client.close());
+          }
+          async.flushMicrotasks();
+          expect(client.connection, isNull);
+          expect(client.state.phase, ClientPhase.disconnected);
+          expect(client.state.lastStatus, isStatus(StatusCode.cancelled));
+          expect(closed, [isStatus(StatusCode.goingAway)]);
+          expect(serverDone.value, isStatus(StatusCode.goingAway));
+          async.elapse(const Duration(minutes: 5));
+          expect(endpoint.attempts, hasLength(1));
+          expect(async.pendingTimers, isEmpty);
+          if (closing != null) {
+            expect(closing.isDone, isTrue);
+            return;
+          }
+          client.start();
+          async.flushMicrotasks();
+          expect(endpoint.attempts, hasLength(2));
+          expect(client.state.phase, ClientPhase.connected);
+          closeAndCheck(async, client);
+        });
+      });
+    }
+
+    test('stop() during the attempt that follows it', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final pending = Completer<StreamChannel<Uint8List>>();
+        var calls = 0;
+        final client = clientFor(
+          endpoint,
+          connect: () {
+            calls++;
+            return calls == 1 ? endpoint.connect() : pending.future;
+          },
+        );
+        async.flushMicrotasks();
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(calls, 2);
+        expect(client.state.phase, ClientPhase.connecting);
+        client.stop();
+        expect(client.state.phase, ClientPhase.disconnected);
+        pending.complete(endpoint.accept());
+        final strayDone = Outcome(endpoint.last.done);
+        async.elapse(const Duration(minutes: 5));
+        expect(strayDone.isDone, isTrue, reason: 'late transport closed');
+        expect(calls, 2);
+        expect(client.connection, isNull);
+        expect(async.pendingTimers, isEmpty);
+        closeAndCheck(async, client);
+      });
+    });
+
+    test('a failed attempt after it backs off as usual', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint);
+        final opened = <MuxChannel>[];
+        client.openPersistent(events, opened.add);
+        async.elapse(ms(1000));
+        endpoint.failures = 2;
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(endpoint.attemptSeconds, [0, 1]);
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.state.lastStatus, isStatus(StatusCode.unavailable));
+        expect(client.state.attempt, 1);
+        // Waits for the next connection.
+        final waiting = Outcome(client.openChannel(feed));
+        async.elapse(ms(499));
+        expect(endpoint.attempts, hasLength(2));
+        async.elapse(ms(1));
+        expect(endpoint.attemptSeconds, [0, 1, 1.5]);
+        expect(waiting.isDone, isFalse);
+        async.elapse(ms(1000));
+        expect(endpoint.attemptSeconds, [0, 1, 1.5, 2.5]);
+        expect(client.state.phase, ClientPhase.connected);
+        expect(client.state.attempt, 3);
+        expect(waiting.value?.connection, same(client.connection));
+        expect(opened, hasLength(2));
+        expect(opened.last.connection, same(client.connection));
+        closeAndCheck(async, client, appChannels: true);
+      });
+    });
+
+    test('again soon after reconnecting at once: backs off', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        final client = clientFor(endpoint, maxBackoff: ms(8000));
+        async.elapse(ms(1000));
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(endpoint.attemptSeconds, [0, 1]);
+        // The new connection goes away too before lasting maxBackoff.
+        async.elapse(ms(1000));
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(client.state.phase, ClientPhase.disconnected);
+        expect(client.state.lastStatus, isStatus(StatusCode.goingAway));
+        async.elapse(ms(499));
+        expect(endpoint.attempts, hasLength(2));
+        async.elapse(ms(1));
+        expect(endpoint.attemptSeconds, [0, 1, 2.5]);
+        expect(client.state.phase, ClientPhase.connected);
+        // A connection that lasted maxBackoff makes the next GOAWAY a
+        // planned restart again.
+        async.elapse(ms(10000));
+        unawaited(endpoint.last.goAway());
+        async.flushMicrotasks();
+        expect(endpoint.attemptSeconds, [0, 1, 2.5, 12.5]);
+        expect(client.state.phase, ClientPhase.connected);
+        closeAndCheck(async, client);
+      });
+    });
+  });
+
+  group('the endpoint', () {
     test('pushed channels arrive on incoming across reconnects', () {
       fakeAsync((async) {
         final endpoint = FakeEndpoint(async);
