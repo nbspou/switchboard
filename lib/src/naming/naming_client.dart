@@ -130,6 +130,13 @@ class NamingClient {
   /// is assigned (and logged). While disconnected, the returned future
   /// completes once the registration succeeds after the next connect.
   ///
+  /// [onAssigned], if given, is called synchronously with the instance id
+  /// whenever the registration gets an id different from the one it had:
+  /// once on the first success, just before the returned future completes,
+  /// and again after a reconnect that had to assign a new id. A host uses
+  /// it to keep its local dispatch registration in step with the id the
+  /// mesh routes to. Exceptions it throws are logged and ignored.
+  ///
   /// Fails with the naming service's [SwitchboardException]
   /// ([StatusCode.alreadyExists] for a requested id in use,
   /// [StatusCode.invalidArgument]), with [StatusCode.invalidArgument] for an
@@ -137,7 +144,12 @@ class NamingClient {
   /// first, and [StatusCode.failedPrecondition] after [close]. Fails with
   /// [ArgumentError] or [RangeError] for more than 255 endpoints, an endpoint
   /// longer than 255 bytes, or an instance outside the `u48` range.
-  Future<int> register(Name type, List<Uri> endpoints, {int instance = 0}) {
+  Future<int> register(
+    Name type,
+    List<Uri> endpoints, {
+    int instance = 0,
+    void Function(int instance)? onAssigned,
+  }) {
     if (_closed) {
       return Future.error(
         SwitchboardException.of(
@@ -175,7 +187,12 @@ class NamingClient {
             e.type == type && e.instance == instance && e.completer.isCompleted,
       );
     }
-    final entry = _Entry(type, List.unmodifiable(endpoints), instance);
+    final entry = _Entry(
+      type,
+      List.unmodifiable(endpoints),
+      instance,
+      onAssigned,
+    );
     _entries.add(entry);
     final session = _session;
     if (session != null && session.alive) {
@@ -417,9 +434,14 @@ class NamingClient {
           '${ServiceAddress(entry.type, assigned)}',
         );
       }
+      final changed =
+          !entry.completer.isCompleted || assigned != entry.instance;
       entry.instance = assigned;
       entry.session = session;
       _log.fine('registered ${ServiceAddress(entry.type, assigned)}');
+      if (changed) {
+        _notifyAssigned(entry, assigned);
+      }
       if (!entry.completer.isCompleted) {
         entry.completer.complete(assigned);
       }
@@ -456,6 +478,22 @@ class NamingClient {
       if (identical(entry.pending, session)) {
         entry.pending = null;
       }
+    }
+  }
+
+  static void _notifyAssigned(_Entry entry, int assigned) {
+    final callback = entry.onAssigned;
+    if (callback == null) {
+      return;
+    }
+    try {
+      callback(assigned);
+    } catch (e, st) {
+      _log.severe(
+        'onAssigned for ${ServiceAddress(entry.type, assigned)} failed',
+        e,
+        st,
+      );
     }
   }
 
@@ -590,10 +628,13 @@ class NamingClient {
 
 /// A registration remembered for re-registration.
 class _Entry {
-  _Entry(this.type, this.endpoints, this.instance);
+  _Entry(this.type, this.endpoints, this.instance, this.onAssigned);
 
   final Name type;
   final List<Uri> endpoints;
+
+  /// Told about every new id.
+  final void Function(int instance)? onAssigned;
 
   /// The assigned id once registered, else the requested id (0: any).
   int instance;

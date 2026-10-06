@@ -571,7 +571,9 @@ class Switchboard {
   /// Throws [SwitchboardException] with [StatusCode.notFound] if no
   /// instance is known, [StatusCode.unavailable] if none is reachable, and
   /// [StatusCode.failedPrecondition] if there is no resolver or the node
-  /// is closed. Throws [RangeError] if [shard] is outside `u32`.
+  /// is closed; also whatever [Resolver.resolve] throws (a naming resolver
+  /// that was never synced: [StatusCode.unavailable] after its resolve
+  /// timeout). Throws [RangeError] if [shard] is outside `u32`.
   Future<(ServiceRecord, MuxConnection)> selectAndConnect(
     ServiceAddress address, {
     int? shard,
@@ -588,7 +590,10 @@ class Switchboard {
     if (shard != null) {
       RangeError.checkValueInInterval(shard, 0, 0xFFFFFFFF, 'shard');
     }
-    await r.ready;
+    // Not `await r.ready`: resolve() waits for the table itself, bounded,
+    // and a naming resolver that has been synced once serves its stale
+    // table while the naming service is away, whereas `ready` then waits
+    // for the next SYNCED without a bound.
     final known = await r.resolve(address.type);
     final candidates = [
       for (final record in known)

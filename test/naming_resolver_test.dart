@@ -84,6 +84,19 @@ void main() {
     expect(await resolver.resolve(Name('npc')), hasLength(1));
   });
 
+  test('serves the stale table after a loss even if never used', () async {
+    await client.start();
+    await client.register(Name('npc'), [uriA]);
+    await client.synced.timeout(timeout);
+    await pump();
+    connector.down = true;
+    await connector.servers.last.close();
+    await until(() => !client.isSynced);
+    // Nothing was resolved before the loss; the table was synced, so it is
+    // served without waiting for the resolve timeout.
+    expect(await resolver.resolve(Name('npc')).timeout(ms10 * 4), hasLength(1));
+  });
+
   test('events pass through', () async {
     final events = <String>[];
     resolver.events.listen((e) => events.add(describeEvent(e)));
