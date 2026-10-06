@@ -51,6 +51,7 @@ lib/src/switchboard/channel_policy.dart  ChannelPolicy, ChannelPolicies (listene
 lib/src/switchboard/generic_status.dart  genericStatus: rejection statuses for peers (internal, not exported)
 lib/src/switchboard/incoming_channel.dart  IncomingChannel, ChannelHandler (core)
 lib/src/switchboard/switchboard.dart   Switchboard (dart:io)
+lib/src/switchboard/memory_endpoints.dart  MemoryEndpoints: the isolate-wide registry of mem:// listeners behind Switchboard.listenMemory (no dart:io; internal, not exported)
 lib/src/switchboard/proxy.dart         pipeChannels, proxyHandler
 lib/src/switchboard/slot_channel.dart  SlotChannel: a channel to a slot's owner with the MOVED retry (no dart:io; exported from switchboard.dart)
 lib/src/switchboard/slot_reopen.dart   reopenAtSlotOwner: the re-resolution after MOVED shared by openChannelToSlot and proxyHandler (internal, not exported)
@@ -529,8 +530,17 @@ class Switchboard {
   // that refuses reserved types. Connections this node initiates (connect) have no policy.
   Future<Uri> listenWebSocket(Object address, int port, {String path = '/', ChannelPolicy? policy});   // returns the bound ws:// uri (port resolved)
   Future<Uri> listenTcp(Object address, int port, {ChannelPolicy? policy});                              // returns tcp:// uri
+  // In-process listener: mem://<name or generated id>, registered isolate-wide (static map in
+  // memory_endpoints.dart) until close. connect(mem://id) hands one side of a MemoryTransport pair
+  // (delay: zero, so frames go through the event queue like socket I/O and a request loop cannot
+  // starve timers) to the listener, which adopts it like a TCP accept (policy, dispatch,
+  // connections, GOAWAY on close); unknown or closed id: UNAVAILABLE. Pool key and isOwnEndpoint use
+  // the id alone (port, path, query ignored). Names: [A-Za-z0-9._~-]+, lower-cased; taken:
+  // ALREADY_EXISTS. Generated ids: counter + random suffix. mem:// URIs are meaningless outside the
+  // isolate: publish them to a naming service only when every node runs in the same isolate.
+  Future<Uri> listenMemory({ChannelPolicy? policy, String? name});
   List<Uri> get listeningEndpoints;
-  bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses
+  bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses; mem: the id
 
   void registerService(Name type, ChannelHandler handler, {int instance = 0});
   void unregisterService(Name type, {int instance = 0});
@@ -545,9 +555,9 @@ class Switchboard {
   Future<SlotChannel> openChannelToSlot(Name type, int slot, {Uint8List? payload});            // openChannel(type/0, shard: slot) + one MOVED retry
   Future<TalkChannel> openTalkToSlot(Name type, int slot, {Uint8List? payload, TalkOptions? options});
   Future<ServiceAddress> resolveSlotOwner(Name type, int slot, {bool refresh = false});          // for callers handling MOVED themselves
-  Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
+  Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp, mem; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
   Stream<MuxConnection> get connections;              // every accepted or initiated connection
-  Future<void> close();                               // stop listening, goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout) get GOAWAY at once and are waited for too
+  Future<void> close();                               // stop listening (mem ids released at once), goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout) get GOAWAY at once and are waited for too
 }
 
 /// Forwards every subframe and the close between two channels. Completes when both are done.
@@ -566,15 +576,20 @@ Future<void> pipeChannels(MuxChannel a, MuxChannel b);
 /// the owner) unless allowExplicitInstance; a channel that needs a LOCATE takes a token from
 /// its connection's bucket (maxLocatesPerConnection, 0 = no limit; one back per
 /// locateRefillInterval, zero = never), else RESOURCE_EXHAUSTED. MOVED/RELOCATED reach the
-/// client with owner and epoch 0 and no reason unless revealOwners.
-/// allow throwing: PERMISSION_DENIED. authorize (after allow and the budget, before
+/// client with owner and epoch 0 and no reason unless revealOwners. A channel without a shard
+/// slot (after authorize) to a type with a slot table in the resolver is PERMISSION_DENIED unless
+/// allowNoSlot(type) is true (null: never), since it would reach the instances' noSlotHandler
+/// (state transfer); checked once resolve(type) answered (a resolver still syncing has no table
+/// yet), not for host-hint relays; an admitted one is routed by the no-shard rule (the named
+/// instance, else round robin). allow or allowNoSlot throwing: PERMISSION_DENIED. authorize (after allow and the budget, before
 /// resolution; the channel is not read meanwhile): the address to forward (rewritten shard,
 /// payload, ...), null = UNAUTHENTICATED, throw = PERMISSION_DENIED, no answer within
 /// authorizeTimeout (zero = none) = UNAUTHENTICATED; a channel the client closed meanwhile is dropped.
 ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddress)? allow,
     FutureOr<ChannelAddress?> Function(IncomingChannel)? authorize, Duration authorizeTimeout = 10 s,
     Resolver? resolver, int maxChannelsPerConnection = 256, bool allowExplicitInstance = false,
-    bool revealOwners = false, int maxLocatesPerConnection = 32, Duration locateRefillInterval = 1 s});
+    bool revealOwners = false, int maxLocatesPerConnection = 32, Duration locateRefillInterval = 1 s,
+    bool Function(Name type)? allowNoSlot});
 
 /// slot_channel.dart: a StreamChannel<Uint8List> and StatusClosable forwarding to the current MuxChannel.
 class SlotChannel { Name type; int slot; MuxChannel get channel; bool get retried; bool get canSend;
@@ -735,7 +750,7 @@ Behaviour notes (wiki "Switchboard Sharding"):
 
 Routing and the instance side (stage B):
 
-* Slot routing in `selectAndConnect`: only when the address names any instance, a shard is given and the resolver is a `SlotResolver` with a table for the type. Owner from the table (`from` while migrating); no owner: managed space `locateSlot`, static space `UNAVAILABLE`; a slot outside the space `OUT_OF_RANGE`; the owner missing from the service table or unreachable `UNAVAILABLE`, never another instance. The header carries the owner's id. `proxyHandler` gets slot routing through `selectAndConnect`. The `LOCATE` of slot routing (in `selectAndConnect` and in the retry) is bounded by `slotRefreshTimeout` (5 s, then `UNAVAILABLE`). For a channel routed by a slot table the proxy pipes the client to a `SlotChannel` (below), so a backend's CLOSE `MOVED` before any subframe was piped either way is retried once at the new owner without the client noticing, the re-resolution being the same as `openChannelToSlot`'s (`reopenAtSlotOwner`, with the proxy's resolver, never towards the node's own listeners); after the first subframe the `MOVED` is forwarded to the client, which retries itself; a `RELOCATED` is always forwarded. The retry counts as the same channel for `maxChannelsPerConnection`. Untrusted clients: for a table-routed type the proxy ignores an instance in the address (it would reach an instance loading the slot, or one forwarding it, and overtake the hand-over) unless `allowExplicitInstance`; it passes `MOVED` and `RELOCATED` on with owner and epoch 0 and no reason unless `revealOwners` (its clients reopen through it; a `SlotChannel` at the client then reopens at the same address); and a channel whose routing needs a `LOCATE` (a managed space, no owner in the table), or a retry that does, takes a token from its client connection's bucket (`maxLocatesPerConnection` 32, one back per `locateRefillInterval` 1 s), else `RESOURCE_EXHAUSTED` (a retry without a token forwards the `MOVED`), since a `LOCATE` assigns slots in a lazy space.
+* Slot routing in `selectAndConnect`: only when the address names any instance, a shard is given and the resolver is a `SlotResolver` with a table for the type. Owner from the table (`from` while migrating); no owner: managed space `locateSlot`, static space `UNAVAILABLE`; a slot outside the space `OUT_OF_RANGE`; the owner missing from the service table or unreachable `UNAVAILABLE`, never another instance. The header carries the owner's id. `proxyHandler` gets slot routing through `selectAndConnect`. The `LOCATE` of slot routing (in `selectAndConnect` and in the retry) is bounded by `slotRefreshTimeout` (5 s, then `UNAVAILABLE`). For a channel routed by a slot table the proxy pipes the client to a `SlotChannel` (below), so a backend's CLOSE `MOVED` before any subframe was piped either way is retried once at the new owner without the client noticing, the re-resolution being the same as `openChannelToSlot`'s (`reopenAtSlotOwner`, with the proxy's resolver, never towards the node's own listeners); after the first subframe the `MOVED` is forwarded to the client, which retries itself; a `RELOCATED` is always forwarded. The retry counts as the same channel for `maxChannelsPerConnection`. Untrusted clients: for a table-routed type the proxy ignores an instance in the address (it would reach an instance loading the slot, or one forwarding it, and overtake the hand-over) unless `allowExplicitInstance`; it passes `MOVED` and `RELOCATED` on with owner and epoch 0 and no reason unless `revealOwners` (its clients reopen through it; a `SlotChannel` at the client then reopens at the same address); and a channel whose routing needs a `LOCATE` (a managed space, no owner in the table), or a retry that does, takes a token from its client connection's bucket (`maxLocatesPerConnection` 32, one back per `locateRefillInterval` 1 s), else `RESOURCE_EXHAUSTED` (a retry without a token forwards the `MOVED`), since a `LOCATE` assigns slots in a lazy space; and a channel without a shard slot to a table-routed type, which would reach the instances' `noSlotHandler` (state transfer), is refused with `PERMISSION_DENIED` unless `allowNoSlot` admits the type (checked on the address `authorize` returned, so a hook that sets the slot makes it moot).
 * `openChannelToSlot` / `openTalkToSlot`: a mux OPEN has no acknowledgement, so the retry is decided on the channel's end. A `SlotChannel` forwards to the current `MuxChannel`; when it ends with `MOVED` and nothing was sent on it or received from it, it is replaced once: to the owner the status names (`MovedStatus`), unless the table has an entry with a higher epoch; with no owner named, through `locateSlot` (bounded by `slotRefreshTimeout`), in either mode; through a resolver without tables, the same address again. Nowhere else to go: the channel ends with the `MOVED`. Subframes sent while the replacement opens are held and sent on it. After the first subframe either way, `MOVED` is surfaced, since the subframes already sent went with the old channel; `MOVED` means nothing was processed, so the application may open again and resend. A `RELOCATED` (the owner was serving the channel, its work may have taken effect) is never retried. Server-first protocols (greeting, snapshot) always get the retry; a Talk client sending at once retries at its level.
 * `SlotGate`, per sharded type per node, is the client's `SlotHandler` (through `SlotGates` when a client serves several types, which routes `onDiscard` to `lifecycle.discard` too) and the type's `ChannelHandler`. A lifecycle serves one gate at a time; once its gate is closed it may be attached to a new one (`gate` returns the closed gate until then, so detached channels of a closed gate still get `ABORT MOVED` through `serveRequest`), so a failed `publishSharded` can be repeated with the same lifecycle. Per slot: `loading` (ASSIGN running; channels queue), `serving`, `locked` (DRAIN; channels queue), `forwarding` (after FORWARD for `forwardGrace`; channels piped to the new owner, requests forwarded). Not held: `MOVED` naming the mirror's owner and epoch (the new owner while forwarding; owner 0 when the mirror names this instance or nobody). No shard: `noSlotHandler` (state transfer between instances), else `INVALID_ARGUMENT`; outside the space: `OUT_OF_RANGE`. Queued channels are never read (the mux buffers them), at most `maxQueuedChannels` over all slots (`UNAVAILABLE` beyond).
 * Work in flight: with `trackChannels` (default) a served channel counts until it ends, unless `detach`ed (a long-lived channel); requests run through `serveRequest` count until their handler completes. DRAIN locks, waits until the slot has no work in flight, then calls `lifecycle.drain`. When the wait exceeds `drainTimeout`, the tracked channels still open are closed with `RELOCATED` naming `to` and the new epoch before `lifecycle.drain` (otherwise the old owner would keep serving them, through FORWARD and the whole grace period, on state already handed over), and the `serveRequest` handlers still running are logged at WARNING (they cannot be stopped). A DRAIN for a slot not served is `FAILED_PRECONDITION`. `serveRequest`: a slot outside the mirrored space is `ABORT OUT_OF_RANGE`; a queued request leaves the queue (and `maxQueuedRequests`) when it can no longer be answered (`onCancel`, or its channel's end for a plain message).
@@ -759,5 +774,6 @@ The first four were adopted by the wiki since.
 
 * `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`, the name and status tests, and `test/reconnecting_client_test.dart` (fake_async over `MemoryTransport`).
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
-* `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).
-* `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing.
+* `test/memory_endpoint_test.dart`: `listenMemory` and `mem://` connections (dispatch, policy, pooling, GOAWAY, `UNAVAILABLE`, own endpoints, timers not starved); the tests that use `mem` endpoints check that the registry is empty at the end.
+* `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0, and `naming_mesh_test.dart` over `mem://` endpoints too; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).
+* `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup, over `tcp`, `ws` or `mem`; the kv store runs over `tcp` and `mem`). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing.

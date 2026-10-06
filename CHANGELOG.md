@@ -27,11 +27,12 @@ The protocol specification lives in the project wiki (section
   `TalkMessage.replyStream`.
 - Addressing: `ServiceAddress` and `ChannelAddress` (the OPEN payload with
   service type, instance, shard slot, host hint and application payload).
-- `Switchboard` node: TCP and WebSocket listeners, pooled outgoing
-  connections, dispatch by `(type, instance)` with a default service and a
-  catch-all, dispatch on initiated connections too, static, endpoint and
-  naming resolvers, round robin and shard slot selection, a default
-  application payload per node.
+- `Switchboard` node: TCP and WebSocket listeners, in-process `mem://`
+  listeners (`listenMemory`) for running a whole mesh in one isolate,
+  pooled outgoing connections, dispatch by `(type, instance)` with a
+  default service and a catch-all, dispatch on initiated connections too,
+  static, endpoint and naming resolvers, round robin and shard slot
+  selection, a default application payload per node.
 - Naming service: `NamingService` (`REGISTER`, `UNREGSTR`, `WATCH`,
   `LOOKUP`, heartbeat, assignment hold after a restart), `NamingClient`
   (re-registration on reconnect, mirrored table served while stale),
@@ -44,7 +45,9 @@ The protocol specification lives in the project wiki (section
   changes.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
   host hint relays, routing by shard slot with a one-shot retry on `MOVED`,
-  and an asynchronous `authorize` hook that may rewrite the address.
+  an asynchronous `authorize` hook that may rewrite the address, and
+  refusal of slot-less channels to sharded types unless `allowNoSlot`
+  admits the type.
 - Sharding: slot spaces per service type in the naming service (`SLOTS`,
   `HOLDING`, `CLAIM`, `RELEASE`, `LOCATE`, `MIGRATE`, `SLOTSPC` and `SLOT`
   table items), managed and static modes, lazy and shared-recovery flags,

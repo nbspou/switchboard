@@ -1,6 +1,6 @@
 // Shared setup of the sharding use case tests: a naming service and mesh
-// nodes on 127.0.0.1 (TCP or WebSocket, port 0), with short timeouts, torn
-// down in a fixed order.
+// nodes on 127.0.0.1 (TCP or WebSocket, port 0) or in this isolate (mem),
+// with short timeouts, torn down in a fixed order.
 
 import 'dart:async';
 import 'dart:convert';
@@ -63,7 +63,7 @@ bool retryable(Object error) =>
 class Cluster {
   Cluster(this.scheme);
 
-  /// `tcp` or `ws`.
+  /// `tcp`, `ws` or `mem`.
   final String scheme;
 
   late final Switchboard namingNode;
@@ -90,7 +90,7 @@ class Cluster {
     naming.registerLocal(Services.naming, [namingUri], instance: 1);
   }
 
-  /// A new node listening on 127.0.0.1.
+  /// A new node listening on 127.0.0.1, or in this isolate for `mem`.
   Future<Switchboard> node({Resolver? resolver, bool listen = true}) async {
     final node = Switchboard(
       resolver: resolver,
@@ -101,14 +101,17 @@ class Cluster {
     final connections = _connections[node] = [];
     node.connections.listen(connections.add);
     if (listen) {
-      if (scheme == 'tcp') {
-        await node.listenTcp(InternetAddress.loopbackIPv4, 0);
-      } else {
-        await node.listenWebSocket(
-          InternetAddress.loopbackIPv4,
-          0,
-          path: '/mesh',
-        );
+      switch (scheme) {
+        case 'tcp':
+          await node.listenTcp(InternetAddress.loopbackIPv4, 0);
+        case 'ws':
+          await node.listenWebSocket(
+            InternetAddress.loopbackIPv4,
+            0,
+            path: '/mesh',
+          );
+        default:
+          await node.listenMemory();
       }
     }
     return node;

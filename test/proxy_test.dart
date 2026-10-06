@@ -1189,6 +1189,147 @@ void main() {
       expect(await again.stream.first, bytes('2 6'));
     });
   });
+
+  group('proxyHandler: channels without a shard slot', () {
+    // Table-routed: zone and room (allowed by the proxy below), lobby (its
+    // allowNoSlot throws). No table: plain.
+    final zone = Name('zone');
+    final room = Name('room');
+    final lobby = Name('lobby');
+    final plain = Name('plain');
+    late List<ChannelAddress> opened;
+    late _Gated table;
+    late Switchboard client;
+
+    /// Instance [id] of every type: greets with `<type> <instance> <shard>`
+    /// and closes.
+    Future<List<ServiceRecord>> backend(int id) async {
+      final node = Switchboard(muxOptions: fast);
+      addTearDown(node.close);
+      final uri = await node.listenTcp('127.0.0.1', 0);
+      return [
+        for (final type in [zone, room, lobby, plain])
+          () {
+            node.registerService(type, (incoming) {
+              final a = incoming.address;
+              opened.add(a);
+              incoming.channel.send(
+                bytes('${a.type} ${a.instance} ${a.shard}'),
+              );
+              unawaited(incoming.channel.close());
+            }, instance: id);
+            return ServiceRecord(ServiceAddress(type, id), endpoints: [uri]);
+          }(),
+      ];
+    }
+
+    /// A proxy with [allowNoSlot] and [authorize], and [client] of it.
+    Future<void> startProxy({
+      bool Function(Name type)? allowNoSlot,
+      FutureOr<ChannelAddress?> Function(IncomingChannel incoming)? authorize,
+    }) async {
+      final proxy = Switchboard(muxOptions: fast);
+      addTearDown(proxy.close);
+      proxy.catchAll = proxyHandler(
+        proxy,
+        resolver: table,
+        allowNoSlot: allowNoSlot,
+        authorize: authorize,
+      );
+      final proxyUri = await proxy.listenTcp('127.0.0.1', 0);
+      client = Switchboard(
+        resolver: EndpointResolver(proxyUri),
+        muxOptions: fast,
+      );
+      addTearDown(client.close);
+    }
+
+    setUp(() async {
+      opened = [];
+      table = _Gated([...await backend(1), ...await backend(2)]);
+      addTearDown(table.close);
+      for (final type in [zone, room, lobby]) {
+        table.defineSlots(SlotSpace(type, count: 8, mode: SlotMode.static));
+        table.setSlot(type, 5, const SlotEntry.owned(2, epoch: 1));
+      }
+    });
+
+    /// The greeting of a new channel to [type] through the proxy, or its
+    /// close status.
+    Future<String> greeting(Name type, {int instance = 0, int? shard}) async {
+      final channel = await client.openChannel(
+        ServiceAddress(type, instance),
+        shard: shard,
+      );
+      final frames = await channel.stream.toList();
+      if (frames.isNotEmpty) {
+        return utf8.decode(frames.first);
+      }
+      final status = await channel.done;
+      return 'closed ${status.known?.name} ${status.reason}';
+    }
+
+    test('refused unless allowNoSlot admits the type; an admitted one goes '
+        'round robin with the instance filled in', () async {
+      await startProxy(
+        allowNoSlot: (type) =>
+            type == lobby ? throw StateError('broken filter') : type == room,
+      );
+      const denied = 'closed permissionDenied permission denied';
+      expect(await greeting(zone), denied);
+      expect(await greeting(zone, instance: 2), denied);
+      expect(await greeting(lobby), denied);
+      expect(opened, isEmpty);
+      expect(
+        [for (var i = 0; i < 4; i++) await greeting(room)],
+        ['room 1 null', 'room 2 null', 'room 1 null', 'room 2 null'],
+      );
+      // An instance in the address is honoured, as for a type without a
+      // slot table.
+      expect(await greeting(room, instance: 2), 'room 2 null');
+      // With a slot, every type is routed by its table.
+      expect(await greeting(zone, shard: 5), 'zone 2 5');
+      expect(await greeting(lobby, shard: 5), 'lobby 2 5');
+      expect(await greeting(plain), 'plain 1 null');
+    });
+
+    test('the default refuses every table-routed type', () async {
+      await startProxy();
+      const denied = 'closed permissionDenied permission denied';
+      expect(await greeting(zone), denied);
+      expect(await greeting(room), denied);
+      expect(opened, isEmpty);
+      expect(await greeting(room, shard: 5), 'room 2 5');
+      // Types without a slot table are not concerned.
+      expect(await greeting(plain), 'plain 1 null');
+      expect(await greeting(plain), 'plain 2 null');
+    });
+
+    test('a slot set by authorize routes the channel by the table', () async {
+      await startProxy(
+        authorize: (incoming) => incoming.address.type == zone
+            ? incoming.address.copyWith(shard: 5)
+            : incoming.address,
+      );
+      // The client sends no slot; the address authorize returns has one.
+      expect(await greeting(zone), 'zone 2 5');
+      expect(opened.single.shard, 5);
+      expect(await greeting(room), 'closed permissionDenied permission denied');
+    });
+
+    test('the table is looked at once the resolver answers', () async {
+      await startProxy(allowNoSlot: (type) => type == room);
+      table.removeSlots(zone);
+      final gate = table.gate = Completer<void>();
+      final pending = greeting(zone);
+      await table.waiting.future;
+      // The resolver syncs, with a slot table for zone.
+      table.defineSlots(SlotSpace(zone, count: 8, mode: SlotMode.static));
+      gate.complete();
+      expect(await pending, 'closed permissionDenied permission denied');
+      expect(opened, isEmpty);
+    });
+  });
 }
 
 /// A static resolver whose LOCATE answers are scripted.
@@ -1202,5 +1343,26 @@ class _Locating extends StaticResolver {
   Future<SlotEntry?> locateSlot(Name type, int slot) async {
     located.add(slot);
     return answer(slot);
+  }
+}
+
+/// A static resolver whose [resolve] waits for [gate], if set: a resolver
+/// that has not synced yet. [waiting] completes when a resolve waits.
+class _Gated extends StaticResolver {
+  _Gated(super.records);
+
+  Completer<void>? gate;
+  final Completer<void> waiting = Completer<void>();
+
+  @override
+  Future<List<ServiceRecord>> resolve(Name type) async {
+    final g = gate;
+    if (g != null && !g.isCompleted) {
+      if (!waiting.isCompleted) {
+        waiting.complete();
+      }
+      await g.future;
+    }
+    return super.resolve(type);
   }
 }

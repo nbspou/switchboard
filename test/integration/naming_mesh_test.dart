@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:switchboard/src/switchboard/memory_endpoints.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -48,11 +49,22 @@ Future<void> until(bool Function() condition, [String? what]) async {
 }
 
 /// Listens on 127.0.0.1 with the stream binding (`tcp`) or WebSocket
-/// (`ws`). [port] 0 picks a free port.
-Future<Uri> listen(Switchboard node, String scheme, [int port = 0]) =>
-    scheme == 'tcp'
-    ? node.listenTcp(InternetAddress.loopbackIPv4, port)
-    : node.listenWebSocket(InternetAddress.loopbackIPv4, port, path: '/mesh');
+/// (`ws`), or in this isolate (`mem`). With [previous], where that
+/// listener was (its port, or its mem id); otherwise on a free port or a
+/// new id.
+Future<Uri> listen(Switchboard node, String scheme, [Uri? previous]) =>
+    switch (scheme) {
+      'tcp' => node.listenTcp(
+        InternetAddress.loopbackIPv4,
+        previous?.port ?? 0,
+      ),
+      'ws' => node.listenWebSocket(
+        InternetAddress.loopbackIPv4,
+        previous?.port ?? 0,
+        path: '/mesh',
+      ),
+      _ => node.listenMemory(name: previous?.host),
+    };
 
 /// Joins [node] to the mesh with short test timeouts.
 MeshNode join(Switchboard node, Uri naming) => MeshNode.join(
@@ -89,13 +101,13 @@ class NamingNode {
   final NamingService service;
   final Uri uri;
 
-  /// Starts on [port], retrying the bind for a while (a port just released
-  /// by a previous naming node). [taken] ids are registered locally as
-  /// `squat/<id>` before anyone can connect. No assignment hold unless
-  /// asked for.
+  /// Starts where [previous] was (null: anywhere), retrying the bind for
+  /// a while (a port just released by a previous naming node). [taken] ids
+  /// are registered locally as `squat/<id>` before anyone can connect. No
+  /// assignment hold unless asked for.
   static Future<NamingNode> start(
     String scheme, {
-    int port = 0,
+    Uri? previous,
     List<int> taken = const [],
     Duration assignmentHold = Duration.zero,
   }) async {
@@ -112,7 +124,7 @@ class NamingNode {
     Uri? uri;
     for (var attempt = 0; uri == null; attempt++) {
       try {
-        uri = await listen(node, scheme, port);
+        uri = await listen(node, scheme, previous);
       } on SocketException {
         if (attempt >= 100) {
           rethrow;
@@ -239,13 +251,19 @@ Future<String> nodeOf(
   int? shard,
 }) async => (await who(from, to, shard: shard))['node']! as String;
 
-/// A mesh run by a naming service, over TCP and over WebSocket: a naming
+/// A mesh run by a naming service, over TCP, over WebSocket and over
+/// in-process `mem://` endpoints (every node in this isolate): a naming
 /// node hosting `_ns/1`, backend nodes `b1` (`npc`, `chat`) and `b2`
 /// (`npc`) joined with [MeshNode], consumer nodes resolving through the
 /// mirrored table, a frontend endpoint proxying `chat` for clients that
 /// only know the endpoint, and a raw mux peer without a Switchboard.
 void main() {
-  for (final scheme in ['tcp', 'ws']) {
+  // Every node is closed by its test's tear-down, which releases its ids.
+  tearDownAll(() {
+    expect(MemoryEndpoints.ids, isEmpty, reason: 'a memory listener leaked');
+  });
+
+  for (final scheme in ['tcp', 'ws', 'mem']) {
     group('over $scheme', () {
       late NamingNode naming;
       late Backend b1;
@@ -392,7 +410,7 @@ void main() {
         final (node, mesh) = await client();
         final before = Map.of(mesh.client.table);
         expect(await nodeOf(node, ServiceAddress(chat)), 'b1');
-        final port = naming.uri.port;
+        final previous = naming.uri;
 
         await naming.stop();
         await until(
@@ -413,9 +431,9 @@ void main() {
         expect(rotation, {'b1', 'b2'});
         expect(await nodeOf(node, ServiceAddress(npc, b2.ids[npc]!)), 'b2');
 
-        // A new naming service on the same port. The backends register
+        // A new naming service at the same endpoint. The backends register
         // their old ids again; every node resyncs.
-        naming = await NamingNode.start(scheme, port: port);
+        naming = await NamingNode.start(scheme, previous: previous);
         expect(
           naming.uri,
           before[ServiceAddress(Services.naming, 1)]!.endpoints.single,
@@ -457,10 +475,14 @@ void main() {
       test('an id taken during an outage moves to a new id', () async {
         final (node, mesh) = await client();
         final old = b2.ids[npc]!;
-        final port = naming.uri.port;
+        final previous = naming.uri;
         await naming.stop();
         await until(() => !b2.mesh.client.isSynced, 'loss noticed');
-        naming = await NamingNode.start(scheme, port: port, taken: [old]);
+        naming = await NamingNode.start(
+          scheme,
+          previous: previous,
+          taken: [old],
+        );
         // b2 asks for its old id, gets ALREADY_EXISTS, takes a new one, and
         // its local dispatch follows.
         await until(
@@ -494,7 +516,7 @@ void main() {
 
       test('after a restart, newcomers do not get surviving ids', () async {
         final survivors = {...b1.ids.values, ...b2.ids.values};
-        final port = naming.uri.port;
+        final previous = naming.uri;
         await naming.stop();
         await until(
           () => !b1.mesh.client.isSynced && !b2.mesh.client.isSynced,
@@ -504,7 +526,7 @@ void main() {
         // survivors reconnect within it and reclaim theirs.
         naming = await NamingNode.start(
           scheme,
-          port: port,
+          previous: previous,
           assignmentHold: const Duration(milliseconds: 500),
         );
         final b3 = await Backend.start('b3', scheme, naming.uri, [npc, chat]);
@@ -683,48 +705,55 @@ void main() {
           },
         );
 
-        test('a raw mux peer without a Switchboard', () async {
-          // What an embedded device does: its own transport and mux, and a
-          // hand-built OPEN payload: HAS_SERVICE, `chat` padded to 8 bytes,
-          // then the application payload.
-          final open = Uint8List.fromList([
-            0x01,
-            ...ascii.encode('chat'),
-            0,
-            0,
-            0,
-            0,
-            ...ascii.encode('device-7'),
-          ]);
-          expect(
-            open,
-            ChannelAddress(type: chat, payload: bytes('device-7')).encode(),
-          );
-          final transport = scheme == 'tcp'
-              ? await StreamTransport.connectTcp(
-                  endpointUri.host,
-                  endpointUri.port,
-                )
-              : await WebSocketTransport.connect(endpointUri);
-          final connection = MuxConnection(
-            transport,
-            isInitiator: true,
-            options: const MuxOptions(
-              keepAliveInterval: null,
-              shortIdsOnly: true,
-            ),
-          );
-          addTearDown(connection.close);
-          final talk = TalkChannel(connection.open(open), options: talkOptions);
-          final reply = jsonDecode(
-            text(await talk.request('WHO', Uint8List(0)).timeout(limit)),
-          ) as Map<String, Object?>;
-          expect(reply['node'], 'b1');
-          expect(reply['payload'], 'device-7');
-          expect(reply['instance'], b1.ids[chat]);
-          await talk.close();
-          await connection.close();
-        });
+        // A raw peer brings its own transport; a mem endpoint is reached
+        // only through a Switchboard of this isolate.
+        if (scheme != 'mem') {
+          test('a raw mux peer without a Switchboard', () async {
+            // What an embedded device does: its own transport and mux, and a
+            // hand-built OPEN payload: HAS_SERVICE, `chat` padded to 8 bytes,
+            // then the application payload.
+            final open = Uint8List.fromList([
+              0x01,
+              ...ascii.encode('chat'),
+              0,
+              0,
+              0,
+              0,
+              ...ascii.encode('device-7'),
+            ]);
+            expect(
+              open,
+              ChannelAddress(type: chat, payload: bytes('device-7')).encode(),
+            );
+            final transport = scheme == 'tcp'
+                ? await StreamTransport.connectTcp(
+                    endpointUri.host,
+                    endpointUri.port,
+                  )
+                : await WebSocketTransport.connect(endpointUri);
+            final connection = MuxConnection(
+              transport,
+              isInitiator: true,
+              options: const MuxOptions(
+                keepAliveInterval: null,
+                shortIdsOnly: true,
+              ),
+            );
+            addTearDown(connection.close);
+            final talk = TalkChannel(
+              connection.open(open),
+              options: talkOptions,
+            );
+            final reply = jsonDecode(
+              text(await talk.request('WHO', Uint8List(0)).timeout(limit)),
+            ) as Map<String, Object?>;
+            expect(reply['node'], 'b1');
+            expect(reply['payload'], 'device-7');
+            expect(reply['instance'], b1.ids[chat]);
+            await talk.close();
+            await connection.close();
+          });
+        }
       });
     });
   }

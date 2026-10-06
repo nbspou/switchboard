@@ -15,6 +15,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:switchboard/src/switchboard/memory_endpoints.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -214,179 +215,193 @@ class Client {
 }
 
 void main() {
-  test('kv: slots move one at a time while clients write; a reboot gets '
-      'its slots back without transfer', () async {
-    final cluster = Cluster('tcp');
-    await cluster.start();
-    final stats = Stats();
-    final disks = <int, Map<int, Map<String, List<int>>>>{
-      0x11: {},
-      0x12: {},
-      0x13: {},
-    };
-    final clientMesh = await cluster.member(listen: false);
-    final watch = MigrationWatch(clientMesh.client, kv);
-    Map<int, int> shares() {
-      final table = clientMesh.client.slotTable(kv);
-      final counts = <int, int>{};
-      for (final entry in table?.entries.values ?? const <SlotEntry>[]) {
-        if (entry.state == SlotState.owned) {
-          counts.update(entry.owner, (n) => n + 1, ifAbsent: () => 1);
+  // Every node is closed by its cluster's tear-down, which releases its ids.
+  tearDownAll(() {
+    expect(MemoryEndpoints.ids, isEmpty, reason: 'a memory listener leaked');
+  });
+
+  for (final scheme in ['tcp', 'mem']) {
+    test('$scheme kv: slots move one at a time while clients write; a reboot '
+        'gets its slots back without transfer', () async {
+      final cluster = Cluster(scheme);
+      await cluster.start();
+      final stats = Stats();
+      final disks = <int, Map<int, Map<String, List<int>>>>{
+        0x11: {},
+        0x12: {},
+        0x13: {},
+      };
+      final clientMesh = await cluster.member(listen: false);
+      final watch = MigrationWatch(clientMesh.client, kv);
+      Map<int, int> shares() {
+        final table = clientMesh.client.slotTable(kv);
+        final counts = <int, int>{};
+        for (final entry in table?.entries.values ?? const <SlotEntry>[]) {
+          if (entry.state == SlotState.owned) {
+            counts.update(entry.owner, (n) => n + 1, ifAbsent: () => 1);
+          }
+        }
+        return counts;
+      }
+
+      // Two instances share the space.
+      final (_, second) = await (
+        startStore(cluster, 0x11, disks[0x11]!, stats),
+        startStore(cluster, 0x12, disks[0x12]!, stats),
+      ).wait;
+      await until(
+        () =>
+            watch.idle &&
+            shares()[0x11] == slots ~/ 2 &&
+            shares()[0x12] == slots ~/ 2,
+        'two instances with half the slots each',
+      );
+
+      // Clients keep writing and reading.
+      final random = Random(7);
+      final clients = [
+        for (var c = 0; c < 3; c++)
+          Client(clientMesh.switchboard, [
+            for (var k = 0; k < 24; k++) 'c$c-k$k',
+          ], random)..start(),
+      ];
+      await until(() => clients.every((c) => c.operations >= 5));
+
+      // A third instance joins: slots migrate to it one at a time.
+      final movesBefore = watch.moves.length;
+      final third = await startStore(cluster, 0x13, disks[0x13]!, stats);
+      await until(
+        () => watch.idle && (shares()[0x13] ?? 0) >= slots ~/ 3,
+        'the third instance has its share',
+      );
+      final moved = watch.moves.skip(movesBefore).toList();
+      expect(moved, hasLength(greaterThanOrEqualTo(slots ~/ 3)));
+      expect(moved.every((m) => m.$3 == 0x13), isTrue);
+      expect(watch.maxConcurrent, 1, reason: 'one migration at a time');
+      expect(third.$2.servedSlots, hasLength(shares()[0x13]));
+      final opsAtJoin = [for (final c in clients) c.operations];
+      await until(
+        () => [
+          for (var i = 0; i < clients.length; i++)
+            clients[i].operations - opsAtJoin[i],
+        ].every((n) => n >= 5),
+      );
+
+      // Old copies are dropped once the forwarding grace is over.
+      await until(
+        () => disks.values.fold(0, (n, d) => n + d.length) == slots,
+        'one copy of every slot',
+      );
+
+      // While slots moved, no PUT reached an owner twice: MOVED means
+      // nothing was processed, and a client only resends after MOVED.
+      expect(stats.replays, 0, reason: 'no PUT applied twice');
+
+      // The second instance reboots with its id and its disk.
+      final held = disks[0x12]!.keys.toSet();
+      expect(held, clientMesh.client.slotTable(kv)!.slotsOf(0x12).toSet());
+      final before = Map.of(stats.loads);
+      await cluster.crash(second.$1);
+      await until(
+        () => !clientMesh.client.slotOwners(kv).contains(0x12),
+        'the slots of the crashed instance are free',
+      );
+      // Holder-only: they wait for their holder.
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(clientMesh.client.slotOwners(kv), {0x11, 0x13});
+      final (rebooted, _) = await startStore(
+        cluster,
+        0x12,
+        disks[0x12]!,
+        stats,
+      );
+      await until(
+        () => shares()[0x12] == held.length,
+        'the rebooted instance has its slots back',
+      );
+      expect(clientMesh.client.slotTable(kv)!.slotsOf(0x12).toSet(), held);
+      // Served before the naming service published them.
+      expect(rebooted.gates[kv]!.servedSlots.keys.toSet(), held);
+      expect(stats.loads['reclaim'], (before['reclaim'] ?? 0) + held.length);
+      expect(stats.loads['fetch'], before['fetch'], reason: 'no transfer');
+      expect(stats.loads['fresh'], before['fresh']);
+
+      // Operations go on; then everything written is there, once, in order.
+      final opsAtReboot = [for (final c in clients) c.operations];
+      await until(
+        () => [
+          for (var i = 0; i < clients.length; i++)
+            clients[i].operations - opsAtReboot[i],
+        ].every((n) => n >= 5),
+      );
+      for (final client in clients) {
+        await client.stop();
+      }
+      final table = clientMesh.client.slotTable(kv)!;
+      for (final client in clients) {
+        for (final MapEntry(:key, value: last) in client.written.entries) {
+          final slot = slotForText(key, slots);
+          final owner = table[slot].owner;
+          expect(disks[owner]![slot]![key], [
+            for (var s = 1; s <= last; s++) s,
+          ]);
         }
       }
-      return counts;
-    }
+      expect(stats.gaps, 0);
+      // The crash may cut a PUT whose answer was on its way: the client
+      // resends it, and the store answers without applying it again. At
+      // most one per client.
+      expect(stats.replays, lessThanOrEqualTo(clients.length));
+    });
 
-    // Two instances share the space.
-    final (_, second) = await (
-      startStore(cluster, 0x11, disks[0x11]!, stats),
-      startStore(cluster, 0x12, disks[0x12]!, stats),
-    ).wait;
-    await until(
-      () =>
-          watch.idle &&
-          shares()[0x11] == slots ~/ 2 &&
-          shares()[0x12] == slots ~/ 2,
-      'two instances with half the slots each',
-    );
-
-    // Clients keep writing and reading.
-    final random = Random(7);
-    final clients = [
-      for (var c = 0; c < 3; c++)
-        Client(clientMesh.switchboard, [
-          for (var k = 0; k < 24; k++) 'c$c-k$k',
-        ], random)..start(),
-    ];
-    await until(() => clients.every((c) => c.operations >= 5));
-
-    // A third instance joins: slots migrate to it one at a time.
-    final movesBefore = watch.moves.length;
-    final third = await startStore(cluster, 0x13, disks[0x13]!, stats);
-    await until(
-      () => watch.idle && (shares()[0x13] ?? 0) >= slots ~/ 3,
-      'the third instance has its share',
-    );
-    final moved = watch.moves.skip(movesBefore).toList();
-    expect(moved, hasLength(greaterThanOrEqualTo(slots ~/ 3)));
-    expect(moved.every((m) => m.$3 == 0x13), isTrue);
-    expect(watch.maxConcurrent, 1, reason: 'one migration at a time');
-    expect(third.$2.servedSlots, hasLength(shares()[0x13]));
-    final opsAtJoin = [for (final c in clients) c.operations];
-    await until(
-      () => [
-        for (var i = 0; i < clients.length; i++)
-          clients[i].operations - opsAtJoin[i],
-      ].every((n) => n >= 5),
-    );
-
-    // Old copies are dropped once the forwarding grace is over.
-    await until(
-      () => disks.values.fold(0, (n, d) => n + d.length) == slots,
-      'one copy of every slot',
-    );
-
-    // While slots moved, no PUT reached an owner twice: MOVED means
-    // nothing was processed, and a client only resends after MOVED.
-    expect(stats.replays, 0, reason: 'no PUT applied twice');
-
-    // The second instance reboots with its id and its disk.
-    final held = disks[0x12]!.keys.toSet();
-    expect(held, clientMesh.client.slotTable(kv)!.slotsOf(0x12).toSet());
-    final before = Map.of(stats.loads);
-    await cluster.crash(second.$1);
-    await until(
-      () => !clientMesh.client.slotOwners(kv).contains(0x12),
-      'the slots of the crashed instance are free',
-    );
-    // Holder-only: they wait for their holder.
-    await Future<void>.delayed(const Duration(milliseconds: 50));
-    expect(clientMesh.client.slotOwners(kv), {0x11, 0x13});
-    final (rebooted, _) = await startStore(cluster, 0x12, disks[0x12]!, stats);
-    await until(
-      () => shares()[0x12] == held.length,
-      'the rebooted instance has its slots back',
-    );
-    expect(clientMesh.client.slotTable(kv)!.slotsOf(0x12).toSet(), held);
-    // Served before the naming service published them.
-    expect(rebooted.gates[kv]!.servedSlots.keys.toSet(), held);
-    expect(stats.loads['reclaim'], (before['reclaim'] ?? 0) + held.length);
-    expect(stats.loads['fetch'], before['fetch'], reason: 'no transfer');
-    expect(stats.loads['fresh'], before['fresh']);
-
-    // Operations go on; then everything written is there, once, in order.
-    final opsAtReboot = [for (final c in clients) c.operations];
-    await until(
-      () => [
-        for (var i = 0; i < clients.length; i++)
-          clients[i].operations - opsAtReboot[i],
-      ].every((n) => n >= 5),
-    );
-    for (final client in clients) {
-      await client.stop();
-    }
-    final table = clientMesh.client.slotTable(kv)!;
-    for (final client in clients) {
-      for (final MapEntry(:key, value: last) in client.written.entries) {
-        final slot = slotForText(key, slots);
-        final owner = table[slot].owner;
-        expect(disks[owner]![slot]![key], [for (var s = 1; s <= last; s++) s]);
+    test('$scheme kv: a node that leaves hands its slots over before it '
+        'stops; no key is lost', () async {
+      final cluster = Cluster(scheme);
+      await cluster.start(holderGrace: const Duration(milliseconds: 300));
+      final stats = Stats();
+      final d11 = <int, Map<String, List<int>>>{};
+      final d12 = <int, Map<String, List<int>>>{};
+      final clientMesh = await cluster.member(listen: false);
+      final table = clientMesh.client;
+      await startStore(cluster, 0x11, d11, stats);
+      final (leaving, gate) = await startStore(cluster, 0x12, d12, stats);
+      await until(
+        () =>
+            table.slotTable(kv)?.slotsOf(0x11).length == slots ~/ 2 &&
+            table.slotTable(kv)?.slotsOf(0x12).length == slots ~/ 2,
+        'two instances with half the slots each',
+      );
+      // One key in every slot.
+      final keys = <int, String>{};
+      for (var i = 0; keys.length < slots; i++) {
+        keys.putIfAbsent(slotForText('k$i', slots), () => 'k$i');
       }
-    }
-    expect(stats.gaps, 0);
-    // The crash may cut a PUT whose answer was on its way: the client
-    // resends it, and the store answers without applying it again. At
-    // most one per client.
-    expect(stats.replays, lessThanOrEqualTo(clients.length));
-  });
+      final client = Client(clientMesh.switchboard, const [], Random(1));
+      for (final key in keys.values) {
+        expect(await client.call('PUT', key, '1'), '1');
+      }
+      final held = gate.servedSlots.keys.toList()..sort();
+      expect(held, hasLength(slots ~/ 2));
+      final fetches = stats.loads['fetch'] ?? 0;
 
-  test('kv: a node that leaves hands its slots over before it stops; no '
-      'key is lost', () async {
-    final cluster = Cluster('tcp');
-    await cluster.start(holderGrace: const Duration(milliseconds: 300));
-    final stats = Stats();
-    final d11 = <int, Map<String, List<int>>>{};
-    final d12 = <int, Map<String, List<int>>>{};
-    final clientMesh = await cluster.member(listen: false);
-    final table = clientMesh.client;
-    await startStore(cluster, 0x11, d11, stats);
-    final (leaving, gate) = await startStore(cluster, 0x12, d12, stats);
-    await until(
-      () =>
-          table.slotTable(kv)?.slotsOf(0x11).length == slots ~/ 2 &&
-          table.slotTable(kv)?.slotsOf(0x12).length == slots ~/ 2,
-      'two instances with half the slots each',
-    );
-    // One key in every slot.
-    final keys = <int, String>{};
-    for (var i = 0; keys.length < slots; i++) {
-      keys.putIfAbsent(slotForText('k$i', slots), () => 'k$i');
-    }
-    final client = Client(clientMesh.switchboard, const [], Random(1));
-    for (final key in keys.values) {
-      expect(await client.call('PUT', key, '1'), '1');
-    }
-    final held = gate.servedSlots.keys.toList()..sort();
-    expect(held, hasLength(slots ~/ 2));
-    final fetches = stats.loads['fetch'] ?? 0;
-
-    final report = await leaving.leave();
-    await leaving.switchboard.close();
-    expect(report.handedOver, {kv: held});
-    expect(report.released, isEmpty);
-    expect(report.dropped, isEmpty);
-    expect(report.isComplete, isTrue);
-    // Taken over, fetched while the leaving node was still up.
-    expect(stats.loads['fetch'], fetches + held.length);
-    await until(
-      () => table.slotTable(kv)?.slotsOf(0x11).length == slots,
-      'every slot on the remaining instance',
-    );
-    for (final MapEntry(key: slot, value: key) in keys.entries) {
-      expect(await client.call('GET', key), '1', reason: 'slot $slot');
-      expect(d11[slot]![key], [1]);
-    }
-    expect(stats.replays, 0);
-    expect(stats.gaps, 0);
-  });
+      final report = await leaving.leave();
+      await leaving.switchboard.close();
+      expect(report.handedOver, {kv: held});
+      expect(report.released, isEmpty);
+      expect(report.dropped, isEmpty);
+      expect(report.isComplete, isTrue);
+      // Taken over, fetched while the leaving node was still up.
+      expect(stats.loads['fetch'], fetches + held.length);
+      await until(
+        () => table.slotTable(kv)?.slotsOf(0x11).length == slots,
+        'every slot on the remaining instance',
+      );
+      for (final MapEntry(key: slot, value: key) in keys.entries) {
+        expect(await client.call('GET', key), '1', reason: 'slot $slot');
+        expect(d11[slot]![key], [1]);
+      }
+      expect(stats.replays, 0);
+      expect(stats.gaps, 0);
+    });
+  }
 }

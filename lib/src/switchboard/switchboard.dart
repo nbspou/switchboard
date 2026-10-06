@@ -21,12 +21,14 @@ import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
+import '../transport/memory_transport.dart';
 import '../transport/stream_transport.dart';
 import '../transport/web_socket_server.dart';
 import '../transport/web_socket_transport_io.dart';
 import 'channel_policy.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
+import 'memory_endpoints.dart';
 import 'resolver.dart';
 import 'slot_channel.dart';
 import 'slot_reopen.dart';
@@ -42,9 +44,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// connection this node initiated are dispatched exactly like channels on
 /// accepted connections.
 ///
-/// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`
-/// and `tcp://host:port`. A URI fragment (the text form of a service
-/// address, as in `ws://host/path#npc/1a2b`) is ignored for connecting.
+/// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`,
+/// `tcp://host:port` and, within one isolate, `mem://id` (see
+/// [listenMemory]). A URI fragment (the text form of a service address, as
+/// in `ws://host/path#npc/1a2b`) is ignored for connecting.
 class Switchboard {
   /// Creates a node.
   ///
@@ -125,6 +128,7 @@ class Switchboard {
 
   final List<HttpServer> _httpServers = [];
   final List<ServerSocket> _tcpServers = [];
+  final List<String> _memoryIds = [];
   final List<Uri> _endpoints = [];
   final List<_OwnEndpoint> _ownEndpoints = [];
 
@@ -223,6 +227,48 @@ class Switchboard {
     }, (server) => server.close());
   }
 
+  /// Starts accepting in-process connections at a `mem://` endpoint, for
+  /// running every node of a mesh in one isolate (tests, a single-process
+  /// mode of a deployment).
+  ///
+  /// [name] is the endpoint id: ASCII letters, digits, `.`, `_`, `~` and
+  /// `-`, compared in lower case (the URI carries it in lower case). Null
+  /// generates an id unique in this isolate. The id is registered
+  /// isolate-wide until [close]: [connect] on any [Switchboard] of the
+  /// isolate reaches this node at the returned URI over a
+  /// [MemoryTransport] pair, and the connection is accepted exactly like a
+  /// TCP connection (listener [policy], dispatch, [connections], GOAWAY on
+  /// [close]). The port, path and query of a `mem` URI are ignored. Frames
+  /// are delivered through the event queue, as from a socket, so that
+  /// timers still run while nodes of the isolate exchange requests.
+  ///
+  /// [policy] is the listener policy, as for [listenWebSocket]; null
+  /// allows everything.
+  ///
+  /// A `mem://` URI means nothing outside this isolate: publish it to a
+  /// naming service (as [listeningEndpoints] does through
+  /// `MeshNode.publish`) only when every node of the mesh runs in the same
+  /// isolate. A node also listening on TCP or WebSocket for nodes elsewhere
+  /// should publish only those endpoints.
+  ///
+  /// Returns the `mem://id` URI. Throws [ArgumentError] for an invalid
+  /// [name], and [SwitchboardException] with [StatusCode.alreadyExists] if
+  /// a listener of this isolate already has that id, or with
+  /// [StatusCode.failedPrecondition] after [close].
+  Future<Uri> listenMemory({ChannelPolicy? policy, String? name}) async {
+    _checkOpen();
+    final uri = MemoryEndpoints.register(
+      (transport, remote) =>
+          _adopt(transport, isInitiator: false, remote: remote, policy: policy),
+      name: name,
+    );
+    _memoryIds.add(uri.host);
+    _endpoints.add(uri);
+    _ownEndpoints.add(_OwnEndpoint(uri, {_canonicalHost(uri.host)}));
+    _log.info('listening on $uri');
+    return uri;
+  }
+
   Future<Uri> _listen<T>(
     T server,
     (Uri, InternetAddress) Function(T server) start,
@@ -301,7 +347,8 @@ class Switchboard {
   /// loopback names (`localhost`) and, for a wildcard bind, the loopback
   /// addresses, the host name and the addresses of the local network
   /// interfaces. Host names that resolve to this host by other means are
-  /// not recognised.
+  /// not recognised. A `mem` URI matches by its id alone
+  /// ([listenMemory]).
   bool isOwnEndpoint(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
     final port = _portOf(endpoint);
@@ -319,8 +366,8 @@ class Switchboard {
     return false;
   }
 
-  /// The URIs returned by [listenWebSocket] and [listenTcp], until
-  /// [close].
+  /// The URIs returned by [listenWebSocket], [listenTcp] and
+  /// [listenMemory], until [close].
   List<Uri> get listeningEndpoints => List.unmodifiable(_endpoints);
 
   static String _normalizePath(String path) {
@@ -454,11 +501,11 @@ class Switchboard {
   ///
   /// Connections are pooled per endpoint (scheme, host and port compared
   /// case-insensitively with default ports filled in, plus the path and
-  /// query for WebSocket URIs; the fragment is ignored). A pooled
-  /// connection that is closing or whose peer sent GOAWAY is dropped from
-  /// the pool and replaced (it keeps serving its open channels).
-  /// Concurrent calls for the same endpoint share one attempt. Failures
-  /// are not cached.
+  /// query for WebSocket URIs; the fragment is ignored; a `mem` URI by its
+  /// id alone). A pooled connection that is closing or whose peer sent
+  /// GOAWAY is dropped from the pool and replaced (it keeps serving its
+  /// open channels). Concurrent calls for the same endpoint share one
+  /// attempt. Failures are not cached.
   ///
   /// The first pooled connection with room for another channel is
   /// returned. A connection has room unless its peer announced a channel
@@ -468,11 +515,16 @@ class Switchboard {
   /// is returned (opening on it then fails with
   /// [StatusCode.resourceExhausted]).
   ///
+  /// A `mem://id` endpoint ([listenMemory]) is reached in this isolate
+  /// over a [MemoryTransport] pair, at once.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.unavailable] if the
-  /// connection cannot be established within [connectTimeout], with
+  /// connection cannot be established within [connectTimeout] (for a `mem`
+  /// URI: no listener of this isolate has that id, or it has closed), with
   /// [StatusCode.unimplemented] for an unsupported scheme, with
-  /// [StatusCode.invalidArgument] for a `tcp` URI without host or port,
-  /// and with [StatusCode.failedPrecondition] after [close].
+  /// [StatusCode.invalidArgument] for a `tcp` URI without host or port or
+  /// a `mem` URI without id, and with [StatusCode.failedPrecondition]
+  /// after [close].
   Future<MuxConnection> connect(Uri endpoint) {
     if (_closing) {
       return Future.error(_closedException());
@@ -513,13 +565,20 @@ class Switchboard {
     return max == 0 || connection.openChannelCount < max;
   }
 
-  static int _portOf(Uri endpoint) => endpoint.hasPort
-      ? endpoint.port
-      : switch (endpoint.scheme.toLowerCase()) {
-          'ws' => 80,
-          'wss' => 443,
-          _ => 0,
-        };
+  static int _portOf(Uri endpoint) {
+    final scheme = endpoint.scheme.toLowerCase();
+    if (scheme == MemoryEndpoints.scheme) {
+      // Ignored: a mem endpoint is its id.
+      return 0;
+    }
+    return endpoint.hasPort
+        ? endpoint.port
+        : switch (scheme) {
+            'ws' => 80,
+            'wss' => 443,
+            _ => 0,
+          };
+  }
 
   static String _poolKey(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
@@ -561,6 +620,8 @@ class Switchboard {
         transport = await _connectWebSocket(endpoint);
       case 'tcp':
         transport = await _connectTcp(endpoint);
+      case MemoryEndpoints.scheme:
+        transport = _connectMemory(endpoint);
       default:
         throw SwitchboardException.of(
           StatusCode.unimplemented,
@@ -603,6 +664,38 @@ class Switchboard {
         'cannot connect to $endpoint: $e',
       );
     }
+  }
+
+  /// Hands one side of a new [MemoryTransport] pair to the listener at
+  /// [endpoint] and returns the other.
+  StreamChannel<Uint8List> _connectMemory(Uri endpoint) {
+    final id = endpoint.host;
+    if (id.isEmpty) {
+      throw SwitchboardException.of(
+        StatusCode.invalidArgument,
+        'mem endpoint needs an id: $endpoint',
+      );
+    }
+    final acceptor = MemoryEndpoints.lookup(id);
+    if (acceptor == null) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'cannot connect to $endpoint: no memory listener with that id',
+      );
+    }
+    // Every frame is delivered through the event queue, as from a socket,
+    // not as a microtask: a request loop between nodes of the isolate
+    // would otherwise never let a timer (timeouts, keep-alive, heartbeats)
+    // run.
+    final (local, remote) = MemoryTransport.pair(delay: Duration.zero);
+    // The accepting node sees this node by its first mem endpoint, if any.
+    acceptor(
+      remote,
+      _memoryIds.isEmpty
+          ? 'memory peer'
+          : '${MemoryEndpoints.scheme}://${_memoryIds.first}',
+    );
+    return local;
   }
 
   Future<StreamChannel<Uint8List>> _connectWebSocket(Uri endpoint) async {
@@ -1151,10 +1244,12 @@ class Switchboard {
 
   // Shutdown ------------------------------------------------------------
 
-  /// Shuts the node down: stops listening, sends GOAWAY on every
-  /// connection and waits for each to finish its channels (up to
-  /// [MuxOptions.goAwayGrace]) and close. Further calls to [connect] and
-  /// the open methods fail with [StatusCode.failedPrecondition].
+  /// Shuts the node down: stops listening (the ids of [listenMemory] are
+  /// released at once, so connecting to them fails with
+  /// [StatusCode.unavailable]), sends GOAWAY on every connection and waits
+  /// for each to finish its channels (up to [MuxOptions.goAwayGrace]) and
+  /// close. Further calls to [connect] and the open methods fail with
+  /// [StatusCode.failedPrecondition].
   ///
   /// Connections that are established while closing (a WebSocket upgrade
   /// or a dial that was in progress, a TCP connection accepted before the
@@ -1175,6 +1270,10 @@ class Switchboard {
     final tcp = List.of(_tcpServers);
     _httpServers.clear();
     _tcpServers.clear();
+    for (final id in _memoryIds) {
+      MemoryEndpoints.unregister(id);
+    }
+    _memoryIds.clear();
     _endpoints.clear();
     _ownEndpoints.clear();
     // Stop listening. HTTP connections busy with a request are kept until

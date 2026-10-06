@@ -306,7 +306,7 @@ Future<void> main() async {
 ## Security defaults and resource limits
 
 * **Listener policy.** `listenTcp` and `listenWebSocket` take a `policy` that decides which service types a peer on that listener may address. Without one everything is allowed, which is only safe on internal listeners. A listener reachable by untrusted peers must set a policy that refuses the reserved types: `ChannelPolicies.denyReserved`, or `ChannelPolicies.allowTypes` with an explicit list. Otherwise a peer can reach the naming service `_ns`, register services and receive other peers' channels and credentials.
-* **Proxy.** `proxyHandler` refuses reserved types unless its `allow` filter admits them, forwards at most 256 channels at a time per client connection by default, and never forwards to the node's own listeners. It acts on host hints only with `Switchboard(allowHostHint: true)`, which makes the node an open relay.
+* **Proxy.** `proxyHandler` refuses reserved types unless its `allow` filter admits them, forwards at most 256 channels at a time per client connection by default, refuses channels without a shard slot to sharded types (the state transfer path) unless `allowNoSlot` admits the type, and never forwards to the node's own listeners. It acts on host hints only with `Switchboard(allowHostHint: true)`, which makes the node an open relay.
 * **Rejections.** Statuses sent to peers carry a generic reason such as `permission denied`. Instance ids, endpoints and resolver state go to the local log only.
 * **Frame size.** Frames are limited to 1 MiB by default (`MuxOptions.maxFrameSize`, which a `Switchboard` also applies to its transports). The WebSocket listener uses `WebSocketServerTransport`, which checks the size of a message, all fragments counted, before buffering it, and never negotiates compression.
 * **Buffers.** Unread data is buffered up to 4 MiB per channel; beyond that the channel is closed with `RESOURCE_EXHAUSTED`. Above 16 MiB over all channels, the connection stops reading the transport until half has drained. The number of channels, the OPEN payloads they hold and the unconfirmed CLOSEs are bounded too.
@@ -320,6 +320,7 @@ Every limit is an option. The wiki page "Switchboard Dart Reference Implementati
 * `package:switchboard/core.dart` does not import `dart:io` and compiles for the web. It has the status codes, names, the in-memory and WebSocket client transports, the stream binding wire format, the mux and Talk layers, addressing, the naming service and client, and the resolvers.
 * `package:switchboard/switchboard.dart` adds the `dart:io` parts: the TCP transport, the WebSocket server transports, `Switchboard`, `MeshNode`, `proxyHandler`, `namingClientFor`, and the instance side of sharding (`SlotGate`, `SlotLifecycle`).
 * `dart test` runs the whole suite on the VM. `dart test -P node` runs the codec and test vector tests compiled to JavaScript on Node.js, which checks the 32 and 48-bit arithmetic of the wire codecs.
+* `Switchboard.listenMemory` gives a node an in-process `mem://` endpoint, so a whole mesh (naming service included) can run in one isolate, for tests or a single-process mode; `mem://` URIs mean nothing outside that isolate, so publish them to a naming service only when every node is in it.
 
 ## Specification
 
