@@ -109,6 +109,52 @@ class FakeMuxChannel extends StreamChannelMixin<Uint8List>
     _done.complete(status);
     foreign.sink.close().ignore();
   }
+
+  /// Completes [done] alone, as the mux does once the close completes.
+  void completeDone(Status status) => _done.complete(status);
+}
+
+/// A sink that refuses frames over [limit] bytes, like a mux channel whose
+/// peer announced a frame size limit.
+class _LimitedSink implements StreamSink<Uint8List> {
+  _LimitedSink(this._inner, this.limit);
+
+  final StreamSink<Uint8List> _inner;
+  final int limit;
+
+  @override
+  void add(Uint8List event) {
+    if (event.length > limit) {
+      throw SwitchboardException.of(StatusCode.frameTooLarge);
+    }
+    _inner.add(event);
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) =>
+      _inner.addError(error, stackTrace);
+
+  @override
+  Future<void> addStream(Stream<Uint8List> stream) => _inner.addStream(stream);
+
+  @override
+  Future<void> close() => _inner.close();
+
+  @override
+  Future<void> get done => _inner.done;
+}
+
+/// Runs [body] and returns the errors it left unhandled.
+Future<List<Object>> uncaughtErrors(Future<void> Function() body) {
+  final errors = <Object>[];
+  final finished = Completer<List<Object>>();
+  runZonedGuarded(() {
+    body().whenComplete(() async {
+      await pumpEventQueue();
+      finished.complete(errors);
+    });
+  }, (error, stackTrace) => errors.add(error));
+  return finished.future;
 }
 
 /// Synchronously observable outcome of a future, for fake_async tests.
@@ -588,55 +634,86 @@ void main() {
   });
 
   group('cancel', () {
-    test(
-      'requester cancels, responder sees it and replies CANCELLED',
-      () async {
-        final p = Pair();
-        final cancelSeen = Completer<TalkMessage>();
-        serve(p.b, (m) {
-          m.replyItem(bytes([1]));
-          expect(m.isCancelled, isFalse);
-          m.onCancel.then((_) {
-            expect(m.isCancelled, isTrue);
-            cancelSeen.complete(m);
-          });
+    test('requester cancels: the channel answers CANCELLED at once and '
+        'the responder sees onCancel', () async {
+      final p = Pair();
+      final cancelSeen = Completer<TalkMessage>();
+      serve(p.b, (m) {
+        m.replyItem(bytes([1]));
+        expect(m.isCancelled, isFalse);
+        m.onCancel.then((_) {
+          expect(m.isCancelled, isTrue);
+          cancelSeen.complete(m);
         });
-        final s = p.a.streamRequest('WATCH', Uint8List(0));
-        final got = <int>[];
-        Object? error;
-        final ended = Completer<void>();
-        s.items.listen(
-          (m) {
-            got.add(m.payload.single);
-            s.cancel();
-          },
-          onError: (Object e) => error = e,
-          onDone: ended.complete,
-        );
-        await ended.future;
-        expect(got, [1]);
-        expect(error, isStatus(StatusCode.cancelled));
-        await expectLater(s.done, throwsStatus(StatusCode.cancelled));
-        // The id stays reserved until the responder's final response.
-        expect(p.a.outgoingRequestCount, 1);
-        final cancel = p.aToB.last;
-        expect(cancel.kind, TalkKind.abort);
-        expect(cancel.requestId, s.requestId);
-        expect(cancel.hasResponse, isFalse);
-        expect(cancel.status.known, StatusCode.cancelled);
+      });
+      final s = p.a.streamRequest('WATCH', Uint8List(0));
+      final got = <int>[];
+      Object? error;
+      final ended = Completer<void>();
+      s.items.listen(
+        (m) {
+          got.add(m.payload.single);
+          s.cancel();
+        },
+        onError: (Object e) => error = e,
+        onDone: ended.complete,
+      );
+      await ended.future;
+      expect(got, [1]);
+      expect(error, isStatus(StatusCode.cancelled));
+      expect(error, isNot(isA<TalkAbortException>()), reason: 'local');
+      await expectLater(s.done, throwsStatus(StatusCode.cancelled));
+      final cancel = p.aToB.last;
+      expect(cancel.kind, TalkKind.abort);
+      expect(cancel.requestId, s.requestId);
+      expect(cancel.hasResponse, isFalse);
+      expect(cancel.status.known, StatusCode.cancelled);
 
-        final m = await cancelSeen.future;
-        // Anything arriving before the final is ignored by the requester.
-        m.replyItem(bytes([2]));
-        m.replyAbort(Status.of(StatusCode.cancelled));
-        await pumpEventQueue();
-        expect(got, [1]);
-        expect(p.a.outgoingRequestCount, 0);
-        expect(p.b.incomingRequestCount, 0);
-        expect(p.a.isOpen, isTrue);
-        await p.close();
-      },
-    );
+      final m = await cancelSeen.future;
+      // The channel already sent the final; the request is finished.
+      expect(m.canReply, isFalse);
+      final failed = throwsStatus(StatusCode.failedPrecondition);
+      expect(() => m.replyItem(bytes([2])), failed);
+      expect(() => m.replyAbort(Status.of(StatusCode.cancelled)), failed);
+      expect(() => m.extend(), failed);
+      await pumpEventQueue();
+      final aborts = p.bToA.where((f) => f.kind == TalkKind.abort).toList();
+      expect(aborts, hasLength(1));
+      expect(aborts.single.responseId, s.requestId);
+      expect(aborts.single.status.known, StatusCode.cancelled);
+      expect(got, [1]);
+      expect(p.a.outgoingRequestCount, 0);
+      expect(p.b.incomingRequestCount, 0);
+      expect(p.a.isOpen, isTrue);
+      await p.close();
+    });
+
+    test('a peer cancel with no responder timeout still finishes the '
+        'request', () async {
+      final peer = RawPeer(
+        options: const TalkOptions(replyTimeout: Duration.zero),
+      );
+      TalkMessage? held;
+      serve(peer.talk, (m) => held = m);
+      peer.send(
+        TalkFrame(kind: TalkKind.message, procedure: Name('A'), requestId: 1),
+      );
+      await pumpEventQueue();
+      expect(peer.talk.incomingRequestCount, 1);
+      peer.sendHex('22 01 00 00 01 00');
+      await pumpEventQueue();
+      expect(peer.received.single.kind, TalkKind.abort);
+      expect(peer.received.single.responseId, 1);
+      expect(peer.received.single.status.known, StatusCode.cancelled);
+      expect(peer.talk.incomingRequestCount, 0);
+      expect(held!.isCancelled, isTrue);
+      expect(held!.canReply, isFalse);
+      expect(
+        () => held!.reply(Uint8List(0)),
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      await peer.talk.close();
+    });
 
     test('a cancelled request rejects a chained final', () async {
       final peer = RawPeer();
@@ -647,6 +724,8 @@ void main() {
       await pumpEventQueue();
       expect(peer.received.last.status, const Status(1, 'stop'));
       expect(peer.received, hasLength(2));
+      // The id stays reserved until the final arrives.
+      expect(peer.talk.outgoingRequestCount, 1);
       peer.send(
         TalkFrame(
           kind: TalkKind.message,
@@ -1187,6 +1266,905 @@ void main() {
         expect(p.b.isOpen, isFalse);
         expect(async.pendingTimers, isEmpty);
       });
+    });
+  });
+
+  group('abort statuses', () {
+    test('an empty abort response payload means UNKNOWN', () async {
+      final peer = RawPeer();
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.sendHex('24 01 00 00');
+      await expectLater(
+        pending,
+        throwsA(
+          isA<TalkAbortException>()
+              .having((e) => e.code, 'code', StatusCode.unknown)
+              .having((e) => e.isChannelAbort, 'isChannelAbort', isFalse),
+        ),
+      );
+      await peer.talk.close();
+    });
+
+    test('an abort response carrying OK reads as UNKNOWN', () async {
+      final peer = RawPeer();
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.sendHex('24 01 00 00 00 00 6F 6B');
+      await expectLater(
+        pending,
+        throwsA(
+          isA<TalkAbortException>().having(
+            (e) => e.status,
+            'status',
+            const Status(2, 'ok'),
+          ),
+        ),
+      );
+      await peer.talk.close();
+    });
+
+    test('an empty channel abort closes the channel with UNKNOWN', () async {
+      final peer = RawPeer(mux: true);
+      final errors = <Object>[];
+      peer.talk.messages.listen((_) {}, onError: errors.add);
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.sendHex('20');
+      expect((await peer.talk.done).known, StatusCode.unknown);
+      await expectLater(
+        pending,
+        throwsA(
+          isA<TalkAbortException>()
+              .having((e) => e.code, 'code', StatusCode.unknown)
+              .having((e) => e.isChannelAbort, 'isChannelAbort', isTrue),
+        ),
+      );
+      expect(errors.single, isA<TalkAbortException>());
+      expect(peer.mux!.closedWith.single.known, StatusCode.unknown);
+    });
+
+    test('replyAbort and abort refuse OK', () async {
+      final p = Pair();
+      serve(p.b, (m) {
+        expect(() => m.replyAbort(Status.ok), throwsArgumentError);
+        expect(
+          () => m.replyAbort(const Status(0, 'fine')),
+          throwsArgumentError,
+        );
+        expect(m.canReply, isTrue);
+        m.reply(bytes([1]));
+      });
+      expect((await p.a.request('X', Uint8List(0))).payload, [1]);
+      expect(() => p.a.abort(Status.ok), throwsArgumentError);
+      expect(p.a.isOpen, isTrue);
+      expect(p.aToB, hasLength(1));
+      await p.close();
+      expect(() => p.a.abort(Status.ok), throwsArgumentError);
+    });
+
+    test('CONNECTION_LOST never goes on the wire', () async {
+      final lost = Status.of(StatusCode.connectionLost, 'upstream gone');
+      final peer = RawPeer(mux: true);
+      final held = <TalkMessage>[];
+      serve(peer.talk, held.add);
+      peer.send(
+        TalkFrame(kind: TalkKind.message, procedure: Name('A'), requestId: 1),
+      );
+      final s = peer.talk.streamRequest('S', Uint8List(0));
+      await pumpEventQueue();
+      held.single.replyAbort(lost);
+      s.cancel(lost);
+      await pumpEventQueue();
+      final replyAbort = peer.received.firstWhere((f) => f.hasResponse);
+      expect(replyAbort.status.known, StatusCode.unavailable);
+      expect(replyAbort.status.reason, contains('upstream gone'));
+      final cancel = peer.received.lastWhere((f) => f.kind == TalkKind.abort);
+      expect(cancel.requestId, s.requestId);
+      expect(cancel.status.known, StatusCode.unavailable);
+      // Locally the cancel status is reported as given.
+      await expectLater(s.done, throwsStatus(StatusCode.connectionLost));
+
+      peer.talk.abort(lost);
+      await peer.talk.done;
+      await pumpEventQueue();
+      expect(peer.received.last.hasRequest, isFalse);
+      expect(peer.received.last.hasResponse, isFalse);
+      expect(peer.received.last.status.known, StatusCode.unavailable);
+      expect(peer.mux!.closedWith.single.known, StatusCode.unavailable);
+      expect(await peer.talk.done, lost);
+    });
+
+    test('close with CONNECTION_LOST, or a peer channel abort carrying it, '
+        'closes the mux channel with UNAVAILABLE', () async {
+      final closing = RawPeer(mux: true);
+      await closing.talk.close(Status.of(StatusCode.connectionLost));
+      expect(closing.mux!.closedWith.single.known, StatusCode.unavailable);
+
+      final aborted = RawPeer(mux: true);
+      aborted.talk.messages.listen((_) {});
+      aborted.send(
+        TalkFrame(
+          kind: TalkKind.abort,
+          payload: Status.of(StatusCode.connectionLost).encode(),
+        ),
+      );
+      expect((await aborted.talk.done).known, StatusCode.connectionLost);
+      expect(aborted.mux!.closedWith.single.known, StatusCode.unavailable);
+    });
+  });
+
+  group('unhandled errors', () {
+    test('a messages listener without onError survives a channel '
+        'abort', () async {
+      final errors = await uncaughtErrors(() async {
+        final p = Pair();
+        var ended = false;
+        p.a.messages.listen((_) {}, onDone: () => ended = true);
+        p.b.abort(Status.of(StatusCode.unauthenticated, 'bad token'));
+        expect((await p.a.done).known, StatusCode.unauthenticated);
+        await pumpEventQueue();
+        expect(ended, isTrue);
+      });
+      expect(errors, isEmpty);
+    });
+
+    test('onError(null) on the subscription logs instead', () async {
+      final errors = await uncaughtErrors(() async {
+        final peer = RawPeer();
+        final seen = <Object>[];
+        final subscription = peer.talk.messages.listen(
+          (_) {},
+          onError: seen.add,
+        );
+        subscription.onError(null);
+        peer.sendHex('20 10 00');
+        await peer.talk.done;
+        await pumpEventQueue();
+        expect(seen, isEmpty);
+        await subscription.cancel();
+      });
+      expect(errors, isEmpty);
+    });
+
+    test('items listeners without onError survive aborts, cancels and '
+        'timeouts', () async {
+      final errors = await uncaughtErrors(() async {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(milliseconds: 5)),
+        );
+        final aborted = peer.talk.streamRequest('A', Uint8List(0));
+        aborted.items.listen((_) {});
+        final cancelled = peer.talk.streamRequest('C', Uint8List(0));
+        cancelled.items.listen((_) {});
+        final expired = peer.talk.streamRequest('T', Uint8List(0));
+        expired.items.listen((_) {});
+        await pumpEventQueue();
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.abort,
+            responseId: aborted.requestId,
+            payload: Status.of(StatusCode.notFound).encode(),
+          ),
+        );
+        cancelled.cancel();
+        await expectLater(
+          expired.done,
+          throwsStatus(StatusCode.deadlineExceeded),
+        );
+        await expectLater(aborted.done, throwsA(isA<TalkAbortException>()));
+        await peer.talk.close();
+        await pumpEventQueue();
+      });
+      expect(errors, isEmpty);
+    });
+
+    test('an abort response to an unlistened items stream', () async {
+      final errors = await uncaughtErrors(() async {
+        final peer = RawPeer();
+        final s = peer.talk.streamRequest('S', Uint8List(0));
+        await pumpEventQueue();
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.abort,
+            responseId: s.requestId,
+            payload: const Status(300, 'app').encode(),
+          ),
+        );
+        await pumpEventQueue();
+        await peer.talk.close();
+        await pumpEventQueue();
+        // The error is still there for a late listener.
+        await expectLater(s.items.toList(), throwsA(isA<TalkAbortException>()));
+      });
+      expect(errors, isEmpty);
+    });
+
+    test('dropped request futures fail quietly on close', () async {
+      final errors = await uncaughtErrors(() async {
+        final p = Pair();
+        final held = <TalkMessage>[];
+        serve(p.b, (m) {
+          held.add(m);
+          if (m.procedureName == 'CHAIN') {
+            unawaited(m.replyRequest(Uint8List(0)));
+          } else if (m.procedureName == 'ITEMS') {
+            unawaited(m.replyItemRequest(Uint8List(0)));
+          }
+        });
+        unawaited(p.a.request('PLAIN', Uint8List(0)));
+        unawaited(p.a.startRequest('HANDLE', Uint8List(0)).response);
+        unawaited(p.a.request('CHAIN', Uint8List(0)));
+        final s = p.a.streamRequest('ITEMS', Uint8List(0));
+        s.items.listen((_) {}, onError: (Object _) {});
+        await pumpEventQueue();
+        expect(held, hasLength(4));
+        expect(p.b.outgoingRequestCount, 2);
+        await p.close();
+        await pumpEventQueue();
+      });
+      expect(errors, isEmpty);
+    });
+  });
+
+  group('request handles and EXTEND', () {
+    test(
+      'startRequest returns a handle with the id and the response',
+      () async {
+        final p = Pair();
+        final held = <TalkMessage>[];
+        serve(p.b, held.add);
+        final r = p.a.startRequest('A', bytes([1]));
+        final c = p.a.startRequest('B', bytes([2]));
+        await pumpEventQueue();
+        expect(r.requestId, p.aToB.first.requestId);
+        expect(c.requestId, p.aToB.last.requestId);
+        held.first.reply(bytes([3]));
+        expect((await r.response).payload, [3]);
+        c.cancel();
+        await expectLater(
+          c.response,
+          throwsA(
+            isA<SwitchboardException>()
+                .having((e) => e.code, 'code', StatusCode.cancelled)
+                .having((e) => e is TalkAbortException, 'remote', isFalse),
+          ),
+        );
+        await pumpEventQueue();
+        expect(held.last.isCancelled, isTrue);
+        expect(p.a.outgoingRequestCount, 0);
+        await p.close();
+      },
+    );
+
+    test('onExtend is called for every EXTEND, on every kind of '
+        'request', () async {
+      final p = Pair();
+      final counts = <String, int>{};
+      void Function() counter(String key) =>
+          () => counts[key] = (counts[key] ?? 0) + 1;
+      serve(p.b, (m) async {
+        m.extend();
+        m.extend();
+        if (m.procedureName == 'CHAIN') {
+          final r = m.startReplyRequest(
+            Uint8List(0),
+            onExtend: counter('chained'),
+          );
+          await r.response;
+        } else if (m.procedureName == 'CHAINS') {
+          final s = m.replyStreamRequest(
+            Uint8List(0),
+            onExtend: counter('chainedStream'),
+          );
+          await s.done;
+        } else if (m.procedureName == 'ITEMS') {
+          final r = m.startReplyItemRequest(
+            Uint8List(0),
+            onExtend: counter('item'),
+          );
+          final s = m.replyItemStreamRequest(
+            Uint8List(0),
+            onExtend: counter('itemStream'),
+          );
+          await r.response;
+          await s.done;
+          m.reply(Uint8List(0));
+        } else {
+          m.reply(Uint8List(0));
+        }
+      });
+      final plain = p.a.startRequest(
+        'PLAIN',
+        Uint8List(0),
+        onExtend: counter('request'),
+      );
+      await plain.response;
+      final stream = p.a.streamRequest(
+        'STREAM',
+        Uint8List(0),
+        onExtend: counter('stream'),
+      );
+      await stream.done;
+      for (final procedure in ['CHAIN', 'CHAINS']) {
+        final r = await p.a.request(procedure, Uint8List(0));
+        r.extend();
+        r.reply(Uint8List(0));
+      }
+      final items = p.a.streamRequest('ITEMS', Uint8List(0));
+      items.items.listen((item) {
+        item.extend();
+        item.reply(Uint8List(0));
+      });
+      await items.done;
+      await pumpEventQueue();
+      expect(counts, {
+        'request': 2,
+        'stream': 2,
+        'chained': 1,
+        'chainedStream': 1,
+        'item': 1,
+        'itemStream': 1,
+      });
+      await p.close();
+    });
+
+    test('an onExtend callback that throws is logged only', () async {
+      final peer = RawPeer();
+      final r = peer.talk.startRequest(
+        'X',
+        Uint8List(0),
+        onExtend: () => throw StateError('callback bug'),
+      );
+      await pumpEventQueue();
+      peer.send(TalkFrame(kind: TalkKind.extend, responseId: r.requestId));
+      peer.send(TalkFrame(kind: TalkKind.message, responseId: r.requestId));
+      await r.response;
+      expect(peer.talk.isOpen, isTrue);
+      await peer.talk.close();
+    });
+
+    test('EXTEND restarts the timer of a stream request', () {
+      fakeAsync((async) {
+        final peer = RawPeer(options: const TalkOptions(requestTimeout: ms30));
+        var extends_ = 0;
+        final s = peer.talk.streamRequest(
+          'S',
+          Uint8List(0),
+          onExtend: () => extends_++,
+        );
+        final done = Outcome(s.done);
+        async.flushMicrotasks();
+        for (var i = 0; i < 5; i++) {
+          async.elapse(const Duration(milliseconds: 20));
+          peer.send(TalkFrame(kind: TalkKind.extend, responseId: s.requestId));
+          async.flushMicrotasks();
+        }
+        async.elapse(const Duration(milliseconds: 20));
+        expect(done.isDone, isFalse);
+        expect(extends_, 5);
+        peer.send(TalkFrame(kind: TalkKind.message, responseId: s.requestId));
+        async.flushMicrotasks();
+        expect(done.value, isNotNull);
+        peer.talk.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('EXTEND after a cancel is ignored', () {
+      fakeAsync((async) {
+        final peer = RawPeer(options: const TalkOptions(requestTimeout: ms30));
+        var extends_ = 0;
+        final s = peer.talk.streamRequest(
+          'S',
+          Uint8List(0),
+          onExtend: () => extends_++,
+        );
+        s.done.ignore();
+        async.flushMicrotasks();
+        s.cancel();
+        async.elapse(const Duration(milliseconds: 20));
+        peer.send(TalkFrame(kind: TalkKind.extend, responseId: s.requestId));
+        async.flushMicrotasks();
+        expect(extends_, 0);
+        expect(peer.talk.outgoingRequestCount, 1);
+        // The release timer was not restarted by the EXTEND.
+        async.elapse(const Duration(milliseconds: 11));
+        expect(peer.talk.outgoingRequestCount, 0);
+        peer.talk.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('a cancelled request without a timeout is released after the '
+        'channel default', () {
+      fakeAsync((async) {
+        final peer = RawPeer(options: const TalkOptions(requestTimeout: ms30));
+        final s = peer.talk.streamRequest(
+          'S',
+          Uint8List(0),
+          timeout: Duration.zero,
+        );
+        s.done.ignore();
+        async.elapse(const Duration(hours: 1));
+        expect(peer.talk.outgoingRequestCount, 1);
+        s.cancel();
+        async.elapse(const Duration(milliseconds: 31));
+        expect(peer.talk.outgoingRequestCount, 0);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('an item that is itself a stream request', () async {
+      final p = Pair();
+      serve(p.b, (m) async {
+        final sub = m.replyItemStreamRequest(bytes([1]), procedure: 'SUB');
+        final got = await sub.items.map((i) => i.payload.single).toList();
+        final end = await sub.done;
+        m.reply(bytes([...got, end.payload.single]));
+      });
+      final s = p.a.streamRequest('S', Uint8List(0));
+      s.items.listen((item) {
+        expect(item.kind, TalkKind.streamItem);
+        expect(item.expectsReply, isTrue);
+        expect(item.expectsStream, isTrue);
+        expect(item.procedureName, 'SUB');
+        item.replyItem(bytes([7]));
+        item.replyItem(bytes([8]));
+        item.reply(bytes([9]));
+      });
+      expect((await s.done).payload, [7, 8, 9]);
+      final item = p.bToA.first;
+      expect(item.kind, TalkKind.streamItem);
+      expect(item.flags, 0x1F);
+      expect(item.responseId, s.requestId);
+      expect(p.a.incomingRequestCount, 0);
+      expect(p.b.outgoingRequestCount, 0);
+      await p.close();
+    });
+
+    test('remote aborts are TalkAbortException, local failures are '
+        'not', () async {
+      final peer = RawPeer();
+      final remote = peer.talk.request('R', Uint8List(0));
+      final expired = peer.talk.request(
+        'T',
+        Uint8List(0),
+        timeout: const Duration(milliseconds: 1),
+      );
+      final cancelled = peer.talk.startRequest('C', Uint8List(0));
+      cancelled.cancel();
+      await pumpEventQueue();
+      peer.send(
+        TalkFrame(
+          kind: TalkKind.abort,
+          responseId: peer.received.first.requestId,
+          payload: Status.of(StatusCode.deadlineExceeded).encode(),
+        ),
+      );
+      Matcher local(StatusCode code) => throwsA(
+        isA<SwitchboardException>()
+            .having((e) => e.code, 'code', code)
+            .having((e) => e is TalkAbortException, 'remote', isFalse),
+      );
+      await expectLater(
+        remote,
+        throwsA(
+          isA<TalkAbortException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.deadlineExceeded,
+          ),
+        ),
+      );
+      await expectLater(expired, local(StatusCode.deadlineExceeded));
+      await expectLater(cancelled.response, local(StatusCode.cancelled));
+      final lost = peer.talk.request('L', Uint8List(0));
+      final broken = RawPeer();
+      final protocol = broken.talk.request('P', Uint8List(0));
+      await pumpEventQueue();
+      peer.raw.sink.close().ignore();
+      broken.sendHex('41');
+      await expectLater(lost, local(StatusCode.connectionLost));
+      await expectLater(protocol, local(StatusCode.protocolError));
+    });
+  });
+
+  group('responder timeout override', () {
+    test('setReplyTimeout applies at once and to later restarts', () {
+      fakeAsync((async) {
+        final p = Pair(
+          a: const TalkOptions(requestTimeout: Duration.zero),
+          b: const TalkOptions(replyTimeout: ms30),
+        );
+        final held = <String, TalkMessage>{};
+        serve(p.b, (m) {
+          held[m.procedureName] = m;
+          switch (m.procedureName) {
+            case 'LONGER':
+              m.setReplyTimeout(const Duration(milliseconds: 100));
+            case 'NONE':
+              m.setReplyTimeout(Duration.zero);
+            case 'BACK':
+              m.setReplyTimeout(Duration.zero);
+          }
+        });
+        final longer = Outcome(p.a.request('LONGER', Uint8List(0)));
+        final none = Outcome(p.a.request('NONE', Uint8List(0)));
+        final back = Outcome(p.a.request('BACK', Uint8List(0)));
+        final normal = Outcome(p.a.request('NORMAL', Uint8List(0)));
+        async.elapse(const Duration(milliseconds: 20));
+        held['BACK']!.setReplyTimeout(null);
+        async.elapse(const Duration(milliseconds: 11));
+        expect(normal.error, isStatus(StatusCode.deadlineExceeded));
+        expect(longer.isDone, isFalse);
+        expect(back.isDone, isFalse, reason: 'restarted at 20 ms');
+        async.elapse(const Duration(milliseconds: 20));
+        expect(back.error, isStatus(StatusCode.deadlineExceeded));
+        held['LONGER']!.extend();
+        async.elapse(const Duration(milliseconds: 99));
+        expect(longer.isDone, isFalse, reason: 'extend restarts 100 ms');
+        async.elapse(const Duration(milliseconds: 2));
+        expect(longer.error, isStatus(StatusCode.deadlineExceeded));
+        async.elapse(const Duration(hours: 1));
+        expect(none.isDone, isFalse);
+        held['NONE']!.reply(bytes([1]));
+        async.flushMicrotasks();
+        expect(none.value!.payload, [1]);
+        held['NONE']!.setReplyTimeout(ms30);
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+  });
+
+  group('synchronous transport', () {
+    test('a response sent while the request is being sent is not '
+        'lost', () async {
+      final c = StreamChannelController<Uint8List>(sync: true);
+      final talk = TalkChannel(c.local);
+      c.foreign.stream.listen((data) {
+        final frame = TalkFrame.decode(data);
+        if (frame.hasRequest && frame.kind == TalkKind.message) {
+          c.foreign.sink.add(
+            TalkFrame(
+              kind: TalkKind.message,
+              responseId: frame.requestId,
+              payload: bytes([42]),
+            ).encode(),
+          );
+        }
+      });
+      final r = await talk.request('X', Uint8List(0), timeout: Duration.zero);
+      expect(r.payload, [42]);
+      expect(talk.outgoingRequestCount, 0);
+      await talk.close();
+    });
+
+    test('a synchronous rejection reaches the request', () async {
+      final c = StreamChannelController<Uint8List>(sync: true);
+      final a = TalkChannel(c.local);
+      final b = TalkChannel(
+        c.foreign,
+        options: const TalkOptions(maxIncomingRequests: 1),
+      );
+      final held = <TalkMessage>[];
+      b.messages.listen(held.add);
+      final first = a.request('A', Uint8List(0), timeout: Duration.zero);
+      final second = a.request('B', Uint8List(0), timeout: Duration.zero);
+      await expectLater(second, throwsStatus(StatusCode.resourceExhausted));
+      await pumpEventQueue();
+      held.single.reply(Uint8List(0));
+      await first;
+      expect(a.outgoingRequestCount, 0);
+      await a.close();
+      await b.close();
+    });
+
+    test('a failed send leaves no request behind', () async {
+      final c = StreamChannelController<Uint8List>();
+      final talk = TalkChannel(
+        StreamChannel<Uint8List>(
+          c.local.stream,
+          _LimitedSink(c.local.sink, 64),
+        ),
+      );
+      final held = <TalkMessage>[];
+      serve(talk, held.add);
+      expect(
+        () => talk.request('BIG', Uint8List(100)),
+        throwsStatus(StatusCode.frameTooLarge),
+      );
+      expect(talk.outgoingRequestCount, 0);
+      // A chained reply that cannot be sent leaves the message answerable.
+      c.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('Q'),
+          requestId: 1,
+        ).encode(),
+      );
+      await pumpEventQueue();
+      expect(
+        () => held.single.replyRequest(Uint8List(100)),
+        throwsStatus(StatusCode.frameTooLarge),
+      );
+      expect(talk.outgoingRequestCount, 0);
+      expect(held.single.canReply, isTrue);
+      held.single.reply(Uint8List(0));
+      await talk.close();
+    });
+  });
+
+  group('subscriptions', () {
+    test('leaving await for early cancels the stream request', () async {
+      final p = Pair();
+      final cancelled = Completer<void>();
+      serve(p.b, (m) {
+        m.replyItem(bytes([1]));
+        m.replyItem(bytes([2]));
+        m.replyItem(bytes([3]));
+        m.onCancel.then(cancelled.complete);
+      });
+      final s = p.a.streamRequest('WATCH', Uint8List(0));
+      await for (final item in s.items) {
+        if (item.payload.single == 2) {
+          break;
+        }
+      }
+      await cancelled.future;
+      await pumpEventQueue();
+      final cancel = p.aToB.last;
+      expect(cancel.kind, TalkKind.abort);
+      expect(cancel.requestId, s.requestId);
+      expect(cancel.status.known, StatusCode.cancelled);
+      expect(p.bToA.last.kind, TalkKind.abort);
+      expect(p.bToA.last.responseId, s.requestId);
+      await expectLater(s.done, throwsStatus(StatusCode.cancelled));
+      expect(p.a.outgoingRequestCount, 0);
+      expect(p.b.incomingRequestCount, 0);
+      await p.close();
+    });
+
+    test('messages.first: buffered requests never delivered get '
+        'UNIMPLEMENTED', () async {
+      final peer = RawPeer(
+        options: const TalkOptions(replyTimeout: Duration.zero),
+      );
+      for (final (id, name) in [(1, 'A'), (2, 'B'), (3, 'C')]) {
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name(name),
+            requestId: id,
+          ),
+        );
+      }
+      peer.send(TalkFrame(kind: TalkKind.message, procedure: Name('NOTE')));
+      await pumpEventQueue();
+      final first = await peer.talk.messages.first;
+      expect(first.procedureName, 'A');
+      first.reply(Uint8List(0));
+      await pumpEventQueue();
+      final answers = {
+        for (final f in peer.received)
+          f.responseId: f.kind == TalkKind.abort ? f.status.known : null,
+      };
+      expect(answers, {
+        1: null,
+        2: StatusCode.unimplemented,
+        3: StatusCode.unimplemented,
+      });
+      expect(peer.talk.incomingRequestCount, 0);
+      await peer.talk.close();
+    });
+
+    test('items.first: buffered item requests never delivered get '
+        'CANCELLED', () async {
+      final peer = RawPeer(
+        options: const TalkOptions(replyTimeout: Duration.zero),
+      );
+      final s = peer.talk.streamRequest('S', Uint8List(0));
+      await pumpEventQueue();
+      for (final id in [5, 6]) {
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.streamItem,
+            requestId: id,
+            responseId: s.requestId,
+          ),
+        );
+      }
+      await pumpEventQueue();
+      final first = await s.items.first;
+      expect(first.requestId, 5);
+      await pumpEventQueue();
+      final refused = peer.received.firstWhere((f) => f.responseId == 6);
+      expect(refused.status.known, StatusCode.cancelled);
+      final cancel = peer.received.firstWhere((f) => f.hasRequest);
+      expect(cancel.requestId, s.requestId);
+      expect(first.canReply, isTrue, reason: 'delivered items stay usable');
+      first.reply(Uint8List(0));
+      expect(peer.talk.incomingRequestCount, 0);
+      peer.send(
+        TalkFrame(
+          kind: TalkKind.abort,
+          responseId: s.requestId,
+          payload: Status.of(StatusCode.cancelled).encode(),
+        ),
+      );
+      await pumpEventQueue();
+      expect(peer.talk.outgoingRequestCount, 0);
+      await peer.talk.close();
+    });
+
+    test('items subscription cancelled, then an item request gets '
+        'ABORT CANCELLED', () async {
+      final peer = RawPeer();
+      final s = peer.talk.streamRequest('S', Uint8List(0));
+      final subscription = s.items.listen((_) {});
+      await subscription.cancel();
+      await pumpEventQueue();
+      expect(peer.received.last.kind, TalkKind.abort);
+      expect(peer.received.last.requestId, s.requestId);
+      peer.send(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          requestId: 7,
+          responseId: s.requestId,
+        ),
+      );
+      await pumpEventQueue();
+      expect(peer.received.last.responseId, 7);
+      expect(peer.received.last.status.known, StatusCode.cancelled);
+      expect(peer.talk.incomingRequestCount, 0);
+      await peer.talk.close();
+    });
+
+    test('a STREAM_ITEM with HAS_REQUEST to a cancelled stream gets '
+        'ABORT CANCELLED', () async {
+      final peer = RawPeer();
+      final s = peer.talk.streamRequest('S', Uint8List(0));
+      final items = <TalkMessage>[];
+      s.items.listen(items.add, onError: (Object _) {});
+      s.cancel();
+      await pumpEventQueue();
+      peer.send(TalkFrame(kind: TalkKind.streamItem, responseId: s.requestId));
+      peer.send(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          requestId: 8,
+          responseId: s.requestId,
+          stream: true,
+        ),
+      );
+      await pumpEventQueue();
+      expect(items, isEmpty);
+      expect(peer.received, hasLength(3));
+      expect(peer.received.last.responseId, 8);
+      expect(peer.received.last.status.known, StatusCode.cancelled);
+      expect(peer.talk.isOpen, isTrue);
+      await peer.talk.close();
+    });
+  });
+
+  group('chained and item requests', () {
+    test('the responder timeout applies to chained and item requests', () {
+      fakeAsync((async) {
+        final p = Pair(a: const TalkOptions(replyTimeout: ms30));
+        final results = <String, Outcome<TalkMessage>>{};
+        serve(p.b, (m) {
+          if (m.procedureName == 'CHAIN') {
+            results['chain'] = Outcome(m.replyRequest(Uint8List(0)));
+          } else {
+            results['item'] = Outcome(m.replyItemRequest(Uint8List(0)));
+          }
+        });
+        final chained = Outcome(p.a.request('CHAIN', Uint8List(0)));
+        final s = p.a.streamRequest('ITEMS', Uint8List(0));
+        final items = <TalkMessage>[];
+        s.items.listen(items.add);
+        async.elapse(const Duration(milliseconds: 29));
+        expect(chained.value!.expectsReply, isTrue);
+        expect(items.single.expectsReply, isTrue);
+        expect(results['chain']!.isDone, isFalse);
+        async.elapse(const Duration(milliseconds: 2));
+        for (final key in ['chain', 'item']) {
+          expect(
+            results[key]!.error,
+            isA<TalkAbortException>().having(
+              (e) => e.code,
+              'code',
+              StatusCode.deadlineExceeded,
+            ),
+          );
+        }
+        expect(chained.value!.isCancelled, isTrue);
+        expect(items.single.canReply, isFalse);
+        expect(p.a.incomingRequestCount, 0);
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('maxIncomingRequests applies to chained and item requests', () async {
+      final p = Pair(a: const TalkOptions(maxIncomingRequests: 1));
+      final itemResults = <Future<TalkMessage>>[];
+      serve(p.b, (m) {
+        if (m.procedureName == 'CHAIN') {
+          itemResults.add(m.replyRequest(Uint8List(0)));
+        } else {
+          itemResults.add(m.replyItemRequest(bytes([1])));
+          itemResults.add(m.replyItemRequest(bytes([2])));
+        }
+      });
+      final s = p.a.streamRequest('ITEMS', Uint8List(0));
+      final items = <TalkMessage>[];
+      s.items.listen(items.add);
+      await pumpEventQueue();
+      expect(items, hasLength(2));
+      expect(items[0].canReply, isTrue);
+      expect(items[1].expectsReply, isTrue);
+      expect(items[1].canReply, isFalse, reason: 'refused by the limit');
+      await expectLater(
+        itemResults[1],
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      // A chained final is refused the same way, but still completes the
+      // request.
+      final chained = await p.a.request('CHAIN', Uint8List(0));
+      expect(chained.expectsReply, isTrue);
+      expect(chained.canReply, isFalse);
+      await expectLater(
+        itemResults[2],
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      items[0].reply(Uint8List(0));
+      expect((await itemResults[0]).expectsReply, isFalse);
+      await p.close();
+    });
+  });
+
+  group('channel end races and protocol errors', () {
+    test('close after the raw stream ended uses the end status', () async {
+      final peer = RawPeer(mux: true);
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.raw.sink.close().ignore();
+      await pumpEventQueue();
+      final closing = peer.talk.close(Status.of(StatusCode.internal));
+      peer.mux!.completeDone(Status.of(StatusCode.goingAway));
+      await expectLater(pending, throwsStatus(StatusCode.goingAway));
+      await closing;
+      expect((await peer.talk.done).known, StatusCode.goingAway);
+      expect(peer.mux!.closedWith, isEmpty, reason: 'nothing to close');
+    });
+
+    test('a one-byte abort payload closes the channel with '
+        'PROTOCOL_ERROR', () async {
+      final peer = RawPeer(mux: true);
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.sendHex('24 01 00 00 05');
+      await expectLater(pending, throwsStatus(StatusCode.protocolError));
+      expect((await peer.talk.done).known, StatusCode.protocolError);
+      expect(peer.mux!.closedWith.single.known, StatusCode.protocolError);
+    });
+
+    test('a request without procedure closes the channel with '
+        'PROTOCOL_ERROR', () async {
+      final peer = RawPeer(mux: true);
+      final messages = <TalkMessage>[];
+      serve(peer.talk, messages.add);
+      peer.sendHex('02 01 00 00');
+      expect((await peer.talk.done).known, StatusCode.protocolError);
+      expect(messages, isEmpty);
+      expect(peer.mux!.closedWith.single.known, StatusCode.protocolError);
     });
   });
 }

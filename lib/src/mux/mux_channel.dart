@@ -12,7 +12,7 @@ import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../status.dart';
-import '../talk/talk_channel.dart' show StatusClosable;
+import '../status_closable.dart';
 import 'mux_connection.dart';
 import 'mux_frame.dart';
 
