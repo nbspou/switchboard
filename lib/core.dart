@@ -24,6 +24,7 @@ export 'src/mux/mux_frame.dart'
 export 'src/name.dart';
 export 'src/naming/naming_protocol.dart';
 export 'src/status.dart';
+export 'src/switchboard/incoming_channel.dart';
 export 'src/switchboard/resolver.dart';
 export 'src/talk/talk_channel.dart';
 export 'src/talk/talk_frame.dart';
