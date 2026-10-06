@@ -110,6 +110,10 @@ class TalkChannel extends Stream<TalkMessage> {
     try {
       await _channel.sink.close();
     } catch (error) {}
+    _closed();
+  }
+
+  void _closed() {
     /*
     for (StreamController<TalkMessage> streamController in _streams.values) {
       streamController.close();
@@ -187,7 +191,8 @@ class TalkChannel extends Stream<TalkMessage> {
       bool isAbort = (flags & 0x30) == 0x20;
       TalkMessage message = new TalkMessage(this, procedureId, requestId,
           responseId, expectStreamResponse, subFrame);
-      _log.finer("Received message '${procedureId}' (${requestId}, ${responseId}).");
+      _log.finer(
+          "Received message '${procedureId}' (${requestId}, ${responseId}).");
 
       // Process message
       if (requestId != 0) {
@@ -225,7 +230,8 @@ class TalkChannel extends Stream<TalkMessage> {
           } else if (isAbort) {
             state.timer.cancel();
             String reason = utf8.decode(subFrame);
-            _log.severe("Abort received from remote in reply to request: $reason");
+            _log.severe(
+                "Abort received from remote in reply to request: $reason");
             state.completer.completeError(new TalkAbort(reason));
             _abortRequiresReply(message);
             _remoteResponseStates.remove(responseId);
@@ -280,7 +286,7 @@ class TalkChannel extends Stream<TalkMessage> {
         // Invalid message state
         _log.severe(
             "Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
-        throw new TalkException(
+        throw TalkException(
             "Received invalid talk message flags: $flags (${isStreamResponse ? 'isStreamResponse' : 'isTimeoutExtend'})");
       } else {
         // New message, or new request chain
@@ -288,7 +294,7 @@ class TalkChannel extends Stream<TalkMessage> {
       }
     } catch (error, stackTrace) {
       _log.severe(
-          "Error while handling channel frame, channel closed: $error\n$stackTrace");
+          'Error while handling channel frame, channel closed', error, stackTrace);
       close();
     }
   }
@@ -296,12 +302,13 @@ class TalkChannel extends Stream<TalkMessage> {
   void _listen() {
     _channel.stream.listen(
       _onFrame,
-      onError: (error, stackTrace) {
-        _log.severe("Error from channel: $error\n$stackTrace");
+      onError: (dynamic error, StackTrace stackTrace) {
+        _log.severe('Error from channel', error, stackTrace);
         _listenController.addError(error, stackTrace);
       },
       onDone: () {
         _listenController.close();
+        _closed();
       },
       cancelOnError: true,
     );
@@ -313,8 +320,13 @@ class TalkChannel extends Stream<TalkMessage> {
       {Function onError,
       void Function() onDone,
       bool cancelOnError}) {
-    return _listenController.stream.listen(onData,
-        onError: onError, onDone: onDone, cancelOnError: cancelOnError);
+    return _listenController.stream.listen(onData, onError: onError,
+        onDone: () {
+      if (onDone != null) {
+        onDone();
+      }
+      _closed();
+    }, cancelOnError: cancelOnError);
   }
 
   int _makeRequestId() {
@@ -533,7 +545,8 @@ class TalkChannel extends Stream<TalkMessage> {
   }
 
   void _unknownResponseIdentifier(TalkMessage replying) {
-    _log.severe("Unknown response identifier '${replying.responseId}' in message with response procedure '${replying.procedureId}'.");
+    _log.severe(
+        "Unknown response identifier '${replying.responseId}' in message with response procedure '${replying.procedureId}'.");
     if (replying.requestId != 0) {
       _sendingResponse(replying.requestId, false);
     }
@@ -543,7 +556,8 @@ class TalkChannel extends Stream<TalkMessage> {
   }
 
   void _invalidResponseType(TalkMessage replying) {
-    _log.severe("Unknown response type in message with response procedure '${replying.procedureId}'");
+    _log.severe(
+        "Unknown response type in message with response procedure '${replying.procedureId}'");
     if (replying.requestId != 0) {
       _sendingResponse(replying.requestId, false);
     }
@@ -566,7 +580,7 @@ class TalkChannel extends Stream<TalkMessage> {
       replyStreamRequest(replying, message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stackTrace) {
+      }, onError: (dynamic error, StackTrace stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);
@@ -589,7 +603,7 @@ class TalkChannel extends Stream<TalkMessage> {
       sendStreamRequest(message.procedureId, message.data).listen(
           (TalkMessage reply) {
         sender._forwardReply(sender, message, reply, true);
-      }, onError: (error, stackTrace) {
+      }, onError: (dynamic error, StackTrace stackTrace) {
         if (error is TalkEndOfStream) {
           TalkEndOfStream eos = error;
           sender._forwardReply(sender, message, eos.message, false);

@@ -41,7 +41,7 @@ TalkChannel serverChannel;
 TalkChannel clientChannel;
 Completer<void> awaitServer;
 
-runServer() async {
+Future<void> runServer() async {
   awaitServer = new Completer<void>();
   server = await HttpServer.bind('127.0.0.1', 9092);
   print("bound");
@@ -71,7 +71,7 @@ runServer() async {
   }();
 }
 
-runClient() async {
+Future<void> runClient() async {
   WebSocket ws =
       await WebSocket.connect("ws://localhost:9092/ws", protocols: ['wstalk2']);
   print("connected");
@@ -136,13 +136,13 @@ void main() {
     ]);
     expect(
         serverChannel,
-        emitsInOrder([
+        emitsInOrder(<dynamic>[
           new TalkMessage(serverChannel, "HELLO", 0, 0, false, sentPayload),
           emitsDone
         ]));
     expect(
         clientChannel,
-        emitsInOrder([
+        emitsInOrder(<dynamic>[
           new TalkMessage(clientChannel, "WORLD", 0, 0, false, sentPayload),
           emitsDone
         ]));
@@ -159,8 +159,8 @@ void main() {
           "XYZ",
           new Uint8List(0));
     }(), throwsA(isInstanceOf<TalkException>()));
-    expect(serverChannel, emitsInOrder([emitsDone]));
-    expect(clientChannel, emitsInOrder([emitsDone]));
+    expect(serverChannel, emitsInOrder(<dynamic>[emitsDone]));
+    expect(clientChannel, emitsInOrder(<dynamic>[emitsDone]));
     await clientChannel.close();
   });
 
@@ -172,9 +172,9 @@ void main() {
         "XYZ",
         new Uint8List(0));
     expect(serverChannel,
-        emitsInOrder([emitsError(isInstanceOf<TalkAbort>()), emitsDone]));
-    expect(clientChannel, emitsInOrder([emitsDone]));
-    await new Future.delayed(new Duration(seconds: 1));
+        emitsInOrder(<dynamic>[emitsError(isInstanceOf<TalkAbort>()), emitsDone]));
+    expect(clientChannel, emitsInOrder(<dynamic>[emitsDone]));
+    await Future<void>.delayed(new Duration(seconds: 1));
     await serverChannel.close();
   });
 
@@ -188,9 +188,9 @@ void main() {
       random.nextInt(256),
     ]);
     serverChannel.listen((TalkMessage message) {
-      serverChannel.replyMessage(message, "WORLD", message.data);
+      serverChannel.replyMessage(message, 'WORLD', message.data);
       serverChannel.close();
-    }, onError: (error, stackTrace) {
+    }, onError: (dynamic error, StackTrace stackTrace) {
       fail("$error\n$stackTrace");
     });
     expect(
@@ -217,19 +217,19 @@ void main() {
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyEndOfStream(message);
       serverChannel.close();
-    }, onError: (error, stackTrace) {
+    }, onError: (dynamic error, StackTrace stackTrace) {
       fail("$error\n$stackTrace");
     });
     expect(
       clientChannel.sendStreamRequest("HELLO", sentPayload),
       emitsInOrder(
-        [
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
-          new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
+        <dynamic>[
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
+          TalkMessage(clientChannel, 'WORLD', 0, 1, false, sentPayload),
           emitsDone
         ],
       ),
@@ -266,27 +266,27 @@ void main() {
     ]);
     serverChannel.listen((TalkMessage message) async {
       serverChannel.replyMessage(message, "WORLD", message.data);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyExtend(message);
       serverChannel.replyExtend(message);
       serverChannel.replyExtend(message);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.replyEndOfStream(message);
       serverChannel.close();
-    }, onError: (error, stackTrace) {
+    }, onError: (dynamic error, StackTrace stackTrace) {
       fail("$error\n$stackTrace");
     });
     expect(
       clientChannel.sendStreamRequest("HELLO", sentPayload),
       emitsInOrder(
-        [
+        <dynamic>[
           new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
           new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
           new TalkMessage(clientChannel, "WORLD", 0, 1, false, sentPayload),
@@ -310,16 +310,16 @@ void main() {
     ]);
     serverChannel.listen((TalkMessage message) async {
       serverChannel.replyExtend(message);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyExtend(message);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyExtend(message);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyExtend(message);
-      await new Future.delayed(new Duration(seconds: 5));
+      await Future<void>.delayed(new Duration(seconds: 5));
       serverChannel.replyMessage(message, "WORLD", message.data);
       serverChannel.close();
-    }, onError: (error, stackTrace) {
+    }, onError: (dynamic error, StackTrace stackTrace) {
       fail("$error\n$stackTrace");
     });
     expect(

@@ -38,13 +38,13 @@ class MuxChannelImpl with StreamChannelMixin<Uint8List> implements MuxChannel, S
         _streamController.close();
       }
     } catch (error, stackTrace) {
-      _log.fine("Error closing channel: $error\n$stackTrace");
+      _log.fine("Error closing channel", error, stackTrace);
     }
   }
 
   @override
   bool get isOpen {
-    return !_streamController.isClosed;
+    return !_streamController.isClosed && !_closing;
   }
 
   @override
@@ -55,7 +55,7 @@ class MuxChannelImpl with StreamChannelMixin<Uint8List> implements MuxChannel, S
 
   @override
   void addError(Object error, [StackTrace stackTrace]) {
-    _log.severe("Error in channel stream: $error\n$stackTrace");
+    _log.severe("Error in channel stream", error, stackTrace);
   }
 
   @override

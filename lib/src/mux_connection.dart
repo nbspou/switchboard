@@ -29,14 +29,12 @@ Re-opening previously closed channel ids may cause the whole connection to be cl
 Skipping channel ids may cause them to be invalidated as well.
 */
 
-import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/mux_channel.dart';
-import 'package:switchboard/src/mux_channel_impl.dart';
 
 import 'package:switchboard/src/mux_connection_impl.dart';
 
