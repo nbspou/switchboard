@@ -131,19 +131,23 @@ class ChannelAddress {
     }
   }
 
-  /// A copy with the given fields replaced. Fields cannot be reset to null
-  /// through this method; construct a new [ChannelAddress] for that.
+  /// A copy with the given fields replaced.
+  ///
+  /// [clearHost] and [clearShard] drop the host hint and shard slot; a proxy
+  /// uses [clearHost] once it has acted on the hint.
   ChannelAddress copyWith({
     Name? type,
     int? instance,
     int? shard,
     String? host,
     Uint8List? payload,
+    bool clearHost = false,
+    bool clearShard = false,
   }) => ChannelAddress(
     type: type ?? this.type,
     instance: instance ?? this.instance,
-    shard: shard ?? this.shard,
-    host: host ?? this.host,
+    shard: clearShard ? null : (shard ?? this.shard),
+    host: clearHost ? null : (host ?? this.host),
     payload: payload ?? this.payload,
   );
 

@@ -7,6 +7,8 @@ import 'package:switchboard/src/status.dart';
 import 'package:test/test.dart';
 
 void main() {
+  _copyWithClear();
+
   group('ServiceAddress', () {
     test('toString forms', () {
       expect(ServiceAddress(Name('npc'), 0x1A2B).toString(), 'npc/1a2b');
@@ -158,5 +160,16 @@ void main() {
         throwsA(isA<ProtocolException>()),
       );
     });
+  });
+}
+
+void _copyWithClear() {
+  test('copyWith can clear host and shard', () {
+    final a = ChannelAddress(type: Name('api'), shard: 3, host: 'h');
+    final b = a.copyWith(clearHost: true, clearShard: true, instance: 9);
+    expect(b.host, isNull);
+    expect(b.shard, isNull);
+    expect(b.instance, 9);
+    expect(b.type, Name('api'));
   });
 }
