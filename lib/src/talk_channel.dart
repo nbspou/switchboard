@@ -97,6 +97,12 @@ class TalkChannel extends Stream<TalkMessage> {
     return _channel;
   }
 
+  // Only a MuxChannel can tell if it's still open, assume other channels are
+  bool get _isChannelOpen {
+    final StreamChannel raw = _channel;
+    return raw is MuxChannel ? raw.isOpen : true;
+  }
+
   StreamChannel _channel;
   TalkChannel(StreamChannel raw) {
     _channel = raw;
@@ -200,7 +206,7 @@ class TalkChannel extends Stream<TalkMessage> {
         // Ensure we're not past the concurrency limit
         int concurrentRequests = _localAnyResponseStates.length;
         if (concurrentRequests >= _maxConcurrentRequests) {
-          if (outgoingSafety && channel.isOpen) {
+          if (outgoingSafety && _isChannelOpen) {
             _replyAbort(requestId, "Too many incoming concurrent requests.");
           }
           return;
@@ -213,7 +219,7 @@ class TalkChannel extends Stream<TalkMessage> {
           if (state != null) {
             _log.severe(
                 "TalkMessage '$procedureId' was not replied to by the local program in time, sending abort.");
-            if (outgoingSafety && channel.isOpen) {
+            if (outgoingSafety && _isChannelOpen) {
               _replyAbort(requestId, "Reply not sent in time.");
             }
           }

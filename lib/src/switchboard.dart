@@ -389,7 +389,7 @@ class Switchboard extends Stream<ChannelInfo> {
           "shardSlot '${shardSlot}', payload ${payload}");
       while (_openingSharedTalkChannelMap[ush] != null) {
         TalkChannel channel = await _openingSharedTalkChannelMap[ush];
-        if ((_sharedTalkChannelMap[ush]?.channel as MuxChannel)?.isOpen == true) {
+        if ((channel?.channel as MuxChannel)?.isOpen == true) {
           return channel;
         }
       }
