@@ -152,7 +152,18 @@ ChannelHandler proxyHandler(
   final forwarding = Expando<int>('forwarded channels');
   return (incoming) async {
     final address = incoming.address;
-    if (!permitted(address)) {
+    bool allowed;
+    try {
+      allowed = permitted(address);
+    } catch (error, stackTrace) {
+      _log.warning(
+        'proxy: allow filter threw for $incoming',
+        error,
+        stackTrace,
+      );
+      allowed = false;
+    }
+    if (!allowed) {
       _log.fine('proxy: $incoming not allowed');
       await incoming.reject(genericStatus(StatusCode.permissionDenied));
       return;

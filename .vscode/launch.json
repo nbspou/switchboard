@@ -1,32 +1,30 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        // {
-        //     "name": "Switchboard Example",
-        //     "program": "example/switchboard_example.dart",
-        //     "request": "launch",
-        //     "type": "dart"
-        // },
         {
-            "name": "Switchboard Mux Test",
-            "program": "test/mux_test.dart",
-            "request": "launch",
+            "name": "All tests",
             "type": "dart",
+            "request": "launch",
+            "program": "test/",
+            "templateFor": "test"
         },
         {
-            "name": "Switchboard Talk Test",
-            "program": "test/talk_test.dart",
-            "request": "launch",
+            "name": "Example: echo over TCP",
             "type": "dart",
+            "request": "launch",
+            "program": "example/echo_tcp.dart"
         },
         {
-            "name": "Switchboard Router Test",
-            "program": "test/router_test.dart",
-            "request": "launch",
+            "name": "Example: mesh",
             "type": "dart",
+            "request": "launch",
+            "program": "example/mesh.dart"
+        },
+        {
+            "name": "Example: endpoint proxy",
+            "type": "dart",
+            "request": "launch",
+            "program": "example/endpoint_proxy.dart"
         }
     ]
 }

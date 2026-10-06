@@ -9,3 +9,5 @@ presets:
     paths:
       - test/vectors
       - test/bytes_test.dart
+      - test/name_test.dart
+      - test/status_test.dart

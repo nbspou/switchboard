@@ -783,7 +783,8 @@ void main() {
         await ca.close();
         await goingAway;
         expect(await a.done, hasCode(StatusCode.goingAway));
-        expect(await b.done, hasCode(StatusCode.connectionLost));
+        // The side that sent GOAWAY reports the status it sent.
+        expect(await b.done, hasCode(StatusCode.goingAway));
         expect(await ca.done, Status.ok);
         expect(await rb.done, Status.ok);
       },
@@ -813,7 +814,7 @@ void main() {
       final watch = Stopwatch()..start();
       await b.goAway(Status.of(StatusCode.unavailable, 'maintenance'));
       expect(watch.elapsed, greaterThan(const Duration(milliseconds: 20)));
-      expect(await rb.done, hasCode(StatusCode.connectionLost));
+      expect(await rb.done, hasCode(StatusCode.unavailable));
       expect(await ca.done, hasCode(StatusCode.goingAway));
       final status = await a.done;
       expect(status.known, StatusCode.goingAway);
@@ -825,7 +826,7 @@ void main() {
       await mux.goAway();
       final rest = await raw.rest();
       expect(rest.map((f) => hexString(f.encode())), ['02 00 00 03 21 00']);
-      expect(await mux.done, hasCode(StatusCode.connectionLost));
+      expect(await mux.done, hasCode(StatusCode.goingAway));
       await mux.goAway();
     });
 
@@ -1172,7 +1173,7 @@ void main() {
       expect(await client.ping(), isA<Duration>());
       await server.goAway();
       expect(await client.done, hasCode(StatusCode.goingAway));
-      expect(await server.done, hasCode(StatusCode.connectionLost));
+      expect(await server.done, hasCode(StatusCode.goingAway));
     }
 
     test('TCP', () async {

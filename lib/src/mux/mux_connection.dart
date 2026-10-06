@@ -449,6 +449,7 @@ class MuxConnection {
     }
     if (!_goAwaySent) {
       _goAwaySent = true;
+      _ownGoAway = status;
       _log.fine('$this: sending GOAWAY $status');
       _sendGoAway(status);
     }
@@ -471,7 +472,7 @@ class MuxConnection {
   }
 
   /// Closes the transport now. Every channel ends with `CONNECTION_LOST`
-  /// (or `GOING_AWAY` if the peer sent GOAWAY) and [done] completes.
+  /// (or the GOAWAY status if either side sent GOAWAY) and [done] completes.
   ///
   /// Completes once the transport has closed, waiting at most
   /// [MuxOptions.keepAliveTimeout] for it; a transport still open then is
@@ -991,10 +992,14 @@ class MuxConnection {
 
   // Shutdown ------------------------------------------------------------
 
+  /// The status we sent in our own graceful GOAWAY, if any.
+  Status? _ownGoAway;
+
   /// Status for channels (and the connection) when the transport ends
-  /// without us killing it.
+  /// without us killing it for a protocol error: the peer's GOAWAY status,
+  /// else our own graceful GOAWAY status, else `CONNECTION_LOST`.
   Status _lostStatus([String reason = '']) =>
-      _peerGoAway ?? Status.of(StatusCode.connectionLost, reason);
+      _peerGoAway ?? _ownGoAway ?? Status.of(StatusCode.connectionLost, reason);
 
   /// Ends the connection because the peer broke the protocol: GOAWAY with
   /// [status], then close.
