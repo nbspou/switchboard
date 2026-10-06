@@ -11,6 +11,7 @@ import 'package:switchboard/src/naming/naming_client.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/naming/naming_resolver.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:test/test.dart';
 
 import 'naming_harness.dart';
@@ -328,7 +329,10 @@ void main() {
     await a.defineSlots(kv, count: 2);
     await until(() => a.servedSlots(kv).length == 2);
     log.clear();
-    final restarted = Harness(assignmentHold: ms50);
+    final restarted = Harness(
+      assignmentHold: ms50,
+      holdingSettle: const Duration(seconds: 1),
+    );
     addTearDown(restarted.close);
     connect.harness = restarted;
     await h.close();
@@ -346,7 +350,10 @@ void main() {
     await a.defineSlots(kv, count: 1100);
     await until(() => a.servedSlots(kv).length == 1100);
     log.clear();
-    final restarted = Harness(assignmentHold: ms50);
+    final restarted = Harness(
+      assignmentHold: ms50,
+      holdingSettle: const Duration(seconds: 1),
+    );
     addTearDown(restarted.close);
     connect.harness = restarted;
     await h.close();
@@ -366,6 +373,71 @@ void main() {
     );
     await until(() => a.servedSlots(kv).length == 1100);
     expect(restarted.service.slotTable(kv)!.slotsOf(1), hasLength(1100));
+  });
+
+  test('served slots come back to their holder after the hold', () async {
+    final connect = SwitchableConnector(h);
+    final (a, _) = await sharded('A', kv, 1, connect: connect.call);
+    await a.defineSlots(kv, count: 8);
+    await until(() => a.servedSlots(kv).length == 8);
+    log.clear();
+    // A restarted naming service whose hold is over (none at all) when the
+    // instance is back: SLOTS gives it capacity before its HOLDING is
+    // processed, and the settle window keeps the allocator from starting
+    // those slots fresh (holder 0) meanwhile.
+    final restarted = Harness(holdingSettle: const Duration(seconds: 1));
+    addTearDown(restarted.close);
+    connect.harness = restarted;
+    await h.close();
+    await until(() => log.length == 8);
+    await pump();
+    expect(log, [for (var s = 0; s < 8; s++) 'A ASSIGN $s e1 h1']);
+    expect(restarted.service.slotTable(kv)!.slotsOf(1), hasLength(8));
+  });
+
+  test('HOLDING goes ahead of SLOTS when the mirror shows the space', () async {
+    final sent = <String>[];
+    final lossy = LossyConnector(h)
+      ..dropToService = (frame) {
+        final procedure = frame.procedure?.toString();
+        if (frame.kind == TalkKind.message &&
+            frame.requestId != 0 &&
+            (procedure == 'SLOTS' || procedure == 'HOLDING')) {
+          sent.add(procedure!);
+        }
+        return false;
+      };
+    final (b, _) = await sharded('B', kv, 2);
+    await b.defineSlots(kv, count: 4, capacity: 0);
+    final a = newClient(lossy.call);
+    a.slotHandler = RecordingHandler('A', log);
+    await a.start();
+    await a.synced.timeout(timeout);
+    await until(() => a.slotTable(kv) != null);
+    // Defined and declared before the registration is back: sent
+    // together once it is.
+    final registered = a.register(kv, [], instance: 1);
+    final defined = a.defineSlots(kv, count: 4);
+    final discard = a.declareHolding(kv, [2]);
+    await registered;
+    await defined;
+    expect(await discard, isEmpty);
+    expect(sent, ['HOLDING', 'SLOTS']);
+    await until(() => log.length == 4);
+    expect(log, contains('A ASSIGN 2 e1 h1'));
+    // Without the space in the mirror: SLOTS first (HOLDING would fail).
+    sent.clear();
+    final c = newClient(lossy.call);
+    c.slotHandler = RecordingHandler('C', log);
+    await c.start();
+    await c.synced.timeout(timeout);
+    final registeredC = c.register(zone, [], instance: 3);
+    final definedC = c.defineSlots(zone, count: 4, capacity: 0);
+    final discardC = c.declareHolding(zone, [1]);
+    await registeredC;
+    await definedC;
+    expect(await discardC, isEmpty);
+    expect(sent, ['SLOTS', 'HOLDING']);
   });
 
   test('close leaves no timers while a handler runs', () {

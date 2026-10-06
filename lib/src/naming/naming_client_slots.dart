@@ -279,16 +279,26 @@ class _ClientSlots {
   // Restoring after a (re)connect
 
   /// Sends what is remembered for [type] on [session], once per session:
-  /// `SLOTS`, then `HOLDING`, then a `CLAIM` of every slot this instance
-  /// serves, pipelined. Waits for the registration of [type] on [session]
-  /// if this client registers that type; without any registration of it
-  /// (a router or an operator tool) only `SLOTS` is sent.
+  /// `SLOTS` and `HOLDING`, then a `CLAIM` of every slot this instance
+  /// serves, pipelined (all in the same turn). Waits for the registration
+  /// of [type] on [session] if this client registers that type; without
+  /// any registration of it (a router or an operator tool) only `SLOTS` is
+  /// sent.
   ///
   /// The `HOLDING` also lists the served slots whose storage this instance
   /// holds. It is a single request, so it reaches a restarted naming
   /// service within its assignment hold even when the claims (sent a
   /// window at a time) do not; the service then gives those slots back to
   /// this instance as their holder instead of assigning them fresh.
+  ///
+  /// `HOLDING` goes first when the mirror, synced on [session], shows the
+  /// space as defined: the holders are then known before `SLOTS` gives
+  /// this instance capacity, so the allocator never sees those slots
+  /// without their holder. Otherwise (after a reconnect the mirror is not
+  /// synced yet, and a restarted naming service may not know the space, so
+  /// `HOLDING` would fail) `SLOTS` goes first, with `HOLDING` right behind
+  /// it; the naming service's settle window after `SLOTS` covers the gap
+  /// (`NamingService.holdingSettle`).
   void restore(_Session session, Name type) {
     if (!session.usable) {
       return;
@@ -303,10 +313,10 @@ class _ClientSlots {
     }
     session.restored[type] = registered;
     final definition = definitions[type];
-    if (definition != null) {
-      _sendSlots(session, definition);
-    }
     if (!registered) {
+      if (definition != null) {
+        _sendSlots(session, definition);
+      }
       return;
     }
     final declared = holdings[type];
@@ -319,7 +329,19 @@ class _ClientSlots {
     };
     final pending = List.of(declared?.pending ?? const <_PendingHolding>[]);
     declared?.pending.clear();
-    if (held.isNotEmpty || pending.isNotEmpty) {
+    final declare = held.isNotEmpty || pending.isNotEmpty;
+    final holdingFirst =
+        declare &&
+        definition != null &&
+        !session.syncing &&
+        mirrors[type]?.space == definition.request.space;
+    if (holdingFirst) {
+      _sendHolding(session, type, held.toList()..sort(), pending);
+    }
+    if (definition != null) {
+      _sendSlots(session, definition);
+    }
+    if (declare && !holdingFirst) {
       _sendHolding(session, type, held.toList()..sort(), pending);
     }
     if (bySlot != null) {
