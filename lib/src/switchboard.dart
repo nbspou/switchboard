@@ -243,14 +243,15 @@ class Switchboard extends Stream<ChannelInfo> {
     if (!_isPayload(payload)) {
       _log.finest("Request to set channel payload to '$payload'.");
       _payload = payload;
+      // Wait for any pending opening channels, outside the lock,
+      // since opening a new connection needs the lock
+      await Future.wait(_openingSharedTalkChannelMap.values.toList());
       return await _lock.synchronized(() async {
         _log.finest("Set channel payload to '$payload'.");
-        // Wait for any pending opening channels
-        await _openingSharedTalkChannelMap.values.toList();
         // Wait for all existing channels to close
         if (closeExisting)
-          await _openedConnectionMap.values
-              .map((MuxConnection connection) => connection.closeChannels());
+          await Future.wait(_openedConnectionMap.values
+              .map((MuxConnection connection) => connection.closeChannels()));
       });
     }
   }
@@ -594,9 +595,12 @@ class Switchboard extends Stream<ChannelInfo> {
       }
       _log.finest(
           "Closing switchboard (${boundWebSockets.length}, ${muxConnections.length}).");
-      await futures + opening;
-      _log.finer("Closed switchboard.");
+      await Future.wait(futures);
     });
+    // Wait for any pending opening channels, outside the lock,
+    // since opening a new connection needs the lock
+    await Future.wait(opening);
+    _log.finer("Closed switchboard.");
   }
 }
 
