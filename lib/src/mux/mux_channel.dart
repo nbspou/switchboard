@@ -12,6 +12,7 @@ import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../status.dart';
+import '../talk/talk_channel.dart' show StatusClosable;
 import 'mux_connection.dart';
 import 'mux_frame.dart';
 
@@ -43,7 +44,7 @@ enum MuxChannelState {
 /// not end [stream] at once: DATA the peer sent before it saw our CLOSE is
 /// still delivered, and [stream] ends when the peer's CLOSE arrives or the
 /// connection drops, as the mux specification describes.
-class MuxChannel with StreamChannelMixin<Uint8List> {
+class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   MuxChannel._(
     this._link,
     this.connection,
@@ -105,6 +106,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> {
   /// non-OK status sent or received, else OK. If the connection ended
   /// first, [StatusCode.connectionLost], or [StatusCode.goingAway] if the
   /// peer had sent GOAWAY. Never completes with an error.
+  @override
   Future<Status> get done => _done.future;
 
   /// Sends one DATA subframe, which may be empty.
@@ -137,6 +139,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> {
   /// already closed. Never completes with an error. Throws [ArgumentError]
   /// synchronously for application status codes (256 and above), which
   /// must not be used in CLOSE.
+  @override
   Future<void> close([Status status = Status.ok]) {
     checkMuxStatus(status);
     if (_state == MuxChannelState.open) {
