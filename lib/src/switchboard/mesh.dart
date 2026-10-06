@@ -256,7 +256,9 @@ class MeshNode {
         lazy: lazy,
         shared: shared,
       );
-      await client.defineSlots(
+      // Start SLOTS and HOLDING back to back, so that the naming service
+      // sees them in one burst and no round trip separates them.
+      final defined = client.defineSlots(
         type,
         count: count,
         mode: mode,
@@ -264,13 +266,15 @@ class MeshNode {
         shared: shared,
         capacity: capacity,
       );
-      _spaces[type] = space;
       final held = holding.toList();
-      if (held.isNotEmpty) {
-        final discard = await client.declareHolding(type, held);
-        if (discard.isNotEmpty) {
-          lifecycle.discard(discard);
-        }
+      final declared = held.isNotEmpty
+          ? client.declareHolding(type, held)
+          : Future<List<int>>.value(const []);
+      await defined;
+      _spaces[type] = space;
+      final discard = await declared;
+      if (discard.isNotEmpty) {
+        lifecycle.discard(discard);
       }
       return gate;
     } catch (_) {
