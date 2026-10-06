@@ -59,11 +59,17 @@ Future<void> until(bool Function() condition) async {
 /// A naming service and in-memory links to it. No assignment hold unless
 /// asked for.
 class Harness {
-  Harness({Duration heartbeat = ms50, Duration assignmentHold = Duration.zero})
-    : service = NamingService(
-        heartbeat: heartbeat,
-        assignmentHold: assignmentHold,
-      );
+  Harness({
+    Duration heartbeat = ms50,
+    Duration assignmentHold = Duration.zero,
+    Duration holderGrace = const Duration(minutes: 5),
+    Duration handoverTimeout = const Duration(milliseconds: 300),
+  }) : service = NamingService(
+         heartbeat: heartbeat,
+         assignmentHold: assignmentHold,
+         holderGrace: holderGrace,
+         handoverTimeout: handoverTimeout,
+       );
 
   final NamingService service;
 
