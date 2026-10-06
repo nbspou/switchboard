@@ -528,7 +528,11 @@ class Switchboard {
   // compression offered), both with maxFrameSize = muxOptions.maxFrameSize (0: the 1 MiB transport default).
   // policy: null allows everything (internal listeners only); internet-facing listeners MUST set one
   // that refuses reserved types. Connections this node initiates (connect) have no policy.
-  Future<Uri> listenWebSocket(Object address, int port, {String path = '/', ChannelPolicy? policy});   // returns the bound ws:// uri (port resolved)
+  // Other paths get 403, or with onOtherRequest are handed to it: the callback owns the response; if it
+  // throws before starting it, logged SEVERE and answered 500. close() waits for callbacks in progress
+  // like upgrades (at most connectTimeout).
+  Future<Uri> listenWebSocket(Object address, int port, {String path = '/', ChannelPolicy? policy,
+      FutureOr<void> Function(HttpRequest request)? onOtherRequest});   // returns the bound ws:// uri (port resolved)
   Future<Uri> listenTcp(Object address, int port, {ChannelPolicy? policy});                              // returns tcp:// uri
   // In-process listener: mem://<name or generated id>, registered isolate-wide (static map in
   // memory_endpoints.dart) until close. connect(mem://id) hands one side of a MemoryTransport pair
@@ -539,6 +543,17 @@ class Switchboard {
   // ALREADY_EXISTS. Generated ids: counter + random suffix. mem:// URIs are meaningless outside the
   // isolate: publish them to a naming service only when every node runs in the same isolate.
   Future<Uri> listenMemory({ChannelPolicy? policy, String? name});
+  // A transport accepted outside the node (an app's own HttpServer, another listener), adopted exactly
+  // like a listener's connection: acceptor side with muxOptions, policy, dispatch, connections, GOAWAY on
+  // close. remote defaults to 'external' (no transport exposes a peer description). Once close() has
+  // started: adopted all the same as a late adoption (GOAWAY at once, close waits for it), and the call
+  // fails with FAILED_PRECONDITION.
+  Future<MuxConnection> accept(StreamChannel<Uint8List> transport, {ChannelPolicy? policy, String? remote});
+  // For an app routing its own HttpServer: the upgrade of listenWebSocket (limit maxFrameSize, default
+  // the node's WebSocket limit; path not checked; remote = the peer address), then accept. A bad upgrade
+  // is answered 400/426 and fails with INVALID_ARGUMENT; once closing, 503 and FAILED_PRECONDITION. The
+  // upgrade is tracked like a listener's, so close() waits for it (at most connectTimeout).
+  Future<MuxConnection> acceptWebSocket(HttpRequest request, {ChannelPolicy? policy, int? maxFrameSize});
   List<Uri> get listeningEndpoints;
   bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses; mem: the id
 
@@ -557,7 +572,7 @@ class Switchboard {
   Future<ServiceAddress> resolveSlotOwner(Name type, int slot, {bool refresh = false});          // for callers handling MOVED themselves
   Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp, mem; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
   Stream<MuxConnection> get connections;              // every accepted or initiated connection
-  Future<void> close();                               // stop listening (mem ids released at once), goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout) get GOAWAY at once and are waited for too
+  Future<void> close();                               // stop listening (mem ids released at once), goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout; accept calls) get GOAWAY at once and are waited for too
 }
 
 /// Forwards every subframe and the close between two channels. Completes when both are done.

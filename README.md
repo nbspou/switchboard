@@ -260,6 +260,8 @@ client: admin -> permissionDenied: permission denied
 client: chat without a session -> permissionDenied: permission denied
 ```
 
+To serve other routes on the same port (OAuth returns, `.well-known` files), give `listenWebSocket` an `onOtherRequest` callback, or hand the node an upgrade from your own `HttpServer` with `acceptWebSocket`.
+
 ### The lower layers alone
 
 `MuxConnection` and `TalkChannel` work over any `StreamChannel<Uint8List>` that carries one frame per event. Use them directly in a browser client (over `WebSocketTransport.connect`) or in a peer that does its own addressing. Only `core.dart` is needed.
@@ -305,7 +307,7 @@ Future<void> main() async {
 
 ## Security defaults and resource limits
 
-* **Listener policy.** `listenTcp` and `listenWebSocket` take a `policy` that decides which service types a peer on that listener may address. Without one everything is allowed, which is only safe on internal listeners. A listener reachable by untrusted peers must set a policy that refuses the reserved types: `ChannelPolicies.denyReserved`, or `ChannelPolicies.allowTypes` with an explicit list. Otherwise a peer can reach the naming service `_ns`, register services and receive other peers' channels and credentials.
+* **Listener policy.** `listenTcp` and `listenWebSocket` (and `accept` and `acceptWebSocket`) take a `policy` that decides which service types a peer on that listener may address. Without one everything is allowed, which is only safe on internal listeners. A listener reachable by untrusted peers must set a policy that refuses the reserved types: `ChannelPolicies.denyReserved`, or `ChannelPolicies.allowTypes` with an explicit list. Otherwise a peer can reach the naming service `_ns`, register services and receive other peers' channels and credentials.
 * **Proxy.** `proxyHandler` refuses reserved types unless its `allow` filter admits them, forwards at most 256 channels at a time per client connection by default, refuses channels without a shard slot to sharded types (the state transfer path) unless `allowNoSlot` admits the type, and never forwards to the node's own listeners. It acts on host hints only with `Switchboard(allowHostHint: true)`, which makes the node an open relay.
 * **Rejections.** Statuses sent to peers carry a generic reason such as `permission denied`. Instance ids, endpoints and resolver state go to the local log only.
 * **Frame size.** Frames are limited to 1 MiB by default (`MuxOptions.maxFrameSize`, which a `Switchboard` also applies to its transports). The WebSocket listener uses `WebSocketServerTransport`, which checks the size of a message, all fragments counted, before buffering it, and never negotiates compression.

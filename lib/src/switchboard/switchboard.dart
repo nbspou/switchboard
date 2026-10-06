@@ -161,6 +161,16 @@ class Switchboard {
   /// plain HTTP request for [path] (or another WebSocket version) gets
   /// 426, and any other path gets 403.
   ///
+  /// With [onOtherRequest], requests for any other path are handed to it
+  /// instead of being answered 403, so that the port can also serve, for
+  /// example, OAuth return routes or `.well-known` files. The callback owns
+  /// the response: it must answer and close it (or detach its socket).
+  /// If it throws or its future fails, the error is logged and the
+  /// request is answered 500, unless the callback had already started the
+  /// response, which is then left as it is. [close] waits for callbacks in
+  /// progress as for upgrades (at most [connectTimeout]). An application
+  /// that needs its own `HttpServer` uses [acceptWebSocket] instead.
+  ///
   /// [policy] is the listener policy applied to every channel arriving on
   /// a connection accepted here; null allows everything. **A listener
   /// reachable by untrusted peers must have a policy**, and that policy
@@ -178,13 +188,15 @@ class Switchboard {
     int port, {
     String path = '/',
     ChannelPolicy? policy,
+    FutureOr<void> Function(HttpRequest request)? onOtherRequest,
   }) async {
     _checkOpen();
     final base = _normalizePath(path);
     return _listen(await HttpServer.bind(address, port), (server) {
       _httpServers.add(server);
       server.listen(
-        (request) => _track(_onHttpRequest(request, base, policy)),
+        (request) =>
+            _track(_onHttpRequest(request, base, policy, onOtherRequest)),
         onError: (Object e) => _log.warning('HTTP listener failed: $e'),
       );
       return (
@@ -267,6 +279,96 @@ class Switchboard {
     _ownEndpoints.add(_OwnEndpoint(uri, {_canonicalHost(uri.host)}));
     _log.info('listening on $uri');
     return uri;
+  }
+
+  /// Adopts [transport], a connection accepted outside this node, exactly
+  /// like a connection a listener accepts: the node is the acceptor side
+  /// of the mux ([MuxConnection.isInitiator] false, with [muxOptions]),
+  /// [policy] is the listener policy of every channel arriving on it,
+  /// those channels are dispatched to the local services, the connection
+  /// appears on [connections], and [close] sends it GOAWAY and waits for
+  /// it. For a WebSocket upgrade from an application's own `HttpServer`,
+  /// [acceptWebSocket] does the upgrade too.
+  ///
+  /// [policy] null allows everything; a connection from untrusted peers
+  /// must have a policy that refuses the reserved types, as a listener
+  /// must (see [listenWebSocket]). [remote] describes the peer in logs and
+  /// in [IncomingChannel.remote]; default `'external'`. The transport
+  /// carries one mux frame per event and should bound incoming frames by
+  /// [MuxOptions.maxFrameSize], as the node's own transports do.
+  ///
+  /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
+  /// once [close] has started. The transport is then adopted all the same
+  /// and sent GOAWAY at once, so that the peer is told and the transport
+  /// closed, and a [close] in progress waits for it.
+  Future<MuxConnection> accept(
+    StreamChannel<Uint8List> transport, {
+    ChannelPolicy? policy,
+    String? remote,
+  }) async {
+    final connection = _adopt(
+      transport,
+      isInitiator: false,
+      remote: remote ?? 'external',
+      policy: policy,
+    );
+    if (_closing) {
+      // Adopted while closing: it goes away at once and close() waits for
+      // it.
+      throw _closedException();
+    }
+    return connection;
+  }
+
+  /// Upgrades [request], received by an application's own `HttpServer`,
+  /// to a WebSocket and [accept]s it: the one-call form for an application
+  /// that routes its own server, for example to serve OAuth return routes
+  /// or `.well-known` files on the same port, instead of [listenWebSocket].
+  /// The path is not checked; routing is the caller's.
+  ///
+  /// The upgrade is the one [listenWebSocket] performs:
+  /// [WebSocketServerTransport.upgrade] with no compression, selecting the
+  /// `switchboard` subprotocol when the client offers it, and bounding
+  /// every incoming message, fragments included, by [maxFrameSize]
+  /// (default: [MuxOptions.maxFrameSize], or the transport's 1 MiB default
+  /// when that is 0; 0 for no limit). [policy] is the connection's listener
+  /// policy, as for [accept]: **a connection from untrusted peers must have
+  /// one**. The peer's address is its remote description.
+  ///
+  /// A request that is not a valid upgrade is answered 400 (no valid key,
+  /// or only other subprotocols offered) or 426 (a plain HTTP request,
+  /// another WebSocket version), and the call fails with
+  /// [SwitchboardException] [StatusCode.invalidArgument]. Once [close] has
+  /// started, the request is answered 503 and the call fails with
+  /// [StatusCode.failedPrecondition]; an upgrade in progress when [close]
+  /// starts is completed and fails the same way, its connection sent
+  /// GOAWAY at once, and [close] waits for it (for the upgrade, at most
+  /// [connectTimeout]). In these cases the request has been answered.
+  /// Throws [RangeError] for a negative [maxFrameSize], before touching
+  /// the request; other errors of the upgrade, such as a [StateError] for
+  /// a response already started, propagate.
+  Future<MuxConnection> acceptWebSocket(
+    HttpRequest request, {
+    ChannelPolicy? policy,
+    int? maxFrameSize,
+  }) {
+    final accepted = _acceptWebSocket(
+      request,
+      policy,
+      maxFrameSize ?? _webSocketFrameLimit,
+    );
+    _track(accepted.then<void>((_) {}, onError: (Object _) {}));
+    return accepted;
+  }
+
+  Future<MuxConnection> _acceptWebSocket(
+    HttpRequest request,
+    ChannelPolicy? policy,
+    int maxFrameSize,
+  ) async {
+    RangeError.checkNotNegative(maxFrameSize, 'maxFrameSize');
+    final (transport, remote) = await _upgrade(request, maxFrameSize);
+    return accept(transport, policy: policy, remote: remote);
   }
 
   Future<Uri> _listen<T>(
@@ -382,35 +484,79 @@ class Switchboard {
     HttpRequest request,
     String base,
     ChannelPolicy? policy,
+    FutureOr<void> Function(HttpRequest request)? onOtherRequest,
   ) async {
-    final response = request.response;
     try {
       final path = request.uri.path;
-      // Refusals are not awaited: dart:io sends a response only once the
-      // request body has arrived, which a client may withhold.
       if (path != base && path != '$base/') {
-        response.statusCode = HttpStatus.forbidden;
-        _closeQuietly(response);
+        if (onOtherRequest != null) {
+          await _handOver(request, onOtherRequest);
+          return;
+        }
+        // Refusals are not awaited: dart:io sends a response only once the
+        // request body has arrived, which a client may withhold.
+        request.response.statusCode = HttpStatus.forbidden;
+        _closeQuietly(request.response);
         return;
       }
-      if (_closing) {
-        response
-          ..statusCode = HttpStatus.serviceUnavailable
-          ..persistentConnection = false;
-        _closeQuietly(response);
-        return;
-      }
-      final info = request.connectionInfo;
-      final remote = info == null
-          ? null
-          : '${info.remoteAddress.address}:${info.remotePort}';
-      final transport = await WebSocketServerTransport.upgrade(
-        request,
-        maxFrameSize: _webSocketFrameLimit,
-      );
+      final (transport, remote) = await _upgrade(request, _webSocketFrameLimit);
       _adopt(transport, isInitiator: false, remote: remote, policy: policy);
     } on Object catch (e) {
       _log.fine('WebSocket request for ${request.uri} failed: $e');
+    }
+  }
+
+  /// Answers 503 once closing, else upgrades [request] and returns the
+  /// transport with the peer's address. Throws [SwitchboardException]:
+  /// [StatusCode.failedPrecondition] when closing, and
+  /// [StatusCode.invalidArgument] for a refused upgrade, both after
+  /// answering the request.
+  Future<(WebSocketServerChannel, String?)> _upgrade(
+    HttpRequest request,
+    int maxFrameSize,
+  ) async {
+    if (_closing) {
+      final response = request.response
+        ..statusCode = HttpStatus.serviceUnavailable
+        ..persistentConnection = false;
+      // Not awaited, as for the refusals.
+      _closeQuietly(response);
+      throw _closedException();
+    }
+    final info = request.connectionInfo;
+    final remote = info == null
+        ? null
+        : '${info.remoteAddress.address}:${info.remotePort}';
+    try {
+      final transport = await WebSocketServerTransport.upgrade(
+        request,
+        maxFrameSize: maxFrameSize,
+      );
+      return (transport, remote);
+    } on WebSocketException catch (e) {
+      throw SwitchboardException.of(StatusCode.invalidArgument, e.message);
+    }
+  }
+
+  /// Runs an application's handler for a request the listener does not
+  /// serve. The handler owns the response; if it fails before starting
+  /// it, the request is answered 500.
+  static Future<void> _handOver(
+    HttpRequest request,
+    FutureOr<void> Function(HttpRequest request) handler,
+  ) async {
+    try {
+      await handler(request);
+    } on Object catch (e, st) {
+      _log.severe('handler for ${request.method} ${request.uri} failed', e, st);
+      final response = request.response;
+      try {
+        // Throws if the handler already started (or closed) the response.
+        response.statusCode = HttpStatus.internalServerError;
+      } on StateError {
+        return;
+      }
+      _closeQuietly(response);
     }
   }
 
@@ -1253,9 +1399,9 @@ class Switchboard {
   ///
   /// Connections that are established while closing (a WebSocket upgrade
   /// or a dial that was in progress, a TCP connection accepted before the
-  /// listener closed) receive GOAWAY at once, and the returned future
-  /// waits for them too (for upgrades and dials in progress, at most
-  /// [connectTimeout]). An HTTP request in progress when closing starts is
+  /// listener closed, a transport given to [accept]) receive GOAWAY at
+  /// once, and the returned future waits for them too (for upgrades and
+  /// dials in progress, at most [connectTimeout]). An HTTP request in progress when closing starts is
   /// still answered; its connection is closed afterwards, and at the latest
   /// when the node has closed.
   ///

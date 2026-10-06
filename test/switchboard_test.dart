@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -105,6 +106,39 @@ StreamQueue<int> httpStatuses(Socket socket) {
     onDone: statuses.close,
   );
   return StreamQueue(statuses.stream);
+}
+
+/// A transport whose sink's close completes only once [release] has: the
+/// node's side of a connection that takes a while to close.
+StreamChannel<Uint8List> gated(
+  StreamChannel<Uint8List> transport,
+  Future<void> release,
+) => StreamChannel(transport.stream, _GatedSink(transport.sink, release));
+
+class _GatedSink extends DelegatingStreamSink<Uint8List> {
+  _GatedSink(super.sink, this.release);
+
+  final Future<void> release;
+
+  @override
+  Future<void> close() async {
+    await super.close();
+    await release;
+  }
+}
+
+/// Sends a GET for [path] to port [port] and returns the status and body.
+Future<(int, String)> httpGet(int port, String path) async {
+  final client = HttpClient();
+  try {
+    final request = await client.getUrl(
+      Uri.parse('http://127.0.0.1:$port$path'),
+    );
+    final response = await request.close();
+    return (response.statusCode, await utf8.decodeStream(response));
+  } finally {
+    client.close(force: true);
+  }
 }
 
 /// A port nothing listens on.
@@ -1170,6 +1204,258 @@ void main() {
       expect(connection.isOpen, isFalse);
       expect(await serverSide.done, hasCode(StatusCode.goingAway));
       expect(await connectionsDone, isEmpty);
+    });
+  });
+
+  group('accept', () {
+    final secret = Name('secret');
+
+    /// A node with `svc` and `secret` services; `svc` reports the remote.
+    Switchboard served(List<String?> remotes, {MuxOptions options = fast}) {
+      final server = Switchboard(muxOptions: options);
+      addTearDown(server.close);
+      server.registerService(svc, (incoming) {
+        remotes.add(incoming.remote);
+        tagged('svc')(incoming);
+      });
+      server.registerService(secret, tagged('secret'));
+      return server;
+    }
+
+    /// A raw mux peer on one side of a memory pair; the other side is
+    /// returned for the node.
+    (MuxConnection, StreamChannel<Uint8List>) rawPeer() {
+      final (local, remote) = MemoryTransport.pair();
+      final peer = MuxConnection(local, isInitiator: true, options: fast);
+      addTearDown(peer.close);
+      return (peer, remote);
+    }
+
+    test('adopts a transport like a listener: acceptor side, mux options, '
+        'policy, dispatch, connections', () async {
+      final remotes = <String?>[];
+      final server = served(remotes, options: fast.copyWith(maxChannels: 7));
+      final announced = server.connections.first;
+      final (peer, transport) = rawPeer();
+      final connection = await server.accept(
+        transport,
+        policy: ChannelPolicies.allowTypes({svc}),
+      );
+      expect(await announced, same(connection));
+      expect(connection.isInitiator, isFalse);
+      await peer.ping();
+      // The node's mux options, announced with LIMITS.
+      expect(peer.peerLimits!.maxChannels, 7);
+      expect(await tagOf(peer.open(svcAddress().encode())), 'svc');
+      final refused = peer.open(ChannelAddress(type: secret).encode());
+      final status = await refused.done;
+      expect(status, hasCode(StatusCode.permissionDenied));
+      expect(status.reason, 'permission denied');
+      // Without a policy everything is reachable; the remote is as given.
+      final (other, otherTransport) = rawPeer();
+      await server.accept(otherTransport, remote: 'app peer 1');
+      expect(
+        await tagOf(other.open(ChannelAddress(type: secret).encode())),
+        'secret',
+      );
+      expect(await tagOf(other.open(svcAddress().encode())), 'svc');
+      expect(remotes, ['external', 'app peer 1']);
+      // Symmetric dispatch: the node opens channels back on it.
+      peer.incoming.listen((channel) {
+        channel.send(bytes('peer'));
+        unawaited(channel.close());
+      });
+      expect(
+        await tagOf(server.openChannelOn(connection, ChannelAddress())),
+        'peer',
+      );
+    });
+
+    test('close sends GOAWAY to an accepted connection', () async {
+      final server = Switchboard(muxOptions: fast);
+      final (peer, transport) = rawPeer();
+      final connection = await server.accept(transport);
+      await peer.ping();
+      await server.close();
+      expect(await peer.done, hasCode(StatusCode.goingAway));
+      expect(await connection.done, hasCode(StatusCode.goingAway));
+    });
+
+    test('accept after close fails and closes the transport', () async {
+      final server = Switchboard(muxOptions: fast);
+      await server.close();
+      final (peer, transport) = rawPeer();
+      await expectLater(
+        server.accept(transport),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      // The peer is told, and the transport closed.
+      expect(await peer.done, hasCode(StatusCode.goingAway));
+    });
+
+    test('close waits for a connection accepted while closing', () async {
+      final server = Switchboard(
+        muxOptions: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+      );
+      final held = Completer<IncomingChannel>();
+      server.registerService(Name('hold'), held.complete);
+      final (first, firstTransport) = rawPeer();
+      await server.accept(firstTransport);
+      first.open(ChannelAddress(type: Name('hold')).encode());
+      final holding = await held.future;
+      var closed = false;
+      final closing = server.close().then((_) => closed = true);
+      // The held channel keeps the node closing.
+      while (!first.peerGoingAway) {
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      // A connection accepted now is refused and sent GOAWAY at once, but
+      // the node's side takes a while to close.
+      final release = Completer<void>();
+      final (second, secondTransport) = rawPeer();
+      await expectLater(
+        server.accept(gated(secondTransport, release.future)),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      expect(await second.done, hasCode(StatusCode.goingAway));
+      await holding.channel.close();
+      expect(await first.done, hasCode(StatusCode.goingAway));
+      await pumpEventQueue();
+      expect(closed, isFalse);
+      release.complete();
+      await closing;
+      expect(closed, isTrue);
+    });
+  });
+
+  group('an app HttpServer', () {
+    test('acceptWebSocket: /ws to the node, other routes to the app, bad '
+        'upgrades refused', () async {
+      final server = node();
+      final remotes = <String?>[];
+      server.registerService(svc, (incoming) {
+        remotes.add(incoming.remote);
+        incoming.talk().messages.listen((m) => m.reply(m.payload));
+      });
+      server.registerService(Name('_ns'), tagged('naming'));
+      final http = await HttpServer.bind('127.0.0.1', 0);
+      addTearDown(() => http.close(force: true));
+      final accepted = <MuxConnection>[];
+      final failures = StreamController<SwitchboardException>();
+      http.listen((request) async {
+        switch (request.uri.path) {
+          case '/ws':
+            try {
+              accepted.add(
+                await server.acceptWebSocket(
+                  request,
+                  policy: ChannelPolicies.denyReserved,
+                ),
+              );
+            } on SwitchboardException catch (e) {
+              failures.add(e);
+            }
+          case '/oauth':
+            request.response.write('signed in');
+            await request.response.close();
+          default:
+            request.response.statusCode = HttpStatus.notFound;
+            await request.response.close();
+        }
+      });
+      final refusals = StreamQueue(failures.stream);
+      final endpoint = Uri.parse('ws://127.0.0.1:${http.port}/ws');
+      final client = node();
+      final talk = await client.openTalkAt(endpoint, svcAddress());
+      expect((await talk.request('ECHO', bytes('hi'))).payload, bytes('hi'));
+      await talk.close();
+      expect(accepted.single.isInitiator, isFalse);
+      expect(remotes.single, startsWith('127.0.0.1:'));
+      // The policy applies.
+      final naming = await client.openChannelAt(
+        endpoint,
+        ChannelAddress(type: Name('_ns')),
+      );
+      expect(await naming.done, hasCode(StatusCode.permissionDenied));
+      // The app's own routes.
+      expect(await httpGet(http.port, '/oauth'), (200, 'signed in'));
+      expect((await httpGet(http.port, '/nothing')).$1, HttpStatus.notFound);
+      // A bad key gets 400, a plain request 426; the call fails.
+      final raw = await Socket.connect('127.0.0.1', http.port);
+      addTearDown(raw.destroy);
+      final statuses = httpStatuses(raw);
+      raw.write(
+        'GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n'
+        'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n'
+        'Sec-WebSocket-Key: short\r\n\r\n',
+      );
+      expect(await statuses.next, HttpStatus.badRequest);
+      expect((await refusals.next).code, StatusCode.invalidArgument);
+      expect((await httpGet(http.port, '/ws')).$1, HttpStatus.upgradeRequired);
+      expect((await refusals.next).code, StatusCode.invalidArgument);
+      expect(accepted, hasLength(1));
+      // Closing the node sends GOAWAY; then upgrades are answered 503.
+      final pooled = await client.connect(endpoint);
+      await server.close();
+      expect(await pooled.done, hasCode(StatusCode.goingAway));
+      expect(
+        (await httpGet(http.port, '/ws')).$1,
+        HttpStatus.serviceUnavailable,
+      );
+      expect((await refusals.next).code, StatusCode.failedPrecondition);
+      await refusals.cancel(immediate: true);
+      await failures.close();
+    });
+
+    test('listenWebSocket hands other paths to onOtherRequest', () async {
+      final server = node();
+      server.registerService(svc, tagged('svc'));
+      final uri = await server.listenWebSocket(
+        '127.0.0.1',
+        0,
+        path: '/ws',
+        onOtherRequest: (request) async {
+          final response = request.response;
+          switch (request.uri.path) {
+            case '/.well-known/thing':
+              response.write('{"ok":true}');
+              await response.close();
+            case '/boom':
+              throw StateError('app bug');
+            case '/late-boom':
+              await Future<void>.delayed(Duration.zero);
+              throw StateError('async app bug');
+            case '/answered-boom':
+              response.statusCode = HttpStatus.accepted;
+              await response.close();
+              throw StateError('after answering');
+            default:
+              response.statusCode = HttpStatus.notFound;
+              await response.close();
+          }
+        },
+      );
+      expect(uri.path, '/ws');
+      // The WebSocket path still upgrades.
+      final client = node();
+      expect(await tagOf(await client.openChannelAt(uri, svcAddress())), 'svc');
+      expect(await httpGet(uri.port, '/.well-known/thing'), (
+        200,
+        '{"ok":true}',
+      ));
+      expect((await httpGet(uri.port, '/')).$1, HttpStatus.notFound);
+      // A failing callback: 500 unless it had answered.
+      expect(
+        (await httpGet(uri.port, '/boom')).$1,
+        HttpStatus.internalServerError,
+      );
+      expect(
+        (await httpGet(uri.port, '/late-boom')).$1,
+        HttpStatus.internalServerError,
+      );
+      expect((await httpGet(uri.port, '/answered-boom')).$1, 202);
+      // The WebSocket path keeps its own answers.
+      expect((await httpGet(uri.port, '/ws')).$1, HttpStatus.upgradeRequired);
     });
   });
 }

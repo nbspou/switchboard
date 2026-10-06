@@ -870,5 +870,36 @@ void main() {
         expect(goAways.single.known, StatusCode.frameTooLarge);
       },
     );
+
+    test('acceptWebSocket bounds messages by its own maxFrameSize', () async {
+      final node = Switchboard(
+        muxOptions: const MuxOptions(keepAliveInterval: null),
+      );
+      addTearDown(node.close);
+      final http = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => http.close(force: true));
+      final accepted = Completer<MuxConnection>();
+      http.listen((request) async {
+        accepted.complete(
+          await node.acceptWebSocket(request, maxFrameSize: 4096),
+        );
+      });
+      final client = await RawClient.connect(http.port);
+      addTearDown(client.destroy);
+      expect(client.status, HttpStatus.switchingProtocols);
+      final connection = await accepted.future;
+      // 5 KiB: over the limit given, far below the node's 1 MiB.
+      for (var i = 0; i < 4; i++) {
+        client.send(
+          clientFrame(
+            i == 0 ? opBinary : opContinuation,
+            Uint8List(1024),
+            fin: false,
+          ),
+        );
+      }
+      client.send(clientHeader(opContinuation, 1024));
+      expect((await connection.done).known, StatusCode.frameTooLarge);
+    });
   });
 }

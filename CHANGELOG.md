@@ -29,10 +29,12 @@ The protocol specification lives in the project wiki (section
   service type, instance, shard slot, host hint and application payload).
 - `Switchboard` node: TCP and WebSocket listeners, in-process `mem://`
   listeners (`listenMemory`) for running a whole mesh in one isolate,
-  pooled outgoing connections, dispatch by `(type, instance)` with a
-  default service and a catch-all, dispatch on initiated connections too,
-  static, endpoint and naming resolvers, round robin and shard slot
-  selection, a default application payload per node.
+  connections accepted by an application's own HTTP server (`accept`,
+  `acceptWebSocket`, and `onOtherRequest` of `listenWebSocket` for the
+  other paths of its port), pooled outgoing connections, dispatch by
+  `(type, instance)` with a default service and a catch-all, dispatch on
+  initiated connections too, static, endpoint and naming resolvers, round
+  robin and shard slot selection, a default application payload per node.
 - Naming service: `NamingService` (`REGISTER`, `UNREGSTR`, `WATCH`,
   `LOOKUP`, heartbeat, assignment hold after a restart), `NamingClient`
   (re-registration on reconnect, mirrored table served while stale),
