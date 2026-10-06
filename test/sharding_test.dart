@@ -8,6 +8,7 @@ import 'dart:typed_data';
 import 'package:fake_async/fake_async.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
+import 'package:switchboard/src/naming/naming_service.dart';
 import 'package:switchboard/src/naming/slot_table.dart';
 import 'package:switchboard/src/status.dart';
 import 'package:test/test.dart';
@@ -753,6 +754,342 @@ void main() {
         DateTime.now().difference(started),
         greaterThan(const Duration(milliseconds: 50)),
       );
+    });
+  });
+
+  group('ASSIGN backoff', () {
+    SwitchboardException notReady() =>
+        SwitchboardException.of(StatusCode.unavailable, 'not ready');
+
+    /// Refuses the first [refusals] ASSIGNs, recording when each arrived
+    /// (ms of fake time) in [at].
+    Future<AssignResponse> Function(AssignRequest) refusing(
+      FakeAsync async,
+      List<int> at, {
+      int refusals = 1 << 30,
+    }) {
+      var left = refusals;
+      return (_) async {
+        at.add(async.elapsed.inMilliseconds);
+        if (left > 0) {
+          left--;
+          throw notReady();
+        }
+        return const AssignResponse();
+      };
+    }
+
+    void closeWithoutTimers(FakeAsync async, Harness h) {
+      unawaited(h.close());
+      async.flushMicrotasks();
+      // The scripted instances' own EXTEND timers notice on their next tick.
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    test('a refusing candidate is retried at the backoff intervals', () {
+      fakeAsync((async) {
+        final h = Harness();
+        final log = <String>[];
+        final at = <int>[];
+        final a = Instance(h, kv, 1, log)
+          ..onAssign = refusing(async, at, refusals: 3);
+        unawaited(a.start(space: SlotSpace(kv, count: 1)));
+        async.elapse(const Duration(seconds: 30));
+        // 200 ms, then doubling: not a burst of retries.
+        expect(at, [0, 200, 600, 1400]);
+        expect(log, List.filled(4, '1 ASSIGN 0 e1 h0'));
+        expect(
+          h.service.slotTable(kv)![0],
+          const SlotEntry.owned(1, holder: 1, epoch: 1),
+        );
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('the backoff grows to its maximum and resets on success', () {
+      fakeAsync((async) {
+        final h = Harness(
+          assignBackoff: ms50,
+          assignBackoffMax: const Duration(milliseconds: 120),
+        );
+        final log = <String>[];
+        final at = <int>[];
+        final a = Instance(h, kv, 1, log)
+          ..onAssign = refusing(async, at, refusals: 4);
+        unawaited(a.start(space: SlotSpace(kv, count: 1)));
+        async.elapse(const Duration(seconds: 1));
+        expect(at, [0, 50, 150, 270, 390]);
+        // Freed again and refused again: from 50 ms again.
+        at.clear();
+        a.onAssign = refusing(async, at, refusals: 1);
+        unawaited(a.release(0));
+        async.elapse(const Duration(seconds: 1));
+        expect(at, [1000, 1050]);
+        expect(h.service.slotTable(kv)![0].owner, 1);
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('another candidate takes the slot meanwhile', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: ms50);
+        final log = <String>[];
+        final at = <int>[];
+        final a = Instance(h, kv, 1, log)..onAssign = refusing(async, at);
+        final b = Instance(h, kv, 2, log);
+        final space = SlotSpace(kv, count: 1);
+        unawaited(a.start(space: space));
+        unawaited(b.start(space: space));
+        async.elapse(const Duration(seconds: 30));
+        // a first (equal share, lower id); once it refuses, b at once.
+        expect(log, ['1 ASSIGN 0 e1 h0', '2 ASSIGN 0 e1 h0']);
+        expect(
+          h.service.slotTable(kv)![0],
+          const SlotEntry.owned(2, holder: 2, epoch: 1),
+        );
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('LOCATE waits for the backoffs, then fails with UNAVAILABLE', () {
+      fakeAsync((async) {
+        final h = Harness();
+        final log = <String>[];
+        final space = SlotSpace(userq, count: 16, lazy: true);
+        final at = <String>[];
+        for (final id in [1, 2]) {
+          final i = Instance(h, userq, id, log)
+            ..onAssign = (_) async {
+              at.add('$id@${async.elapsed.inMilliseconds}');
+              throw notReady();
+            };
+          unawaited(i.start(space: space));
+        }
+        async.elapse(ms10);
+        final router = Instance(h, userq, 0, log)..channel = h.link().$1;
+        final start = async.elapsed.inMilliseconds;
+        Status? status;
+        int? failedAt;
+        router
+            .locate(3)
+            .then<void>(
+              (_) => status = Status.ok,
+              onError: (Object e) {
+                status = (e as SwitchboardException).status;
+                failedAt = async.elapsed.inMilliseconds - start;
+              },
+            );
+        async.elapse(const Duration(seconds: 30));
+        expect(status?.known, StatusCode.unavailable);
+        expect(status?.reason, contains('not ready'));
+        // Both tried, both again when their backoff ended, then the
+        // handover timeout (300 ms) is over: no more ASSIGNs.
+        expect(at, [
+          '1@$start',
+          '2@$start',
+          '1@${start + 200}',
+          '2@${start + 200}',
+        ]);
+        expect(failedAt, 300);
+        expect(h.service.slotTable(userq)![3], SlotEntry.unassigned);
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('a refused rebalancing migration waits for the backoff', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: ms50);
+        final log = <String>[];
+        final space = SlotSpace(kv, count: 4);
+        unawaited(Instance(h, kv, 1, log).start(space: space));
+        unawaited(Instance(h, kv, 2, log).start(space: space));
+        async.elapse(ms50 * 2);
+        final table = h.service.slotTable(kv)!;
+        expect(counts(table), {1: 2, 2: 2});
+        log.clear();
+        final at = <int>[];
+        final c = Instance(h, kv, 3, log)
+          ..onAssign = refusing(async, at, refusals: 3);
+        final joined = async.elapsed.inMilliseconds;
+        unawaited(c.start(space: space));
+        async.elapse(const Duration(seconds: 30));
+        expect(at.map((t) => t - joined), [0, 200, 600, 1400]);
+        expect(log, [
+          for (var i = 0; i < 3; i++) ...[
+            '1 DRAIN 0 e2 to3',
+            '3 ASSIGN 0 e2 h1',
+            '1 RESUME 0 e1',
+          ],
+          '1 DRAIN 0 e2 to3',
+          '3 ASSIGN 0 e2 h1',
+          '1 FORWARD 0 e2 to3',
+        ]);
+        expect(counts(table), {1: 1, 2: 2, 3: 1});
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('close leaves no timers: backoffs, LOCATE, settle window', () {
+      fakeAsync((async) {
+        final h = Harness(
+          handoverTimeout: const Duration(seconds: 10),
+          holdingSettle: const Duration(seconds: 1),
+        );
+        final log = <String>[];
+        final a = Instance(h, kv, 1, log)
+          ..onAssign = (_) async => throw notReady();
+        unawaited(a.start(space: SlotSpace(kv, count: 2)));
+        final u = Instance(h, userq, 2, log)
+          ..onAssign = (_) async => throw notReady();
+        unawaited(u.start(space: SlotSpace(userq, count: 4, lazy: true)));
+        // Through the settle window: both kv slots in their backoff.
+        async.elapse(const Duration(milliseconds: 1100));
+        expect(log, hasLength(2));
+        Status? status;
+        u
+            .locate(1)
+            .then(
+              (_) => status = Status.ok,
+              onError: (Object e) =>
+                  status = (e as SwitchboardException).status,
+            );
+        async.elapse(ms10);
+        // A new settle window.
+        unawaited(a.slots(SlotSpace(kv, count: 2)));
+        async.elapse(ms10);
+        expect(status, isNull);
+        closeWithoutTimers(async, h);
+        expect(status?.known, StatusCode.goingAway);
+      });
+    });
+
+    test('rejects invalid options', () {
+      expect(
+        () => NamingService(assignBackoff: Duration.zero),
+        throwsArgumentError,
+      );
+      expect(
+        () => NamingService(
+          assignBackoff: const Duration(seconds: 2),
+          assignBackoffMax: const Duration(seconds: 1),
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => NamingService(holdingSettle: const Duration(seconds: -1)),
+        throwsArgumentError,
+      );
+      final service = NamingService(assignmentHold: Duration.zero);
+      expect(service.assignBackoff, const Duration(milliseconds: 200));
+      expect(service.assignBackoffMax, const Duration(seconds: 10));
+      expect(service.holdingSettle, const Duration(seconds: 1));
+      unawaited(service.close());
+    });
+  });
+
+  group('settle window after SLOTS', () {
+    test('a holder whose HOLDING comes late after the hold gets its slot', () {
+      fakeAsync((async) {
+        // A restarted naming service; its hold is over before anyone is
+        // back.
+        final h = Harness(
+          assignmentHold: ms50,
+          holdingSettle: const Duration(seconds: 1),
+        );
+        final log = <String>[];
+        final space = SlotSpace(kv, count: 4);
+        async.elapse(ms50 * 2);
+        expect(h.service.isHoldingAssignments, isFalse);
+        // b, which holds nothing, is back first with capacity.
+        unawaited(Instance(h, kv, 2, log).start(space: space));
+        async.elapse(ms10);
+        // a holds the storage of slot 2; its HOLDING comes 300 ms after
+        // its SLOTS.
+        final a = Instance(h, kv, 1, log);
+        unawaited(a.start(space: space));
+        async.elapse(const Duration(milliseconds: 300));
+        expect(log, isEmpty);
+        final discard = a.holding([2]);
+        async.elapse(ms10);
+        expect(log, ['1 ASSIGN 2 e1 h1']);
+        List<int>? discarded;
+        discard.then((d) => discarded = d);
+        async.flushMicrotasks();
+        expect(discarded, isEmpty);
+        // The rest once the window is over: 1 s after it opened (the most
+        // it is extended to here, 5 x 50 ms being shorter).
+        async.elapse(const Duration(milliseconds: 600));
+        expect(log, hasLength(1));
+        async.elapse(const Duration(milliseconds: 200));
+        final table = h.service.slotTable(kv)!;
+        expect(allOwned(table), isTrue);
+        expect(table[2], const SlotEntry.owned(1, holder: 1, epoch: 1));
+        expect(log.skip(1), everyElement(endsWith('e1 h0')));
+        expect(counts(table), {1: 2, 2: 2});
+        unawaited(h.close());
+        async.flushMicrotasks();
+        async.elapse(ms50 * 2);
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('arrivals extend the window until it goes quiet, up to a bound', () {
+      fakeAsync((async) {
+        // Quiet for 200 ms, at most 5 x 50 ms = 250 ms.
+        final h = Harness(
+          assignmentHold: ms50,
+          holdingSettle: const Duration(milliseconds: 200),
+        );
+        final log = <String>[];
+        async.elapse(ms50 * 2);
+        final a = Instance(h, kv, 1, log);
+        unawaited(a.start(space: SlotSpace(kv, count: 4)));
+        async.elapse(const Duration(milliseconds: 150));
+        expect(log, isEmpty);
+        // A CLAIM is served at once and extends the window past 300 ms.
+        int? epoch;
+        a.claim(3).then((e) => epoch = e);
+        async.elapse(ms10);
+        expect(epoch, 1);
+        expect(log, ['1 ASSIGN 3 e1 h0']);
+        async.elapse(const Duration(milliseconds: 80));
+        expect(log, hasLength(1));
+        // 250 ms after it opened it is over all the same.
+        async.elapse(const Duration(milliseconds: 20));
+        expect(log, hasLength(4));
+        expect(allOwned(h.service.slotTable(kv)), isTrue);
+        unawaited(h.close());
+        async.flushMicrotasks();
+        async.elapse(ms50 * 2);
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('LOCATE assigns at once within the window', () {
+      fakeAsync((async) {
+        final h = Harness(holdingSettle: const Duration(seconds: 1));
+        final log = <String>[];
+        final space = SlotSpace(kv, count: 4);
+        final a = Instance(h, kv, 1, log);
+        unawaited(a.start(space: space, capacity: 1));
+        unawaited(Instance(h, kv, 2, log).start(space: space, capacity: 3));
+        async.elapse(ms10);
+        unawaited(a.holding([1]));
+        async.elapse(ms10);
+        // A slot with a known holder goes back to it within the window.
+        expect(log, ['1 ASSIGN 1 e1 h1']);
+        final router = Instance(h, kv, 0, log)..channel = h.link().$1;
+        LocateResponse? located;
+        router.locate(0).then((r) => located = r);
+        async.elapse(ms10);
+        expect(located, const LocateResponse(SlotState.owned, 2, 1));
+        expect(log, ['1 ASSIGN 1 e1 h1', '2 ASSIGN 0 e1 h0']);
+        unawaited(h.close());
+        async.flushMicrotasks();
+        async.elapse(ms50 * 2);
+        expect(async.pendingTimers, isEmpty);
+      });
     });
   });
 

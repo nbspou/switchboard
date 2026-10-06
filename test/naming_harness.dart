@@ -56,19 +56,26 @@ Future<void> until(bool Function() condition) async {
   }
 }
 
-/// A naming service and in-memory links to it. No assignment hold unless
-/// asked for.
+/// A naming service and in-memory links to it. No assignment hold and no
+/// settle window after `SLOTS` unless asked for; the `ASSIGN` backoff of
+/// the service by default.
 class Harness {
   Harness({
     Duration heartbeat = ms50,
     Duration assignmentHold = Duration.zero,
     Duration holderGrace = const Duration(minutes: 5),
     Duration handoverTimeout = const Duration(milliseconds: 300),
+    Duration assignBackoff = const Duration(milliseconds: 200),
+    Duration assignBackoffMax = const Duration(seconds: 10),
+    Duration holdingSettle = Duration.zero,
   }) : service = NamingService(
          heartbeat: heartbeat,
          assignmentHold: assignmentHold,
          holderGrace: holderGrace,
          handoverTimeout: handoverTimeout,
+         assignBackoff: assignBackoff,
+         assignBackoffMax: assignBackoffMax,
+         holdingSettle: holdingSettle,
        );
 
   final NamingService service;
