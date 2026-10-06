@@ -70,17 +70,15 @@ void main() {
     expect(await resolver.resolve(Name('npc')), isEmpty);
   });
 
-  test('UNAVAILABLE while resyncing after a loss', () async {
+  test('serves the stale table while resyncing after a loss', () async {
     await client.start();
     await client.register(Name('npc'), [uriA]);
     expect(await resolver.resolve(Name('npc')), hasLength(1));
     connector.down = true;
     await connector.servers.last.close();
     await until(() => !client.isSynced);
-    await expectLater(
-      resolver.resolve(Name('npc')),
-      throwsStatus(StatusCode.unavailable),
-    );
+    // Synced once before: the mirrored table keeps answering, unblocked.
+    expect(await resolver.resolve(Name('npc')), hasLength(1));
     connector.down = false;
     await resolver.ready.timeout(timeout);
     expect(await resolver.resolve(Name('npc')), hasLength(1));

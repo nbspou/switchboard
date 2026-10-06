@@ -26,7 +26,7 @@ abstract interface class Resolver {
   Stream<ServiceEvent> get events;
 
   /// Completes once the table is usable. Completes immediately for static
-  /// resolvers; for a naming resolver, after the first `SYNCED`.
+  /// resolvers; for a naming resolver, after the current session's `SYNCED`.
   Future<void> get ready;
 
   /// Releases resources. [resolve] fails afterwards.
@@ -90,6 +90,7 @@ class StaticResolver implements Resolver {
 /// The frontend client resolver: the endpoint's proxy does the real
 /// resolution. Also what an embedded device uses.
 class EndpointResolver implements Resolver {
+  /// Creates a resolver that always answers with [endpoint].
   EndpointResolver(this.endpoint);
 
   /// The endpoint every address resolves to.

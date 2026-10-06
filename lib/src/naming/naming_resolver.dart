@@ -7,6 +7,8 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 
+import 'package:logging/logging.dart';
+
 import '../name.dart';
 import '../status.dart';
 import '../switchboard/resolver.dart';
@@ -31,21 +33,24 @@ class NamingResolver implements Resolver {
   /// How long [resolve] waits for the client to be synced.
   final Duration resolveTimeout;
 
+  static final Logger _log = Logger('Switchboard.Naming');
+
   bool _closed = false;
+  bool _everSynced = false;
 
   /// All instances of [type] in the client's table.
   ///
-  /// While the client is not synced (before the first `SYNCED`, and after a
-  /// loss of the naming service until the next one) this waits for
-  /// [NamingClient.synced] of the current session. If that does not happen
-  /// within [resolveTimeout] it fails with [SwitchboardException]
-  /// [StatusCode.unavailable]. Fails with [StatusCode.failedPrecondition]
+  /// Before the first `SYNCED` this waits for [NamingClient.synced], at most
+  /// [resolveTimeout], and then fails with [SwitchboardException]
+  /// [StatusCode.unavailable]. Once the client has been synced once, a later
+  /// loss of the naming service does not block resolution: the mirrored
+  /// table is served as it was (stale) until the client resynchronizes. Fails with [StatusCode.failedPrecondition]
   /// after [close] and with [StatusCode.cancelled] if the client is closed
   /// while waiting.
   @override
   Future<List<ServiceRecord>> resolve(Name type) async {
     _checkOpen();
-    if (!client.isSynced) {
+    if (!client.isSynced && !_everSynced) {
       try {
         await client.synced.timeout(resolveTimeout);
       } on TimeoutException {
@@ -55,6 +60,11 @@ class NamingResolver implements Resolver {
         );
       }
       _checkOpen();
+    }
+    if (client.isSynced) {
+      _everSynced = true;
+    } else {
+      _log.fine('serving stale table for $type while resynchronizing');
     }
     return [
       for (final record in client.table.values)

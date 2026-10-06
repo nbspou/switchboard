@@ -22,7 +22,10 @@ export 'src/mux/mux_connection.dart';
 export 'src/mux/mux_frame.dart'
     show MuxCommand, MuxControlMessage, MuxControlType, MuxFrame, MuxLimits;
 export 'src/name.dart';
+export 'src/naming/naming_client.dart';
 export 'src/naming/naming_protocol.dart';
+export 'src/naming/naming_resolver.dart';
+export 'src/naming/naming_service.dart';
 export 'src/status.dart';
 export 'src/switchboard/resolver.dart';
 export 'src/talk/talk_channel.dart';

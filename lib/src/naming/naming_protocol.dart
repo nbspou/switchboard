@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import '../address/service_address.dart';
@@ -69,7 +70,25 @@ void _writeEndpoints(ByteWriter w, List<Uri> endpoints) {
 
 List<Uri> _readEndpoints(ByteReader r) {
   final count = r.u8('endpoint count');
-  return [for (var i = 0; i < count; i++) Uri.parse(r.string8('endpoint'))];
+  return [for (var i = 0; i < count; i++) _readEndpoint(r)];
+}
+
+/// Reads one endpoint and rejects any that would not re-encode within the
+/// 255-byte limit, so that a decoded record can always be encoded again.
+Uri _readEndpoint(ByteReader r) {
+  final text = r.string8('endpoint');
+  final Uri uri;
+  try {
+    uri = Uri.parse(text);
+  } on FormatException catch (e) {
+    throw ProtocolException('invalid endpoint uri: ${e.message}');
+  }
+  if (utf8.encode(uri.toString()).length > 0xFF) {
+    throw ProtocolException(
+      'endpoint uri longer than 255 bytes once normalized',
+    );
+  }
+  return uri;
 }
 
 /// A service record: address with a non-zero instance and its endpoints.

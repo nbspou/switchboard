@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:switchboard/src/address/service_address.dart';
+import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/status.dart';
@@ -193,5 +194,19 @@ void main() {
       expect(e.procedure, Procedures.down);
       expect(back.encode(), e.encode());
     });
+  });
+
+  test('rejects endpoints that would not re-encode within 255 bytes', () {
+    final raw = 'tcp://h/${'a b' * 80}';
+    expect(raw.length, lessThanOrEqualTo(255));
+    final w = ByteWriter()
+      ..name(Name('npc'))
+      ..u48(5)
+      ..u8(1)
+      ..string8(raw);
+    expect(
+      () => ServiceRecord.decode(w.toBytes()),
+      throwsA(isA<ProtocolException>()),
+    );
   });
 }
