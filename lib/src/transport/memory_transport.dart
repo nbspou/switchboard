@@ -1,0 +1,199 @@
+/*
+Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Author: Jan Boon <jan.boon@kaetemi.be>
+*/
+
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:logging/logging.dart';
+import 'package:stream_channel/stream_channel.dart';
+
+import '../status.dart';
+
+final Logger _log = Logger('Switchboard.Transport');
+
+/// In-memory transport pair, for tests and for connecting two endpoints in
+/// the same isolate.
+abstract final class MemoryTransport {
+  /// Two connected transports. Frames added to one appear on the other.
+  ///
+  /// Frames are copied on [StreamSink.add], so the caller may reuse its
+  /// buffer. With [delay], every frame (and the close) is delivered that
+  /// much later, in order. With [maxFrameSize], a frame longer than that
+  /// fails the receiving side's stream with a [SwitchboardException]
+  /// carrying [StatusCode.frameTooLarge] and closes the pair, mimicking
+  /// what the stream binding does.
+  ///
+  /// Closing one side's sink ends both streams. Errors added to a sink
+  /// close the pair and complete that sink's `done` with the error.
+  static (StreamChannel<Uint8List>, StreamChannel<Uint8List>) pair({
+    Duration? delay,
+    int? maxFrameSize,
+  }) {
+    final link = _MemoryLink(delay, maxFrameSize);
+    return (link.a, link.b);
+  }
+}
+
+class _MemoryLink {
+  _MemoryLink(this.delay, this.maxFrameSize) {
+    a = _MemoryEndpoint(this, 'a');
+    b = _MemoryEndpoint(this, 'b');
+    a.peer = b;
+    b.peer = a;
+  }
+
+  final Duration? delay;
+  final int? maxFrameSize;
+  late final _MemoryEndpoint a;
+  late final _MemoryEndpoint b;
+  bool closed = false;
+  final Set<Timer> _timers = {};
+
+  void schedule(void Function() action) {
+    final d = delay;
+    if (d == null) {
+      action();
+      return;
+    }
+    late final Timer timer;
+    timer = Timer(d, () {
+      _timers.remove(timer);
+      action();
+    });
+    _timers.add(timer);
+  }
+
+  /// Closes the pair on behalf of [from]: its own stream ends at once,
+  /// the other side's stream ends after frames already in flight towards
+  /// it (or at once when [immediate]).
+  void close(_MemoryEndpoint from, {bool immediate = false}) {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    from.finish();
+    if (immediate) {
+      for (final t in _timers) {
+        t.cancel();
+      }
+      _timers.clear();
+      from.peer.finish();
+    } else {
+      schedule(from.peer.finish);
+    }
+  }
+}
+
+class _MemoryEndpoint with StreamChannelMixin<Uint8List> {
+  _MemoryEndpoint(this.link, this.label) {
+    _sink = _MemorySink(this);
+  }
+
+  final _MemoryLink link;
+  final String label;
+  late final _MemoryEndpoint peer;
+  final StreamController<Uint8List> _incoming = StreamController<Uint8List>();
+  // The sink is handed to the user, who closes it.
+  // ignore: close_sinks
+  late final _MemorySink _sink;
+  final Completer<void> _done = Completer<void>();
+
+  @override
+  Stream<Uint8List> get stream => _incoming.stream;
+
+  @override
+  StreamSink<Uint8List> get sink => _sink;
+
+  void send(Uint8List frame) {
+    if (link.closed) {
+      return;
+    }
+    final copy = Uint8List.fromList(frame);
+    final max = link.maxFrameSize;
+    link.schedule(() {
+      if (peer._incoming.isClosed) {
+        return;
+      }
+      if (max != null && copy.length > max) {
+        _log.warning(
+          'memory transport $label: frame of ${copy.length} bytes exceeds '
+          '$max',
+        );
+        peer._incoming.addError(
+          SwitchboardException.of(
+            StatusCode.frameTooLarge,
+            'frame of ${copy.length} bytes exceeds $max',
+          ),
+        );
+        link.close(peer, immediate: true);
+        return;
+      }
+      peer._incoming.add(copy);
+    });
+  }
+
+  void finish() {
+    if (!_incoming.isClosed) {
+      unawaited(_incoming.close());
+    }
+    if (!_done.isCompleted) {
+      _done.complete();
+    }
+  }
+}
+
+class _MemorySink implements StreamSink<Uint8List> {
+  _MemorySink(this.endpoint);
+
+  final _MemoryEndpoint endpoint;
+  bool _closed = false;
+  Object? _error;
+
+  @override
+  void add(Uint8List event) {
+    if (_closed) {
+      throw StateError('memory transport sink is closed');
+    }
+    endpoint.send(event);
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) {
+    if (_closed) {
+      throw StateError('memory transport sink is closed');
+    }
+    _closed = true;
+    _error = error;
+    endpoint.link.close(endpoint, immediate: true);
+  }
+
+  @override
+  Future<void> addStream(Stream<Uint8List> stream) async {
+    await for (final frame in stream) {
+      if (_closed) {
+        break;
+      }
+      endpoint.send(frame);
+    }
+  }
+
+  @override
+  Future<void> close() {
+    _closed = true;
+    endpoint.link.close(endpoint);
+    return done;
+  }
+
+  @override
+  Future<void> get done {
+    final error = _error;
+    if (error != null) {
+      return Future<void>.error(error);
+    }
+    return endpoint._done.future;
+  }
+}
