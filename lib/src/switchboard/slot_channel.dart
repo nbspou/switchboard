@@ -48,7 +48,7 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// at their own level.
 ///
 /// A channel the owner was serving when the slot moved on is closed with
-/// `ABORTED` carrying the same owner and epoch fields
+/// `RELOCATED` carrying the same owner and epoch fields
 /// (`MovedStatus.fromStatus` reads them). It is never retried: the work
 /// may have taken effect, and only the application knows whether it can
 /// be repeated.
@@ -120,8 +120,8 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   StreamSink<Uint8List> get sink => _sink;
 
   /// The end status of the final channel. A `MOVED` that was retried is
-  /// not reported; a `MOVED` that was not is, as is an `ABORTED` for a
-  /// slot move. Never completes with an error.
+  /// not reported; a `MOVED` that was not is, as is a `RELOCATED`. Never
+  /// completes with an error.
   @override
   Future<Status> get done => _done.future;
 

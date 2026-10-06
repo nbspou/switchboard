@@ -57,7 +57,8 @@ class MeshNode {
   /// node had, and starts the client. Returns at once; the client keeps
   /// connecting in the background until [leave], and [synced] completes
   /// once the table is mirrored. [leaveTimeout] bounds what [leave] waits
-  /// for the naming service.
+  /// for the naming service, once for the hand-overs and once for the
+  /// releases.
   factory MeshNode.join(
     Switchboard switchboard,
     Uri namingEndpoint, {
@@ -89,8 +90,8 @@ class MeshNode {
   /// The resolver installed on [switchboard].
   final NamingResolver resolver;
 
-  /// Longest time [leave] waits for the naming service to take back this
-  /// node's slots.
+  /// Longest time [leave] spends handing this node's slots over to other
+  /// instances, and then again releasing those it could not hand over.
   final Duration leaveTimeout;
 
   /// The slot gates of the types published with [publishSharded]; the
@@ -101,7 +102,7 @@ class MeshNode {
 
   final Map<ServiceAddress, ChannelHandler> _published = {};
   bool _leaving = false;
-  Future<void>? _leaveFuture;
+  Future<LeaveReport>? _leaveFuture;
 
   /// The client's [NamingClient.synced]: completes once the current
   /// session has mirrored the table.
@@ -177,9 +178,11 @@ class MeshNode {
   /// the slot space (`SLOTS` with [count], [mode], [lazy], [shared] and
   /// this instance's [capacity]; 0 takes no slots from the allocator) and,
   /// when [holding] lists slots whose storage this instance has, declares
-  /// them (`HOLDING`) and passes the slots it should discard to
-  /// [SlotLifecycle.discard]. Returns the gate once all of that is done;
-  /// in a managed space slots may already be assigned by then.
+  /// them (`HOLDING`); the slots it should discard reach
+  /// [SlotLifecycle.discard] (through [SlotGate.onDiscard], as do those of
+  /// the `HOLDING` the naming client sends again after a reconnect).
+  /// Returns the gate once all of that is done; in a managed space slots
+  /// may already be assigned by then.
   ///
   /// The node's [gates] become the naming client's slot handler. The
   /// remaining parameters configure the gate (see [SlotGate.new]).
@@ -272,10 +275,8 @@ class MeshNode {
           : Future<List<int>>.value(const []);
       await defined;
       _spaces[type] = space;
-      final discard = await declared;
-      if (discard.isNotEmpty) {
-        lifecycle.discard(discard);
-      }
+      // The slots to discard reach lifecycle.discard through the gate.
+      await declared;
       return gate;
     } catch (_) {
       gates.remove(type);
@@ -348,40 +349,92 @@ class MeshNode {
     }
   }
 
-  /// Leaves the mesh: gives up the slots of the types published with
-  /// [publishSharded], closes the resolver and with it the client (the
-  /// naming service then drops every registration of this node and
-  /// publishes `DOWN` for each), stops dispatching the published services
-  /// locally, and removes the resolver from [switchboard] if it is still
-  /// installed there. Channels already open are unaffected.
+  /// Leaves the mesh: hands over or gives up the slots of the types
+  /// published with [publishSharded], closes the resolver and with it the
+  /// client (the naming service then drops every registration of this
+  /// node and publishes `DOWN` for each), stops dispatching the published
+  /// services locally, and removes the resolver from [switchboard] if it
+  /// is still installed there. Channels already open are unaffected.
   ///
-  /// The slots are given up while connected to the naming service: for
-  /// each sharded type, `SLOTS` with capacity 0 (so that the allocator
-  /// does not hand them back), then `RELEASE` of every served slot keeping
-  /// the storage (this instance stays the holder), each slot then stopped
-  /// locally ([SlotGate.release]). This waits for the naming service at
-  /// most [leaveTimeout]; then every gate is closed ([SlotGate.close]). In
-  /// a holder-only managed space the allocator then assigns the released
-  /// slots elsewhere, and their new owners fetch the state from this
-  /// instance while it is still reachable; a node that is going to come
-  /// back with its storage (a reboot) should rather not leave, so that its
-  /// slots wait for it.
+  /// The slots are handled while connected to the naming service, and
+  /// while the gates (and their `noSlotHandler`, which serves state
+  /// transfers) are still up:
+  ///
+  /// 1. For each managed type, `SLOTS` with capacity 0, so that the
+  ///    allocator gives this node no slot back.
+  /// 2. In a holder-only managed space, every served slot is handed over,
+  ///    one after the other, with a migration to an instance the
+  ///    allocator chooses ([migrateSlot] with `to: 0`): the new owner
+  ///    takes the drained state over (fetching it from this node) while
+  ///    this node is still up, so no data stays behind on a node that is
+  ///    about to stop. Steps 1 and 2 take at most [leaveTimeout] in all.
+  /// 3. Every slot still served (not handed over in time, a space with no
+  ///    other instance to take it, a static space, or a `shared` space,
+  ///    whose state is in shared storage and is reassigned at once) is
+  ///    released keeping its storage (`RELEASE`, [SlotGate.release]), at
+  ///    most [leaveTimeout] more. In a holder-only managed space the
+  ///    allocator then assigns such a slot elsewhere, the new owner
+  ///    fetching the state from this node only while it is reachable.
+  ///
+  /// Then every gate is closed ([SlotGate.close]). The returned
+  /// [LeaveReport] tells which slots were handed over, released, or
+  /// dropped (stopped here without the naming service taking them: not
+  /// connected, or the release failed). A node that is going to come back
+  /// with its storage (a reboot) should rather not leave, so that its
+  /// holder-only slots wait for it.
   ///
   /// Call this before closing [switchboard]. Calling it again returns the
   /// same future.
-  Future<void> leave() => _leaveFuture ??= _leave();
+  Future<LeaveReport> leave() => _leaveFuture ??= _leave();
 
-  Future<void> _leave() async {
+  Future<LeaveReport> _leave() async {
     _leaving = true;
+    final served = {
+      for (final gate in gates.gates.values)
+        gate.type: gate.servedSlots.keys.toSet(),
+    };
+    final handedOver = <Name, Set<int>>{};
+    final released = <Name, Set<int>>{};
     if (client.isConnected && gates.gates.isNotEmpty) {
-      await Future.wait([for (final gate in gates.gates.values) _giveUp(gate)])
-          .timeout(
-            leaveTimeout,
-            onTimeout: () {
-              _log.warning('leaving: slots not released within $leaveTimeout');
-              return const [];
-            },
-          );
+      final handOvers = Stopwatch()..start();
+      var over = false;
+      Duration left() => leaveTimeout - handOvers.elapsed;
+      await Future.wait([
+        for (final gate in gates.gates.values)
+          _handOver(gate, left, () => over, handedOver[gate.type] = {}),
+      ]).timeout(
+        leaveTimeout,
+        onTimeout: () {
+          _log.warning('leaving: slots not handed over within $leaveTimeout');
+          return const [];
+        },
+      );
+      over = true;
+      if (client.isConnected) {
+        await Future.wait([
+          for (final gate in gates.gates.values)
+            _release(gate, released[gate.type] = {}),
+        ]).timeout(
+          leaveTimeout,
+          onTimeout: () {
+            _log.warning('leaving: slots not released within $leaveTimeout');
+            return const [];
+          },
+        );
+      }
+    }
+    final report = LeaveReport._(
+      handedOver: _sorted(handedOver),
+      released: _sorted(released),
+      dropped: _sorted({
+        for (final MapEntry(key: type, value: slots) in served.entries)
+          type: slots
+              .difference(handedOver[type] ?? const {})
+              .difference(released[type] ?? const {}),
+      }),
+    );
+    if (report.dropped.isNotEmpty) {
+      _log.warning('leaving: slots dropped: ${report.dropped}');
     }
     await Future.wait([for (final gate in gates.gates.values) gate.close()]);
     if (identical(switchboard.resolver, resolver)) {
@@ -392,34 +445,113 @@ class MeshNode {
       switchboard.unregisterService(address.type, instance: address.instance);
     }
     _published.clear();
+    return report;
   }
 
-  /// Takes this instance out of the allocator for [gate]'s type and
-  /// releases the slots it serves, keeping the storage.
-  Future<void> _giveUp(SlotGate gate) async {
+  static Map<Name, List<int>> _sorted(Map<Name, Set<int>> slots) =>
+      Map.unmodifiable({
+        for (final MapEntry(key: type, value: set) in slots.entries)
+          if (set.isNotEmpty)
+            type: List<int>.unmodifiable(set.toList()..sort()),
+      });
+
+  /// Takes this instance out of the allocator for [gate]'s type, then, in
+  /// a holder-only managed space, hands every served slot over to another
+  /// instance, one at a time, while [left] has time and [over] is false.
+  /// Adds the slots handed over to [done].
+  Future<void> _handOver(
+    SlotGate gate,
+    Duration Function() left,
+    bool Function() over,
+    Set<int> done,
+  ) async {
     final type = gate.type;
     final space = _spaces[type];
+    if (space == null || space.mode != SlotMode.managed) {
+      return;
+    }
     try {
-      if (space != null && space.mode == SlotMode.managed) {
-        await client.defineSlots(
-          type,
-          count: space.count,
-          mode: space.mode,
-          lazy: space.lazy,
-          shared: space.shared,
-          capacity: 0,
-        );
-      }
+      await client.defineSlots(
+        type,
+        count: space.count,
+        mode: space.mode,
+        lazy: space.lazy,
+        shared: space.shared,
+        capacity: 0,
+      );
     } on Object catch (e) {
       _log.info('leaving: capacity of $type not withdrawn: $e');
     }
+    if (space.shared) {
+      // The state is in shared storage: a RELEASE is enough.
+      return;
+    }
+    for (final slot in gate.servedSlots.keys.toList()..sort()) {
+      final time = left();
+      if (over() || time <= Duration.zero || !client.isConnected) {
+        return;
+      }
+      if (!gate.serves(slot)) {
+        continue;
+      }
+      try {
+        await client.migrate(type, slot).drain<void>().timeout(time);
+        done.add(slot);
+      } on TimeoutException {
+        _log.info('leaving: $type/$slot not handed over in time');
+        return;
+      } on Object catch (e) {
+        _log.info('leaving: $type/$slot not handed over: $e');
+      }
+    }
+  }
+
+  /// Releases the slots [gate] still serves, keeping the storage; adds
+  /// those released to [done].
+  Future<void> _release(SlotGate gate, Set<int> done) async {
+    final type = gate.type;
     await Future.wait([
       for (final slot in gate.servedSlots.keys)
         gate
             .release(slot, keepStorage: true)
-            .catchError(
-              (Object e) => _log.info('leaving: $type/$slot not released: $e'),
+            .then<void>(
+              (_) => done.add(slot),
+              onError: (Object e) =>
+                  _log.info('leaving: $type/$slot not released: $e'),
             ),
     ]);
   }
+}
+
+/// What [MeshNode.leave] did with the slots the node served, by type.
+class LeaveReport {
+  const LeaveReport._({
+    required this.handedOver,
+    required this.released,
+    required this.dropped,
+  });
+
+  /// Slots handed over to another instance through a migration while this
+  /// node was still up: their state was drained here and taken over.
+  final Map<Name, List<int>> handedOver;
+
+  /// Slots released keeping their storage (`RELEASE`): not handed over in
+  /// time, or in a space where no other instance could take them, a
+  /// static space or a `shared` one. In a holder-only managed space their
+  /// new owner fetches the state from this node only while it is still
+  /// reachable.
+  final Map<Name, List<int>> released;
+
+  /// Slots stopped here without the naming service taking them: the node
+  /// was not connected to it, or the release failed or timed out. The
+  /// naming service frees them when this node's registration goes away.
+  final Map<Name, List<int>> dropped;
+
+  /// Whether every slot was handed over (nothing released or dropped).
+  bool get isComplete => released.isEmpty && dropped.isEmpty;
+
+  @override
+  String toString() =>
+      'LeaveReport(handed over $handedOver, released $released, '
+      'dropped $dropped)';
 }

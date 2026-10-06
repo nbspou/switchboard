@@ -24,9 +24,11 @@ enum AssignResult {
 /// service to instances".
 ///
 /// The client keeps each request alive with `EXTEND` while the handler
-/// runs, answers it when the returned future completes, and answers
-/// `ABORT` with the status of a thrown [SwitchboardException]
-/// (`UNAVAILABLE` for any other error).
+/// runs, at most [NamingClient.slotHandlerMaxDuration] (then it answers
+/// `ABORT DEADLINE_EXCEEDED` and ignores the handler's late outcome),
+/// answers it when the returned future completes, and answers `ABORT`
+/// with the status of a thrown [SwitchboardException] (`UNAVAILABLE` for
+/// any other error).
 abstract class SlotHandler {
   /// Load or initialise the slot and complete once ready to serve it.
   ///
@@ -61,8 +63,18 @@ abstract class SlotHandler {
 
   /// This instance must stop serving [slot] of [type]: its claim was
   /// refused after a reconnect (another instance owns it), or an `ASSIGN`
-  /// it accepted could not be confirmed. The default does nothing.
+  /// it accepted could not be confirmed (or ran longer than
+  /// [NamingClient.slotHandlerMaxDuration]). The default does nothing.
   Future<void> onRevoke(Name type, int slot) async {}
+
+  /// A `HOLDING` response listed [slots] of [type] as no longer held by
+  /// this instance (their holder is another instance now, or they are
+  /// outside the space): their local storage should be discarded. Called
+  /// for every `HOLDING` response with a non-empty list, those of
+  /// [NamingClient.declareHolding] and those the client sends again after
+  /// a reconnect, before the [NamingClient.declareHolding] future
+  /// completes. The default does nothing.
+  void onDiscard(Name type, List<int> slots) {}
 }
 
 /// At most this many `CLAIM`s of served slots are in flight per channel
@@ -114,7 +126,8 @@ class _ClientSlots {
       return;
     }
     // Loading or draining a slot may take long; the naming service's
-    // requester timeout is kept from firing with EXTEND.
+    // requester timeout is kept from firing with EXTEND, at most for
+    // slotHandlerMaxDuration.
     message.setReplyTimeout(Duration.zero);
     final extend = Timer.periodic(client.slotExtendInterval, (timer) {
       if (!message.canReply) {
@@ -127,7 +140,34 @@ class _ClientSlots {
         timer.cancel();
       }
     });
-    unawaited(_serve(session, message, handler).whenComplete(extend.cancel));
+    final bound = client.slotHandlerMaxDuration;
+    final deadline = bound > Duration.zero
+        ? Timer(bound, () {
+            extend.cancel();
+            if (message.canReply) {
+              _log.warning(
+                '${message.procedureName} handler still running after '
+                '$bound; answered DEADLINE_EXCEEDED',
+              );
+              _abort(
+                message,
+                Status.of(
+                  StatusCode.deadlineExceeded,
+                  'slot handler ran longer than $bound',
+                ),
+              );
+            }
+          })
+        : null;
+    void stop() {
+      extend.cancel();
+      deadline?.cancel();
+    }
+
+    // A request that can no longer be answered (the channel closed, the
+    // client too) needs neither timer.
+    message.onCancel.then((_) => stop()).ignore();
+    unawaited(_serve(session, message, handler).whenComplete(stop));
   }
 
   Future<void> _serve(
@@ -249,17 +289,21 @@ class _ClientSlots {
     );
   }
 
-  /// The channel to the naming service was lost: every locked slot is
-  /// unlocked and served (as `RESUME`), once its `DRAIN` handler is done.
+  /// The channel to the naming service was lost, or the client closed:
+  /// every locked slot is unlocked and served (as `RESUME`), once its
+  /// `DRAIN` handler is done.
   void onLost() {
     final locked = Map.of(draining);
     draining.clear();
     final handler = this.handler;
-    if (handler == null || client._closed) {
+    if (handler == null) {
       return;
     }
     for (final MapEntry(key: (type, slot), value: lock) in locked.entries) {
-      _log.info('naming service lost while $type/$slot was draining, resuming');
+      _log.info(
+        '${client._closed ? 'naming client closed' : 'naming service lost'} '
+        'while $type/$slot was draining, resuming',
+      );
       unawaited(
         lock.drained
             .then(
@@ -445,6 +489,14 @@ class _ClientSlots {
         }
         final drop = discard.toSet();
         holdings[type]?.slots.removeAll(drop);
+        final handler = this.handler;
+        if (discard.isNotEmpty && handler != null) {
+          try {
+            handler.onDiscard(type, List.unmodifiable(discard));
+          } on Object catch (e, st) {
+            _log.warning('onDiscard $type failed', e, st);
+          }
+        }
         for (final p in pending) {
           p.completer.complete(
             [

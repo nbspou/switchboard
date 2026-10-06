@@ -1,7 +1,7 @@
 // Slot-aware routing in the Switchboard: (type, slot) to the owner, the
 // old owner while migrating, LOCATE on a miss in a managed space,
 // UNAVAILABLE in a static one, and the MOVED retry of openChannelToSlot
-// (never on ABORTED).
+// (never on RELOCATED).
 
 import 'dart:async';
 import 'dart:convert';
@@ -53,8 +53,8 @@ enum Mode {
   /// Rejects with MOVED carrying [Backend.moved] at once.
   moved,
 
-  /// Closes with ABORTED carrying [Backend.moved] at once.
-  aborted,
+  /// Closes with RELOCATED carrying [Backend.moved] at once.
+  relocated,
 
   /// Rejects with MOVED once something arrived.
   movedAfterData,
@@ -97,8 +97,8 @@ class Backend {
         channel.stream.listen((d) => channel.send(bytes('$name:${text(d)}')));
       case Mode.moved:
         unawaited(incoming.reject(moved));
-      case Mode.aborted:
-        unawaited(incoming.reject(this.moved.toStatus(aborted: true)));
+      case Mode.relocated:
+        unawaited(incoming.reject(this.moved.toStatus(relocated: true)));
       case Mode.movedAfterData:
         channel.stream.first.then((_) => incoming.reject(moved)).ignore();
       case Mode.greetThenMoved:
@@ -311,13 +311,13 @@ void main() {
       expect(b.opened, hasLength(1));
     });
 
-    test('never on ABORTED: the slot moved after work started', () async {
+    test('never on RELOCATED: the slot moved after work started', () async {
       a
-        ..mode = Mode.aborted
+        ..mode = Mode.relocated
         ..moved = MovedStatus(owner: 2, epoch: 2);
       final channel = await router.openChannelToSlot(svc, 1);
       final status = await channel.done;
-      expect(status, hasCode(StatusCode.aborted));
+      expect(status, hasCode(StatusCode.relocated));
       expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
       expect(channel.retried, isFalse);
       expect(b.opened, isEmpty);

@@ -65,8 +65,10 @@ class Switchboard {
   /// [maxConnectionsPerEndpoint] bounds the pooled connections to one
   /// endpoint; see [connect].
   ///
-  /// [slotRefreshTimeout] bounds the refresh of a slot's owner after a
-  /// `MOVED` rejection that names no owner; see [openChannelToSlot].
+  /// [slotRefreshTimeout] bounds every `LOCATE` slot routing sends: the
+  /// lookup of a slot the table has no owner for (see [selectAndConnect])
+  /// and the refresh of a slot's owner after a `MOVED` rejection that
+  /// names none (see [openChannelToSlot]).
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -112,9 +114,11 @@ class Switchboard {
   /// open as its peer announced it accepts. Default 4.
   final int maxConnectionsPerEndpoint;
 
-  /// Longest wait for the slot owner a `MOVED` rejection sends the
-  /// [openChannelToSlot] retry to, when the rejection names none and the
-  /// resolver has to ask (`LOCATE`).
+  /// Longest wait for a `LOCATE` of slot routing
+  /// ([SlotResolver.locateSlot]): for a slot the table has no owner for,
+  /// and for the owner a `MOVED` rejection sends the [openChannelToSlot]
+  /// retry to when the rejection names none. Then the open fails with
+  /// `UNAVAILABLE`. Default 5 s.
   final Duration slotRefreshTimeout;
 
   final Map<Name, Map<int, ChannelHandler>> _services = {};
@@ -770,8 +774,8 @@ class Switchboard {
   /// table ([SlotResolver.slotOwner], the old owner while the slot
   /// migrates); if the table has none, in a managed space the owner the
   /// resolver locates ([SlotResolver.locateSlot], which assigns a free
-  /// slot), and in a static space the open fails with
-  /// [StatusCode.unavailable]. A slot outside the space fails with
+  /// slot; at most [slotRefreshTimeout], then [StatusCode.unavailable]),
+  /// and in a static space the open fails with [StatusCode.unavailable]. A slot outside the space fails with
   /// [StatusCode.outOfRange]; an owner that cannot be connected, or is
   /// missing from the service table, with [StatusCode.unavailable]. An
   /// explicit instance bypasses slot routing (the shard is still carried
@@ -919,7 +923,15 @@ class Switchboard {
     }
     var entry = refresh ? null : r.slotOwner(type, slot);
     if (entry == null && (refresh || table.space.mode == SlotMode.managed)) {
-      entry = await r.locateSlot(type, slot);
+      entry = await r
+          .locateSlot(type, slot)
+          .timeout(
+            slotRefreshTimeout,
+            onTimeout: () => throw SwitchboardException.of(
+              StatusCode.unavailable,
+              'slot $type/$slot not located within $slotRefreshTimeout',
+            ),
+          );
     }
     if (entry == null || entry.owner == 0) {
       throw SwitchboardException.of(
@@ -1030,7 +1042,7 @@ class Switchboard {
   /// retry fails, the returned channel ends with the `MOVED` status. See
   /// [SlotChannel] for why a `MOVED` after the first subframe is not
   /// retried (the caller may open again and resend: nothing was
-  /// processed) and why an `ABORTED` for a slot move never is.
+  /// processed) and why a `RELOCATED` never is.
   ///
   /// Throws like [openChannel].
   Future<SlotChannel> openChannelToSlot(

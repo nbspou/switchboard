@@ -36,7 +36,8 @@ enum StatusCode {
   connectionLost(34),
   frameTooLarge(35),
   unsupported(36),
-  moved(37);
+  moved(37),
+  relocated(38);
 
   const StatusCode(this.code);
 
@@ -54,11 +55,11 @@ enum StatusCode {
 /// A status: a `u16` code and an optional human readable reason.
 ///
 /// The reason is for logs only; programs must not branch on it. A code's
-/// definition may place fixed fields before the reason (`MOVED`, see
-/// `MovedStatus`); this class does not interpret them: a decoded status
-/// keeps the bytes after the code exactly as received, [encode] writes
-/// them back unchanged (so relaying a status is lossless), and [reason]
-/// is their UTF-8 decoding.
+/// definition may place fixed fields before the reason (`MOVED` and
+/// `RELOCATED`, see `MovedStatus`); this class does not interpret them: a
+/// decoded status keeps the bytes after the code exactly as received,
+/// [encode] writes them back unchanged (so relaying a status is lossless),
+/// and [reason] is their UTF-8 decoding.
 class Status {
   /// A status with [code] and the human readable [reason].
   const Status(this.code, [this.reason = '']) : _body = null;

@@ -880,9 +880,15 @@ void main() {
     late Switchboard proxy;
     late Switchboard client;
 
-    /// The proxy, with [budget] channels per client connection, and a
-    /// client of it.
-    Future<void> startProxy({int budget = 256}) async {
+    /// The proxy, with [budget] channels per client connection and the
+    /// other options of [proxyHandler], and a client of it.
+    Future<void> startProxy({
+      int budget = 256,
+      bool revealOwners = false,
+      bool allowExplicitInstance = false,
+      int maxLocates = 32,
+      Duration refill = const Duration(seconds: 1),
+    }) async {
       proxy = Switchboard(
         muxOptions: fast,
         slotRefreshTimeout: const Duration(milliseconds: 500),
@@ -892,6 +898,10 @@ void main() {
         proxy,
         resolver: table,
         maxChannelsPerConnection: budget,
+        revealOwners: revealOwners,
+        allowExplicitInstance: allowExplicitInstance,
+        maxLocatesPerConnection: maxLocates,
+        locateRefillInterval: refill,
       );
       final proxyUri = await proxy.listenTcp('127.0.0.1', 0);
       client = Switchboard(
@@ -906,8 +916,8 @@ void main() {
     /// echoes (`<id>:<data>`); rejects with MOVED at once
     /// (`moved:<owner>:<epoch>`, `moved:` naming none); rejects with MOVED
     /// once data arrived (`movedAfter:...`); greets, then rejects with
-    /// MOVED (`greetMoved:...`); closes with ABORTED for a slot move once
-    /// data arrived (`abortedAfter:...`).
+    /// MOVED (`greetMoved:...`); closes with RELOCATED once data arrived
+    /// (`relocatedAfter:...`).
     Future<ServiceRecord> backend(int id) async {
       final node = Switchboard(muxOptions: fast);
       addTearDown(node.close);
@@ -934,9 +944,9 @@ void main() {
           case 'greetMoved':
             channel.send(bytes('$id ${incoming.address.shard}'));
             unawaited(incoming.reject(moved));
-          case 'abortedAfter':
+          case 'relocatedAfter':
             channel.stream.first
-                .then((_) => incoming.reject(fields.toStatus(aborted: true)))
+                .then((_) => incoming.reject(fields.toStatus(relocated: true)))
                 .ignore();
         }
       }, instance: id);
@@ -1015,14 +1025,15 @@ void main() {
       expect(table.located, [4]);
     });
 
-    test('MOVED after data is forwarded to the client', () async {
+    test('MOVED after data is forwarded to the client, owner hidden', () async {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'movedAfter:2:2';
       final channel = await open(4);
       channel.send(bytes('x'));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.moved));
-      expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
+      expect(MovedStatus.fromStatus(status), MovedStatus.unknown);
+      expect(status.encode(), MovedStatus.unknown.encode());
       expect(opened[2], isEmpty);
 
       modes[1] = 'greetMoved:2:2';
@@ -1032,27 +1043,120 @@ void main() {
       expect(opened[2], isEmpty);
     });
 
-    test('ABORTED for a slot move reaches the client byte for byte', () async {
+    test('RELOCATED reaches the client without its owner, never '
+        'retried', () async {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
-      modes[1] = 'abortedAfter:0xFFFFFFFFFF80:0x80000000';
+      modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
       final channel = await open(4);
       channel.send(bytes('x'));
       final status = await channel.done;
-      expect(status, hasCode(StatusCode.aborted));
-      expect(
-        status.encode(),
-        MovedStatus(
-          owner: 0xFFFFFFFFFF80,
-          epoch: 0x80000000,
-        ).encode(aborted: true),
-      );
+      expect(status, hasCode(StatusCode.relocated));
+      expect(status.encode(), MovedStatus.unknown.encode(relocated: true));
       expect(opened[2], isEmpty);
       // Not retried by a client either.
       final slotChannel = await client.openChannelToSlot(zone, 4);
       slotChannel.send(bytes('y'));
-      expect(await slotChannel.done, hasCode(StatusCode.aborted));
+      expect(await slotChannel.done, hasCode(StatusCode.relocated));
       expect(slotChannel.retried, isFalse);
       expect(opened[1], hasLength(2));
+    });
+
+    test('revealOwners: MOVED and RELOCATED byte for byte', () async {
+      await startProxy(revealOwners: true);
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
+      final channel = await open(4);
+      channel.send(bytes('x'));
+      expect(
+        (await channel.done).encode(),
+        MovedStatus(
+          owner: 0xFFFFFFFFFF80,
+          epoch: 0x80000000,
+        ).encode(relocated: true),
+      );
+      modes[1] = 'movedAfter:2:2';
+      final moved = await open(4);
+      moved.send(bytes('x'));
+      final status = await moved.done;
+      expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
+    });
+
+    test(
+      'an explicit instance is routed by the table unless allowed',
+      () async {
+        table
+          ..setSlot(zone, 4, const SlotEntry.migrating(1, 2, epoch: 4))
+          ..setSlot(zone, 5, const SlotEntry.owned(1, epoch: 2));
+        // The client names the instance that is taking the slot over.
+        final overtaking = await client.openChannel(
+          ServiceAddress(zone, 2),
+          shard: 4,
+        );
+        expect(await overtaking.stream.first, bytes('1 4'));
+        expect(opened[1]!.single.instance, 1);
+        expect(opened[2], isEmpty);
+        await overtaking.close();
+        // No LOCATE for a slot with an owner.
+        expect(table.located, isEmpty);
+        await startProxy(allowExplicitInstance: true);
+        final explicit = await client.openChannel(
+          ServiceAddress(zone, 2),
+          shard: 5,
+        );
+        expect(await explicit.stream.first, bytes('2 5'));
+        expect(opened[2]!.single.instance, 2);
+        await explicit.close();
+      },
+    );
+
+    test('LOCATEs per client connection are bounded', () async {
+      await startProxy(maxLocates: 2, refill: Duration.zero);
+      table.answer = (_) => const SlotEntry.owned(2, epoch: 1);
+      for (final slot in [1, 2]) {
+        final located = await open(slot);
+        expect(await located.stream.first, bytes('2 $slot'));
+        await located.close();
+      }
+      // The table still shows no owner: the next one would ask again.
+      final refused = await open(3);
+      expect(await refused.done, hasCode(StatusCode.resourceExhausted));
+      expect(table.located, [1, 2]);
+      // A slot with an owner needs no LOCATE.
+      table.setSlot(zone, 3, const SlotEntry.owned(1, epoch: 1));
+      final owned = await open(3);
+      expect(await owned.stream.first, bytes('1 3'));
+      await owned.close();
+      // Another client connection has its own budget.
+      final other = Switchboard(resolver: client.resolver, muxOptions: fast);
+      addTearDown(other.close);
+      final fresh = await other.openChannel(ServiceAddress(zone), shard: 6);
+      expect(await fresh.stream.first, bytes('2 6'));
+      expect(table.located, [1, 2, 6]);
+    });
+
+    test('the LOCATE budget refills', () async {
+      await startProxy(
+        maxLocates: 1,
+        refill: const Duration(milliseconds: 100),
+      );
+      table.answer = (_) => const SlotEntry.owned(2, epoch: 1);
+      expect(await (await open(1)).stream.first, bytes('2 1'));
+      expect(await (await open(2)).done, hasCode(StatusCode.resourceExhausted));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      expect(await (await open(2)).stream.first, bytes('2 2'));
+      expect(table.located, [1, 2]);
+    });
+
+    test('a LOCATE that does not answer: UNAVAILABLE after '
+        'slotRefreshTimeout', () async {
+      final never = Completer<SlotEntry?>();
+      addTearDown(() => never.complete());
+      table.answer = (_) => never.future;
+      final watch = Stopwatch()..start();
+      final channel = await open(1);
+      expect(await channel.done, hasCode(StatusCode.unavailable));
+      expect(watch.elapsed, greaterThanOrEqualTo(Duration(milliseconds: 450)));
+      expect(table.located, [1]);
     });
 
     test('MOVED with nowhere else to go is forwarded', () async {
@@ -1092,7 +1196,7 @@ class _Locating extends StaticResolver {
   _Locating(super.records);
 
   final List<int> located = [];
-  SlotEntry? Function(int slot) answer = (_) => null;
+  FutureOr<SlotEntry?> Function(int slot) answer = (_) => null;
 
   @override
   Future<SlotEntry?> locateSlot(Name type, int slot) async {

@@ -468,10 +468,13 @@ void main() {
       expect(Procedures.slotSpace.bytes, hexBytes('53 4C 4F 54 53 50 43 00'));
       expect(StatusCode.moved.code, 37);
       expect(StatusCode.fromCode(37), StatusCode.moved);
+      expect(StatusCode.relocated.code, 38);
+      expect(StatusCode.fromCode(38), StatusCode.relocated);
+      expect(StatusCode.fromCode(39), isNull);
     });
   });
 
-  group('MOVED status', () {
+  group('MOVED and RELOCATED status', () {
     test('owner and epoch', () {
       final moved = MovedStatus(owner: 0x1A2B, epoch: 7);
       expect(hexString(moved.encode()), '25 00 2B 1A 00 00 00 00 07 00 00 00');
@@ -481,6 +484,27 @@ void main() {
       );
       expect(moved.hasOwner, isTrue);
       expect(moved.ownerOf(userq), ServiceAddress(userq, 0x1A2B));
+    });
+
+    test('RELOCATED, owner and epoch', () {
+      final relocated = MovedStatus(owner: 0x1A2B, epoch: 7);
+      expect(
+        hexString(relocated.encode(relocated: true)),
+        '26 00 2B 1A 00 00 00 00 07 00 00 00',
+      );
+      expect(
+        MovedStatus.parse(hexBytes('26 00 2B 1A 00 00 00 00 07 00 00 00')),
+        relocated,
+      );
+      final status = relocated.toStatus(relocated: true);
+      expect(status.known, StatusCode.relocated);
+      expect(MovedStatus.carriesFields(status), isTrue);
+      // ABORTED has no fields.
+      expect(
+        MovedStatus.parse(hexBytes('0A 00 2B 1A 00 00 00 00 07 00 00 00')),
+        MovedStatus.unknown,
+      );
+      expect(MovedStatus.carriesFields(Status.of(StatusCode.aborted)), isFalse);
     });
 
     test('unknown', () {
@@ -497,13 +521,13 @@ void main() {
       expect(MovedStatus.unknown.ownerOf(userq), isNull);
     });
 
-    test('largest values, a reason, and ABORTED', () {
+    test('largest values, a reason, and RELOCATED', () {
       final moved = MovedStatus(owner: maxInstance, epoch: maxU32, reason: 'é');
       const hex = 'FF FF FF FF FF FF FF FF FF FF C3 A9';
       expect(hexString(moved.encode()), '25 00 $hex');
-      expect(hexString(moved.encode(aborted: true)), '0A 00 $hex');
+      expect(hexString(moved.encode(relocated: true)), '26 00 $hex');
       expect(MovedStatus.parse(hexBytes('25 00 $hex')), moved);
-      expect(MovedStatus.parse(hexBytes('0A 00 $hex')), moved);
+      expect(MovedStatus.parse(hexBytes('26 00 $hex')), moved);
       expect(
         () => MovedStatus(owner: maxInstance + 1),
         throwsA(isA<RangeError>()),
@@ -513,14 +537,17 @@ void main() {
 
     test('through Status, losslessly', () {
       final moved = MovedStatus(owner: 0xFEDCBA987654, epoch: 0x80000001);
-      for (final aborted in [false, true]) {
-        final status = moved.toStatus(aborted: aborted);
-        expect(status.known, aborted ? StatusCode.aborted : StatusCode.moved);
-        expect(status.encode(), moved.encode(aborted: aborted));
+      for (final relocated in [false, true]) {
+        final status = moved.toStatus(relocated: relocated);
+        expect(
+          status.known,
+          relocated ? StatusCode.relocated : StatusCode.moved,
+        );
+        expect(status.encode(), moved.encode(relocated: relocated));
         expect(MovedStatus.fromStatus(status), moved);
         // A status decoded from the wire re-encodes byte for byte.
         final relayed = Status.decode(status.encode());
-        expect(relayed.encode(), moved.encode(aborted: aborted));
+        expect(relayed.encode(), moved.encode(relocated: relocated));
         expect(relayed, status);
         expect(MovedStatus.fromStatus(relayed), moved);
       }
@@ -542,8 +569,11 @@ void main() {
         '25',
         '25 00',
         '25 00 2B 1A 00 00 00 00 07 00 00',
+        '26 00 2B 1A 00 00 00 00 07 00 00',
         '0E 00 2B 1A 00 00 00 00 07 00 00 00',
+        '0A 00 2B 1A 00 00 00 00 07 00 00 00',
         '25 01 2B 1A 00 00 00 00 07 00 00 00',
+        '27 00 2B 1A 00 00 00 00 07 00 00 00',
       ]) {
         expect(
           MovedStatus.parse(hexBytes(hex)),

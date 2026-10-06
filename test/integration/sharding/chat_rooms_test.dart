@@ -3,7 +3,7 @@
 // the test fast. Room history is in shared storage (a map shared by the
 // servers), so a crashed server's rooms are reassigned at once. Members
 // hold a long-lived channel per room: the server greets them with the
-// history, pushes new messages, and closes their channels with ABORTED
+// history, pushes new messages, and closes their channels with RELOCATED
 // naming the new owner when the room moves (they were served, so MOVED,
 // which means nothing was processed, does not apply); members then rejoin
 // through openTalkToSlot.
@@ -53,9 +53,9 @@ class RoomServer extends SlotLifecycle {
   }
 
   void _dismiss(int slot) {
-    final aborted = gate.abortedStatus(slot);
+    final relocated = gate.relocatedStatus(slot);
     for (final member in members[slot]?.toList() ?? const <IncomingChannel>[]) {
-      unawaited(member.reject(aborted));
+      unawaited(member.reject(relocated));
     }
   }
 
@@ -90,12 +90,12 @@ class RoomServer extends SlotLifecycle {
 }
 
 /// Whether a member rejoins and posts again after [error]: [retryable], or
-/// `ABORTED`, the room moving while the member was in it. Posts carry
+/// `RELOCATED`, the room moving while the member was in it. Posts carry
 /// their author and number, so one that may have been applied is safely
 /// sent again.
 bool rejoinable(Object error) =>
     retryable(error) ||
-    (error is SwitchboardException && error.code == StatusCode.aborted);
+    (error is SwitchboardException && error.code == StatusCode.relocated);
 
 /// A chat member in one room.
 class Member {
@@ -181,7 +181,7 @@ class Member {
 
 void main() {
   test('a crashed server\'s rooms are reassigned at once; members follow '
-      'the rooms through ABORTED', () async {
+      'the rooms through RELOCATED', () async {
     final cluster = Cluster('tcp');
     await cluster.start();
     final storage = <int, List<String>>{};
@@ -264,7 +264,7 @@ void main() {
     }
 
     // It comes back: rooms move to it one at a time, and members on their
-    // old channels are told ABORTED.
+    // old channels are told RELOCATED.
     final movesBefore = watch.moves.length;
     await server(0x41);
     await until(
@@ -291,7 +291,7 @@ void main() {
     stop = true;
     await Future.wait(loops).timeout(limit);
     for (final m in followers) {
-      expect(m.ends.last, StatusCode.aborted, reason: m.name);
+      expect(m.ends.last, StatusCode.relocated, reason: m.name);
     }
 
     // Every post is in its room once, in order; members see the room as

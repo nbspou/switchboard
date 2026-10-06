@@ -522,6 +522,37 @@ void main() {
         throwsStatus(StatusCode.notFound),
       );
     });
+
+    test('a slot being assigned fresh elsewhere is answered once that is '
+        'decided', () async {
+      final a = instance(kv, 1);
+      final b = instance(kv, 2);
+      final decide = Completer<void>();
+      // Slot 0 is refused, slot 1 accepted, both once decided.
+      b.onAssign = (r) async {
+        await decide.future;
+        if (r.slot == 0) {
+          throw SwitchboardException.of(StatusCode.unavailable, 'no');
+        }
+        return const AssignResponse();
+      };
+      // a is registered but takes no slots yet (no SLOTS).
+      await a.start();
+      await b.start(space: SlotSpace(kv, count: 2));
+      await until(() => log.length == 2);
+      List<int>? discard;
+      unawaited(a.holding([0, 1]).then((d) => discard = d));
+      await Future<void>.delayed(ms50);
+      expect(discard, isNull, reason: 'waits for the ASSIGNs');
+      decide.complete();
+      await until(() => discard != null);
+      // Slot 0 stayed free: a holds it and keeps its storage. Slot 1 went
+      // to b, fresh: a's copy is stale.
+      expect(discard, [1]);
+      final table = h.service.slotTable(kv)!;
+      expect(table[0], const SlotEntry.free(holder: 1));
+      expect(table[1], const SlotEntry.owned(2, holder: 2, epoch: 1));
+    });
   });
 
   group('WATCH and LOOKUP', () {
@@ -710,6 +741,126 @@ void main() {
       await b.slots(staticSpace(zone, 4), capacity: 1);
       expect(await migrate(zone, 1, 0), StatusCode.ok);
       expect(h.service.slotTable(zone)![1].owner, 2);
+    });
+  });
+
+  group('hand-over bound', () {
+    /// Two zone instances; 1 owns slots 1 and 2. Returns them and a
+    /// router.
+    (Instance, Instance, Instance) zones(
+      FakeAsync async,
+      Harness h,
+      List<String> log,
+    ) {
+      final a = Instance(h, zone, 1, log);
+      final b = Instance(h, zone, 2, log);
+      unawaited(a.start(space: staticSpace(zone, 4), capacity: 0));
+      unawaited(b.start(space: staticSpace(zone, 4), capacity: 0));
+      async.elapse(ms10);
+      unawaited(a.claim(1));
+      unawaited(a.claim(2));
+      async.elapse(ms10);
+      log.clear();
+      final router = Instance(h, zone, 0, log)..channel = h.link().$1;
+      return (a, b, router);
+    }
+
+    void closeWithoutTimers(FakeAsync async, Harness h) {
+      unawaited(h.close());
+      async.flushMicrotasks();
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    test('a DRAIN running longer is cancelled and the migration rolled '
+        'back', () {
+      fakeAsync((async) {
+        final h = Harness(handoverMaxDuration: const Duration(seconds: 1));
+        final log = <String>[];
+        final (a, _, router) = zones(async, h, log);
+        // Hangs, kept alive with EXTEND all along.
+        a.onDrain = (_) => Completer<void>().future;
+        final m = Migration(router.channel, zone, 1, to: 2);
+        async.elapse(const Duration(milliseconds: 990));
+        expect(log, ['1 DRAIN 1 e2 to2']);
+        Status? status;
+        m.done.then((s) => status = s);
+        async.elapse(const Duration(milliseconds: 20));
+        expect(status?.known, StatusCode.unavailable);
+        expect(status?.reason, contains('ran longer than'));
+        expect(m.phases, ['draining', 'rolledBack']);
+        expect(log, ['1 DRAIN 1 e2 to2', '1 RESUME 1 e1']);
+        expect(
+          h.service.slotTable(zone)![1],
+          const SlotEntry.owned(1, holder: 1, epoch: 1),
+        );
+        // The next migration of the space is not held up.
+        a.onDrain = (_) async {};
+        final next = Migration(router.channel, zone, 2, to: 2);
+        async.elapse(ms10);
+        Status? nextStatus;
+        next.done.then((s) => nextStatus = s);
+        async.flushMicrotasks();
+        expect(nextStatus, Status.ok);
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('an ASSIGN running longer: RESUME to the old owner', () {
+      fakeAsync((async) {
+        final h = Harness(handoverMaxDuration: const Duration(seconds: 1));
+        final log = <String>[];
+        final (_, b, router) = zones(async, h, log);
+        b.onAssign = (_) => Completer<AssignResponse>().future;
+        final m = Migration(router.channel, zone, 1, to: 2);
+        async.elapse(const Duration(milliseconds: 1010));
+        Status? status;
+        m.done.then((s) => status = s);
+        async.flushMicrotasks();
+        expect(status?.known, StatusCode.unavailable);
+        expect(m.phases, ['draining', 'assigning', 'rolledBack']);
+        expect(log, ['1 DRAIN 1 e2 to2', '2 ASSIGN 1 e2 h1', '1 RESUME 1 e1']);
+        expect(h.service.slotTable(zone)![1].owner, 1);
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('an allocator ASSIGN running longer frees the slot for the '
+        'backoff', () {
+      fakeAsync((async) {
+        final h = Harness(handoverMaxDuration: const Duration(seconds: 1));
+        final log = <String>[];
+        final at = <int>[];
+        var first = true;
+        final a = Instance(h, kv, 1, log)
+          ..onAssign = (_) {
+            at.add(async.elapsed.inMilliseconds);
+            if (first) {
+              first = false;
+              return Completer<AssignResponse>().future;
+            }
+            return Future.value(const AssignResponse());
+          };
+        unawaited(a.start(space: SlotSpace(kv, count: 1)));
+        async.elapse(const Duration(seconds: 3));
+        // Cancelled after 1 s, offered again after the 200 ms backoff.
+        expect(at, [0, 1200]);
+        expect(
+          h.service.slotTable(kv)![0],
+          const SlotEntry.owned(1, holder: 1, epoch: 1),
+        );
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('rejects a negative bound', () {
+      expect(
+        () => NamingService(handoverMaxDuration: const Duration(seconds: -1)),
+        throwsArgumentError,
+      );
+      final service = NamingService(assignmentHold: Duration.zero);
+      expect(service.handoverMaxDuration, const Duration(minutes: 10));
+      unawaited(service.close());
     });
   });
 
@@ -926,6 +1077,65 @@ void main() {
           '1 FORWARD 0 e2 to3',
         ]);
         expect(counts(table), {1: 1, 2: 2, 3: 1});
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('a refused DRAIN of a rebalancing migration waits for a backoff', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: ms50);
+        final log = <String>[];
+        final at = <int, List<int>>{};
+        final a = Instance(h, kv, 1, log)
+          ..onDrain = (r) async {
+            at.putIfAbsent(r.slot, () => []).add(async.elapsed.inMilliseconds);
+            throw SwitchboardException.of(StatusCode.unavailable, 'busy');
+          };
+        final space = SlotSpace(kv, count: 2);
+        unawaited(a.start(space: space));
+        async.elapse(ms50 * 2);
+        expect(counts(h.service.slotTable(kv)!), {1: 2});
+        final joined = async.elapsed.inMilliseconds;
+        unawaited(Instance(h, kv, 3, log).start(space: space, capacity: 3));
+        async.elapse(const Duration(seconds: 2));
+        // Each slot is retried at the backoff intervals, not at once.
+        for (final slot in [0, 1]) {
+          expect(at[slot]!.map((t) => t - joined), [0, 200, 600, 1400]);
+        }
+        expect(counts(h.service.slotTable(kv)!), {1: 2});
+        closeWithoutTimers(async, h);
+      });
+    });
+
+    test('rebalancing takes a slot from the next over-share instance when '
+        'the first has none it can move', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: ms50);
+        final log = <String>[];
+        final space = SlotSpace(kv, count: 4);
+        final a = Instance(h, kv, 1, log)
+          ..onDrain = (_) async =>
+              throw SwitchboardException.of(StatusCode.unavailable, 'busy');
+        unawaited(a.start(space: space));
+        unawaited(Instance(h, kv, 2, log).start(space: space));
+        async.elapse(ms50 * 2);
+        final table = h.service.slotTable(kv)!;
+        expect(counts(table), {1: 2, 2: 2});
+        final [a0, a1] = table.slotsOf(1)..sort();
+        final b0 = (table.slotsOf(2)..sort()).first;
+        log.clear();
+        unawaited(Instance(h, kv, 3, log).start(space: space));
+        async.elapse(ms50);
+        expect(log, [
+          '1 DRAIN $a0 e2 to3',
+          '1 RESUME $a0 e1',
+          '1 DRAIN $a1 e2 to3',
+          '1 RESUME $a1 e1',
+          '2 DRAIN $b0 e2 to3',
+          '3 ASSIGN $b0 e2 h2',
+          '2 FORWARD $b0 e2 to3',
+        ]);
+        expect(counts(table), {1: 2, 2: 1, 3: 1});
         closeWithoutTimers(async, h);
       });
     });

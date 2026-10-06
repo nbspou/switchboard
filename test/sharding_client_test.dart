@@ -6,6 +6,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:fake_async/fake_async.dart';
+import 'package:switchboard/src/address/service_address.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_client.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
@@ -313,6 +314,9 @@ void main() {
     await until(() => handlerA.revoked.isNotEmpty);
     expect(handlerA.revoked, ['zone/1']);
     expect(log, ['A RESUME 1 e1', 'B ASSIGN 1 e3 h2', 'A REVOKE 1']);
+    // A's HOLDING after the restart listed slot 1, held by B now.
+    await until(() => handlerA.discarded.isNotEmpty);
+    expect(handlerA.discarded, ['zone: 1']);
     expect(a.servedSlots(zone), isEmpty);
     expect(b.servedSlots(zone), {1: 3});
     final table = restarted.service.slotTable(zone)!;
@@ -331,7 +335,7 @@ void main() {
     log.clear();
     final restarted = Harness(
       assignmentHold: ms50,
-      holdingSettle: const Duration(seconds: 1),
+      holdingSettle: Harness.productionSettle,
     );
     addTearDown(restarted.close);
     connect.harness = restarted;
@@ -352,7 +356,7 @@ void main() {
     log.clear();
     final restarted = Harness(
       assignmentHold: ms50,
-      holdingSettle: const Duration(seconds: 1),
+      holdingSettle: Harness.productionSettle,
     );
     addTearDown(restarted.close);
     connect.harness = restarted;
@@ -385,7 +389,7 @@ void main() {
     // instance is back: SLOTS gives it capacity before its HOLDING is
     // processed, and the settle window keeps the allocator from starting
     // those slots fresh (holder 0) meanwhile.
-    final restarted = Harness(holdingSettle: const Duration(seconds: 1));
+    final restarted = Harness(holdingSettle: Harness.productionSettle);
     addTearDown(restarted.close);
     connect.harness = restarted;
     await h.close();
@@ -438,6 +442,167 @@ void main() {
     await definedC;
     expect(await discardC, isEmpty);
     expect(sent, ['SLOTS', 'HOLDING']);
+  });
+
+  test('with the service\'s settle window: declared storage first, fresh '
+      'slots once quiet', () async {
+    // The service's default window, as a fresh deployment has it.
+    final h = Harness(holdingSettle: Harness.productionSettle);
+    addTearDown(h.close);
+    final (a, _) = await sharded('A', kv, 1, connect: Connector(h).call);
+    final watch = Stopwatch()..start();
+    // SLOTS and HOLDING back to back, as MeshNode.publishSharded sends them.
+    final defined = a.defineSlots(kv, count: 4);
+    final declared = a.declareHolding(kv, [2]);
+    await defined;
+    expect(await declared, isEmpty);
+    await until(() => log.isNotEmpty);
+    expect(log, ['A ASSIGN 2 e1 h1']);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(log, hasLength(1), reason: 'fresh slots wait for the window');
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    await until(() => log.length == 4);
+    expect(watch.elapsed, greaterThanOrEqualTo(Harness.productionSettle));
+    expect(log.skip(1), everyElement(endsWith('e1 h0')));
+    expect(a.servedSlots(kv).keys.toSet(), {0, 1, 2, 3});
+  });
+
+  test('discards of a HOLDING sent again after a reconnect reach the '
+      'handler', () async {
+    final connect = Connector(h);
+    final (a, handlerA) = await sharded('A', zone, 1, connect: connect.call);
+    await a.defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0);
+    expect(await a.declareHolding(zone, [2, 3]), isEmpty);
+    expect(handlerA.discarded, isEmpty);
+    // A goes away; meanwhile B takes slot 2 (fetching it from A) and is
+    // its holder from then on.
+    connect.down = true;
+    await connect.servers.last.close();
+    await until(() => !h.service.table.containsKey(ServiceAddress(zone, 1)));
+    final b = Instance(h, zone, 2, log);
+    await b.start(space: staticSpace(zone, 4), capacity: 0);
+    await b.claim(2);
+    expect(log, ['2 ASSIGN 2 e1 h1']);
+    expect(h.service.slotTable(zone)![2].holder, 2);
+    connect.down = false;
+    await until(() => handlerA.discarded.isNotEmpty);
+    expect(handlerA.discarded, ['zone: 2']);
+    expect(h.service.slotTable(zone)![3], const SlotEntry.free(holder: 1));
+  });
+
+  test('close while a slot is locked resumes it', () async {
+    final (a, handlerA) = await sharded('A', zone, 1);
+    final (b, handlerB) = await sharded('B', zone, 2);
+    for (final client in [a, b]) {
+      await client.defineSlots(
+        zone,
+        count: 4,
+        mode: SlotMode.static,
+        capacity: 0,
+      );
+    }
+    await a.claim(zone, 1);
+    // B never confirms: the slot stays locked at A.
+    handlerB.assign = (_) => Completer<AssignResult>().future;
+    final router = newClient(Connector(h).call);
+    await router.start();
+    unawaited(router.migrate(zone, 1, to: 2).drain<void>().catchError((_) {}));
+    await until(() => log.contains('B ASSIGN 1 e2 h1'));
+    expect(handlerA.revoked, isEmpty);
+    await a.close();
+    await until(() => log.contains('A RESUME 1 e1'));
+    expect(log, [
+      'A ASSIGN 1 e1 h0',
+      'A DRAIN 1 e2 to2',
+      'B ASSIGN 1 e2 h1',
+      'A RESUME 1 e1',
+    ]);
+  });
+
+  test('a handler running longer than slotHandlerMaxDuration is answered '
+      'DEADLINE_EXCEEDED', () {
+    fakeAsync((async) {
+      final h = Harness(handoverTimeout: const Duration(seconds: 5));
+      final log = <String>[];
+      NamingClient client(String name, int id, RecordingHandler handler) {
+        final c = NamingClient(
+          Connector(h).call,
+          reconnectDelay: reconnectDelay,
+          watchTimeout: clientOptions.requestTimeout,
+          slotExtendInterval: ms50,
+          slotHandlerMaxDuration: const Duration(seconds: 1),
+        )..slotHandler = handler;
+        unawaited(c.start());
+        unawaited(c.register(zone, [], instance: id));
+        async.elapse(ms10);
+        unawaited(
+          c.defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0),
+        );
+        async.elapse(ms10);
+        return c;
+      }
+
+      final handlerA = RecordingHandler('A', log);
+      final handlerB = RecordingHandler('B', log);
+      final a = client('A', 1, handlerA);
+      final b = client('B', 2, handlerB);
+      // An ASSIGN that never completes in time.
+      final loading = Completer<AssignResult>();
+      handlerA.assign = (_) => loading.future;
+      Object? claimed;
+      a
+          .claim(zone, 1)
+          .then<void>((e) => claimed = e, onError: (Object e) => claimed = e);
+      async.elapse(const Duration(milliseconds: 990));
+      expect(claimed, isNull);
+      async.elapse(ms50);
+      expect(claimed, isStatus(StatusCode.unavailable));
+      expect(
+        (claimed! as SwitchboardException).status.reason,
+        contains('deadlineExceeded'),
+      );
+      // Its late outcome is not served.
+      loading.complete(AssignResult.holding);
+      async.elapse(ms10);
+      expect(handlerA.revoked, ['zone/1']);
+      expect(a.servedSlots(zone), isEmpty);
+      // A DRAIN that never completes: the migration is rolled back.
+      handlerA.assign = (_) async => AssignResult.holding;
+      unawaited(a.claim(zone, 2));
+      async.elapse(ms10);
+      handlerA.drain = (_) => Completer<void>().future;
+      log.clear();
+      Object? migrated;
+      // Listened to rather than drained: under fake time the cancel that
+      // drain makes on an error completes outside the fake zone.
+      b
+          .migrate(zone, 2, to: 2)
+          .listen(
+            null,
+            onError: (Object e) => migrated = e,
+            onDone: () => migrated ??= 'done',
+          );
+      async.elapse(const Duration(milliseconds: 1100));
+      expect(log, ['A DRAIN 2 e2 to2', 'A RESUME 2 e1']);
+      expect(migrated, isStatus(StatusCode.unavailable));
+      expect(h.service.slotTable(zone)![2].owner, 1);
+      unawaited(a.close());
+      unawaited(b.close());
+      unawaited(h.close());
+      async.flushMicrotasks();
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    });
+  });
+
+  test('rejects a negative slotHandlerMaxDuration', () {
+    expect(
+      () => NamingClient(
+        () async => throw StateError('unused'),
+        slotHandlerMaxDuration: const Duration(seconds: -1),
+      ),
+      throwsArgumentError,
+    );
   });
 
   test('close leaves no timers while a handler runs', () {

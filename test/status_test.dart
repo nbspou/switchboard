@@ -60,6 +60,11 @@ void main() {
             .toString(),
         'moved: [2b 1a 00 00 00 00 07 00 00 00]',
       );
+      expect(
+        Status.decode(hexBytes('26 00 2B 1A 00 00 00 00 07 00 00 00'))
+            .toString(),
+        'relocated: [2b 1a 00 00 00 00 07 00 00 00]',
+      );
       expect(Status.decode(hexBytes('00 01 FF')).toString(), 'code 256: [ff]');
     });
 

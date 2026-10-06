@@ -76,17 +76,30 @@ Future<(MeshNode, Frontend)> startFrontend(
 }
 
 /// Posts [message] in [guild] from a service that knows nothing of the
-/// frontends but the table; returns who posted it.
+/// frontends but the table; returns who posted it. A transient
+/// `UNAVAILABLE` (a pooled connection replaced under load, say) is retried
+/// a few times, as a real caller would.
 Future<String> post(MeshNode service, int guild, String message) async {
   final count = service.client.slotTable(discord)!.count;
-  final talk = await service.switchboard.openTalkToSlot(
-    discord,
-    (guild >> 22) % count,
-  );
-  try {
-    return text((await talk.request('POST', bytes('$guild $message'))).payload);
-  } finally {
-    await talk.close();
+  for (var attempt = 1; ; attempt++) {
+    try {
+      final talk = await service.switchboard.openTalkToSlot(
+        discord,
+        (guild >> 22) % count,
+      );
+      try {
+        return text(
+          (await talk.request('POST', bytes('$guild $message'))).payload,
+        );
+      } finally {
+        await talk.close();
+      }
+    } on SwitchboardException catch (e) {
+      if (e.code != StatusCode.unavailable || attempt >= 5) {
+        rethrow;
+      }
+      await Future<void>.delayed(Duration(milliseconds: 20 * attempt));
+    }
   }
 }
 
@@ -167,6 +180,39 @@ void main() {
         await until(() => service.slotOwners(discord).isNotEmpty);
         expect(service.slotOwners(discord), {a.gates[discord]!.instance});
         expect(await post(service, 81384788765712384, 'still'), 'A shard 2');
+      });
+
+      test('a frontend whose publish failed publishes again', () async {
+        await startFrontend(cluster, 'A', count: 4, shards: [0]);
+        final mesh = await cluster.member();
+        final frontend = Frontend('B');
+        await expectLater(
+          mesh.publishSharded(
+            discord,
+            frontend,
+            count: 8,
+            mode: SlotMode.static,
+          ),
+          throwsA(
+            isA<SwitchboardException>().having(
+              (e) => e.code,
+              'code',
+              StatusCode.failedPrecondition,
+            ),
+          ),
+        );
+        // The same lifecycle, with the right configuration.
+        final gate = await mesh
+            .publishSharded(discord, frontend, count: 4, mode: SlotMode.static)
+            .timeout(limit);
+        expect(frontend.gate, same(gate));
+        await mesh.claimSlot(discord, 1).timeout(limit);
+        expect(await post(service, (1001 << 22) | 4242, 'again'), 'B shard 1');
+        final report = await mesh.leave();
+        expect(report.released, {
+          discord: [1],
+        });
+        expect(report.handedOver, isEmpty);
       });
 
       test(

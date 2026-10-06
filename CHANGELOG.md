@@ -52,11 +52,15 @@ The protocol specification lives in the project wiki (section
   `FORWARD`, `RESUME` hand-over; on the node, slot-aware routing,
   `openChannelToSlot`, `SlotGate` and `SlotLifecycle`, and
   `MeshNode.publishSharded`; the `MOVED` status with the owner and epoch
-  as fixed fields (nothing was processed), and `ABORTED` with the same
-  fields for served channels; statuses relay byte for byte; use case
-  integration tests
+  as fixed fields (nothing was processed); statuses relay byte for byte;
+  use case integration tests
   (key-value store, Discord frontends, per-user workers, zone servers, chat
   rooms, job partitions).
+- Sharding: status code 38 `RELOCATED` (`StatusCode.relocated`, same
+  fields as `MOVED`) for work the slot moved away from after it started,
+  replacing `ABORTED`, never retried; `MeshNode.leave()` hands each slot
+  of a holder-only managed space over to another instance while the node
+  is still up, releases the rest, and returns a `LeaveReport`.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for
