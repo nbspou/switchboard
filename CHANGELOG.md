@@ -73,7 +73,7 @@ The protocol specification lives in the project wiki (section
   held OPEN payloads, a cap on unconfirmed CLOSEs, output high-water marks,
   a per-client limit on proxied channels, and host hint relaying only on
   request.
-- Tests: 667 tests, including the wiki test vectors (the codec tests also
+- Tests: over 950 tests, including the wiki test vectors (the codec tests also
   run on Node.js with `dart test -P node`) and integration tests over TCP
   and WebSocket.
 - Documentation: README with quick start programs (`example/`), and the
