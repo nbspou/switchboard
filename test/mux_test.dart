@@ -830,11 +830,86 @@ void main() {
       await mux.goAway();
     });
 
+    test('peerGoAwayStatus: the status the peer sent', () async {
+      final (a, b) = muxPair();
+      Status? seen;
+      unawaited(a.peerGoAwayStatus.then((status) => seen = status));
+      await a.ping();
+      expect(seen, isNull);
+      final keep = a.open(empty);
+      final goingAway = b.goAway(Status.of(StatusCode.goingAway, 'deploy'));
+      expect(
+        await a.peerGoAwayStatus.timeout(const Duration(seconds: 5)),
+        Status.of(StatusCode.goingAway, 'deploy'),
+      );
+      expect(a.peerGoingAway, isTrue);
+      expect(a.isOpen, isTrue);
+      await keep.close();
+      await goingAway;
+      // An error GOAWAY keeps its code here; done reports GOING_AWAY.
+      final (c, d) = muxPair();
+      final failing = d.goAway(Status.of(StatusCode.resourceExhausted, 'x'));
+      expect(
+        await c.peerGoAwayStatus.timeout(const Duration(seconds: 5)),
+        Status.of(StatusCode.resourceExhausted, 'x'),
+      );
+      expect(await c.done, hasCode(StatusCode.goingAway));
+      await failing;
+    });
+
+    test('peerGoAwayStatus never completes without a GOAWAY', () async {
+      final (a, b) = muxPair();
+      var completed = false;
+      unawaited(a.peerGoAwayStatus.then((_) => completed = true));
+      await b.close();
+      expect(await a.done, hasCode(StatusCode.connectionLost));
+      await pumpEventQueue();
+      expect(completed, isFalse);
+      // The side that sent GOAWAY never sees one.
+      final (c, d) = muxPair();
+      var dCompleted = false;
+      unawaited(d.peerGoAwayStatus.then((_) => dCompleted = true));
+      await d.goAway();
+      await c.done;
+      await pumpEventQueue();
+      expect(dCompleted, isFalse);
+    });
+
     test('application codes are refused for GOAWAY', () async {
       final (a, _) = muxPair();
       expect(() => a.goAway(const Status(1000)), throwsArgumentError);
       expect(a.isOpen, isTrue);
       await a.close();
+    });
+  });
+
+  group('byte counters', () {
+    test('sentBytes and receivedBytes count whole mux frames', () async {
+      final (a, b) = muxPair(initiator: rawOptions, acceptor: rawOptions);
+      expect(a.sentBytes, 0);
+      expect(a.receivedBytes, 0);
+      final bIncoming = StreamQueue(b.incoming);
+      final ca = a.open(hexBytes('AA BB'));
+      ca.send(Uint8List(100));
+      final rb = await bIncoming.next;
+      final data = StreamQueue(rb.stream);
+      expect(await data.next, hasLength(100));
+      final sent =
+          MuxFrame.open(2, hexBytes('AA BB')).encode().length +
+          MuxFrame.data(2, Uint8List(100)).encode().length;
+      expect(a.sentBytes, sent);
+      expect(b.receivedBytes, sent);
+      rb.send(Uint8List(10));
+      await ca.stream.first;
+      expect(a.receivedBytes, MuxFrame.data(2, Uint8List(10)).encode().length);
+      expect(b.sentBytes, a.receivedBytes);
+      // Control frames count too.
+      final before = a.sentBytes;
+      await a.ping();
+      expect(a.sentBytes, greaterThan(before));
+      expect(b.receivedBytes, a.sentBytes);
+      await a.close();
+      await b.done;
     });
   });
 

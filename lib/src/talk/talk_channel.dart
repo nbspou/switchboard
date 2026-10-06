@@ -205,11 +205,15 @@ class TalkChannel {
 
   /// Sends a plain message (fire and forget).
   ///
+  /// [name], when given, is the procedure instead of [procedure], which is
+  /// then ignored: generated code passes the exact wire name (a [Name]
+  /// need not be valid UTF-8, so a string cannot always stand for it).
+  ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
   /// the channel is closed, and [ArgumentError] if [procedure] is not a
   /// valid name.
-  void send(String procedure, Uint8List payload) =>
-      _send(Name(procedure), payload);
+  void send(String procedure, Uint8List payload, {Name? name}) =>
+      _send(name ?? Name(procedure), payload);
 
   void _send(Name procedure, Uint8List payload) {
     _sendChecked(
@@ -227,12 +231,13 @@ class TalkChannel {
   /// or the channel's failure status. It never reports an unhandled error,
   /// so it may be dropped.
   ///
-  /// Throws synchronously like [startRequest].
+  /// Throws synchronously like [startRequest]. [name] as for [send].
   Future<TalkMessage> request(
     String procedure,
     Uint8List payload, {
     Duration? timeout,
-  }) => startRequest(procedure, payload, timeout: timeout).response;
+    Name? name,
+  }) => startRequest(procedure, payload, timeout: timeout, name: name).response;
 
   /// Sends a request and returns its handle, through which the response
   /// arrives and the request can be cancelled.
@@ -241,6 +246,9 @@ class TalkChannel {
   /// defaults to [TalkOptions.requestTimeout] and [Duration.zero] disables
   /// it. [onExtend] is called synchronously each time the peer sends
   /// `EXTEND` for the request; exceptions it throws are logged.
+  ///
+  /// [name], when given, is the procedure instead of [procedure], as for
+  /// [send].
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
@@ -251,8 +259,9 @@ class TalkChannel {
     Uint8List payload, {
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) {
-    final name = Name(procedure);
+    final wire = name ?? Name(procedure);
     return _TalkRequest(
       _startRequest(
         stream: false,
@@ -260,7 +269,7 @@ class TalkChannel {
         onExtend: onExtend,
         build: (id) => TalkFrame(
           kind: TalkKind.message,
-          procedure: name,
+          procedure: wire,
           requestId: id,
           payload: payload,
         ),
@@ -276,8 +285,9 @@ class TalkChannel {
     Uint8List payload, {
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) {
-    final name = Name(procedure);
+    final wire = name ?? Name(procedure);
     return _TalkStream(
       _startRequest(
         stream: true,
@@ -285,7 +295,7 @@ class TalkChannel {
         onExtend: onExtend,
         build: (id) => TalkFrame(
           kind: TalkKind.message,
-          procedure: name,
+          procedure: wire,
           requestId: id,
           stream: true,
           payload: payload,
@@ -1110,12 +1120,12 @@ class _Message extends TalkMessage {
     }
   }
 
-  static Name? _name(String? procedure) =>
-      procedure == null ? null : Name(procedure);
+  static Name? _name(String? procedure, Name? name) =>
+      name ?? (procedure == null ? null : Name(procedure));
 
   @override
-  void reply(Uint8List payload, {String? procedure}) =>
-      _reply(payload, _name(procedure));
+  void reply(Uint8List payload, {String? procedure, Name? name}) =>
+      _reply(payload, _name(procedure, name));
 
   void _reply(Uint8List payload, Name? procedure) {
     _check();
@@ -1135,10 +1145,12 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
+    Name? name,
   }) => startReplyRequest(
     payload,
     procedure: procedure,
     timeout: timeout,
+    name: name,
   ).response;
 
   @override
@@ -1147,10 +1159,11 @@ class _Message extends TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) => _TalkRequest(
     _startReplyRequest(
       payload,
-      _name(procedure),
+      _name(procedure, name),
       stream: false,
       timeout: timeout,
       onExtend: onExtend,
@@ -1163,10 +1176,11 @@ class _Message extends TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) => _TalkStream(
     _startReplyRequest(
       payload,
-      _name(procedure),
+      _name(procedure, name),
       stream: true,
       timeout: timeout,
       onExtend: onExtend,
@@ -1201,8 +1215,8 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void replyItem(Uint8List payload, {String? procedure}) =>
-      _replyItem(payload, _name(procedure));
+  void replyItem(Uint8List payload, {String? procedure, Name? name}) =>
+      _replyItem(payload, _name(procedure, name));
 
   void _replyItem(Uint8List payload, Name? procedure) {
     _check(item: true);
@@ -1222,10 +1236,12 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
+    Name? name,
   }) => startReplyItemRequest(
     payload,
     procedure: procedure,
     timeout: timeout,
+    name: name,
   ).response;
 
   @override
@@ -1234,10 +1250,11 @@ class _Message extends TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) => _TalkRequest(
     _startItemRequest(
       payload,
-      _name(procedure),
+      _name(procedure, name),
       stream: false,
       timeout: timeout,
       onExtend: onExtend,
@@ -1250,10 +1267,11 @@ class _Message extends TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   }) => _TalkStream(
     _startItemRequest(
       payload,
-      _name(procedure),
+      _name(procedure, name),
       stream: true,
       timeout: timeout,
       onExtend: onExtend,

@@ -13,6 +13,7 @@ import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
+import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
@@ -527,6 +528,47 @@ void main() {
         MuxControlMessage.goAway(Status.of(StatusCode.unavailable, 'x' * 2000))
             .payload,
         hasLength(MuxControlMessage.maxControlPayload),
+      );
+    });
+
+    test('truncation keeps fixed fields before the reason', () {
+      final moved = MovedStatus(
+        owner: 0xFEDCBA987654,
+        epoch: 7,
+        reason: '€' * 400,
+      ).toStatus();
+      final cut = truncateStatus(moved, 1024);
+      final encoded = cut.encode();
+      expect(encoded.length, inInclusiveRange(1022, 1024));
+      expect(encoded.sublist(0, 12), moved.encode().sublist(0, 12));
+      final fields = MovedStatus.fromStatus(cut);
+      expect(fields.owner, 0xFEDCBA987654);
+      expect(fields.epoch, 7);
+      expect(fields.reason.replaceAll('€', ''), isEmpty);
+      // No room for the reason: the fields alone; no room for the fields:
+      // nothing, never part of them.
+      expect(
+        MovedStatus.fromStatus(truncateStatus(moved, 12)).owner,
+        0xFEDCBA987654,
+      );
+      expect(truncateStatus(moved, 11), const Status(37));
+      expect(truncateStatus(moved, 2), const Status(37));
+    });
+
+    test('a MOVED status crosses a CLOSE byte for byte', () async {
+      final (a, b) = muxPair();
+      final ca = a.open(empty);
+      final cb = await b.incoming.first;
+      final moved = MovedStatus(
+        owner: 0x80FF80FF80FF,
+        epoch: 0x80808080,
+      ).toStatus(aborted: true);
+      await cb.close(moved);
+      final received = await ca.done;
+      expect(received.encode(), moved.encode());
+      expect(
+        MovedStatus.fromStatus(received),
+        MovedStatus(owner: 0x80FF80FF80FF, epoch: 0x80808080),
       );
     });
 

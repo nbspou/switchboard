@@ -25,9 +25,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// instance [rejectedBy] closed with [moved], or returns null when there is
 /// nowhere else to go.
 ///
-/// The target is the owner the reason names, unless the resolver's table
-/// has an entry with a higher epoch; when the reason names none, the owner
-/// [SlotResolver.locateSlot] finds within [Switchboard.slotRefreshTimeout].
+/// The target is the owner the status names ([MovedStatus]), unless the
+/// resolver's table has an entry with a higher epoch; when the status
+/// names none, the owner [SlotResolver.locateSlot] finds within
+/// [Switchboard.slotRefreshTimeout].
 /// An owner equal to [rejectedBy] does not count. Through a resolver
 /// without a table for the type, the target is the named owner, or the
 /// same address again (instance 0).
@@ -49,16 +50,15 @@ Future<MuxChannel?> reopenAtSlotOwner(
   final slot = header.shard!;
   final named = MovedStatus.fromStatus(moved);
   var target = 0;
-  final owner = named.owner;
-  if (owner != null && owner.type == type && owner.instance != rejectedBy) {
-    target = owner.instance;
+  if (named.hasOwner && named.owner != rejectedBy) {
+    target = named.owner;
   }
   final r = resolver ?? switchboard.resolver;
   if (r is SlotResolver && r.slotTable(type) != null) {
     final mirrored = r.slotOwner(type, slot);
     if (mirrored != null &&
         mirrored.owner != rejectedBy &&
-        (target == 0 || mirrored.epoch > (named.epoch ?? 0))) {
+        (target == 0 || mirrored.epoch > named.epoch)) {
       target = mirrored.owner;
     }
     if (target == 0) {

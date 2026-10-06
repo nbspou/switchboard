@@ -1021,14 +1021,16 @@ class Switchboard {
   /// such as the [EndpointResolver] of a frontend client, the endpoint
   /// routes). If the owner rejects it with CLOSE `MOVED` before anything
   /// was sent or received, it is retried once, with the same [payload]
-  /// (default: [defaultPayload]): to the owner the rejection names, unless
-  /// the resolver's table has a more recent one; when it names none, to
-  /// the owner the resolver finds by asking ([SlotResolver.locateSlot],
-  /// bounded by [slotRefreshTimeout]); through a resolver without slot
-  /// tables, the same address again. When the refresh finds no owner
-  /// other than the instance that rejected, or the retry fails, the
-  /// returned channel ends with the `MOVED` status. See [SlotChannel] for
-  /// why a `MOVED` after the first subframe is not retried.
+  /// (default: [defaultPayload]): to the owner the rejection names
+  /// (`MovedStatus`), unless the resolver's table has a more recent one;
+  /// when it names none, to the owner the resolver finds by asking
+  /// ([SlotResolver.locateSlot], bounded by [slotRefreshTimeout]); through
+  /// a resolver without slot tables, the same address again. When the
+  /// refresh finds no owner other than the instance that rejected, or the
+  /// retry fails, the returned channel ends with the `MOVED` status. See
+  /// [SlotChannel] for why a `MOVED` after the first subframe is not
+  /// retried (the caller may open again and resend: nothing was
+  /// processed) and why an `ABORTED` for a slot move never is.
   ///
   /// Throws like [openChannel].
   Future<SlotChannel> openChannelToSlot(

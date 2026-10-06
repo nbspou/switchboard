@@ -289,6 +289,9 @@ class MuxConnection {
   bool _writable = true;
   bool _goAwaySent = false;
   Status? _peerGoAway;
+  final Completer<Status> _peerGoAwayStatus = Completer<Status>();
+  int _sentBytes = 0;
+  int _receivedBytes = 0;
   MuxLimits? _peerLimits;
   Completer<void>? _idle;
   Future<void>? _closeFuture;
@@ -322,6 +325,28 @@ class MuxConnection {
 
   /// Whether the peer sent GOAWAY.
   bool get peerGoingAway => _peerGoAway != null;
+
+  /// Completes with the status of the peer's GOAWAY when it arrives:
+  /// `GOING_AWAY` for a graceful shutdown, or the error the peer ended the
+  /// connection with (`PROTOCOL_ERROR`, `RESOURCE_EXHAUSTED`, ...), with
+  /// its reason. An application code, which GOAWAY must not carry, reads
+  /// as `UNKNOWN` as in [done].
+  ///
+  /// Never completes if the connection ends without a GOAWAY from the
+  /// peer, and never completes with an error. Lets a client that cannot
+  /// see the transport notice a server draining (to reconnect elsewhere
+  /// before [done]), and tell it from a loss.
+  Future<Status> get peerGoAwayStatus => _peerGoAwayStatus.future;
+
+  /// Bytes of the mux frames handed to the transport so far, headers
+  /// included. The transport's own framing (the stream binding's length
+  /// prefix, WebSocket headers, TLS) is not counted, and frames handed
+  /// over are not necessarily sent yet (see `OutputBufferedTransport`).
+  int get sentBytes => _sentBytes;
+
+  /// Bytes of the mux frames received from the transport so far, headers
+  /// included, counted as [sentBytes] is.
+  int get receivedBytes => _receivedBytes;
 
   /// Limits the peer announced with LIMITS, or null if none arrived.
   MuxLimits? get peerLimits => _peerLimits;
@@ -557,7 +582,9 @@ class MuxConnection {
       return;
     }
     try {
-      _transport.sink.add(frame.encode());
+      final bytes = frame.encode();
+      _transport.sink.add(bytes);
+      _sentBytes += bytes.length;
     } on Object catch (e) {
       _log.fine('$this: transport write failed: $e');
       _writable = false;
@@ -591,6 +618,7 @@ class MuxConnection {
     if (_closing) {
       return;
     }
+    _receivedBytes += bytes.length;
     _noteReceive();
     try {
       _handleFrame(bytes);
@@ -758,6 +786,7 @@ class MuxConnection {
         _peerGoAway = status.known == StatusCode.goingAway
             ? status
             : Status.of(StatusCode.goingAway, status.toString());
+        _peerGoAwayStatus.complete(status);
         scheduleMicrotask(_checkIdle);
       case MuxControlType.limits:
         _peerLimits = MuxLimits.decode(message.payload);

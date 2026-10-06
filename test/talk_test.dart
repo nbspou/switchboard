@@ -2167,4 +2167,253 @@ void main() {
       expect(peer.mux!.closedWith.single.known, StatusCode.protocolError);
     });
   });
+
+  group('generated stub conveniences', () {
+    // Not valid UTF-8: a string cannot stand for these names.
+    final odd = Name.fromBytes([0xFF, 0x41, 0, 0, 0, 0, 0, 0]);
+    final other = Name.fromBytes([0x80, 0, 0, 0, 0, 0, 0, 0]);
+    const ignored = 'not used: longer than eight bytes';
+
+    test('a Name takes precedence over the procedure string', () async {
+      final p = Pair();
+      final seen = <Name>[];
+      serve(p.b, (m) async {
+        seen.add(m.procedure);
+        if (!m.expectsReply) {
+          return;
+        }
+        if (m.expectsStream) {
+          m.replyItem(bytes([1]), procedure: ignored, name: other);
+          final answer = await m.replyItemRequest(
+            bytes([2]),
+            procedure: ignored,
+            name: other,
+          );
+          m.reply(answer.payload, procedure: ignored, name: odd);
+        } else {
+          final back = await m.replyRequest(
+            bytes([3]),
+            procedure: ignored,
+            name: other,
+          );
+          expect(back.payload, [4]);
+        }
+      });
+      p.a.send(ignored, bytes([0]), name: odd);
+      final chained = await p.a.request(ignored, bytes([0]), name: odd);
+      expect(chained.procedure, other);
+      chained.reply(bytes([4]));
+      final stream = p.a.streamRequest(ignored, bytes([0]), name: odd);
+      final items = StreamQueue(stream.items);
+      final item = await items.next;
+      expect(item.procedure, other);
+      final asking = await items.next;
+      expect(asking.procedure, other);
+      asking.reply(bytes([5]));
+      final end = await stream.done;
+      expect(end.procedure, odd);
+      expect(end.payload, [5]);
+      await pumpEventQueue();
+      expect(seen, [odd, odd, odd]);
+      expect(
+        p.aToB.where((f) => f.responseId == 0).map((f) => f.procedure),
+        everyElement(odd),
+      );
+      // Without a name the string still applies, and is still checked.
+      expect(() => p.a.send(ignored, bytes([0])), throwsArgumentError);
+      await p.close();
+    });
+
+    test(
+      'startRequest and the start/stream reply variants take a name too',
+      () async {
+        final p = Pair();
+        serve(p.b, (m) {
+          if (m.expectsStream) {
+            m
+              ..startReplyItemRequest(bytes([1]), name: other).response.ignore()
+              ..replyItemStreamRequest(bytes([2]), name: other).done.ignore()
+              ..replyStreamRequest(bytes([3]), name: odd).done.ignore();
+          } else {
+            m.startReplyRequest(bytes([4]), name: odd).response.ignore();
+          }
+        });
+        final single = await p.a
+            .startRequest(ignored, bytes([0]), name: odd)
+            .response;
+        expect(single.procedure, odd);
+        final stream = p.a.streamRequest('S', bytes([0]));
+        final items = StreamQueue(stream.items);
+        expect((await items.next).procedure, other);
+        expect((await items.next).procedure, other);
+        expect((await stream.done).procedure, odd);
+        await items.cancel();
+        await p.close();
+      },
+    );
+
+    test('replyStream: every item, then the trailer', () async {
+      final p = Pair();
+      final finished = Completer<void>();
+      serve(p.b, (m) {
+        if (m.procedureName == 'NONE') {
+          // Without a trailer the final reply is empty.
+          m.replyStream(const Stream.empty()).ignore();
+          return;
+        }
+        finished.complete(
+          m.replyStream(
+            Stream.fromIterable([
+              bytes([1]),
+              bytes([2]),
+              bytes([3]),
+            ]),
+            trailer: bytes([9]),
+            name: odd,
+          ),
+        );
+      });
+      final stream = p.a.streamRequest('LIST', Uint8List(0));
+      final items = await stream.items.toList();
+      expect(items.map((m) => m.payload.single), [1, 2, 3]);
+      expect(items.map((m) => m.procedure), everyElement(odd));
+      final end = await stream.done;
+      expect(end.payload, [9]);
+      expect(end.procedure, odd);
+      await finished.future;
+      final empty = p.a.streamRequest('NONE', Uint8List(0));
+      expect(await empty.items.toList(), isEmpty);
+      expect((await empty.done).payload, isEmpty);
+      await p.close();
+    });
+
+    test('replyStream: a failing source aborts the request', () async {
+      for (final (error, code) in [
+        (StateError('boom'), StatusCode.internal),
+        (SwitchboardException.of(StatusCode.notFound), StatusCode.notFound),
+        (
+          TalkAbortException(Status.of(StatusCode.dataLoss)),
+          StatusCode.dataLoss,
+        ),
+        (SwitchboardException(Status.ok), StatusCode.internal),
+      ]) {
+        final p = Pair();
+        serve(p.b, (m) {
+          unawaited(
+            m.replyStream(() async* {
+              yield bytes([1]);
+              throw error;
+            }()),
+          );
+        });
+        final stream = p.a.streamRequest('X', Uint8List(0));
+        final items = StreamQueue(stream.items);
+        expect((await items.next).payload, [1]);
+        await expectLater(items.next, throwsStatus(code), reason: '$error');
+        await expectLater(stream.done, throwsStatus(code));
+        await p.close();
+      }
+      final p = Pair();
+      serve(p.b, (m) {
+        unawaited(
+          m.replyStream(
+            Stream.error(SwitchboardException(const Status(300, 'app'))),
+          ),
+        );
+      });
+      await expectLater(
+        p.a.streamRequest('X', Uint8List(0)).done,
+        throwsA(
+          isA<TalkAbortException>().having(
+            (e) => e.status,
+            'status',
+            const Status(300, 'app'),
+          ),
+        ),
+      );
+      await p.close();
+    });
+
+    test('replyStream: a cancel stops consuming the source', () async {
+      final p = Pair();
+      var cancelled = false;
+      final source = StreamController<Uint8List>(
+        onCancel: () => cancelled = true,
+      );
+      final finished = Completer<void>();
+      serve(p.b, (m) => finished.complete(m.replyStream(source.stream)));
+      final stream = p.a.streamRequest('X', Uint8List(0));
+      final items = StreamQueue(stream.items);
+      source.add(bytes([1]));
+      expect((await items.next).payload, [1]);
+      stream.cancel();
+      await finished.future.timeout(const Duration(seconds: 5));
+      expect(cancelled, isTrue);
+      source.add(bytes([2]));
+      await pumpEventQueue();
+      final sent = p.bToA.where((f) => f.kind == TalkKind.streamItem);
+      expect(sent, hasLength(1));
+      expect(p.bToA.last.kind, TalkKind.abort);
+      expect(p.bToA.last.status.known, StatusCode.cancelled);
+      await source.close();
+      await p.close();
+    });
+
+    test(
+      'replyStream: the channel closing stops consuming the source',
+      () async {
+        final p = Pair();
+        var cancelled = false;
+        final source = StreamController<Uint8List>(
+          onCancel: () => cancelled = true,
+        );
+        final finished = Completer<void>();
+        serve(p.b, (m) => finished.complete(m.replyStream(source.stream)));
+        final stream = p.a.streamRequest('X', Uint8List(0));
+        source.add(bytes([1]));
+        expect((await stream.items.first).payload, [1]);
+        await p.b.close();
+        await finished.future.timeout(const Duration(seconds: 5));
+        expect(cancelled, isTrue);
+        await source.close();
+        await p.close();
+      },
+    );
+
+    test(
+      'replyStream throws at once when no stream answer can start',
+      () async {
+        final p = Pair();
+        final source = StreamController<Uint8List>();
+        final arrived = StreamQueue(p.b.messages);
+        p.a.send('PLAIN', Uint8List(0));
+        final plain = await arrived.next;
+        expect(
+          () => plain.replyStream(source.stream),
+          throwsStatus(StatusCode.failedPrecondition),
+        );
+        final answer = p.a.request('ONE', Uint8List(0));
+        final single = await arrived.next;
+        expect(
+          () => single.replyStream(source.stream),
+          throwsStatus(StatusCode.failedPrecondition),
+        );
+        single.reply(Uint8List(0));
+        await answer;
+        final stream = p.a.streamRequest('MANY', Uint8List(0));
+        final many = await arrived.next;
+        many.reply(Uint8List(0));
+        await stream.done;
+        expect(
+          () => many.replyStream(source.stream),
+          throwsStatus(StatusCode.failedPrecondition),
+        );
+        expect(source.hasListener, isFalse);
+        // Never listened to: its close never completes.
+        unawaited(source.close());
+        await arrived.cancel();
+        await p.close();
+      },
+    );
+  });
 }

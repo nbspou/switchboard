@@ -160,18 +160,35 @@ Status _closeStatusFor(Status status) {
 ///
 /// For each channel:
 ///
-/// 1. If [allow] returns false for the address header, the channel is
-///    rejected with `PERMISSION_DENIED`. The default [allow] refuses the
-///    reserved types (`_ns` and the rest of the `_` namespace), so that
-///    the naming service of the mesh behind the proxy is not reachable
-///    through it; pass an explicit [allow] to proxy those deliberately. A
-///    channel without a service type is rejected with `NOT_FOUND`.
+/// 1. If [allow] returns false for the address header, or throws, the
+///    channel is rejected with `PERMISSION_DENIED`. The default [allow]
+///    refuses the reserved types (`_ns` and the rest of the `_`
+///    namespace), so that the naming service of the mesh behind the proxy
+///    is not reachable through it; pass an explicit [allow] to proxy those
+///    deliberately. A channel without a service type is rejected with
+///    `NOT_FOUND`.
 /// 2. If the client connection the channel arrived on already has
-///    [maxChannelsPerConnection] channels being forwarded (0 = no limit),
-///    the channel is rejected with `RESOURCE_EXHAUSTED`. All clients share
-///    the proxy's pooled connections to a backend, so without this bound
-///    one client could use up the channels a backend accepts for everyone.
-/// 3. If the header carries a host hint and [Switchboard.allowHostHint] is
+///    [maxChannelsPerConnection] channels being forwarded or authorized
+///    (0 = no limit), the channel is rejected with `RESOURCE_EXHAUSTED`.
+///    All clients share the proxy's pooled connections to a backend, so
+///    without this bound one client could use up the channels a backend
+///    accepts for everyone.
+/// 3. If [authorize] is given, it is called with the channel and may take
+///    its time, for example to verify the session credential in the
+///    application payload with an authentication service; meanwhile the
+///    channel is not read (the mux buffers what the client sends, within
+///    its limits). It returns the address to forward to: the channel's
+///    own [IncomingChannel.address], or a rewritten one (the shard slot
+///    set from the verified account, the payload replaced by a credential
+///    the backends trust, and so on), which steps 4 and 5 use instead of
+///    the client's. It returns null to reject the channel with
+///    `UNAUTHENTICATED`; a throw rejects it with `PERMISSION_DENIED`; an
+///    address without a service type is rejected with `NOT_FOUND`. If it
+///    has not answered within [authorizeTimeout] (default 10 s,
+///    [Duration.zero] for no bound) the channel is rejected with
+///    `UNAUTHENTICATED` and its late answer is ignored. A channel whose
+///    client closed it meanwhile is dropped.
+/// 4. If the header carries a host hint and [Switchboard.allowHostHint] is
 ///    set, the proxy connects to that host: a URI, or `host:port` meaning
 ///    `tcp://host:port`. Otherwise the hint is ignored and the destination
 ///    is resolved with [resolver] (default: [Switchboard.resolver]) as in
@@ -184,11 +201,12 @@ Status _closeStatusFor(Status status) {
 ///    A channel with a shard slot whose type has a slot table in the
 ///    resolver goes to the slot's owner (the old owner while the slot
 ///    migrates; see [Switchboard.selectAndConnect]).
-/// 4. A channel is opened to the destination with the same open payload,
-///    except that the host hint is removed and the instance is set to the
-///    selected one. The application payload is forwarded unchanged; the
-///    proxy's own [Switchboard.defaultPayload] is not applied.
-/// 5. The two channels are joined with [pipeChannels]. For a slot routed
+/// 5. A channel is opened to the destination with the same open payload
+///    (as rewritten by [authorize]), except that the host hint is removed
+///    and the instance is set to the selected one. The application payload
+///    is forwarded unchanged; the proxy's own [Switchboard.defaultPayload]
+///    is not applied.
+/// 6. The two channels are joined with [pipeChannels]. For a slot routed
 ///    by a slot table, if the owner rejects the channel with CLOSE `MOVED`
 ///    before any subframe has been piped either way, the proxy opens it
 ///    once more at the new owner (named by the rejection, or a newer table
@@ -196,9 +214,12 @@ Status _closeStatusFor(Status status) {
 ///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
 ///    instance set to the new owner's, and the client does not notice.
 ///    After the first subframe, or when no other owner is found, the
-///    `MOVED` is forwarded to the client, which retries itself (see
-///    `Switchboard.openChannelToSlot`). The retry counts as the same
-///    channel for [maxChannelsPerConnection].
+///    `MOVED` is forwarded to the client, which may open the channel again
+///    and resend, since `MOVED` means nothing was processed (see
+///    `Switchboard.openChannelToSlot`). An `ABORTED` for a slot move (the
+///    owner was serving the channel) is forwarded unchanged and never
+///    retried. The retry counts as the same channel for
+///    [maxChannelsPerConnection].
 ///
 /// Rejections carry the status code and a generic reason only; the
 /// details (instance ids, endpoints, resolver state) are logged locally.
@@ -208,6 +229,8 @@ Status _closeStatusFor(Status status) {
 ChannelHandler proxyHandler(
   Switchboard switchboard, {
   bool Function(ChannelAddress address)? allow,
+  FutureOr<ChannelAddress?> Function(IncomingChannel incoming)? authorize,
+  Duration authorizeTimeout = const Duration(seconds: 10),
   Resolver? resolver,
   int maxChannelsPerConnection = 256,
 }) {
@@ -215,11 +238,18 @@ ChannelHandler proxyHandler(
     maxChannelsPerConnection,
     'maxChannelsPerConnection',
   );
+  if (authorizeTimeout.isNegative) {
+    throw ArgumentError.value(
+      authorizeTimeout,
+      'authorizeTimeout',
+      'must not be negative',
+    );
+  }
   final permitted = allow ?? _notReserved;
   // Channels being forwarded, per client connection.
   final forwarding = Expando<int>('forwarded channels');
   return (incoming) async {
-    final address = incoming.address;
+    var address = incoming.address;
     bool allowed;
     try {
       allowed = permitted(address);
@@ -236,8 +266,7 @@ ChannelHandler proxyHandler(
       await incoming.reject(genericStatus(StatusCode.permissionDenied));
       return;
     }
-    final type = address.type;
-    if (type == null) {
+    if (address.type == null) {
       _log.fine('proxy: $incoming has no service type');
       await incoming.reject(genericStatus(StatusCode.notFound));
       return;
@@ -254,6 +283,28 @@ ChannelHandler proxyHandler(
     }
     forwarding[client] = count + 1;
     try {
+      if (authorize != null) {
+        final (authorized, refusal) = await _authorize(
+          incoming,
+          authorize,
+          authorizeTimeout,
+        );
+        if (authorized == null) {
+          await incoming.reject(genericStatus(refusal));
+          return;
+        }
+        if (!incoming.channel.canSend) {
+          _log.fine('proxy: $incoming closed while being authorized');
+          return;
+        }
+        address = authorized;
+      }
+      final type = address.type;
+      if (type == null) {
+        _log.fine('proxy: $incoming authorized without a service type');
+        await incoming.reject(genericStatus(StatusCode.notFound));
+        return;
+      }
       final _Backend backend;
       try {
         backend = await _openBackend(switchboard, address, type, resolver);
@@ -302,6 +353,42 @@ ChannelHandler proxyHandler(
 
 bool _notReserved(ChannelAddress address) =>
     !(address.type?.isReserved ?? false);
+
+/// Runs the `authorize` hook of [proxyHandler] on [incoming], bounded by
+/// [timeout] (zero: no bound). Returns the address to forward to, or null
+/// and the code to reject with.
+Future<(ChannelAddress?, StatusCode)> _authorize(
+  IncomingChannel incoming,
+  FutureOr<ChannelAddress?> Function(IncomingChannel incoming) authorize,
+  Duration timeout,
+) async {
+  try {
+    var answer = Future<ChannelAddress?>.sync(() => authorize(incoming));
+    if (timeout > Duration.zero) {
+      answer = answer.timeout(
+        timeout,
+        onTimeout: () => throw const _AuthorizeTimedOut(),
+      );
+    }
+    final address = await answer;
+    if (address == null) {
+      _log.fine('proxy: $incoming not authenticated');
+    }
+    return (address, StatusCode.unauthenticated);
+  } on _AuthorizeTimedOut {
+    _log.info('proxy: $incoming not authorized within $timeout');
+    return (null, StatusCode.unauthenticated);
+  } catch (error, stackTrace) {
+    // Clients can trigger this at will (a malformed credential, say).
+    _log.fine('proxy: authorize refused $incoming', error, stackTrace);
+    return (null, StatusCode.permissionDenied);
+  }
+}
+
+/// The `authorize` hook of [proxyHandler] did not answer in time.
+class _AuthorizeTimedOut implements Exception {
+  const _AuthorizeTimedOut();
+}
 
 /// The outgoing channel of a proxied channel, the header it was opened
 /// with, and whether it went to a host hint rather than through the

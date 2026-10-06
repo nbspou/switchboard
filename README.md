@@ -210,6 +210,7 @@ Future<void> main() async {
     endpoint,
     // Checked for every channel: `chat` only, with a credential.
     allow: (address) => address.type == chat && address.payload.isNotEmpty,
+    // `authorize:` could also verify it asynchronously and rewrite the address.
   );
   // Internet facing, so the listener has a policy. It refuses every type
   // but `chat`, including the reserved ones such as `_ns`.

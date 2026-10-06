@@ -1,6 +1,7 @@
 // Slot-aware routing in the Switchboard: (type, slot) to the owner, the
 // old owner while migrating, LOCATE on a miss in a managed space,
-// UNAVAILABLE in a static one, and the MOVED retry of openChannelToSlot.
+// UNAVAILABLE in a static one, and the MOVED retry of openChannelToSlot
+// (never on ABORTED).
 
 import 'dart:async';
 import 'dart:convert';
@@ -49,8 +50,11 @@ enum Mode {
   /// Sends `<name> <shard>` at once, then echoes `<name>:<data>`.
   greet,
 
-  /// Rejects with MOVED carrying [Backend.reason] at once.
+  /// Rejects with MOVED carrying [Backend.moved] at once.
   moved,
+
+  /// Closes with ABORTED carrying [Backend.moved] at once.
+  aborted,
 
   /// Rejects with MOVED once something arrived.
   movedAfterData,
@@ -70,7 +74,7 @@ class Backend {
   late final Switchboard node;
   late final Uri uri;
   Mode mode = Mode.greet;
-  String reason = '';
+  MovedStatus moved = MovedStatus.unknown;
   final List<ChannelAddress> opened = [];
 
   ServiceRecord get record =>
@@ -86,13 +90,15 @@ class Backend {
   void _serve(IncomingChannel incoming) {
     opened.add(incoming.address);
     final channel = incoming.channel;
-    final moved = Status.of(StatusCode.moved, reason);
+    final moved = this.moved.toStatus();
     switch (mode) {
       case Mode.greet:
         channel.send(bytes('$name ${incoming.address.shard}'));
         channel.stream.listen((d) => channel.send(bytes('$name:${text(d)}')));
       case Mode.moved:
         unawaited(incoming.reject(moved));
+      case Mode.aborted:
+        unawaited(incoming.reject(this.moved.toStatus(aborted: true)));
       case Mode.movedAfterData:
         channel.stream.first.then((_) => incoming.reject(moved)).ignore();
       case Mode.greetThenMoved:
@@ -236,7 +242,7 @@ void main() {
     test('retried once at the owner the reason names', () async {
       a
         ..mode = Mode.moved
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       final channel = await router.openChannelToSlot(svc, 1);
       final answers = StreamQueue(channel.stream.map(text));
       expect(await answers.next.timeout(limit), 'B 1');
@@ -254,7 +260,7 @@ void main() {
     test('the open payload is sent again', () async {
       a
         ..mode = Mode.moved
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       final channel = await router.openChannelToSlot(
         svc,
         1,
@@ -276,7 +282,7 @@ void main() {
     test('a newer table entry wins over the reason', () async {
       a
         ..mode = Mode.moved
-        ..reason = 'svc/9 2';
+        ..moved = MovedStatus(owner: 9, epoch: 2);
       final channel = await router.openChannelToSlot(svc, 1);
       resolver.setSlot(svc, 1, const SlotEntry.owned(2, epoch: 3));
       expect(await greeting(channel), 'B 1');
@@ -295,23 +301,37 @@ void main() {
     test('only once', () async {
       a
         ..mode = Mode.moved
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       b
         ..mode = Mode.moved
-        ..reason = 'svc/1 3';
+        ..moved = MovedStatus(owner: 1, epoch: 3);
       final channel = await router.openChannelToSlot(svc, 1);
       expect(await channel.done, hasCode(StatusCode.moved));
       expect(a.opened, hasLength(1));
       expect(b.opened, hasLength(1));
     });
 
-    test('not after the first send', () async {
+    test('never on ABORTED: the slot moved after work started', () async {
+      a
+        ..mode = Mode.aborted
+        ..moved = MovedStatus(owner: 2, epoch: 2);
+      final channel = await router.openChannelToSlot(svc, 1);
+      final status = await channel.done;
+      expect(status, hasCode(StatusCode.aborted));
+      expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
+      expect(channel.retried, isFalse);
+      expect(b.opened, isEmpty);
+    });
+
+    test('not after the first send; the fields still name the owner', () async {
       a
         ..mode = Mode.movedAfterData
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       final channel = await router.openChannelToSlot(svc, 1);
       channel.sink.add(bytes('x'));
-      expect(await channel.done, hasCode(StatusCode.moved));
+      final status = await channel.done;
+      expect(status, hasCode(StatusCode.moved));
+      expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
       expect(channel.retried, isFalse);
       expect(b.opened, isEmpty);
     });
@@ -319,7 +339,7 @@ void main() {
     test('not after the first subframe received', () async {
       a
         ..mode = Mode.greetThenMoved
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       final channel = await router.openChannelToSlot(svc, 1);
       expect(await channel.stream.toList(), hasLength(1));
       expect(await channel.done, hasCode(StatusCode.moved));
@@ -330,7 +350,7 @@ void main() {
     test('Talk: a server that speaks first gets the retry', () async {
       a
         ..mode = Mode.moved
-        ..reason = 'svc/2 2';
+        ..moved = MovedStatus(owner: 2, epoch: 2);
       b.mode = Mode.talk;
       final talk = await router.openTalkToSlot(svc, 1);
       final hello = await talk.messages.first.timeout(limit);

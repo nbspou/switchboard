@@ -3,8 +3,10 @@
 // the test fast. Room history is in shared storage (a map shared by the
 // servers), so a crashed server's rooms are reassigned at once. Members
 // hold a long-lived channel per room: the server greets them with the
-// history, pushes new messages, and closes their channels with MOVED when
-// the room moves; members then rejoin through openTalkToSlot.
+// history, pushes new messages, and closes their channels with ABORTED
+// naming the new owner when the room moves (they were served, so MOVED,
+// which means nothing was processed, does not apply); members then rejoin
+// through openTalkToSlot.
 
 import 'dart:async';
 
@@ -51,9 +53,9 @@ class RoomServer extends SlotLifecycle {
   }
 
   void _dismiss(int slot) {
-    final moved = gate.movedStatus(slot);
+    final aborted = gate.abortedStatus(slot);
     for (final member in members[slot]?.toList() ?? const <IncomingChannel>[]) {
-      unawaited(member.reject(moved));
+      unawaited(member.reject(aborted));
     }
   }
 
@@ -86,6 +88,14 @@ class RoomServer extends SlotLifecycle {
     );
   }
 }
+
+/// Whether a member rejoins and posts again after [error]: [retryable], or
+/// `ABORTED`, the room moving while the member was in it. Posts carry
+/// their author and number, so one that may have been applied is safely
+/// sent again.
+bool rejoinable(Object error) =>
+    retryable(error) ||
+    (error is SwitchboardException && error.code == StatusCode.aborted);
 
 /// A chat member in one room.
 class Member {
@@ -135,7 +145,7 @@ class Member {
         );
         return _talk = talk;
       } on Object catch (e) {
-        if (!retryable(e)) {
+        if (!rejoinable(e)) {
           rethrow;
         }
         await Future<void>.delayed(const Duration(milliseconds: 5));
@@ -153,7 +163,7 @@ class Member {
         await talk.request('POST', bytes(message));
         return;
       } on Object catch (e) {
-        if (!retryable(e)) {
+        if (!rejoinable(e)) {
           rethrow;
         }
         if (identical(_talk, talk)) {
@@ -171,7 +181,7 @@ class Member {
 
 void main() {
   test('a crashed server\'s rooms are reassigned at once; members follow '
-      'the rooms through MOVED', () async {
+      'the rooms through ABORTED', () async {
     final cluster = Cluster('tcp');
     await cluster.start();
     final storage = <int, List<String>>{};
@@ -254,7 +264,7 @@ void main() {
     }
 
     // It comes back: rooms move to it one at a time, and members on their
-    // old channels are told MOVED.
+    // old channels are told ABORTED.
     final movesBefore = watch.moves.length;
     await server(0x41);
     await until(
@@ -281,7 +291,7 @@ void main() {
     stop = true;
     await Future.wait(loops).timeout(limit);
     for (final m in followers) {
-      expect(m.ends.last, StatusCode.moved, reason: m.name);
+      expect(m.ends.last, StatusCode.aborted, reason: m.name);
     }
 
     // Every post is in its room once, in order; members see the room as

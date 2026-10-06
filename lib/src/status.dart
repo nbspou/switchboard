@@ -53,17 +53,31 @@ enum StatusCode {
 
 /// A status: a `u16` code and an optional human readable reason.
 ///
-/// The reason is for logs only; programs must not branch on it.
+/// The reason is for logs only; programs must not branch on it. A code's
+/// definition may place fixed fields before the reason (`MOVED`, see
+/// `MovedStatus`); this class does not interpret them: a decoded status
+/// keeps the bytes after the code exactly as received, [encode] writes
+/// them back unchanged (so relaying a status is lossless), and [reason]
+/// is their UTF-8 decoding.
 class Status {
-  const Status(this.code, [this.reason = '']);
+  /// A status with [code] and the human readable [reason].
+  const Status(this.code, [this.reason = '']) : _body = null;
 
+  /// A status with a well-known [code] and the human readable [reason].
   Status.of(StatusCode code, [String reason = '']) : this(code.code, reason);
+
+  Status._decoded(this.code, this.reason, this._body);
 
   /// Numeric code, 0 to 0xFFFF.
   final int code;
 
-  /// Human readable reason, may be empty.
+  /// Human readable reason, may be empty. For a decoded status, the bytes
+  /// after the code decoded as UTF-8 (malformed sequences replaced), fixed
+  /// fields included.
   final String reason;
+
+  /// The bytes after the code as received; null when built from [reason].
+  final Uint8List? _body;
 
   static const Status ok = Status(0);
 
@@ -75,20 +89,24 @@ class Status {
   /// Application codes are 256 and above and are only valid in Talk aborts.
   bool get isApplicationCode => code >= 256;
 
-  /// Encodes as `u16 code` followed by the UTF-8 reason.
+  /// Encodes as `u16 code` followed by the UTF-8 reason, or, for a decoded
+  /// status, by the bytes after the code exactly as they were received.
   Uint8List encode() {
     if (code < 0 || code > 0xFFFF) {
       throw ArgumentError.value(code, 'code', 'must fit in u16');
     }
-    final reasonBytes = utf8.encode(reason);
-    final out = Uint8List(2 + reasonBytes.length);
+    final body = _body ?? utf8.encode(reason);
+    final out = Uint8List(2 + body.length);
     out[0] = code & 0xFF;
     out[1] = (code >> 8) & 0xFF;
-    out.setRange(2, out.length, reasonBytes);
+    out.setRange(2, out.length, body);
     return out;
   }
 
   /// Decodes a status payload. An empty payload decodes as [Status.ok].
+  ///
+  /// The bytes after the code become the [reason] and are also kept as
+  /// they are, so that [encode] reproduces [bytes] exactly.
   ///
   /// Throws [FormatException] if the payload is exactly one byte, which
   /// cannot be a status.
@@ -100,24 +118,55 @@ class Status {
       throw const FormatException('status payload shorter than 2 bytes');
     }
     final code = bytes[0] | (bytes[1] << 8);
-    final reason = bytes.length > 2
-        ? utf8.decode(bytes.sublist(2), allowMalformed: true)
-        : '';
-    return Status(code, reason);
+    if (bytes.length == 2) {
+      return Status(code);
+    }
+    final body = Uint8List.fromList(bytes.sublist(2));
+    return Status._decoded(code, utf8.decode(body, allowMalformed: true), body);
   }
 
   @override
   bool operator ==(Object other) =>
-      other is Status && other.code == code && other.reason == reason;
+      other is Status &&
+      other.code == code &&
+      other.reason == reason &&
+      ((_body == null && other._body == null) || _sameBody(other));
+
+  bool _sameBody(Status other) {
+    final a = _body ?? utf8.encode(reason);
+    final b = other._body ?? utf8.encode(other.reason);
+    if (a.length != b.length) {
+      return false;
+    }
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   @override
   int get hashCode => Object.hash(code, reason);
 
+  /// The code's name and the reason; a reason with control characters or
+  /// malformed UTF-8 (fixed fields before it, say) is shown as hex bytes.
   @override
   String toString() {
     final name = known?.name ?? 'code $code';
-    return reason.isEmpty ? name : '$name: $reason';
+    if (reason.isEmpty) {
+      return name;
+    }
+    if (_printable.hasMatch(reason)) {
+      return '$name: $reason';
+    }
+    final body = _body ?? utf8.encode(reason);
+    final hex = [for (final b in body) b.toRadixString(16).padLeft(2, '0')]
+        .join(' ');
+    return '$name: [$hex]';
   }
+
+  static final RegExp _printable = RegExp(r'^[^\x00-\x1F\x7F\uFFFD]*$');
 }
 
 /// Base exception for every failure reported by the library.

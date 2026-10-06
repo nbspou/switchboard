@@ -31,20 +31,27 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// one. In addition it retries **once** when the owner rejects the channel
 /// with CLOSE `MOVED` (the slot moved, and the router's table was stale)
 /// **before anything was sent on it or received from it**: the
-/// replacement channel is opened to the owner the rejection names (or, if
-/// it names none, the one the router finds by refreshing the slot) with
-/// the same open payload, and takes over transparently. Subframes the
-/// caller sends while the replacement is being opened are sent on it, in
-/// order.
+/// replacement channel is opened to the owner the rejection names
+/// (`MovedStatus`; or, if it names none, the one the router finds by
+/// refreshing the slot) with the same open payload, and takes over
+/// transparently. Subframes the caller sends while the replacement is
+/// being opened are sent on it, in order.
 ///
 /// Once the caller has sent a subframe, or a subframe has arrived, a
-/// `MOVED` close is surfaced like any other close ([done]): the owner may
-/// have acted on what was sent (an instance that loses a slot closes the
-/// channels it was serving with `MOVED`), so resending it could apply it
-/// twice. Protocols in which the server speaks first (a greeting or a
-/// snapshot before the client sends) get the retry on every open; Talk
-/// clients that send their first request at once see a `MOVED` only when
-/// the router's table was stale, and retry at their own level.
+/// `MOVED` close is surfaced like any other close ([done]), because the
+/// subframes already sent are gone with the old channel. `MOVED` means
+/// the owner processed nothing on the channel, so the caller may open the
+/// slot again and send the same data. Protocols in which the server
+/// speaks first (a greeting or a snapshot before the client sends) get
+/// the retry on every open; Talk clients that send their first request at
+/// once see a `MOVED` only when the router's table was stale, and retry
+/// at their own level.
+///
+/// A channel the owner was serving when the slot moved on is closed with
+/// `ABORTED` carrying the same owner and epoch fields
+/// (`MovedStatus.fromStatus` reads them). It is never retried: the work
+/// may have taken effect, and only the application knows whether it can
+/// be repeated.
 class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// Wraps [channel], the first channel opened for [slot] of [type];
   /// [reopen] opens the replacement. Created by
@@ -113,8 +120,8 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   StreamSink<Uint8List> get sink => _sink;
 
   /// The end status of the final channel. A `MOVED` that was retried is
-  /// not reported; a `MOVED` that was not is. Never completes with an
-  /// error.
+  /// not reported; a `MOVED` that was not is, as is an `ABORTED` for a
+  /// slot move. Never completes with an error.
   @override
   Future<Status> get done => _done.future;
 
@@ -230,7 +237,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     try {
       next = await _reopen(moved);
     } on Object catch (e) {
-      _log.fine('$type/$slot: retry after ${moved.reason} failed: $e');
+      _log.fine('$type/$slot: retry after $moved failed: $e');
     }
     _reopening = false;
     if (next == null) {
@@ -239,7 +246,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       _finish(moved);
       return;
     }
-    _log.fine('$type/$slot moved (${moved.reason}), retried on $next');
+    _log.fine('$type/$slot moved ($moved), retried on $next');
     _current = next;
     _watch(next);
     if (_incoming.hasListener) {

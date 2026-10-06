@@ -74,8 +74,9 @@ abstract class SlotLifecycle {
   /// waited for the work in flight to end; make the state available to
   /// [to] (transfer it over a channel to [to], flush it to shared storage,
   /// or keep it for [to] to fetch) and close the long-lived channels that
-  /// the slot's queued work must not overtake. Throwing abandons the
-  /// migration (the slot is resumed here). The default does nothing.
+  /// the slot's queued work must not overtake (with
+  /// [SlotGate.abortedStatus], since they were served). Throwing abandons
+  /// the migration (the slot is resumed here). The default does nothing.
   Future<void> drain(int slot, {required int epoch, required int to}) async {}
 
   /// This instance no longer serves [slot]: after the forwarding grace
@@ -151,6 +152,13 @@ enum SlotGateState {
 /// same way, at the request level: served, queued, forwarded as message
 /// chains ([forwardMessage]) or answered `ABORT MOVED`.
 ///
+/// `MOVED` always means that nothing was processed: the channel was
+/// refused at open, or queued and never read, or the request was never
+/// run, so the client may send it again to the new owner. A channel that
+/// was served here (handed to [SlotLifecycle.serve]) and is ended because
+/// the slot moved on is closed with `ABORTED` carrying the same owner and
+/// epoch fields ([abortedStatus]): its work may have taken effect.
+///
 /// On `DRAIN` the gate locks the slot, waits until the slot's work in
 /// flight has ended (its tracked channels have closed and its
 /// [serveRequest] handlers have completed), at most [drainTimeout] (then
@@ -160,7 +168,9 @@ enum SlotGateState {
 /// [forwardGrace], then calls [SlotLifecycle.unload]. On `RESUME` it
 /// serves the queue itself. On revocation (and [release], [close]) it
 /// rejects the queue with `MOVED`, closes the slot's tracked channels
-/// with `MOVED` and calls [SlotLifecycle.unload].
+/// with `ABORTED` ([abortedStatus]) and calls [SlotLifecycle.unload]; so
+/// does the end of the forwarding grace period, for the tracked channels
+/// still open.
 class SlotGate implements SlotHandler {
   /// Creates the gate of [type] on [switchboard], serving the slot
   /// requests [client] receives, with the application's [lifecycle] (which
@@ -196,7 +206,7 @@ class SlotGate implements SlotHandler {
   final Switchboard switchboard;
 
   /// The naming client whose slot requests this gate serves, and whose
-  /// mirror names the owners in `MOVED`.
+  /// mirror names the owners in `MOVED` and `ABORTED`.
   final NamingClient client;
 
   /// The sharded type.
@@ -256,24 +266,32 @@ class SlotGate implements SlotHandler {
   /// over).
   bool serves(int slot) => _slots[slot]?.state == SlotGateState.serving;
 
-  /// The `MOVED` status for [slot], whose reason names the current owner
-  /// (wiki page "Switchboard Sharding", section "Routing"): the new owner
-  /// while forwarding, else the owner in the naming client's mirror unless
-  /// that is this instance, else no owner (empty reason).
-  Status movedStatus(int slot) {
-    final s = _slots[slot];
+  /// The owner and epoch of [slot] for `MOVED` and `ABORTED` (wiki page
+  /// "Switchboard Sharding", section "Routing"): the new owner while
+  /// forwarding, else the owner in the naming client's mirror unless that
+  /// is this instance, else unknown.
+  MovedStatus movedTo(int slot) => _movedTo(slot, _slots[slot]);
+
+  MovedStatus _movedTo(int slot, _GateSlot? s) {
     if (s != null && s.state == SlotGateState.forwarding) {
-      return MovedStatus(ServiceAddress(type, s.to), s.epoch).toStatus();
+      return MovedStatus(owner: s.to, epoch: s.epoch);
     }
     final entry = client.slotOwner(type, slot);
     if (entry != null && entry.owner != instance) {
-      return MovedStatus(
-        ServiceAddress(type, entry.owner),
-        entry.epoch,
-      ).toStatus();
+      return MovedStatus(owner: entry.owner, epoch: entry.epoch);
     }
-    return const MovedStatus().toStatus();
+    return MovedStatus.unknown;
   }
+
+  /// The `MOVED` status for [slot], carrying [movedTo]: for channels and
+  /// requests about [slot] that were not processed here, which the client
+  /// may send again to the owner.
+  Status movedStatus(int slot) => movedTo(slot).toStatus();
+
+  /// The `ABORTED` status for [slot], carrying [movedTo] like `MOVED`:
+  /// for channels about [slot] that were served here and are ended
+  /// because the slot moved on, whose work may have taken effect.
+  Status abortedStatus(int slot) => movedTo(slot).toStatus(aborted: true);
 
   /// Stops counting [channel], served through [SlotLifecycle.serve], as
   /// work in flight of its slot: a long-lived channel whose requests the
@@ -318,9 +336,9 @@ class SlotGate implements SlotHandler {
   }
 
   Future<void> _rejectMoved(IncomingChannel incoming, int slot) {
-    final status = movedStatus(slot);
-    _log.fine('$type gate: $incoming refused, $status');
-    return incoming.reject(status);
+    final moved = movedTo(slot);
+    _log.fine('$type gate: $incoming refused, moved: $moved');
+    return incoming.reject(moved.toStatus());
   }
 
   void _queue(_GateSlot s, IncomingChannel incoming) {
@@ -619,7 +637,7 @@ class SlotGate implements SlotHandler {
     } catch (e) {
       if (identical(_slots[slot], s)) {
         _slots.remove(slot);
-        _refuseQueue(s, slot);
+        _refuseQueue(s, movedStatus(slot));
       }
       rethrow;
     }
@@ -761,9 +779,9 @@ class SlotGate implements SlotHandler {
     return parked;
   }
 
-  /// Refuses the queue of [s], which is no longer served here.
-  void _refuseQueue(_GateSlot s, int slot) {
-    final moved = movedStatus(slot);
+  /// Refuses the queue of [s], which is no longer served here, with
+  /// [moved]: nothing in it was processed.
+  void _refuseQueue(_GateSlot s, Status moved) {
     for (final incoming in _takeQueue(s)) {
       unawaited(incoming.reject(moved));
     }
@@ -782,9 +800,10 @@ class SlotGate implements SlotHandler {
     unawaited(_retire(s, slot));
   }
 
-  /// Ends what is left of [s] after it stopped being served: closes its
-  /// tracked channels with `MOVED`, closes the forwarding channel once its
-  /// requests are answered, and unloads the slot.
+  /// Ends what is left of [s] after it stopped being served: refuses its
+  /// queue with `MOVED`, closes its tracked channels, which were served,
+  /// with `ABORTED`, closes the forwarding channel once its requests are
+  /// answered, and unloads the slot.
   Future<void> _retire(_GateSlot s, int slot) async {
     s.grace?.cancel();
     s.grace = null;
@@ -792,10 +811,13 @@ class SlotGate implements SlotHandler {
     if (idle != null && !idle.isCompleted) {
       idle.complete();
     }
-    _refuseQueue(s, slot);
-    final moved = movedStatus(slot);
+    // [s] is gone from the table, unless the slot came back (an ASSIGN
+    // during the grace period): then the mirror tells.
+    final moved = _movedTo(slot, _slots.containsKey(slot) ? null : s);
+    _refuseQueue(s, moved.toStatus());
+    final aborted = moved.toStatus(aborted: true);
     for (final incoming in List.of(s.tracked)) {
-      unawaited(incoming.reject(moved));
+      unawaited(incoming.reject(aborted));
     }
     s.tracked.clear();
     final forward = s.forward;
@@ -839,7 +861,8 @@ class SlotGate implements SlotHandler {
 
   /// Gives up [slot] (`RELEASE`, see [NamingClient.release]), then stops
   /// serving it here: its queue is refused with `MOVED`, its tracked
-  /// channels are closed with `MOVED`, and [SlotLifecycle.unload] runs.
+  /// channels are closed with `ABORTED` ([abortedStatus]), and
+  /// [SlotLifecycle.unload] runs.
   Future<void> release(int slot, {bool keepStorage = false}) async {
     await client.release(type, slot, keepStorage: keepStorage);
     await _stop(slot);

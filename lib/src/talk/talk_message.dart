@@ -5,7 +5,10 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
+import 'dart:async';
 import 'dart:typed_data';
+
+import 'package:logging/logging.dart';
 
 import '../name.dart';
 import '../status.dart';
@@ -14,6 +17,8 @@ import 'talk_frame.dart';
 import 'talk_request.dart';
 import 'talk_stream.dart';
 
+final Logger _log = Logger('Switchboard.Talk');
+
 /// A message received on a [TalkChannel]: a plain message, a request, a
 /// final response, or a stream item.
 ///
@@ -21,6 +26,11 @@ import 'talk_stream.dart';
 /// arrive through the requester's `Future`, [TalkRequest] or [TalkStream].
 /// Any of them may itself be a request ([expectsReply]), in which case the
 /// reply API below answers it; this is how message chains continue.
+///
+/// Every reply method that takes a `procedure` string also takes a [Name]
+/// `name`, which, when given, is sent instead (the string is then
+/// ignored): generated code passes the exact wire name, which need not be
+/// valid UTF-8.
 ///
 /// Instances are created by [TalkChannel] only.
 abstract class TalkMessage {
@@ -87,7 +97,7 @@ abstract class TalkMessage {
   /// the message expects no reply, was already finally replied (including
   /// by the responder timeout or because the peer cancelled it), or the
   /// channel is closed.
-  void reply(Uint8List payload, {String? procedure});
+  void reply(Uint8List payload, {String? procedure, Name? name});
 
   /// Sends the final response as a request of our own (a chained response)
   /// and returns the peer's answer to it. Shorthand for
@@ -101,6 +111,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
+    Name? name,
   });
 
   /// Sends the final response as a request of our own (a chained response)
@@ -118,6 +129,7 @@ abstract class TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   });
 
   /// Sends the final response as a stream request of our own.
@@ -128,6 +140,7 @@ abstract class TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   });
 
   /// Sends one stream item. Restarts the responder timeout.
@@ -135,7 +148,7 @@ abstract class TalkMessage {
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
   /// like [reply], and also if the request is not a stream request
   /// ([expectsStream] is false).
-  void replyItem(Uint8List payload, {String? procedure});
+  void replyItem(Uint8List payload, {String? procedure, Name? name});
 
   /// Sends one stream item that is itself a request, and returns the peer's
   /// answer to it. Shorthand for [startReplyItemRequest] followed by
@@ -146,6 +159,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
+    Name? name,
   });
 
   /// Sends one stream item that is itself a request, and returns its
@@ -158,6 +172,7 @@ abstract class TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   });
 
   /// Sends one stream item that is itself a stream request. Restarts the
@@ -169,7 +184,123 @@ abstract class TalkMessage {
     String? procedure,
     Duration? timeout,
     void Function()? onExtend,
+    Name? name,
   });
+
+  /// Answers a stream request with [items]: each one is sent with
+  /// [replyItem] as it arrives, then the final reply carries [trailer]
+  /// (empty by default). [procedure] or [name] go with every item and the
+  /// final reply.
+  ///
+  /// An error event on [items] ends the answer with [replyAbort]: the
+  /// error's status if it is a [SwitchboardException] (a
+  /// [TalkAbortException] from a backend passes its status on), otherwise
+  /// `INTERNAL` (the error is logged). An item that cannot be sent (for
+  /// example over the peer's frame limit) aborts the request the same way
+  /// with its status.
+  ///
+  /// When the request is cancelled ([onCancel]: the peer cancelled it, the
+  /// responder timeout expired, or the channel closed) the subscription to
+  /// [items] is cancelled and nothing more is sent; when the peer
+  /// cancelled, the channel has already answered `ABORT CANCELLED`. Each
+  /// item restarts the responder timeout; a source slower than
+  /// [TalkOptions.replyTimeout] between items should be paired with
+  /// [setReplyTimeout] or [extend].
+  ///
+  /// The future completes once the answer has ended (or the subscription
+  /// was cancelled); it never completes with an error. Throws
+  /// synchronously, without listening to [items], like [replyItem] (also
+  /// if the request is not a stream request) and with [ArgumentError] if
+  /// [procedure] is not a valid name.
+  Future<void> replyStream(
+    Stream<Uint8List> items, {
+    Uint8List? trailer,
+    String? procedure,
+    Name? name,
+  }) {
+    final wire = name ?? (procedure == null ? null : Name(procedure));
+    _checkStreamReply();
+    final done = Completer<void>();
+    late final StreamSubscription<Uint8List> subscription;
+    void finish() {
+      if (!done.isCompleted) {
+        done.complete();
+      }
+    }
+
+    void stop() {
+      unawaited(subscription.cancel().whenComplete(finish));
+    }
+
+    void abort(Object error, StackTrace stackTrace) {
+      var status = error is SwitchboardException
+          ? error.status
+          : Status.of(StatusCode.internal, 'stream failed');
+      if (error is! SwitchboardException) {
+        _log.warning(
+          'stream reply to request $requestId failed',
+          error,
+          stackTrace,
+        );
+      }
+      if (status.isOk) {
+        status = Status.of(StatusCode.internal, 'stream failed');
+      }
+      if (canReply) {
+        try {
+          replyAbort(status);
+        } on SwitchboardException catch (e) {
+          _log.fine('stream reply abort not sent: ${e.status}');
+        }
+      }
+    }
+
+    subscription = items.listen(
+      (item) {
+        if (!canReply) {
+          stop();
+          return;
+        }
+        try {
+          replyItem(item, name: wire);
+        } on SwitchboardException catch (e, st) {
+          abort(e, st);
+          stop();
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) {
+        abort(error, stackTrace);
+        stop();
+      },
+      onDone: () {
+        if (canReply) {
+          try {
+            reply(trailer ?? Uint8List(0), name: wire);
+          } on SwitchboardException catch (e, st) {
+            abort(e, st);
+          }
+        }
+        finish();
+      },
+      cancelOnError: true,
+    );
+    onCancel.then((_) => stop()).ignore();
+    return done.future;
+  }
+
+  /// Throws like [replyItem] when no stream answer can start.
+  void _checkStreamReply() {
+    if (!expectsReply || !expectsStream || !canReply) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        !expectsReply
+            ? 'message expects no reply'
+            : !expectsStream
+            ? 'request $requestId is not a stream request'
+            : 'request $requestId cannot be answered',
+      );
+    }
+  }
 
   /// Sends the final response as an abort carrying [status]. Application
   /// codes (256 and above) are allowed. [StatusCode.connectionLost], which
