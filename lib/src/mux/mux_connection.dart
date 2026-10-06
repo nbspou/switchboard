@@ -35,6 +35,7 @@ class MuxOptions {
     this.maxChannelBufferBytes = defaultMaxChannelBufferBytes,
     this.receiveHighWaterMarkBytes = defaultReceiveHighWaterMarkBytes,
     this.closeConfirmTimeout = const Duration(seconds: 30),
+    this.maxOpenPayloadBytes = defaultMaxOpenPayloadBytes,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -51,6 +52,9 @@ class MuxOptions {
 
   /// Default [receiveHighWaterMarkBytes]: 16 MiB.
   static const int defaultReceiveHighWaterMarkBytes = 16 * 1024 * 1024;
+
+  /// Default [maxOpenPayloadBytes]: 16 MiB.
+  static const int defaultMaxOpenPayloadBytes = 16 * 1024 * 1024;
 
   /// Largest incoming mux frame, header included, that we accept; a larger
   /// one ends the connection with GOAWAY `FRAME_TOO_LARGE`. Announced with
@@ -127,6 +131,24 @@ class MuxOptions {
   /// [Duration.zero] waits forever.
   final Duration closeConfirmTimeout;
 
+  /// Largest number of bytes of OPEN payloads held for the channels the
+  /// peer opened and that are not closed yet (mutually, or by
+  /// [closeConfirmTimeout]). A channel keeps its open payload for its
+  /// whole life, so without this budget a peer could open [maxChannels]
+  /// channels with frame-sized OPEN payloads and never send DATA while a
+  /// handler holds them. A peer OPEN that would exceed it is rejected with
+  /// CLOSE `RESOURCE_EXHAUSTED`.
+  ///
+  /// The held payloads count toward [MuxConnection.bufferedBytes], so
+  /// [receiveHighWaterMarkBytes] reacts to them. Since reading resumes
+  /// only once the buffered bytes drop to half of that mark, the budget is
+  /// at most half of [receiveHighWaterMarkBytes] when that is set:
+  /// otherwise held payloads alone could keep the reading paused, and with
+  /// it the CLOSE frames that would release them. With the defaults the
+  /// effective budget is therefore 8 MiB. 0 means no budget of its own
+  /// (half the high-water mark still applies when set). Default 16 MiB.
+  final int maxOpenPayloadBytes;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -142,6 +164,7 @@ class MuxOptions {
     int? maxChannelBufferBytes,
     int? receiveHighWaterMarkBytes,
     Duration? closeConfirmTimeout,
+    int? maxOpenPayloadBytes,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -157,6 +180,7 @@ class MuxOptions {
     receiveHighWaterMarkBytes:
         receiveHighWaterMarkBytes ?? this.receiveHighWaterMarkBytes,
     closeConfirmTimeout: closeConfirmTimeout ?? this.closeConfirmTimeout,
+    maxOpenPayloadBytes: maxOpenPayloadBytes ?? this.maxOpenPayloadBytes,
   );
 }
 
@@ -179,8 +203,16 @@ class MuxConnection {
     this.options = const MuxOptions(),
   }) : _transport = transport,
        _firstId = isInitiator ? 2 : 3,
-       _maxId = options.shortIdsOnly ? MuxFrame.maxShortId : MuxFrame.maxId {
-    _nextId = _firstId;
+       _firstLongId = MuxFrame.maxShortId + (isInitiator ? 1 : 2) {
+    _nextShortId = _firstId;
+    _nextLongId = _firstLongId;
+    var shortIds = (MuxFrame.maxShortId - _firstId) ~/ 2 + 1;
+    for (var id = _firstId; id <= MuxFrame.maxShortId; id += 2) {
+      if (MuxFrame.isReservedId(id)) {
+        shortIds--;
+      }
+    }
+    _shortIdCapacity = shortIds;
     _host = _Host(this);
     // Synchronous, fed from [_undelivered] only while the listener is
     // active, so the connection knows which channels the application has.
@@ -238,11 +270,17 @@ class MuxConnection {
   final Completer<Status> _done = Completer<Status>();
   final List<_PendingPing> _pings = [];
   final int _firstId;
-  final int _maxId;
-  late int _nextId;
+  final int _firstLongId;
+  late final int _shortIdCapacity;
+  late int _nextShortId;
+  late int _nextLongId;
+  // Ids of our parity below 0x10000 that are open or await a CLOSE.
+  int _shortIdsInUse = 0;
   int _openCount = 0;
   int _pingCounter = 0;
   int _bufferedBytes = 0;
+  // OPEN payload bytes of the peer's channels that are not closed yet.
+  int _openPayloadBytes = 0;
   bool _incomingCancelled = false;
   bool _incomingEndRequested = false;
   bool _incomingDrainScheduled = false;
@@ -299,8 +337,14 @@ class MuxConnection {
   ];
 
   /// Bytes buffered in the receive queues of all channels, counted as for
-  /// [MuxOptions.maxChannelBufferBytes].
+  /// [MuxOptions.maxChannelBufferBytes], plus the OPEN payloads held for
+  /// the channels the peer opened until they are closed (see
+  /// [MuxOptions.maxOpenPayloadBytes]).
   int get bufferedBytes => _bufferedBytes;
+
+  /// Bytes of OPEN payloads held for the channels the peer opened that are
+  /// not closed yet; bounded by [MuxOptions.maxOpenPayloadBytes].
+  int get openPayloadBytes => _openPayloadBytes;
 
   /// Whether reading the transport is paused because more than
   /// [MuxOptions.receiveHighWaterMarkBytes] are buffered.
@@ -358,6 +402,9 @@ class MuxConnection {
     );
     _links[id] = link;
     _openCount++;
+    if (_isOwnShortId(id)) {
+      _shortIdsInUse++;
+    }
     _sendFrame(MuxFrame.open(id, payload));
     return link.channel;
   }
@@ -436,19 +483,59 @@ class MuxConnection {
       'MuxConnection(${isInitiator ? 'initiator' : 'acceptor'}, '
       '$_openCount channels${_closing ? ', closed' : ''})';
 
-  /// Sets the next id the allocator tries. For tests of id wrapping.
+  /// Sets the next id the allocator tries: in the short range for ids
+  /// below 0x10000, else in the long range (used only once every short id
+  /// of our parity is in use). For tests of id wrapping.
   @visibleForTesting
-  set nextChannelIdForTesting(int id) => _nextId = id;
+  set nextChannelIdForTesting(int id) {
+    if (id <= MuxFrame.maxShortId) {
+      _nextShortId = id;
+    } else {
+      _nextLongId = id;
+    }
+  }
 
   // Allocation ----------------------------------------------------------
 
+  bool _isOwnShortId(int id) =>
+      id <= MuxFrame.maxShortId && (id & 1) == (_firstId & 1);
+
+  /// Allocates by incrementing within the short range (ids below 0x10000
+  /// of our parity), wrapping there, so that a long-lived connection keeps
+  /// using short ids however many channels come and go. The long range is
+  /// used only while every short id of our parity is in use, and never
+  /// with [MuxOptions.shortIdsOnly]. Ids that are reserved, open or await
+  /// the peer's CLOSE are skipped.
   int _allocateId() {
-    // Number of ids of our parity in [_firstId, _maxId].
-    final candidates = (_maxId - _firstId) ~/ 2 + 1;
-    var id = _nextId;
+    if (_shortIdsInUse < _shortIdCapacity) {
+      final id = _scan(_nextShortId, _firstId, MuxFrame.maxShortId);
+      if (id != null) {
+        _nextShortId = id + 2;
+        return id;
+      }
+      _log.severe('$this: short id accounting is off, $_shortIdsInUse used');
+    }
+    if (!options.shortIdsOnly) {
+      final id = _scan(_nextLongId, _firstLongId, MuxFrame.maxId);
+      if (id != null) {
+        _nextLongId = id + 2;
+        return id;
+      }
+    }
+    throw SwitchboardException.of(
+      StatusCode.resourceExhausted,
+      'no free channel id',
+    );
+  }
+
+  /// The first free id of our parity from [start], wrapping from [last] to
+  /// [first]; null if there is none.
+  int? _scan(int start, int first, int last) {
+    final candidates = (last - first) ~/ 2 + 1;
+    var id = start < first ? first : start;
     for (var i = 0; i < candidates; i++) {
-      if (id > _maxId) {
-        id = _firstId;
+      if (id > last) {
+        id = first;
       }
       final candidate = id;
       id += 2;
@@ -457,13 +544,9 @@ class MuxConnection {
           _awaitingClose.contains(candidate)) {
         continue;
       }
-      _nextId = id;
       return candidate;
     }
-    throw SwitchboardException.of(
-      StatusCode.resourceExhausted,
-      'no free channel id',
-    );
+    return null;
   }
 
   // Sending -------------------------------------------------------------
@@ -560,6 +643,9 @@ class MuxConnection {
         } else if (link == null && _awaitingClose.remove(id)) {
           // The confirmation of a CLOSE we sent without a channel: the id
           // is mutually closed and free again.
+          if (_isOwnShortId(id)) {
+            _shortIdsInUse--;
+          }
         } else {
           throw ProtocolException('CLOSE on channel $id which is not open');
         }
@@ -575,6 +661,7 @@ class MuxConnection {
       throw ProtocolException('OPEN on channel $id which is in use');
     }
     Status? rejection;
+    final payloadBudget = _openPayloadBudget;
     if (_goAwaySent) {
       rejection = Status.of(StatusCode.goingAway);
     } else if (_incomingCancelled) {
@@ -583,6 +670,12 @@ class MuxConnection {
       rejection = Status.of(
         StatusCode.resourceExhausted,
         'at most ${options.maxChannels} channels',
+      );
+    } else if (payloadBudget != null &&
+        _openPayloadBytes + payload.length > payloadBudget) {
+      rejection = Status.of(
+        StatusCode.resourceExhausted,
+        'open payloads exceed $payloadBudget bytes',
       );
     }
     if (rejection != null) {
@@ -598,8 +691,34 @@ class MuxConnection {
     );
     _links[id] = link;
     _openCount++;
+    _openPayloadBytes += payload.length;
+    _noteBuffered(payload.length);
     _undelivered.add(link);
     _scheduleIncomingDrain();
+  }
+
+  /// [MuxOptions.maxOpenPayloadBytes], or half of
+  /// [MuxOptions.receiveHighWaterMarkBytes] if that is smaller; null for
+  /// none.
+  int? get _openPayloadBudget {
+    final budget = options.maxOpenPayloadBytes;
+    final mark = options.receiveHighWaterMarkBytes;
+    final half = mark > 0 ? mark ~/ 2 : null;
+    if (budget <= 0) {
+      return half;
+    }
+    return half != null && half < budget ? half : budget;
+  }
+
+  /// Releases the accounting of the OPEN payload of a channel the peer
+  /// opened, once it no longer counts as open.
+  void _releaseOpenPayload(MuxChannelLink link) {
+    if (link.channel.isLocallyOpened) {
+      return;
+    }
+    final size = link.channel.openPayload.length;
+    _openPayloadBytes -= size;
+    _noteBuffered(-size);
   }
 
   /// Rejects a peer OPEN with CLOSE carrying [status], remembering only
@@ -735,6 +854,10 @@ class MuxConnection {
     }
     _links.remove(link.id);
     _openCount--;
+    _releaseOpenPayload(link);
+    if (_isOwnShortId(link.id)) {
+      _shortIdsInUse--;
+    }
     // Deferred so that the channel finishes sending its confirming CLOSE
     // before an idle connection is closed.
     scheduleMicrotask(_checkIdle);
@@ -750,6 +873,7 @@ class MuxConnection {
     );
     _links.remove(link.id);
     _openCount--;
+    _releaseOpenPayload(link);
     _awaitingClose.add(link.id);
     link.abandoned();
     scheduleMicrotask(_checkIdle);
@@ -917,6 +1041,9 @@ class MuxConnection {
     final links = _links.values.toList();
     _links.clear();
     _awaitingClose.clear();
+    _shortIdsInUse = 0;
+    _bufferedBytes -= _openPayloadBytes;
+    _openPayloadBytes = 0;
     _openCount = 0;
     for (final link in links) {
       try {

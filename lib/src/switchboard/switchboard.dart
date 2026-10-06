@@ -11,7 +11,6 @@ import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 import 'package:stream_channel/stream_channel.dart';
-import 'package:web_socket_channel/io.dart';
 
 import '../address/channel_address.dart';
 import '../address/service_address.dart';
@@ -22,7 +21,10 @@ import '../naming/naming_protocol.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
 import '../transport/stream_transport.dart';
-import '../transport/web_socket_transport.dart';
+import '../transport/web_socket_server.dart';
+import '../transport/web_socket_transport_io.dart';
+import 'channel_policy.dart';
+import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'resolver.dart';
 
@@ -56,6 +58,9 @@ class Switchboard {
   /// into an open relay** for anyone who can reach it: enable it only on
   /// nodes that are not reachable from untrusted networks, or together
   /// with an `allow` filter on the proxy handler that checks the host.
+  ///
+  /// [maxConnectionsPerEndpoint] bounds the pooled connections to one
+  /// endpoint; see [connect].
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -63,9 +68,17 @@ class Switchboard {
     TalkOptions? talkOptions,
     this.connectTimeout = const Duration(seconds: 10),
     this.allowHostHint = false,
+    this.maxConnectionsPerEndpoint = 4,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        muxOptions = muxOptions ?? const MuxOptions(),
-       talkOptions = talkOptions ?? const TalkOptions();
+       talkOptions = talkOptions ?? const TalkOptions() {
+    RangeError.checkValueInInterval(
+      maxConnectionsPerEndpoint,
+      1,
+      1 << 16,
+      'maxConnectionsPerEndpoint',
+    );
+  }
 
   /// Resolves service types for [openChannel] and [openTalk]. May be
   /// replaced at any time; channels already open are unaffected.
@@ -87,16 +100,25 @@ class Switchboard {
   /// Whether `proxyHandler` honours host hints. See the constructor.
   final bool allowHostHint;
 
+  /// Largest number of pooled connections to one endpoint. A further
+  /// connection is only opened when every pooled one has as many channels
+  /// open as its peer announced it accepts. Default 4.
+  final int maxConnectionsPerEndpoint;
+
   final Map<Name, Map<int, ChannelHandler>> _services = {};
 
   final List<HttpServer> _httpServers = [];
   final List<ServerSocket> _tcpServers = [];
   final List<Uri> _endpoints = [];
+  final List<_OwnEndpoint> _ownEndpoints = [];
 
   final Set<MuxConnection> _live = {};
   final List<Future<void>> _lateShutdowns = [];
+  // Upgrades and dials in progress; [close] waits for them.
+  final Set<Future<void>> _inFlight = {};
   final Expando<String> _remotes = Expando<String>('remote');
-  final Map<String, MuxConnection> _pool = {};
+  final Expando<ChannelPolicy> _policies = Expando<ChannelPolicy>('policy');
+  final Map<String, List<MuxConnection>> _pool = {};
   final Map<String, Future<MuxConnection>> _dialing = {};
   final Map<Name, int> _roundRobin = {};
   final StreamController<MuxConnection> _connections =
@@ -110,10 +132,21 @@ class Switchboard {
   /// Starts accepting WebSocket connections on [address] (a `String` or an
   /// `InternetAddress`) and [port] (0 picks a free port), at [path].
   ///
-  /// Requests for [path], with or without a trailing slash, are upgraded,
-  /// selecting the `switchboard` subprotocol when the client offers it.
-  /// A client that offers only other subprotocols gets 400, a plain HTTP
-  /// request for [path] gets 426, and any other path gets 403.
+  /// Requests for [path], with or without a trailing slash, are upgraded
+  /// with [WebSocketServerTransport.upgrade], which bounds every incoming
+  /// message, fragments included, by [MuxOptions.maxFrameSize] before
+  /// buffering it and negotiates no compression. The `switchboard`
+  /// subprotocol is selected when the client offers it. A client that
+  /// offers only other subprotocols, or sends no valid key, gets 400, a
+  /// plain HTTP request for [path] (or another WebSocket version) gets
+  /// 426, and any other path gets 403.
+  ///
+  /// [policy] is the listener policy applied to every channel arriving on
+  /// a connection accepted here; null allows everything. **A listener
+  /// reachable by untrusted peers must have a policy**, and that policy
+  /// must refuse the reserved types (see [ChannelPolicies.denyReserved]),
+  /// or a peer can reach the local naming service and every other local
+  /// service and the catch-all.
   ///
   /// Returns the bound `ws://host:port/path` URI with the actual port. The
   /// host is the bound address; when binding a wildcard address, advertise
@@ -124,20 +157,24 @@ class Switchboard {
     Object address,
     int port, {
     String path = '/',
+    ChannelPolicy? policy,
   }) async {
     _checkOpen();
     final base = _normalizePath(path);
     return _listen(await HttpServer.bind(address, port), (server) {
       _httpServers.add(server);
       server.listen(
-        (request) => unawaited(_onHttpRequest(request, base)),
+        (request) => _track(_onHttpRequest(request, base, policy)),
         onError: (Object e) => _log.warning('HTTP listener failed: $e'),
       );
-      return Uri(
-        scheme: 'ws',
-        host: server.address.address,
-        port: server.port,
-        path: base,
+      return (
+        Uri(
+          scheme: 'ws',
+          host: server.address.address,
+          port: server.port,
+          path: base,
+        ),
+        server.address,
       );
     }, (server) => server.close(force: true));
   }
@@ -145,38 +182,125 @@ class Switchboard {
   /// Starts accepting TCP connections (stream binding) on [address] (a
   /// `String` or an `InternetAddress`) and [port] (0 picks a free port).
   ///
+  /// [policy] is the listener policy, as for [listenWebSocket]; null
+  /// allows everything, which is only safe for internal listeners.
+  ///
   /// Returns the bound `tcp://host:port` URI with the actual port; see
   /// [listenWebSocket] about wildcard addresses. Throws like
   /// [listenWebSocket].
-  Future<Uri> listenTcp(Object address, int port) async {
+  Future<Uri> listenTcp(
+    Object address,
+    int port, {
+    ChannelPolicy? policy,
+  }) async {
     _checkOpen();
     return _listen(await ServerSocket.bind(address, port), (server) {
       _tcpServers.add(server);
       server.listen(
-        _onSocket,
+        (socket) => _onSocket(socket, policy),
         onError: (Object e) => _log.warning('TCP listener failed: $e'),
       );
-      return Uri(
-        scheme: 'tcp',
-        host: server.address.address,
-        port: server.port,
+      return (
+        Uri(scheme: 'tcp', host: server.address.address, port: server.port),
+        server.address,
       );
     }, (server) => server.close());
   }
 
   Future<Uri> _listen<T>(
     T server,
-    Uri Function(T server) start,
+    (Uri, InternetAddress) Function(T server) start,
     Future<Object?> Function(T server) stop,
   ) async {
     if (_closing) {
       await stop(server);
       throw _closedException();
     }
-    final uri = start(server);
+    final (uri, bound) = start(server);
     _endpoints.add(uri);
+    final own = _OwnEndpoint(uri, _hostsOf(bound));
+    _ownEndpoints.add(own);
     _log.info('listening on $uri');
+    if (bound.address == InternetAddress.anyIPv4.address ||
+        bound.address == InternetAddress.anyIPv6.address) {
+      // Any address of this host reaches a wildcard listener.
+      try {
+        for (final interface in await NetworkInterface.list(
+          includeLoopback: true,
+          includeLinkLocal: true,
+        )) {
+          for (final a in interface.addresses) {
+            if (bound.type == InternetAddressType.IPv6 ||
+                a.type == InternetAddressType.IPv4) {
+              own.hosts.add(_canonicalHost(a.address));
+            }
+          }
+        }
+      } on Object catch (e) {
+        _log.fine('cannot list network interfaces: $e');
+      }
+    }
     return uri;
+  }
+
+  /// Host names that designate a listener bound to [bound]: the address
+  /// itself and, for loopback and wildcard binds, the loopback names.
+  static Set<String> _hostsOf(InternetAddress bound) {
+    final hosts = {_canonicalHost(bound.address)};
+    final any4 = bound.address == InternetAddress.anyIPv4.address;
+    final any6 = bound.address == InternetAddress.anyIPv6.address;
+    if (bound.isLoopback || any4 || any6) {
+      hosts.add('localhost');
+    }
+    if (any4 || any6) {
+      hosts.add(InternetAddress.loopbackIPv4.address);
+      try {
+        hosts.add(Platform.localHostname.toLowerCase());
+      } on Object {
+        // Not available on every platform.
+      }
+    }
+    if (any6) {
+      hosts
+        ..add(InternetAddress.loopbackIPv6.address)
+        ..add(InternetAddress.anyIPv4.address);
+    }
+    return hosts;
+  }
+
+  static String _canonicalHost(String host) {
+    final lower = host.toLowerCase();
+    final bare = lower.startsWith('[') && lower.endsWith(']')
+        ? lower.substring(1, lower.length - 1)
+        : lower;
+    return InternetAddress.tryParse(bare)?.address ?? bare;
+  }
+
+  /// Whether [endpoint] designates one of this node's own listeners, so
+  /// that connecting to it would reach this node.
+  ///
+  /// Compares scheme, port (defaults filled in) and, for WebSocket URIs,
+  /// the path (with or without a trailing slash; the query is ignored, as
+  /// the listener ignores it). The host matches the bound address, its
+  /// loopback names (`localhost`) and, for a wildcard bind, the loopback
+  /// addresses, the host name and the addresses of the local network
+  /// interfaces. Host names that resolve to this host by other means are
+  /// not recognised.
+  bool isOwnEndpoint(Uri endpoint) {
+    final scheme = endpoint.scheme.toLowerCase();
+    final port = _portOf(endpoint);
+    final host = _canonicalHost(endpoint.host);
+    final isWs = scheme == 'ws' || scheme == 'wss';
+    final path = isWs ? _normalizePath(endpoint.path) : '';
+    for (final own in _ownEndpoints) {
+      if (own.uri.scheme == scheme &&
+          own.uri.port == port &&
+          (!isWs || own.uri.path == path) &&
+          own.hosts.contains(host)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// The URIs returned by [listenWebSocket] and [listenTcp], until
@@ -191,66 +315,48 @@ class Switchboard {
     return p;
   }
 
-  Future<void> _onHttpRequest(HttpRequest request, String base) async {
+  Future<void> _onHttpRequest(
+    HttpRequest request,
+    String base,
+    ChannelPolicy? policy,
+  ) async {
     final response = request.response;
     try {
       final path = request.uri.path;
+      // Refusals are not awaited: dart:io sends a response only once the
+      // request body has arrived, which a client may withhold.
       if (path != base && path != '$base/') {
         response.statusCode = HttpStatus.forbidden;
-        await response.close();
+        _closeQuietly(response);
         return;
       }
       if (_closing) {
-        response.statusCode = HttpStatus.serviceUnavailable;
-        await response.close();
-        return;
-      }
-      if (!WebSocketTransformer.isUpgradeRequest(request)) {
-        response.statusCode = HttpStatus.upgradeRequired;
-        response.headers.set(HttpHeaders.upgradeHeader, 'websocket');
-        await response.close();
-        return;
-      }
-      final offered = _offeredProtocols(request);
-      if (offered.isNotEmpty &&
-          !offered.contains(WebSocketTransport.subprotocol)) {
-        response.statusCode = HttpStatus.badRequest;
-        response.write(
-          'the ${WebSocketTransport.subprotocol} subprotocol is required',
-        );
-        await response.close();
+        response
+          ..statusCode = HttpStatus.serviceUnavailable
+          ..persistentConnection = false;
+        _closeQuietly(response);
         return;
       }
       final info = request.connectionInfo;
       final remote = info == null
           ? null
           : '${info.remoteAddress.address}:${info.remotePort}';
-      // Closed through the transport.
-      // ignore: close_sinks
-      final ws = await WebSocketTransformer.upgrade(
+      final transport = await WebSocketServerTransport.upgrade(
         request,
-        // Only called when the client offers subprotocols, which then
-        // include ours (checked above).
-        protocolSelector: (_) => WebSocketTransport.subprotocol,
+        maxFrameSize: _webSocketFrameLimit,
       );
-      _adopt(
-        WebSocketTransport.wrap(IOWebSocketChannel(ws)),
-        isInitiator: false,
-        remote: remote,
-      );
+      _adopt(transport, isInitiator: false, remote: remote, policy: policy);
     } on Object catch (e) {
       _log.fine('WebSocket request for ${request.uri} failed: $e');
     }
   }
 
-  static Set<String> _offeredProtocols(HttpRequest request) => {
-    for (final value
-        in request.headers['Sec-WebSocket-Protocol'] ?? const <String>[])
-      for (final part in value.split(','))
-        if (part.trim().isNotEmpty) part.trim(),
-  };
+  static void _closeQuietly(HttpResponse response) => response.close().then(
+    (_) {},
+    onError: (Object e) => _log.fine('HTTP response failed: $e'),
+  );
 
-  void _onSocket(Socket socket) {
+  void _onSocket(Socket socket, ChannelPolicy? policy) {
     String? remote;
     try {
       remote = '${socket.remoteAddress.address}:${socket.remotePort}';
@@ -261,6 +367,7 @@ class Switchboard {
       StreamTransport.fromSocket(socket, maxFrameSize: _transportFrameLimit),
       isInitiator: false,
       remote: remote,
+      policy: policy,
     );
   }
 
@@ -268,6 +375,19 @@ class Switchboard {
   /// the largest `u32` length.
   int get _transportFrameLimit =>
       muxOptions.maxFrameSize > 0 ? muxOptions.maxFrameSize : 0xFFFFFFFF;
+
+  /// The WebSocket binding enforces the mux frame limit on whole messages;
+  /// 0 (no limit at the mux layer) keeps the transport's default, since a
+  /// WebSocket message has no length bound of its own.
+  int get _webSocketFrameLimit => muxOptions.maxFrameSize > 0
+      ? muxOptions.maxFrameSize
+      : WebSocketServerTransport.defaultMaxFrameSize;
+
+  /// Runs [operation] (which never fails) as work [close] waits for.
+  void _track(Future<void> operation) {
+    _inFlight.add(operation);
+    operation.whenComplete(() => _inFlight.remove(operation)).ignore();
+  }
 
   // Connections ---------------------------------------------------------
 
@@ -279,6 +399,7 @@ class Switchboard {
     StreamChannel<Uint8List> transport, {
     required bool isInitiator,
     String? remote,
+    ChannelPolicy? policy,
   }) {
     final connection = MuxConnection(
       transport,
@@ -287,6 +408,9 @@ class Switchboard {
     );
     if (remote != null) {
       _remotes[connection] = remote;
+    }
+    if (policy != null) {
+      _policies[connection] = policy;
     }
     if (_closing) {
       _log.fine('closing, refusing connection from $remote');
@@ -320,6 +444,14 @@ class Switchboard {
   /// Concurrent calls for the same endpoint share one attempt. Failures
   /// are not cached.
   ///
+  /// The first pooled connection with room for another channel is
+  /// returned. A connection has room unless its peer announced a channel
+  /// limit with LIMITS and [MuxConnection.openChannelCount] has reached
+  /// it. When no pooled connection has room, another one is established,
+  /// up to [maxConnectionsPerEndpoint]; beyond that the least loaded one
+  /// is returned (opening on it then fails with
+  /// [StatusCode.resourceExhausted]).
+  ///
   /// Throws [SwitchboardException] with [StatusCode.unavailable] if the
   /// connection cannot be established within [connectTimeout], with
   /// [StatusCode.unimplemented] for an unsupported scheme, with
@@ -332,24 +464,51 @@ class Switchboard {
     final key = _poolKey(endpoint);
     final pooled = _pool[key];
     if (pooled != null) {
-      if (pooled.isOpen && !pooled.peerGoingAway) {
-        return Future.value(pooled);
+      pooled.removeWhere((c) => !c.isOpen || c.peerGoingAway);
+      MuxConnection? leastLoaded;
+      for (final connection in pooled) {
+        if (_hasRoom(connection)) {
+          return Future.value(connection);
+        }
+        if (leastLoaded == null ||
+            connection.openChannelCount < leastLoaded.openChannelCount) {
+          leastLoaded = connection;
+        }
       }
-      _pool.remove(key);
+      if (pooled.isEmpty) {
+        _pool.remove(key);
+      } else if (pooled.length >= maxConnectionsPerEndpoint) {
+        return Future.value(leastLoaded);
+      }
     }
-    return _dialing[key] ??= _dialPooled(endpoint, key);
+    final existing = _dialing[key];
+    if (existing != null) {
+      return existing;
+    }
+    final dial = _dialing[key] = _dialPooled(endpoint, key);
+    _track(dial.then<void>((_) {}, onError: (_) {}));
+    return dial;
   }
+
+  /// Whether [connection] can take another channel within the limit its
+  /// peer announced.
+  static bool _hasRoom(MuxConnection connection) {
+    final max = connection.peerLimits?.maxChannels ?? 0;
+    return max == 0 || connection.openChannelCount < max;
+  }
+
+  static int _portOf(Uri endpoint) => endpoint.hasPort
+      ? endpoint.port
+      : switch (endpoint.scheme.toLowerCase()) {
+          'ws' => 80,
+          'wss' => 443,
+          _ => 0,
+        };
 
   static String _poolKey(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
     final host = endpoint.host.toLowerCase();
-    final port = endpoint.hasPort
-        ? endpoint.port
-        : switch (scheme) {
-            'ws' => 80,
-            'wss' => 443,
-            _ => 0,
-          };
+    final port = _portOf(endpoint);
     if (scheme != 'ws' && scheme != 'wss') {
       return '$scheme://$host:$port';
     }
@@ -361,10 +520,12 @@ class Switchboard {
   Future<MuxConnection> _dialPooled(Uri endpoint, String key) async {
     try {
       final connection = await _dial(endpoint);
-      _pool[key] = connection;
+      final pooled = _pool[key] ??= [];
+      pooled.add(connection);
       unawaited(
         connection.done.then((_) {
-          if (identical(_pool[key], connection)) {
+          final list = _pool[key];
+          if (list != null && list.remove(connection) && list.isEmpty) {
             _pool.remove(key);
           }
         }),
@@ -390,11 +551,17 @@ class Switchboard {
           'unsupported endpoint scheme: $endpoint',
         );
     }
+    final connection = _adopt(
+      transport,
+      isInitiator: true,
+      remote: endpoint.toString(),
+    );
     if (_closing) {
-      transport.sink.close().ignore();
+      // Adopted while closing: it goes away at once and close() waits for
+      // it.
       throw _closedException();
     }
-    return _adopt(transport, isInitiator: true, remote: endpoint.toString());
+    return connection;
   }
 
   Future<StreamChannel<Uint8List>> _connectTcp(Uri endpoint) async {
@@ -423,7 +590,12 @@ class Switchboard {
   }
 
   Future<StreamChannel<Uint8List>> _connectWebSocket(Uri endpoint) async {
-    final attempt = WebSocketTransport.connect(endpoint.removeFragment());
+    // Compression off: a compressed message could inflate far beyond the
+    // frame limit before it is checked.
+    final attempt = IOWebSocketTransport.connect(
+      endpoint.removeFragment(),
+      maxFrameSize: _webSocketFrameLimit,
+    );
     try {
       return await attempt.timeout(connectTimeout);
     } on TimeoutException {
@@ -491,17 +663,19 @@ class Switchboard {
       unawaited(channel.close(e.status));
       return;
     }
+    final policy = _policies[connection];
+    if (policy != null && !_permitted(policy, address, connection)) {
+      _log.info(
+        'channel ${channel.id} from $remote: $address refused by the '
+        'listener policy',
+      );
+      unawaited(channel.close(genericStatus(StatusCode.permissionDenied)));
+      return;
+    }
     final handler = _select(address);
     if (handler == null) {
       _log.fine('channel ${channel.id} from $remote: no handler for $address');
-      unawaited(
-        channel.close(
-          Status.of(
-            StatusCode.notFound,
-            'no service ${address.address ?? '(default)'}',
-          ),
-        ),
-      );
+      unawaited(channel.close(genericStatus(StatusCode.notFound)));
       return;
     }
     final incoming = IncomingChannel(
@@ -523,6 +697,19 @@ class Switchboard {
       }
     } on Object catch (e, st) {
       _handlerFailed(incoming, e, st);
+    }
+  }
+
+  static bool _permitted(
+    ChannelPolicy policy,
+    ChannelAddress address,
+    MuxConnection connection,
+  ) {
+    try {
+      return policy(address, connection);
+    } on Object catch (e, st) {
+      _log.warning('listener policy failed for $address', e, st);
+      return false;
     }
   }
 
@@ -568,6 +755,10 @@ class Switchboard {
   /// header: the selected record's instance, or the requested instance
   /// when the record's is 0.
   ///
+  /// With [excludeOwnEndpoints], endpoints for which [isOwnEndpoint] holds
+  /// are skipped as unreachable, so that a proxy never forwards a channel
+  /// to itself.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.notFound] if no
   /// instance is known, [StatusCode.unavailable] if none is reachable, and
   /// [StatusCode.failedPrecondition] if there is no resolver or the node
@@ -578,6 +769,7 @@ class Switchboard {
     ServiceAddress address, {
     int? shard,
     Resolver? resolver,
+    bool excludeOwnEndpoints = false,
   }) async {
     _checkOpen();
     final r = resolver ?? this.resolver;
@@ -616,6 +808,14 @@ class Switchboard {
     for (var i = 0; i < n; i++) {
       final record = candidates[(start + i) % n];
       for (final endpoint in record.endpoints) {
+        if (excludeOwnEndpoints && isOwnEndpoint(endpoint)) {
+          _log.warning(
+            '$address: ${record.address} at $endpoint is this node itself; '
+            'not connecting',
+          );
+          failures.add('$endpoint: this node');
+          continue;
+        }
         try {
           final connection = await connect(endpoint);
           final selected = record.address.isAny && !address.isAny
@@ -740,10 +940,13 @@ class Switchboard {
       ? address.copyWith(payload: defaultPayload)
       : address;
 
-  /// A pooled connection may receive GOAWAY between [connect] and the
-  /// OPEN; one retry replaces it.
+  /// A pooled connection may receive GOAWAY, or fill up to its peer's
+  /// channel limit, between [connect] and the OPEN; one retry replaces it.
   bool _retryOpen(SwitchboardException e, int attempt) =>
-      attempt == 0 && e.code == StatusCode.failedPrecondition && !_closing;
+      attempt == 0 &&
+      (e.code == StatusCode.failedPrecondition ||
+          e.code == StatusCode.resourceExhausted) &&
+      !_closing;
 
   // Shutdown ------------------------------------------------------------
 
@@ -751,6 +954,14 @@ class Switchboard {
   /// connection and waits for each to finish its channels (up to
   /// [MuxOptions.goAwayGrace]) and close. Further calls to [connect] and
   /// the open methods fail with [StatusCode.failedPrecondition].
+  ///
+  /// Connections that are established while closing (a WebSocket upgrade
+  /// or a dial that was in progress, a TCP connection accepted before the
+  /// listener closed) receive GOAWAY at once, and the returned future
+  /// waits for them too (for upgrades and dials in progress, at most
+  /// [connectTimeout]). An HTTP request in progress when closing starts is
+  /// still answered; its connection is closed afterwards, and at the latest
+  /// when the node has closed.
   ///
   /// The [resolver] is owned by the caller and is not closed. Calling
   /// again returns the same future. Never throws.
@@ -764,15 +975,48 @@ class Switchboard {
     _httpServers.clear();
     _tcpServers.clear();
     _endpoints.clear();
+    _ownEndpoints.clear();
+    // Stop listening. HTTP connections busy with a request are kept until
+    // it is answered (dart:io then closes them) or the end; idle ones are
+    // closed now.
     await Future.wait<void>([
-      for (final server in http) _quietly(server.close(force: true)),
+      for (final server in http) _quietly(server.close()),
       for (final server in tcp) _quietly(server.close()),
     ]);
     _pool.clear();
     await Future.wait<void>([
       for (final connection in List.of(_live)) connection.goAway(),
     ]);
-    await Future.wait<void>(List.of(_lateShutdowns));
+    // Upgrades and dials in progress may still produce connections, which
+    // are adopted and sent GOAWAY at once: wait until none is left, for the
+    // upgrades and dials at most connectTimeout.
+    final watch = Stopwatch()..start();
+    while (true) {
+      final late = List.of(_lateShutdowns);
+      _lateShutdowns.clear();
+      final left = connectTimeout - watch.elapsed;
+      final waiting = left > Duration.zero
+          ? List.of(_inFlight)
+          : const <Future<void>>[];
+      if (late.isEmpty && waiting.isEmpty) {
+        if (_inFlight.isNotEmpty) {
+          _log.fine(
+            'closed with ${_inFlight.length} upgrades or dials pending',
+          );
+        }
+        break;
+      }
+      await Future.wait<void>([
+        ...late,
+        if (waiting.isNotEmpty)
+          Future.wait<void>(waiting)
+              .then<void>((_) {})
+              .timeout(left, onTimeout: () {}),
+      ]);
+    }
+    await Future.wait<void>([
+      for (final server in http) _quietly(server.close(force: true)),
+    ]);
     await _connections.close();
     _log.info('closed');
   }
@@ -792,4 +1036,12 @@ class Switchboard {
     StatusCode.failedPrecondition,
     'switchboard is closed',
   );
+}
+
+/// A listening endpoint and the host names that designate it.
+class _OwnEndpoint {
+  _OwnEndpoint(this.uri, this.hosts);
+
+  final Uri uri;
+  final Set<String> hosts;
 }

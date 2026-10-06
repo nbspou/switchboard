@@ -1,7 +1,7 @@
 // Resource limits of the mux: rejected OPENs, undelivered channels, receive
 // buffers and the connection high-water mark, output backpressure over TCP,
-// reason truncation, application codes from the peer, and the close
-// confirmation timeout.
+// reason truncation, application codes from the peer, the close
+// confirmation timeout and the budget of held OPEN payloads.
 
 import 'dart:async';
 import 'dart:convert';
@@ -680,5 +680,92 @@ void main() {
       expect(await channel.done, hasCode(StatusCode.connectionLost));
       await raw.rest();
     });
+  });
+
+  group('open payload budget', () {
+    test('peer OPENs beyond maxOpenPayloadBytes are refused until channels '
+        'close', () async {
+      final (a, b) = muxPair(
+        acceptor: quiet.copyWith(maxOpenPayloadBytes: 100),
+      );
+      final atB = StreamQueue(b.incoming);
+      final first = a.open(Uint8List(40));
+      final second = a.open(Uint8List(40));
+      final third = a.open(Uint8List(40));
+      final empty = a.open(Uint8List(0));
+      final firstAtB = await atB.next;
+      await atB.next;
+      expect(await third.done, hasCode(StatusCode.resourceExhausted));
+      // An empty payload still fits.
+      expect((await atB.next).id, empty.id);
+      expect(b.openPayloadBytes, 80);
+      // Held payloads count as buffered bytes.
+      expect(b.bufferedBytes, 80);
+      // Channels the acceptor opens itself do not count.
+      b.open(Uint8List(90));
+      await b.ping();
+      expect(b.openPayloadBytes, 80);
+      // A mutually closed channel releases its payload.
+      await firstAtB.close();
+      expect(await first.done, Status.ok);
+      expect(b.openPayloadBytes, 40);
+      expect(b.bufferedBytes, 40);
+      final fourth = a.open(Uint8List(60));
+      expect((await atB.next).openPayload, hasLength(60));
+      expect(b.openPayloadBytes, 100);
+      expect(fourth.state, MuxChannelState.open);
+      expect(second.state, MuxChannelState.open);
+      await a.close();
+      await b.done;
+      expect(b.openPayloadBytes, 0);
+      expect(b.bufferedBytes, 0);
+      await atB.cancel();
+    });
+
+    test('half a smaller receive high-water mark is the budget, so held '
+        'payloads never keep the reading paused', () async {
+      final (a, b) = muxPair(
+        acceptor: quiet.copyWith(receiveHighWaterMarkBytes: 200),
+      );
+      final atB = StreamQueue(b.incoming);
+      a.open(Uint8List(60));
+      final refused = a.open(Uint8List(60));
+      final second = a.open(Uint8List(40));
+      await atB.next;
+      final held = await atB.next;
+      expect(held.openPayload, hasLength(40));
+      expect(await refused.done, hasCode(StatusCode.resourceExhausted));
+      expect(b.bufferedBytes, 100);
+      expect(b.isReceivePaused, isFalse);
+      // Unread data on top of them pauses it, and reading that data
+      // resumes it although the payloads are still held.
+      second.send(Uint8List(120));
+      await pumpEventQueue();
+      expect(b.isReceivePaused, isTrue);
+      await held.stream.first;
+      expect(b.bufferedBytes, 100);
+      expect(b.isReceivePaused, isFalse);
+      await a.close();
+      await atB.cancel();
+    });
+
+    test(
+      'a channel whose close is not confirmed releases its payload',
+      () async {
+        final (mux, raw) = rawPair(
+          options: rawOptions.copyWith(
+            closeConfirmTimeout: const Duration(milliseconds: 30),
+          ),
+        );
+        raw.send(openHex(3, 50));
+        final channel = await mux.incoming.first;
+        expect(mux.openPayloadBytes, 50);
+        await channel.close();
+        expect(mux.openPayloadBytes, 0);
+        expect(mux.bufferedBytes, 0);
+        await mux.close();
+        await raw.rest();
+      },
+    );
   });
 }
