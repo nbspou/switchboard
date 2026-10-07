@@ -373,6 +373,15 @@ class _SlotManager {
       );
       return;
     }
+    final existing = spaces[type];
+    if (!service._permitsSpace(
+      session,
+      message,
+      type,
+      confirm: existing != null && existing.space == definition,
+    )) {
+      return;
+    }
     final _Registration? registration;
     try {
       registration = registrationOf(session, type);
@@ -431,7 +440,8 @@ class _SlotManager {
 
   void onHolding(_Session session, TalkMessage message) {
     final request = decode(message, HoldingRequest.decode);
-    if (request == null) {
+    if (request == null ||
+        !service._permits(session, message, Right.claim, request.type)) {
       return;
     }
     if (!_checkHolding(session, message, request)) {
@@ -614,6 +624,7 @@ class _SlotManager {
   void onClaim(_Session session, TalkMessage message) {
     final request = decode(message, ClaimRequest.decode);
     if (request == null ||
+        !service._permits(session, message, Right.claim, request.type) ||
         lookup(message, request.type, request.slot) == null) {
       return;
     }
@@ -728,6 +739,7 @@ class _SlotManager {
   void onRelease(_Session session, TalkMessage message) {
     final request = decode(message, ReleaseRequest.decode);
     if (request == null ||
+        !service._permits(session, message, Right.claim, request.type) ||
         lookup(message, request.type, request.slot) == null) {
       return;
     }
@@ -804,9 +816,10 @@ class _SlotManager {
   // ---------------------------------------------------------------------
   // LOCATE
 
-  void onLocate(TalkMessage message) {
+  void onLocate(_Session session, TalkMessage message) {
     final request = decode(message, LocateRequest.decode);
     if (request == null ||
+        !service._permits(session, message, Right.watch, request.type) ||
         lookup(message, request.type, request.slot) == null) {
       return;
     }
@@ -936,7 +949,7 @@ class _SlotManager {
   // ---------------------------------------------------------------------
   // MIGRATE
 
-  void onMigrate(TalkMessage message) {
+  void onMigrate(_Session session, TalkMessage message) {
     if (!message.expectsStream) {
       abortCode(
         message,
@@ -946,7 +959,8 @@ class _SlotManager {
       return;
     }
     final request = decode(message, MigrateRequest.decode);
-    if (request == null) {
+    if (request == null ||
+        !service._permits(session, message, Right.migrate, request.type)) {
       return;
     }
     final space = lookup(message, request.type, request.slot);

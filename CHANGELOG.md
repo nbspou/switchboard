@@ -203,7 +203,25 @@ The protocol specification lives in the project wiki (section
   `requireIdentity` and `all`, channels held until their peer identifies,
   `IncomingChannel.peerIdentity`. New dependency: `cryptography` (its pure
   Dart Ed25519, the same on the VM and the web).
-- Tests: over 1000 tests, including the wiki test vectors (the codec tests also
+- Identity (stage B): `IDENT` names the receiver it is meant for, and the
+  proof covers it with the field lengths, so a peer cannot relay a live
+  handshake to a third node (`MuxConnection.localIdentity`,
+  `MuxOptions.requireNamedIdent`, `PeerIdentity.receiver`,
+  `Switchboard(expectedIdentityFor:)`, `dial(intent:, receiver:, record:)`,
+  `identifyOn(receiver:)`); credentials are at most 637 bytes. The naming
+  service enforces scopes per `_ns` channel, from the connection's identity
+  or a bearer credential in the open payload
+  (`NamingService(verifier:, requireCredential:)`), ends a channel whose
+  credential expires, renews credentials (`RENEW`,
+  `NamingService(issuer:, renewable:)`, `NamingClient.renew`, renewal at
+  two thirds of the lifetime by `MeshNode` with
+  `Switchboard.updateCredential`), and brokers connections to instances
+  registered without endpoints (`CONNECT`: `NamingClient.connectTo` and
+  `connectHandler`, `BrokeringResolver`, `Switchboard.broker` and
+  `brokerEndpoint`, brokered records in `openChannel` and `PeerSet`,
+  `MeshNode` dialling back). `NamingClient(watch: false)` and
+  `MeshNode.join(watch: false)` for nodes that may only register.
+- Tests: over 1200 tests, including the wiki test vectors (the codec tests also
   run on Node.js with `dart test -P node`) and integration tests over TCP
   and WebSocket.
 - Documentation: README with quick start programs (`example/`), and the

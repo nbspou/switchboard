@@ -163,6 +163,14 @@ class PeerEvent {
 /// time left divided by the endpoints left, so that one that does not
 /// answer at all leaves time for the next.
 ///
+/// A record without endpoints is reached through the naming service's
+/// `CONNECT` instead ([Switchboard.broker]; the resolver must be a
+/// `BrokeringResolver`, as a `NamingResolver` is): the peer dials this node
+/// and the connection that arrives, accepted on the node's listener and
+/// under that listener's policy (not [policy]), is the peer's, with no
+/// [Peer.endpoint]. After every loss the set brokers again, with the same
+/// backoff, hooks and online rules.
+///
 /// A peer is online only once it is usable: once connected, `onConnect`
 /// runs, then the per-peer [channel] (if any) is opened, a PING round trip
 /// on the connection makes sure the peer did not refuse it on arrival, and
@@ -800,7 +808,9 @@ class Peer {
   /// per-peer channel is re-opened on such a connection).
   int get attempt => _attempt;
 
-  /// The endpoint of [connection] while it is set.
+  /// The endpoint of [connection] while it is set; null for a brokered
+  /// connection (the peer registered without endpoints and dialled this
+  /// node).
   Uri? get endpoint => _endpoint;
 
   /// The peer's connection: set from the moment it is established
@@ -982,8 +992,13 @@ class Peer {
 
   /// Dials the endpoints of the record in order; the first that answers
   /// is the connection. With [PeerSet.connectTimeout], each endpoint gets
-  /// the time left divided by the endpoints left.
+  /// the time left divided by the endpoints left. A record without
+  /// endpoints is brokered instead.
   Future<void> _dialFirst(Object token) async {
+    if (_record.endpoints.isEmpty) {
+      await _brokerConnection(token);
+      return;
+    }
     final endpoints = List.of(_record.endpoints);
     final budget = _set.connectTimeout;
     final clock = Stopwatch()..start();
@@ -1033,11 +1048,62 @@ class Peer {
     );
   }
 
+  /// Has the peer, registered without endpoints, dial this node through
+  /// the naming service ([Switchboard.broker]), within
+  /// [PeerSet.connectTimeout]; a connection that lands after that is sent
+  /// GOAWAY at once.
+  Future<void> _brokerConnection(Object token) async {
+    final brokering = _set.switchboard.broker(
+      _record.address,
+      resolver: _set.resolver,
+    );
+    final budget = _set.connectTimeout;
+    final MuxConnection connection;
+    try {
+      connection = await (budget > Duration.zero
+          ? brokering.timeout(
+              budget,
+              onTimeout: () {
+                _set._track(
+                  brokering.then<void>(_set._retire, onError: (Object _) {}),
+                );
+                throw SwitchboardException.of(
+                  StatusCode.unavailable,
+                  'not brokered within $budget',
+                );
+              },
+            )
+          : brokering);
+    } on Object catch (e) {
+      if (!identical(_token, token)) {
+        return;
+      }
+      _token = null;
+      _connectFailed(
+        e is SwitchboardException
+            ? e.status
+            : Status.of(StatusCode.unavailable, 'cannot broker: $e'),
+      );
+      return;
+    }
+    if (!identical(_token, token)) {
+      _log.fine('$this: closing a connection that arrived too late');
+      _set._retire(connection);
+      return;
+    }
+    _token = null;
+    _onConnected(connection, null);
+  }
+
   /// Dials [endpoint], giving up after [bound] if given; a connection that
   /// lands after that is sent GOAWAY at once ([PeerSet.close] waits for
   /// it).
   Future<MuxConnection> _dial(Uri endpoint, Duration? bound) {
-    final dialing = _set.switchboard.dial(endpoint, policy: _set.policy);
+    final dialing = _set.switchboard.dial(
+      endpoint,
+      policy: _set.policy,
+      record: _record,
+    );
     if (bound == null) {
       return dialing;
     }
@@ -1070,7 +1136,7 @@ class Peer {
     _setState(PeerState.offline, status, retryDelay: delay);
   }
 
-  void _onConnected(MuxConnection connection, Uri endpoint) {
+  void _onConnected(MuxConnection connection, Uri? endpoint) {
     _connection = connection;
     _endpoint = endpoint;
     _established = false;
@@ -1085,7 +1151,9 @@ class Peer {
     connection.peerGoAwayStatus
         .then((status) => _onPeerGoAway(connection, status))
         .ignore();
-    _log.fine('$this: connected to $endpoint');
+    _log.fine(
+      '$this: ${endpoint == null ? 'brokered' : 'connected to $endpoint'}',
+    );
     unawaited(_setUp(connection));
   }
 
@@ -1108,7 +1176,7 @@ class Peer {
       return;
     }
     _established = true;
-    _log.info('$this: online at $_endpoint');
+    _log.info('$this: online at ${_endpoint ?? 'a brokered connection'}');
     _setState(PeerState.online, _lastStatus);
   }
 

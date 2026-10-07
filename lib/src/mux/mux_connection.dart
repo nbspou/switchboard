@@ -7,6 +7,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:clock/clock.dart';
@@ -45,6 +46,7 @@ class MuxOptions {
     this.maxOpenPayloadBytes = defaultMaxOpenPayloadBytes,
     this.identityVerifier,
     this.identityTimeout = const Duration(seconds: 10),
+    this.requireNamedIdent = false,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -169,6 +171,14 @@ class MuxOptions {
   /// [Duration.zero] waits without bound. Default 10 s.
   final Duration identityTimeout;
 
+  /// Whether an `IDENT` must name this side as its receiver: one with an
+  /// empty receiver field is then refused like one that fails
+  /// verification (GOAWAY `UNAUTHENTICATED`). An `IDENT` naming another
+  /// receiver than [MuxConnection.localIdentity] is refused either way.
+  /// Default false; a naming service sets it for its listener, so that no
+  /// node's identification can be relayed to it.
+  final bool requireNamedIdent;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -187,6 +197,7 @@ class MuxOptions {
     int? maxOpenPayloadBytes,
     CredentialVerifier? identityVerifier,
     Duration? identityTimeout,
+    bool? requireNamedIdent,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -205,6 +216,7 @@ class MuxOptions {
     maxOpenPayloadBytes: maxOpenPayloadBytes ?? this.maxOpenPayloadBytes,
     identityVerifier: identityVerifier ?? this.identityVerifier,
     identityTimeout: identityTimeout ?? this.identityTimeout,
+    requireNamedIdent: requireNamedIdent ?? this.requireNamedIdent,
   );
 }
 
@@ -439,6 +451,26 @@ class MuxConnection {
   /// error.
   Future<PeerIdentity> get peerIdentified => _peerIdentified.future;
 
+  /// This side's identity (its credential's identity string), which the
+  /// receiver field of the peer's `IDENT` must name when it names anyone:
+  /// an `IDENT` whose receiver is not empty and differs from it is
+  /// refused (GOAWAY `UNAUTHENTICATED`), so that a peer cannot relay
+  /// another node's identification to this one. Null, the default, for a
+  /// side without a credential, which refuses every `IDENT` that names a
+  /// receiver. A `Switchboard` sets it on every connection from its
+  /// credential. See also [MuxOptions.requireNamedIdent].
+  String? get localIdentity => _localIdentity;
+
+  set localIdentity(String? identity) {
+    _localIdentity = identity;
+    _localIdentityBytes = identity == null
+        ? null
+        : Uint8List.fromList(utf8.encode(identity));
+  }
+
+  String? _localIdentity;
+  Uint8List? _localIdentityBytes;
+
   /// Completes when the peer's `NONCE` arrives before this side sent one:
   /// the peer intends to identify, or asks this side to (the two cannot be
   /// told apart). The connection has answered with its own `NONCE`
@@ -456,10 +488,14 @@ class MuxConnection {
   /// "Switchboard Identity and Credentials", section "Connection
   /// identity"): sends `NONCE` unless this side has sent one, waits for
   /// the peer's `NONCE`, sends `IDENT` with [intent] (at most 64 bytes,
-  /// default empty) and, for a credential with a holder key, the proof
-  /// signed with [holderKey] over `"SWBIDENT" ‖ our nonce ‖ the peer's
-  /// nonce ‖ intent`. A bearer credential carries no proof, and
-  /// [holderKey] is not used for it.
+  /// default empty) and [receiver] (the identity the peer is expected to
+  /// have, at most 255 bytes of UTF-8; null or empty names nobody) and,
+  /// for a credential with a holder key, the proof signed with [holderKey]
+  /// over `"SWBIDENT" ‖ our nonce ‖ the peer's nonce ‖ len8 intent ‖
+  /// intent ‖ len8 receiver ‖ receiver` ([MuxIdent.proofMessage]). A
+  /// bearer credential carries no proof, and [holderKey] is not used for
+  /// it. A peer whose identity is not [receiver] refuses the `IDENT`, so
+  /// that it cannot pass this side's identification on to a third node.
   ///
   /// Completes once the peer has handled the `IDENT`: a PING sent right
   /// after it has been answered. A peer handles the frames after an
@@ -476,12 +512,13 @@ class MuxConnection {
   /// confirmation did not arrive in time, [StatusCode.failedPrecondition]
   /// when the connection is closed, and the connection's end status when it
   /// ends meanwhile. Throws [ArgumentError] when the credential names a
-  /// holder key and [holderKey] is missing or another, and when the intent
-  /// or the `IDENT` is too long.
+  /// holder key and [holderKey] is missing or another, and when the
+  /// intent, the receiver or the `IDENT` is too long.
   Future<void> identify(
     Credential credential, {
     HolderKey? holderKey,
     Uint8List? intent,
+    String? receiver,
     Duration? timeout,
   }) async {
     final holder = credential.holderKey;
@@ -504,11 +541,15 @@ class MuxConnection {
     final intentBytes = intent == null
         ? Uint8List(0)
         : Uint8List.fromList(intent);
+    final receiverBytes = receiver == null
+        ? Uint8List(0)
+        : Uint8List.fromList(utf8.encode(receiver));
     final credentialBytes = credential.encode();
     // Checks the lengths before anything is sent.
     MuxIdent(
       credential: credentialBytes,
       intent: intentBytes,
+      receiver: receiverBytes,
       proof: holder == null ? null : Uint8List(MuxIdent.proofLength),
     ).encode();
     if (_closing) {
@@ -550,19 +591,28 @@ class MuxConnection {
         ? null
         : await bounded(
             holderKey!.sign(
-              MuxIdent.proofMessage(localNonce, peerNonce, intentBytes),
+              MuxIdent.proofMessage(
+                localNonce,
+                peerNonce,
+                intentBytes,
+                receiverBytes,
+              ),
             ),
             'proof not signed',
           );
     if (_closing) {
       throw _identifyFailure();
     }
-    _log.fine('$this: identifying as "${credential.identity}"');
+    _log.fine(
+      '$this: identifying as "${credential.identity}"'
+      '${receiver == null || receiver.isEmpty ? '' : ' to "$receiver"'}',
+    );
     _sendFrame(
       MuxControlMessage.ident(
         MuxIdent(
           credential: credentialBytes,
           intent: intentBytes,
+          receiver: receiverBytes,
           proof: proof,
         ),
       ).toFrame(),
@@ -1084,8 +1134,14 @@ class MuxConnection {
     Uint8List receiverNonce,
   ) async {
     PeerIdentity? identity;
-    var failure = '';
+    var failure = _receiverProblem(ident.receiver) ?? '';
+    // Checked against this side's identity: valid UTF-8 when not empty.
+    final receiver = utf8.decode(ident.receiver, allowMalformed: true);
     try {
+      if (failure.isNotEmpty) {
+        // Refused for its receiver: nothing else is checked.
+        throw SwitchboardException.of(StatusCode.unauthenticated, failure);
+      }
       final credential = await verifier.verify(
         Uint8List.fromList(ident.credential),
       );
@@ -1097,7 +1153,12 @@ class MuxConnection {
       } else if (ident.proof.length != MuxIdent.proofLength ||
           !await ed25519Verify(
             holder,
-            MuxIdent.proofMessage(senderNonce, receiverNonce, ident.intent),
+            MuxIdent.proofMessage(
+              senderNonce,
+              receiverNonce,
+              ident.intent,
+              ident.receiver,
+            ),
             ident.proof,
           )) {
         failure = 'proof of possession does not verify';
@@ -1107,6 +1168,7 @@ class MuxConnection {
           credential: credential,
           intent: Uint8List.fromList(ident.intent),
           verifiedAt: clock.now(),
+          receiver: receiver,
         );
       }
     } on SwitchboardException catch (e) {
@@ -1138,6 +1200,21 @@ class MuxConnection {
     if (!_closing) {
       _subscription.resume();
     }
+  }
+
+  /// Why an `IDENT` naming [receiver] is refused here, or null when it is
+  /// not: a receiver other than [localIdentity], or none while
+  /// [MuxOptions.requireNamedIdent].
+  String? _receiverProblem(Uint8List receiver) {
+    if (receiver.isEmpty) {
+      return options.requireNamedIdent ? 'the IDENT names no receiver' : null;
+    }
+    final own = _localIdentityBytes;
+    if (own == null || !_bytesEqual(own, receiver)) {
+      return 'the IDENT names another receiver '
+          '("${utf8.decode(receiver, allowMalformed: true)}")';
+    }
+    return null;
   }
 
   /// The status of the GOAWAY sent for an `IDENT` that fails verification.

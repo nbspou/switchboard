@@ -6,9 +6,11 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 
+import '../address/service_address.dart';
 import '../name.dart';
 import '../status.dart';
 import '../switchboard/resolver.dart';
@@ -21,7 +23,9 @@ import 'slot_table.dart';
 ///
 /// Resolution waits until the client has been synced once, at most
 /// [resolveTimeout]; see [resolve]. The resolver does not start the client.
-class NamingResolver implements SlotResolver {
+/// It brokers connections to instances registered without endpoints
+/// through the client's `CONNECT` ([connectTo]).
+class NamingResolver implements SlotResolver, BrokeringResolver {
   /// Creates a resolver over [client], which may be in any state: whether
   /// the stale table is served depends only on [NamingClient.hasSynced].
   NamingResolver(
@@ -125,6 +129,27 @@ class NamingResolver implements SlotResolver {
       state: located.state,
       owner: located.owner,
       epoch: located.epoch,
+    );
+  }
+
+  /// Has the instance at [address] dial [endpoint] through the naming
+  /// service ([NamingClient.connectTo]); completes with the identity it
+  /// presents there. Fails with [StatusCode.failedPrecondition] after
+  /// [close].
+  @override
+  Future<String> connectTo(
+    ServiceAddress address,
+    Uri endpoint,
+    Uint8List intent, {
+    Duration? timeout,
+  }) async {
+    _checkOpen();
+    return client.connectTo(
+      address.type,
+      address.instance,
+      endpoint,
+      intent,
+      timeout: timeout,
     );
   }
 

@@ -6,6 +6,8 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' show Random;
 import 'dart:typed_data';
@@ -15,11 +17,15 @@ import 'package:stream_channel/stream_channel.dart';
 
 import '../address/channel_address.dart';
 import '../address/service_address.dart';
+import '../bytes.dart';
 import '../identity/credential.dart';
 import '../identity/credential_verifier.dart';
 import '../identity/holder_key.dart';
+import '../identity/peer_identity.dart';
+import '../identity/secure_random.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
+import '../mux/mux_frame.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
@@ -105,6 +111,12 @@ class Switchboard {
   /// bounds each identification and how long a channel that its policy
   /// refused with `UNAUTHENTICATED` is held for the peer to identify
   /// (zero: no bound on identification, and no holding).
+  /// [expectedIdentityFor] names the peer each identification on an
+  /// initiated connection is meant for (the receiver field of `IDENT`).
+  /// The credential's identity is the [MuxConnection.localIdentity] of
+  /// every connection, which peers' identifications must name, if they
+  /// name anyone. Instances registered without endpoints are reached by
+  /// having them dial this node ([broker], [brokerEndpoint]).
   ///
   /// Throws [ArgumentError] when [credential] names a holder key and
   /// [holderKey] is missing or another, and for a negative
@@ -129,6 +141,7 @@ class Switchboard {
     this.identifyOutgoing = true,
     this.identifyFor,
     this.identityTimeout = const Duration(seconds: 10),
+    this.expectedIdentityFor,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        _identity = credential,
        muxOptions = verifier == null
@@ -159,9 +172,11 @@ class Switchboard {
   /// The credential this node identifies with (wiki page "Switchboard
   /// Identity and Credentials"), or null for none. May be replaced, for
   /// example by a renewed credential: connections established afterwards
-  /// use the new one; [identifyOn] presents it on a live connection.
-  /// Throws [ArgumentError] when the new credential names a holder key
-  /// other than [holderKey]'s.
+  /// use the new one; [identifyOn] presents it on a live connection, and
+  /// [updateCredential] on every connection the node identified on. Its
+  /// identity becomes the [MuxConnection.localIdentity] of every
+  /// connection. Throws [ArgumentError] when the new credential names a
+  /// holder key other than [holderKey]'s.
   Credential? get credential => _identity;
 
   set credential(Credential? value) {
@@ -169,6 +184,43 @@ class Switchboard {
       _checkHolderKey(value);
     }
     _identity = value;
+    for (final connection in _live) {
+      connection.localIdentity = value?.identity;
+    }
+  }
+
+  /// Replaces [credential] with [credential] (a renewed one, typically)
+  /// and presents it again, with `IDENT`, on every open connection this
+  /// node has identified on, with the intent and receiver of the last
+  /// identification there; the peers replace the identity they had.
+  /// Completes once every such identification has completed or failed
+  /// (failures are logged: a peer that refuses the credential ends its
+  /// connection). Throws [ArgumentError] like the [credential] setter.
+  Future<void> updateCredential(Credential credential) async {
+    this.credential = credential;
+    await Future.wait([
+      for (final connection in List.of(_live))
+        if (connection.isOpen && _identified[connection] != null)
+          _reidentify(connection, credential),
+    ]);
+  }
+
+  Future<void> _reidentify(
+    MuxConnection connection,
+    Credential credential,
+  ) async {
+    final last = _identified[connection]!;
+    try {
+      await connection.identify(
+        credential,
+        holderKey: holderKey,
+        intent: last.intent,
+        receiver: last.receiver,
+        timeout: identityTimeout,
+      );
+    } on Object catch (e) {
+      _log.info('identifying again on ${_remotes[connection]} failed: $e');
+    }
   }
 
   Credential? _identity;
@@ -205,11 +257,12 @@ class Switchboard {
   /// initiates, for endpoints [identifyFor] does not decide. Default true.
   ///
   /// The node presents its credential to every such peer: a bearer
-  /// credential can be replayed by whoever receives it, and even a
-  /// holder-key credential lets a peer that relays the handshake to a third
-  /// node pass as this node there (the proof binds the nonces, not the
-  /// peer). A node that dials peers outside its trust domain identifies
-  /// only to its own mesh, through [identifyFor].
+  /// credential can be replayed by whoever receives it, and a holder-key
+  /// credential whose `IDENT` names nobody lets a peer that relays the
+  /// handshake pass as this node at a third node that accepts unnamed
+  /// identifications ([expectedIdentityFor] names the peer, which binds
+  /// the proof to it). A node that dials peers outside its trust domain
+  /// identifies only to its own mesh, through [identifyFor].
   final bool identifyOutgoing;
 
   /// Whether the node identifies on a connection it initiates to
@@ -222,6 +275,14 @@ class Switchboard {
   /// and on how long a channel refused with `UNAUTHENTICATED` by its
   /// connection's policy is held for the peer to identify. Default 10 s.
   final Duration identityTimeout;
+
+  /// The identity the node expects the peer of a connection it initiates
+  /// to have, named in the receiver field of its `IDENT` there, so that
+  /// the peer cannot relay the identification to a third node; consulted
+  /// on every identification on an initiated connection that is not given
+  /// a receiver. Null (the default), or a null answer, names nobody. See
+  /// [ExpectedIdentity].
+  final ExpectedIdentity? expectedIdentityFor;
 
   /// Resolves service types for [openChannel] and [openTalk]. May be
   /// replaced at any time; channels already open are unaffected.
@@ -310,6 +371,13 @@ class Switchboard {
   /// [EndpointCredential].
   final EndpointCredential? credentialFor;
 
+  /// Where an instance that registered without endpoints dials this node
+  /// when the node brokers a connection to it ([broker]): the `endpoint`
+  /// of the naming service's `CONNECT`. Null (the default): the first of
+  /// [listeningEndpoints]. It must be reachable from the instances, and
+  /// its listener's policy is the policy of the brokered connections.
+  Uri? brokerEndpoint;
+
   final Map<Name, Map<int, ChannelHandler>> _services = {};
 
   /// Per type, the instances whose registration also serves channels
@@ -331,10 +399,22 @@ class Switchboard {
   final Expando<ChannelPolicy> _policies = Expando<ChannelPolicy>('policy');
   // The endpoint each initiated connection was established to.
   final Expando<Uri> _dialled = Expando<Uri>('endpoint');
+  // The intent and receiver of the node's last identification on a
+  // connection, for presenting a renewed credential there.
+  final Expando<_Identification> _identified = Expando<_Identification>(
+    'identification',
+  );
   // Keyed by the endpoint's pool key, or by the pool key and the policy
   // for a connect() with an explicit policy.
   final Map<Object, List<MuxConnection>> _pool = {};
   final Map<Object, Future<MuxConnection>> _dialing = {};
+  // Brokered connections (CONNECT): the pooled one per instance, the
+  // attempts in progress, the opens waiting for their instance to dial
+  // back (by intent), and the intents given up on lately.
+  final Map<ServiceAddress, MuxConnection> _brokeredPool = {};
+  final Map<ServiceAddress, Future<MuxConnection>> _brokering = {};
+  final Map<String, Completer<MuxConnection>> _brokerWaits = {};
+  final LinkedHashSet<String> _abandoned = LinkedHashSet<String>();
   final Map<Name, int> _roundRobin = {};
   final StreamController<MuxConnection> _connections =
       StreamController<MuxConnection>.broadcast();
@@ -809,7 +889,7 @@ class Switchboard {
       transport,
       isInitiator: isInitiator,
       options: muxOptions,
-    );
+    )..localIdentity = _identity?.identity;
     if (remote != null) {
       _remotes[connection] = remote;
     }
@@ -832,6 +912,11 @@ class Switchboard {
         _log.fine('connection with $remote ended: $status');
       }),
     );
+    if (!isInitiator) {
+      connection.peerIdentified
+          .then((identity) => _onAcceptedIdentified(connection, identity))
+          .ignore();
+    }
     if (!_connections.isClosed) {
       _connections.add(connection);
     }
@@ -922,12 +1007,60 @@ class Switchboard {
   /// such as `PeerSet` does, so that a peer that reboots does not disturb
   /// the pooled connections other parts of the application use.
   ///
-  /// Throws like [connect].
-  Future<MuxConnection> dial(Uri endpoint, {ChannelPolicy? policy}) {
+  /// The node identifies on it as on any connection it initiates, naming
+  /// the receiver [expectedIdentityFor] gives for [endpoint] and [record]
+  /// (the resolver's record the connection is for, if any). With an
+  /// [intent] or a [receiver] it identifies whatever [identifyFor] and
+  /// [identifyOutgoing] say, sending [intent] (at most 64 bytes) and
+  /// naming [receiver] (at most 255 bytes of UTF-8; empty names nobody)
+  /// instead of what [expectedIdentityFor] gives: this is how an instance
+  /// dials back the consumer a naming service's `CONNECT` names, with
+  /// one `IDENT`.
+  ///
+  /// Throws like [connect]. With an [intent] or a [receiver] and no
+  /// [credential], fails with [StatusCode.failedPrecondition] before
+  /// dialling. Throws [ArgumentError] for an [intent] or [receiver] too
+  /// long for an `IDENT`.
+  Future<MuxConnection> dial(
+    Uri endpoint, {
+    ChannelPolicy? policy,
+    Uint8List? intent,
+    String? receiver,
+    ServiceRecord? record,
+  }) {
     if (_closing) {
       return Future.error(_closedException());
     }
-    final attempt = _dial(endpoint, policy);
+    if (intent != null && intent.length > MuxIdent.maxIntentLength) {
+      throw ArgumentError.value(
+        intent.length,
+        'intent',
+        'at most ${MuxIdent.maxIntentLength} bytes',
+      );
+    }
+    if (receiver != null &&
+        utf8.encode(receiver).length > MuxIdent.maxReceiverLength) {
+      throw ArgumentError.value(
+        receiver,
+        'receiver',
+        'at most ${MuxIdent.maxReceiverLength} bytes of UTF-8',
+      );
+    }
+    if ((intent != null || receiver != null) && _identity == null) {
+      return Future.error(
+        SwitchboardException.of(
+          StatusCode.failedPrecondition,
+          'the node has no credential to identify with',
+        ),
+      );
+    }
+    final attempt = _dial(
+      endpoint,
+      policy,
+      intent: intent,
+      receiver: receiver,
+      record: record,
+    );
     _track(attempt.then<void>((_) {}, onError: (_) {}));
     return attempt;
   }
@@ -1005,7 +1138,15 @@ class Switchboard {
     }
   }
 
-  Future<MuxConnection> _dial(Uri endpoint, ChannelPolicy? policy) async {
+  /// Establishes and adopts a connection to [endpoint] and identifies on
+  /// it (see [dial]).
+  Future<MuxConnection> _dial(
+    Uri endpoint,
+    ChannelPolicy? policy, {
+    Uint8List? intent,
+    String? receiver,
+    ServiceRecord? record,
+  }) async {
     final StreamChannel<Uint8List> transport;
     switch (endpoint.scheme.toLowerCase()) {
       case 'ws' || 'wss':
@@ -1034,13 +1175,19 @@ class Switchboard {
       throw _closedException();
     }
     final credential = _identity;
-    if (credential != null && _identifiesTo(_normalised(endpoint))) {
+    final normalised = _normalised(endpoint);
+    if (credential != null &&
+        (intent != null || receiver != null || _identifiesTo(normalised))) {
+      final named = receiver ?? _expectedIdentity(normalised, record);
       try {
         await connection.identify(
           credential,
           holderKey: holderKey,
+          intent: intent,
+          receiver: named,
           timeout: identityTimeout,
         );
+        _identified[connection] = _Identification(intent, named);
       } on Object catch (e) {
         _log.info('identification to $endpoint failed: $e');
         unawaited(connection.goAway());
@@ -1072,25 +1219,59 @@ class Switchboard {
     }
   }
 
+  /// What [expectedIdentityFor] says for [endpoint] (normalised) and
+  /// [record]; a hook that throws names nobody.
+  String? _expectedIdentity(Uri endpoint, ServiceRecord? record) {
+    final hook = expectedIdentityFor;
+    if (hook == null) {
+      return null;
+    }
+    try {
+      return hook(endpoint, record);
+    } on Object catch (e, st) {
+      _log.warning('expectedIdentityFor failed for $endpoint', e, st);
+      return null;
+    }
+  }
+
   /// Identifies the node with [credential] on [connection], with [intent]
   /// (wiki page "Switchboard Identity and Credentials"): for a connection
   /// this node accepted, whose peer wants it to identify
   /// ([MuxConnection.identityRequested]), or to present a renewed
   /// [credential] on a live connection. Bounded by [identityTimeout].
   ///
+  /// The `IDENT` names [receiver] as the peer's identity; by default the
+  /// receiver of the node's last identification on [connection], else,
+  /// for a connection the node initiated, what [expectedIdentityFor] gives
+  /// for its endpoint, else nobody.
+  ///
   /// Fails like [MuxConnection.identify]. Throws [StateError] when the
   /// node has no credential.
-  Future<void> identifyOn(MuxConnection connection, {Uint8List? intent}) {
+  Future<void> identifyOn(
+    MuxConnection connection, {
+    Uint8List? intent,
+    String? receiver,
+  }) {
     final credential = _identity;
     if (credential == null) {
       throw StateError('the node has no credential');
     }
-    return connection.identify(
-      credential,
-      holderKey: holderKey,
-      intent: intent,
-      timeout: identityTimeout,
-    );
+    final dialled = _dialled[connection];
+    final named =
+        receiver ??
+        _identified[connection]?.receiver ??
+        (dialled == null
+            ? null
+            : _expectedIdentity(_normalised(dialled), null));
+    return connection
+        .identify(
+          credential,
+          holderKey: holderKey,
+          intent: intent,
+          receiver: named,
+          timeout: identityTimeout,
+        )
+        .then((_) => _identified[connection] = _Identification(intent, named));
   }
 
   /// What [endpointPolicy] says for [endpoint]; a hook that throws refuses
@@ -1186,6 +1367,212 @@ class Switchboard {
         StatusCode.unavailable,
         'cannot connect to $endpoint: $e',
       );
+    }
+  }
+
+  // Brokered connections -------------------------------------------------
+
+  /// Has the instance at [address], whose record has no endpoints, dial
+  /// this node, and returns that connection: the naming service's
+  /// `CONNECT` (wiki page "Switchboard Identity and Credentials", section
+  /// "Reverse connections"), through [resolver] (default: the node's),
+  /// which must be a [BrokeringResolver].
+  ///
+  /// The node asks the instance to dial [brokerEndpoint] (by default its
+  /// first listening endpoint) with a random intent, and waits, at most
+  /// [connectTimeout] in all, for the answer (the identity the instance
+  /// presents) and for an accepted connection whose peer identified with
+  /// that identity and that intent. With a [credential], the node then
+  /// identifies on it in turn, naming the instance as the receiver, so
+  /// that the instance's policy can check this node's `open` scopes. The
+  /// connection is accepted: the policy of the listener it arrived on
+  /// applies to the channels the instance opens on it, and channels this
+  /// node opens on it carry the payload of an accepted connection (see
+  /// [payloadFor]).
+  ///
+  /// The connection is not pooled: the caller owns it and ends it with
+  /// [MuxConnection.goAway], as with [dial]. [openChannel] and the other
+  /// resolving opens broker their own pooled connection, one per instance,
+  /// when they select an instance without endpoints.
+  ///
+  /// Fails with [SwitchboardException]: [StatusCode.failedPrecondition]
+  /// when the resolver cannot broker, the node has no [verifier] (it could
+  /// not tell who dialled), listens nowhere, or is closed; [StatusCode.invalidArgument] for an address without an
+  /// instance; what the naming service answers ([StatusCode.notFound],
+  /// [StatusCode.permissionDenied], [StatusCode.unavailable]);
+  /// [StatusCode.unavailable] when the instance did not dial back within
+  /// [connectTimeout]; [StatusCode.unauthenticated] when the connection
+  /// that arrived is not the instance's, or identifying on it failed.
+  Future<MuxConnection> broker(ServiceAddress address, {Resolver? resolver}) {
+    if (_closing) {
+      return Future.error(_closedException());
+    }
+    final attempt = _broker(address, resolver ?? this.resolver);
+    _track(attempt.then<void>((_) {}, onError: (_) {}));
+    return attempt;
+  }
+
+  /// A pooled brokered connection to [address], brokered through [r] if
+  /// there is none; concurrent calls share one attempt.
+  Future<MuxConnection> _brokeredPooled(ServiceAddress address, Resolver r) {
+    final pooled = _brokeredPool[address];
+    if (pooled != null && pooled.isOpen && !pooled.peerGoingAway) {
+      return Future.value(pooled);
+    }
+    _brokeredPool.remove(address);
+    final existing = _brokering[address];
+    if (existing != null) {
+      return existing;
+    }
+    Future<MuxConnection> attempt() async {
+      try {
+        final connection = await _broker(address, r);
+        _brokeredPool[address] = connection;
+        connection.done.then((_) {
+          if (identical(_brokeredPool[address], connection)) {
+            _brokeredPool.remove(address);
+          }
+        }).ignore();
+        return connection;
+      } finally {
+        unawaited(_brokering.remove(address));
+      }
+    }
+
+    final started = _brokering[address] = attempt();
+    _track(started.then<void>((_) {}, onError: (_) {}));
+    return started;
+  }
+
+  Future<MuxConnection> _broker(ServiceAddress address, Resolver? r) async {
+    if (r is! BrokeringResolver) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'the resolver cannot broker connections to $address',
+      );
+    }
+    if (address.isAny) {
+      throw SwitchboardException.of(
+        StatusCode.invalidArgument,
+        'brokering needs an instance: $address',
+      );
+    }
+    if (verifier == null) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'brokering needs a verifier to recognise $address',
+      );
+    }
+    final endpoint =
+        brokerEndpoint ?? (_endpoints.isEmpty ? null : _endpoints.first);
+    if (endpoint == null) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'no listener for $address to dial back',
+      );
+    }
+    final intent = secureRandomBytes(_brokerIntentLength);
+    final key = hexString(intent);
+    final arrived = Completer<MuxConnection>()..future.ignore();
+    _brokerWaits[key] = arrived;
+    final watch = Stopwatch()..start();
+    Duration? left() {
+      if (connectTimeout <= Duration.zero) {
+        return null;
+      }
+      final rest = connectTimeout - watch.elapsed;
+      return rest > Duration.zero ? rest : Duration.zero;
+    }
+
+    MuxConnection? connection;
+    try {
+      final identity = await r.connectTo(
+        address,
+        endpoint,
+        intent,
+        timeout: left(),
+      );
+      _checkOpen();
+      final bound = left();
+      connection = await (bound == null
+          ? arrived.future
+          : arrived.future.timeout(
+              bound,
+              onTimeout: () => throw SwitchboardException.of(
+                StatusCode.unavailable,
+                '$address did not dial back within $connectTimeout',
+              ),
+            ));
+      _checkOpen();
+      final peer = connection.peerIdentity;
+      if (peer == null || peer.identity != identity) {
+        throw SwitchboardException.of(
+          StatusCode.unauthenticated,
+          'the connection for $address is not "$identity"\'s',
+        );
+      }
+      final credential = _identity;
+      if (credential != null) {
+        try {
+          await connection.identify(
+            credential,
+            holderKey: holderKey,
+            receiver: identity,
+            timeout: identityTimeout,
+          );
+        } on Object catch (e) {
+          throw SwitchboardException.of(
+            StatusCode.unauthenticated,
+            'identification to $address failed: '
+            '${e is SwitchboardException ? e.status : e}',
+          );
+        }
+        _identified[connection] = _Identification(null, identity);
+      }
+      _log.fine('$address dialled back from ${_remotes[connection]}');
+      return connection;
+    } catch (e) {
+      if (_brokerWaits.remove(key) != null) {
+        // A connection that lands later is sent GOAWAY.
+        _abandoned.add(key);
+        if (_abandoned.length > _maxAbandoned) {
+          _abandoned.remove(_abandoned.first);
+        }
+      }
+      if (connection != null) {
+        unawaited(connection.goAway());
+      }
+      _log.fine('brokering $address failed: $e');
+      if (_closing) {
+        throw _closedException();
+      }
+      rethrow;
+    }
+  }
+
+  /// Length of the random intent of a brokered connection.
+  static const int _brokerIntentLength = 16;
+
+  /// How many given-up intents are remembered.
+  static const int _maxAbandoned = 256;
+
+  /// An accepted connection identified: if its intent is one this node is
+  /// waiting for ([broker]), it is that connection; if it is one the node
+  /// gave up on, it is sent GOAWAY.
+  void _onAcceptedIdentified(MuxConnection connection, PeerIdentity identity) {
+    if (identity.intent.isEmpty) {
+      return;
+    }
+    final key = hexString(identity.intent);
+    final waiting = _brokerWaits.remove(key);
+    if (waiting != null) {
+      waiting.complete(connection);
+    } else if (_abandoned.remove(key)) {
+      _log.fine(
+        'a brokered connection from "${identity.identity}" arrived too '
+        'late; leaving it',
+      );
+      unawaited(connection.goAway());
     }
   }
 
@@ -1475,6 +1862,11 @@ class Switchboard {
   /// are skipped as unreachable, so that a proxy never forwards a channel
   /// to itself.
   ///
+  /// An instance whose record has no endpoints is reached through the
+  /// naming service's `CONNECT` when the resolver is a
+  /// [BrokeringResolver]: the instance dials this node (see [broker]), and
+  /// the connection is pooled for that instance until it ends.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.notFound] if no
   /// instance is known, or none that [where] accepts,
   /// [StatusCode.unavailable] if none is reachable, and
@@ -1540,6 +1932,7 @@ class Switchboard {
           accepted,
           0,
           excludeOwnEndpoints,
+          r,
         );
       }
     }
@@ -1569,7 +1962,7 @@ class Switchboard {
     final start = shard != null
         ? shard % accepted.length
         : _selectStart(address.type, accepted.length);
-    return _connectFirst(address, accepted, start, excludeOwnEndpoints);
+    return _connectFirst(address, accepted, start, excludeOwnEndpoints, r);
   }
 
   /// The records of instance [instance] of [type] among [records].
@@ -1596,12 +1989,14 @@ class Switchboard {
   };
 
   /// Connects to the first reachable of [candidates], starting at [start]
-  /// and going round.
+  /// and going round; an instance without endpoints is brokered through
+  /// [resolver] when it can.
   Future<(ServiceRecord, MuxConnection)> _connectFirst(
     ServiceAddress address,
     List<ServiceRecord> candidates,
     int start,
     bool excludeOwnEndpoints,
+    Resolver resolver,
   ) async {
     final n = candidates.length;
     final failures = <String>[];
@@ -1638,7 +2033,20 @@ class Switchboard {
         }
       }
       if (record.endpoints.isEmpty) {
-        failures.add('${record.address}: no endpoints');
+        if (resolver is! BrokeringResolver || record.address.isAny) {
+          failures.add('${record.address}: no endpoints');
+          continue;
+        }
+        try {
+          final connection = await _brokeredPooled(record.address, resolver);
+          return (record, connection);
+        } on SwitchboardException catch (e) {
+          if (_closing) {
+            rethrow;
+          }
+          _log.fine('$address: brokering ${record.address}: ${e.status}');
+          failures.add('${record.address} (brokered): ${e.status}');
+        }
       }
     }
     throw SwitchboardException.of(
@@ -2009,6 +2417,12 @@ class Switchboard {
   Future<void> _close() async {
     _closing = true;
     _log.info('closing');
+    final waits = List.of(_brokerWaits.values);
+    _brokerWaits.clear();
+    for (final wait in waits) {
+      wait.completeError(_closedException());
+    }
+    _brokeredPool.clear();
     final http = List.of(_httpServers);
     final tcp = List.of(_tcpServers);
     _httpServers.clear();
@@ -2079,6 +2493,14 @@ class Switchboard {
     StatusCode.failedPrecondition,
     'switchboard is closed',
   );
+}
+
+/// The intent and receiver of an identification of the node.
+class _Identification {
+  _Identification(this.intent, this.receiver);
+
+  final Uint8List? intent;
+  final String? receiver;
 }
 
 /// A listening endpoint and the host names that designate it.

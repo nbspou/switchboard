@@ -10,11 +10,16 @@ import 'dart:collection';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 
 import '../address/service_address.dart';
+import '../identity/credential.dart';
+import '../identity/credential_issuer.dart';
+import '../identity/credential_verifier.dart';
 import '../monotonic.dart';
+import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../status.dart';
 import '../switchboard/incoming_channel.dart';
@@ -83,6 +88,27 @@ final Logger _log = Logger('Switchboard.Naming');
 /// deadline of its own. Nothing is sent from a timer. The service's own
 /// responder timeout is off for such requests, since it answers each of
 /// them when what it waits for ends.
+///
+/// Identity (wiki page "Switchboard Identity and Credentials"): each served
+/// channel is identified by the peer identity of the connection it arrived
+/// on (`IDENT`), else by a bearer credential in its open payload, verified
+/// with [verifier]; see [serve]. An identified channel may do what its
+/// credential's scopes grant: `REGISTER` needs `register` for the type;
+/// `WATCH`, `UNWATCH`, `LOOKUP` and `LOCATE` need `watch` (`watch *` for a
+/// `WATCH` of every type); `CLAIM`, `RELEASE` and `HOLDING` need `claim`;
+/// `MIGRATE` needs `migrate`; `CONNECT` needs `broker`; defining a slot
+/// space with `SLOTS` needs `admin`, confirming the existing definition
+/// `claim` or `register`; `UNREGSTR` needs the record to be the channel's.
+/// A request the scopes do not grant is answered `PERMISSION_DENIED`. A
+/// channel without an identity may do everything, unless
+/// [requireCredential] (every request answered `UNAUTHENTICATED`); a
+/// channel whose identity expires is ended at the expiry (its records go
+/// `DOWN`, the channel is closed and, for a connection identity, the
+/// connection is sent GOAWAY, all with `UNAUTHENTICATED`) unless it was
+/// renewed. `RENEW` re-issues the channel's credential with [issuer], and
+/// `CONNECT` has an instance registered without endpoints dial the
+/// consumer that asks (the instance's registration channel carries the
+/// request; [brokerTimeout] bounds it).
 ///
 /// The service registers nothing by itself. The wiki registers the naming
 /// service in its own table as `_ns/1`; the host does that with
@@ -169,11 +195,25 @@ class NamingService {
   /// old owner enters its `ASSIGN` backoff for it, so that the allocator
   /// places it elsewhere first.
   ///
+  /// [verifier] checks the credentials channels present in their open
+  /// payload (see [serve]); identities established with `IDENT` are
+  /// checked by the connection's own verifier. [requireCredential] refuses
+  /// every request of a channel without a valid identity with
+  /// `UNAUTHENTICATED`; without it such a channel may do everything (a mesh
+  /// that has not moved to identities), while an identified channel is
+  /// held to its scopes either way. [issuer] serves `RENEW`; without one
+  /// it is answered `UNIMPLEMENTED`. [renewable], when given, decides
+  /// whether a valid credential is renewed (false: `PERMISSION_DENIED`,
+  /// which is how a node is revoked: its credential is not renewed, and
+  /// its channel ends when it expires). [brokerTimeout] bounds a `CONNECT`:
+  /// the instance must have dialled the consumer and answered within it
+  /// ([Duration.zero]: no bound).
+  ///
   /// Throws [ArgumentError] if [assignBackoff] is not positive, if
   /// [assignBackoffMax] is shorter than [assignBackoff], if
   /// [assignmentHold], [holderGrace], [handoverTimeout],
-  /// [handoverMaxDuration] or [holdingSettle] is negative, or if
-  /// [maxSlotCount] or [resumeAttempts] is not positive.
+  /// [handoverMaxDuration], [holdingSettle] or [brokerTimeout] is
+  /// negative, or if [maxSlotCount] or [resumeAttempts] is not positive.
   NamingService({
     this.assignmentHold = const Duration(seconds: 2),
     this.holderGrace = const Duration(minutes: 5),
@@ -184,6 +224,11 @@ class NamingService {
     this.holdingSettle = const Duration(seconds: 1),
     this.handoverMaxDuration = const Duration(minutes: 10),
     this.resumeAttempts = 5,
+    this.verifier,
+    this.requireCredential = false,
+    this.issuer,
+    this.renewable,
+    this.brokerTimeout = const Duration(seconds: 30),
   }) {
     if (assignBackoff <= Duration.zero) {
       throw ArgumentError.value(
@@ -205,6 +250,7 @@ class NamingService {
       ('handoverTimeout', handoverTimeout),
       ('handoverMaxDuration', handoverMaxDuration),
       ('holdingSettle', holdingSettle),
+      ('brokerTimeout', brokerTimeout),
     ]) {
       if (value < Duration.zero) {
         throw ArgumentError.value(value, name, 'must not be negative');
@@ -263,6 +309,25 @@ class NamingService {
   /// How many times the `RESUME` of a rolled-back migration is sent before
   /// its slot is set free.
   final int resumeAttempts;
+
+  /// Verifies the credentials channels present in their open payload;
+  /// null: such credentials are ignored.
+  final CredentialVerifier? verifier;
+
+  /// Whether a channel without a valid identity is refused every request
+  /// (`UNAUTHENTICATED`).
+  final bool requireCredential;
+
+  /// Issues the renewed credentials of `RENEW`; null: `RENEW` is
+  /// answered `UNIMPLEMENTED`.
+  final CredentialIssuer? issuer;
+
+  /// Whether a valid credential is renewed by `RENEW`; null: every one.
+  final bool Function(Credential credential)? renewable;
+
+  /// Longest a `CONNECT` waits for the instance to dial back and answer;
+  /// [Duration.zero] for no bound.
+  final Duration brokerTimeout;
 
   late final _SlotManager _slots = _SlotManager(this);
 
@@ -360,24 +425,42 @@ class NamingService {
   /// instance of the type.
   ChannelHandler get handler => _handle;
 
-  void _handle(IncomingChannel incoming) => serve(incoming.talk());
+  void _handle(IncomingChannel incoming) => serve(
+    incoming.talk(),
+    connection: incoming.connection,
+    credential: incoming.address.payload,
+  );
 
   /// Serves one client over [channel] until it closes. Registrations made
   /// on this channel are removed, with `DOWN` events, when it closes.
+  ///
+  /// The channel's identity is the peer identity of [connection] (the
+  /// connection it arrived on, [MuxConnection.peerIdentity], read at every
+  /// request), else the credential in [credential] (the application
+  /// payload of its OPEN), verified with [verifier] before the first
+  /// request is handled, else none. Only a bearer credential identifies a
+  /// channel in its payload: a credential that names a holder key proves
+  /// nothing without the `IDENT` proof, and is ignored there, as are bytes
+  /// that are not a valid credential (the channel is then unidentified).
+  /// [handler] passes both.
   ///
   /// Takes over [TalkChannel.messages], so each channel can be served only
   /// once: throws [StateError] if its messages are already listened to, in
   /// which case the service keeps nothing of it. The channel keeps its own
   /// options. After [close] the channel is closed immediately with
   /// [StatusCode.goingAway].
-  void serve(TalkChannel channel) {
+  void serve(
+    TalkChannel channel, {
+    MuxConnection? connection,
+    Uint8List? credential,
+  }) {
     if (_closed) {
       unawaited(
         channel.close(Status.of(StatusCode.goingAway, 'naming service closed')),
       );
       return;
     }
-    final session = _Session(channel);
+    final session = _Session(channel, connection);
     // Listen before keeping the session: if the stream is taken already,
     // this throws and nothing is left behind.
     session.subscription = channel.messages.listen(
@@ -388,6 +471,13 @@ class NamingService {
     );
     _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
+    if (credential != null && credential.isNotEmpty && verifier != null) {
+      // Requests wait until the credential is checked.
+      session.subscription!.pause();
+      unawaited(_checkPayload(session, Uint8List.fromList(credential)));
+    } else {
+      _watchIdentity(session);
+    }
   }
 
   /// Registers a record owned by the service itself rather than by a
@@ -493,6 +583,19 @@ class NamingService {
       _log.fine('ignoring plain message ${message.procedureName}');
       return;
     }
+    final identity = _identityOf(session);
+    if (identity == null) {
+      if (requireCredential || session.wasIdentified) {
+        _log.info(
+          '${message.procedureName} refused: '
+          '${session.wasIdentified ? 'the credential expired' : 'no credential'}',
+        );
+        _abort(message, _unauthenticated);
+        return;
+      }
+    } else if (!session.wasIdentified || session.expiryTimer == null) {
+      _watchIdentity(session);
+    }
     if (procedure == Procedures.register) {
       _onRegister(session, message);
     } else if (procedure == Procedures.unregister) {
@@ -502,7 +605,11 @@ class NamingService {
     } else if (procedure == Procedures.unwatch) {
       _onUnwatch(session, message);
     } else if (procedure == Procedures.lookup) {
-      _onLookup(message);
+      _onLookup(session, message);
+    } else if (procedure == Procedures.renew) {
+      _onRenew(session, message);
+    } else if (procedure == Procedures.connect) {
+      _onConnect(session, message);
     } else if (procedure == Procedures.slots) {
       _slots.onSlots(session, message);
     } else if (procedure == Procedures.holding) {
@@ -512,9 +619,9 @@ class NamingService {
     } else if (procedure == Procedures.release) {
       _slots.onRelease(session, message);
     } else if (procedure == Procedures.locate) {
-      _slots.onLocate(message);
+      _slots.onLocate(session, message);
     } else if (procedure == Procedures.migrate) {
-      _slots.onMigrate(message);
+      _slots.onMigrate(session, message);
     } else {
       _log.fine('unknown procedure ${message.procedureName}');
       _abort(
@@ -531,10 +638,15 @@ class NamingService {
     final RegisterRequest request;
     try {
       request = RegisterRequest.decode(message.payload);
-      _check(request.type, request.endpoints, request.metadata);
     } on ProtocolException catch (e) {
       _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
       return;
+    }
+    if (!_permits(session, message, Right.register, request.type)) {
+      return;
+    }
+    try {
+      _check(request.type, request.endpoints, request.metadata);
     } on SwitchboardException catch (e) {
       _abort(message, e.status);
       return;
@@ -612,9 +724,18 @@ class NamingService {
     }
   }
 
+  /// Whether [session] may hold the subscription of [request]; answers
+  /// [message] when not.
+  bool _permitsWatch(_Session session, TalkMessage message, WatchRequest r) {
+    final type = r.type;
+    return type == null
+        ? _permitsEvery(session, message, Right.watch)
+        : _permits(session, message, Right.watch, type);
+  }
+
   void _onWatch(_Session session, TalkMessage message) {
     final request = _subscriptionRequest(message);
-    if (request == null) {
+    if (request == null || !_permitsWatch(session, message, request)) {
       return;
     }
     final type = request.type;
@@ -656,7 +777,7 @@ class NamingService {
 
   void _onUnwatch(_Session session, TalkMessage message) {
     final request = _subscriptionRequest(message);
-    if (request == null) {
+    if (request == null || !_permitsWatch(session, message, request)) {
       return;
     }
     final type = request.type;
@@ -690,7 +811,7 @@ class NamingService {
     _watching.remove(session);
   }
 
-  void _onLookup(TalkMessage message) {
+  void _onLookup(_Session session, TalkMessage message) {
     if (!message.expectsStream) {
       _abort(
         message,
@@ -712,6 +833,9 @@ class NamingService {
       );
       return;
     }
+    if (!_permits(session, message, Right.watch, type)) {
+      return;
+    }
     try {
       for (final record in _table.values) {
         if (record.address.type == type) {
@@ -728,6 +852,414 @@ class NamingService {
     } on SwitchboardException catch (e) {
       _log.fine('LOOKUP reply failed: $e');
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Identity
+
+  static final Status _unauthenticated = Status.of(
+    StatusCode.unauthenticated,
+    'unauthenticated',
+  );
+
+  static final Status _permissionDenied = Status.of(
+    StatusCode.permissionDenied,
+    'permission denied',
+  );
+
+  /// The pattern that matches every name.
+  static final Name _everything = Name('*');
+
+  /// The valid credential identifying [session] now: its connection's peer
+  /// identity, else its payload credential, else null.
+  static Credential? _identityOf(_Session session) {
+    final connection = session.connection?.peerIdentity?.credential;
+    if (connection != null) {
+      return connection;
+    }
+    final payload = session.payloadCredential;
+    return payload != null && !payload.isExpired() ? payload : null;
+  }
+
+  /// Checks the credential in the open payload of [session], then starts
+  /// serving its requests.
+  Future<void> _checkPayload(_Session session, Uint8List bytes) async {
+    try {
+      final credential = await verifier!.verify(bytes);
+      if (credential.holderKey != null) {
+        _log.info(
+          'ignoring the payload credential of "${credential.identity}": '
+          'it names a holder key, which only IDENT proves',
+        );
+      } else {
+        session.payloadCredential = credential;
+      }
+    } on Object catch (e) {
+      _log.fine('channel payload is not a valid credential: $e');
+    }
+    if (!session.active) {
+      return;
+    }
+    _watchIdentity(session);
+    session.subscription?.resume();
+  }
+
+  /// Notes that [session] is identified, if it is, and ends it when its
+  /// identity expires without being renewed.
+  void _watchIdentity(_Session session) {
+    final credential = _identityOf(session);
+    if (credential == null || !session.active) {
+      return;
+    }
+    session.wasIdentified = true;
+    session.expiryTimer?.cancel();
+    session.expiryTimer = null;
+    final expires = credential.expiresAtTime;
+    if (expires == null) {
+      return;
+    }
+    final left = expires.difference(clock.now());
+    session.expiryTimer = Timer(left.isNegative ? Duration.zero : left, () {
+      session.expiryTimer = null;
+      _onExpiry(session);
+    });
+  }
+
+  void _onExpiry(_Session session) {
+    if (!session.active) {
+      return;
+    }
+    if (_identityOf(session) != null) {
+      // Renewed (another IDENT, or RENEW of a payload credential), or the
+      // timer ran early.
+      _watchIdentity(session);
+      return;
+    }
+    final connection = session.connection;
+    final byConnection =
+        connection != null && session.payloadCredential == null;
+    _log.info(
+      'naming channel ${byConnection ? 'and connection ' : ''}ended: the '
+      'credential expired',
+    );
+    final status = Status.of(StatusCode.unauthenticated, 'credential expired');
+    _drop(session);
+    unawaited(session.channel.close(status));
+    if (byConnection && connection.isOpen) {
+      unawaited(connection.goAway(status));
+    }
+  }
+
+  /// Whether [session] may use [right] on [type]; answers [message]
+  /// `UNAUTHENTICATED` or `PERMISSION_DENIED` when it may not.
+  bool _permits(_Session session, TalkMessage message, Right right, Name type) {
+    final credential = _identityOf(session);
+    if (credential == null) {
+      if (requireCredential || session.wasIdentified) {
+        _abort(message, _unauthenticated);
+        return false;
+      }
+      return true;
+    }
+    if (credential.allows(right, type)) {
+      return true;
+    }
+    _log.info(
+      '${message.procedureName} refused: "${credential.identity}" has no '
+      '${right.name} scope for ${type.isEmpty ? 'the empty type' : type}',
+    );
+    _abort(message, _permissionDenied);
+    return false;
+  }
+
+  /// Whether [session] may use [right] on every type (a scope with the
+  /// pattern `*`, or `admin`); answers [message] when it may not.
+  bool _permitsEvery(_Session session, TalkMessage message, Right right) {
+    final credential = _identityOf(session);
+    if (credential == null) {
+      return _permits(session, message, right, Name.empty);
+    }
+    for (final scope in credential.scopes) {
+      if (scope.right == Right.admin ||
+          (scope.right == right && scope.pattern == _everything)) {
+        return true;
+      }
+    }
+    _log.info(
+      '${message.procedureName} refused: "${credential.identity}" has no '
+      '${right.name} scope for every type',
+    );
+    _abort(message, _permissionDenied);
+    return false;
+  }
+
+  /// Whether [session] may define a slot space (`admin`) or, with
+  /// [confirm], confirm the existing definition of [type] (`claim` or
+  /// `register` for it); answers [message] when it may not.
+  bool _permitsSpace(
+    _Session session,
+    TalkMessage message,
+    Name type, {
+    required bool confirm,
+  }) {
+    final credential = _identityOf(session);
+    if (credential == null) {
+      return _permits(session, message, Right.admin, type);
+    }
+    if (credential.allows(Right.admin, type) ||
+        (confirm &&
+            (credential.allows(Right.claim, type) ||
+                credential.allows(Right.register, type)))) {
+      return true;
+    }
+    _log.info(
+      'SLOTS refused: "${credential.identity}" may not '
+      '${confirm ? 'confirm' : 'define'} the slot space of $type',
+    );
+    _abort(message, _permissionDenied);
+    return false;
+  }
+
+  // ---------------------------------------------------------------------
+  // RENEW
+
+  void _onRenew(_Session session, TalkMessage message) {
+    final issuer = this.issuer;
+    if (issuer == null) {
+      _abort(
+        message,
+        Status.of(StatusCode.unimplemented, 'RENEW is not served here'),
+      );
+      return;
+    }
+    unawaited(_renew(session, message, issuer));
+  }
+
+  /// Answers `RENEW` with a credential re-issued by [issuer]: the
+  /// channel's own (an empty payload, or its bytes), or the one in the
+  /// payload, which must be valid ([verifier]) and, on an identified
+  /// channel, carry its identity.
+  Future<void> _renew(
+    _Session session,
+    TalkMessage message,
+    CredentialIssuer issuer,
+  ) async {
+    final own = _identityOf(session);
+    Credential? current = own;
+    if (message.payload.isNotEmpty &&
+        !(own != null && _sameBytes(own.encode(), message.payload))) {
+      current = null;
+      final v = verifier;
+      if (v != null) {
+        try {
+          current = await v.verify(Uint8List.fromList(message.payload));
+        } on Object catch (e) {
+          _log.fine('RENEW of an invalid credential: $e');
+        }
+      }
+      if (current != null &&
+          own != null &&
+          (current.identity != own.identity || current.kind != own.kind)) {
+        _log.info(
+          'RENEW refused: "${own.identity}" asked to renew '
+          '"${current.identity}"',
+        );
+        _abort(message, _permissionDenied);
+        return;
+      }
+    }
+    if (current == null) {
+      _abort(message, _unauthenticated);
+      return;
+    }
+    final hook = renewable;
+    if (hook != null) {
+      var allowed = false;
+      try {
+        allowed = hook(current);
+      } on Object catch (e, st) {
+        _log.warning('renewable failed for "${current.identity}"', e, st);
+      }
+      if (!allowed) {
+        _log.info('RENEW refused for "${current.identity}"');
+        _abort(message, _permissionDenied);
+        return;
+      }
+    }
+    final Credential renewed;
+    try {
+      renewed = await issuer.issue(
+        kind: current.kind,
+        identity: current.identity,
+        scopes: current.scopes,
+        holderKey: current.holderKey,
+        lifetime: current.expiresAt == 0
+            ? null
+            : Duration(seconds: max(1, current.expiresAt - current.issuedAt)),
+      );
+    } on Object catch (e) {
+      _log.warning('RENEW of "${current.identity}" failed: $e');
+      _abort(message, Status.of(StatusCode.failedPrecondition, 'cannot renew'));
+      return;
+    }
+    final payload = session.payloadCredential;
+    if (session.active &&
+        payload != null &&
+        payload.identity == renewed.identity &&
+        payload.kind == renewed.kind) {
+      // The channel is identified by its payload: the renewal is its
+      // identity from now on.
+      session.payloadCredential = renewed;
+      _watchIdentity(session);
+    }
+    _log.fine('renewed the credential of "${renewed.identity}"');
+    _reply(message, renewed.encode());
+  }
+
+  // ---------------------------------------------------------------------
+  // CONNECT
+
+  void _onConnect(_Session session, TalkMessage message) {
+    final ConnectRequest request;
+    try {
+      request = ConnectRequest.decode(message.payload);
+    } on ProtocolException catch (e) {
+      _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
+      return;
+    }
+    if (request.type.isEmpty || request.instance == 0) {
+      _abort(
+        message,
+        Status.of(
+          StatusCode.invalidArgument,
+          'CONNECT needs a type and an instance',
+        ),
+      );
+      return;
+    }
+    if (!_permits(session, message, Right.broker, request.type)) {
+      return;
+    }
+    final address = ServiceAddress(request.type, request.instance);
+    final registration = _instances[request.instance];
+    final owner = registration?.owner;
+    final record = _table[address];
+    if (registration == null ||
+        registration.address != address ||
+        owner == null ||
+        !registration.up ||
+        record == null ||
+        record.endpoints.isNotEmpty) {
+      _log.fine(
+        'CONNECT $address: no such record, or it has endpoints, or it is '
+        'not registered by a channel',
+      );
+      _abort(message, Status.of(StatusCode.notFound, 'not found'));
+      return;
+    }
+    final identity = _identityOf(owner)?.identity;
+    if (identity == null) {
+      _log.info('CONNECT $address: its registration channel has no identity');
+      _abort(
+        message,
+        Status.of(
+          StatusCode.failedPrecondition,
+          'the instance has no identity',
+        ),
+      );
+      return;
+    }
+    unawaited(
+      _broker(
+        message,
+        registration,
+        owner,
+        DialBackRequest(
+          _identityOf(session)?.identity ?? '',
+          request.endpoint,
+          intent: request.intent,
+        ),
+        identity,
+      ),
+    );
+  }
+
+  /// Asks the instance of [registration] to dial back (`CONNECT` over its
+  /// registration channel, owned by [owner]), then answers [message] with
+  /// [identity], or `UNAVAILABLE` if it does not within [brokerTimeout].
+  /// Never fails.
+  Future<void> _broker(
+    TalkMessage message,
+    _Registration registration,
+    _Session owner,
+    DialBackRequest dialBack,
+    String identity,
+  ) async {
+    final address = registration.address;
+    final TalkRequest relayed;
+    try {
+      relayed = owner.channel.startRequest(
+        Procedures.connect.toString(),
+        dialBack.encode(),
+        timeout: brokerTimeout,
+      );
+    } on SwitchboardException catch (e) {
+      _log.info('CONNECT $address not relayed: $e');
+      _abort(message, Status.of(StatusCode.unavailable, 'unavailable'));
+      return;
+    }
+    // The consumer's request waits for the instance; it is told the bound,
+    // and answered GOING_AWAY if the service closes meanwhile.
+    message.setReplyTimeout(Duration.zero);
+    _slots.wait(message, brokerTimeout > Duration.zero ? brokerTimeout : null);
+    final outcome = Completer<Status?>();
+    void finish(Status? failure) {
+      if (!outcome.isCompleted) {
+        outcome.complete(failure);
+      }
+    }
+
+    void onGone() {
+      relayed.cancel(Status.of(StatusCode.unavailable, 'instance went down'));
+      finish(Status.of(StatusCode.unavailable, '$address went down'));
+    }
+
+    registration.onGone.add(onGone);
+    Timer? bound;
+    if (brokerTimeout > Duration.zero) {
+      bound = Timer(brokerTimeout, () {
+        final status = Status.of(
+          StatusCode.deadlineExceeded,
+          'CONNECT to $address took longer than $brokerTimeout',
+        );
+        relayed.cancel(status);
+        finish(status);
+      });
+    }
+    message.onCancel.then((_) {
+      relayed.cancel(Status.of(StatusCode.cancelled, 'cancelled'));
+      finish(Status.of(StatusCode.cancelled, 'cancelled by the consumer'));
+    }).ignore();
+    relayed.response
+        .then((_) => finish(null), onError: (Object e) => finish(_statusOf(e)))
+        .ignore();
+    final failure = await outcome.future;
+    registration.onGone.remove(onGone);
+    bound?.cancel();
+    if (!message.canReply) {
+      _slots.unwait(message);
+      return;
+    }
+    if (failure != null) {
+      _log.info('CONNECT $address failed: $failure');
+      _slots.abort(message, Status.of(StatusCode.unavailable, 'unavailable'));
+      return;
+    }
+    _log.fine('CONNECT $address: the instance dialled ${dialBack.endpoint}');
+    _slots.reply(
+      message,
+      ConnectResponse(_identityOf(owner)?.identity ?? identity).encode(),
+    );
   }
 
   // ---------------------------------------------------------------------
@@ -926,6 +1458,8 @@ class NamingService {
       return;
     }
     session.active = false;
+    session.expiryTimer?.cancel();
+    session.expiryTimer = null;
     _held.removeWhere((h) => identical(h.session, session));
     _endWatches(session);
     final owned = session.owned.toList();
@@ -958,11 +1492,38 @@ class NamingService {
   }
 }
 
+bool _sameBytes(List<int> a, List<int> b) {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// One served channel.
 class _Session {
-  _Session(this.channel);
+  _Session(this.channel, this.connection);
 
   final TalkChannel channel;
+
+  /// The connection the channel arrived on, whose peer identity identifies
+  /// it; null when unknown.
+  final MuxConnection? connection;
+
+  /// The verified bearer credential of the channel's open payload.
+  Credential? payloadCredential;
+
+  /// Whether the channel was identified once: losing the identity then
+  /// ends it, rather than leaving it unidentified.
+  bool wasIdentified = false;
+
+  /// Ends the channel when its identity expires.
+  Timer? expiryTimer;
+
   final Set<_Registration> owned = {};
 
   /// Subscriptions: the number of `WATCH`es holding each type filter (null:

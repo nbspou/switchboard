@@ -79,3 +79,38 @@ typedef EndpointCredential = FutureOr<Uint8List?> Function(
   Uri endpoint,
   ServiceRecord? record,
 );
+
+/// Names the identity a node expects the peer at [endpoint] to have, for
+/// the receiver field of the `IDENT` it sends there: the
+/// `expectedIdentityFor` hook of `Switchboard`, consulted every time the
+/// node identifies on a connection it initiates (wiki page "Switchboard
+/// Identity and Credentials", section "Connection identity").
+///
+/// [endpoint] is normalised as for [EndpointPolicy]. [record] is the
+/// resolver's record the connection is established for when the caller
+/// knows it (`PeerSet`, and `Switchboard.dial` given one), else null (the
+/// pooled connections of `Switchboard.connect` and the open methods, which
+/// several records may share).
+///
+/// Null (or empty) names nobody: any peer that verifies the credential
+/// accepts the `IDENT`, so a peer that relays the handshake can pass as
+/// this node to a third node that accepts an unnamed `IDENT`. A peer whose
+/// identity is not the one named refuses the `IDENT`, which fails the
+/// connection with `UNAUTHENTICATED`. A naming service whose host requires
+/// named identification (`MuxOptions.requireNamedIdent`) refuses an
+/// `IDENT` that names nobody.
+///
+/// ```dart
+/// final node = Switchboard(
+///   credential: credential,
+///   holderKey: holderKey,
+///   expectedIdentityFor: (endpoint, record) =>
+///       endpoint == namingEndpoint ? 'ns' : identityOf(record),
+/// );
+/// ```
+///
+/// A hook that throws names nobody (the error is logged).
+typedef ExpectedIdentity = String? Function(
+  Uri endpoint,
+  ServiceRecord? record,
+);

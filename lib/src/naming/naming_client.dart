@@ -12,11 +12,13 @@ import 'dart:typed_data';
 import 'package:logging/logging.dart';
 
 import '../address/service_address.dart';
+import '../identity/credential.dart';
 import '../monotonic.dart';
 import '../name.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
 import '../talk/talk_message.dart';
+import '../talk/talk_request.dart';
 import '../talk/talk_stream.dart';
 import 'naming_protocol.dart';
 import 'slot_table.dart';
@@ -27,6 +29,15 @@ final Logger _log = Logger('Switchboard.Naming');
 
 /// Opens a fresh Talk channel to the naming service.
 typedef TalkConnector = Future<TalkChannel> Function();
+
+/// Serves a `CONNECT` the naming service relays to this instance over the
+/// client's channel: dial [DialBackRequest.endpoint], identify there with
+/// [DialBackRequest.intent] naming [DialBackRequest.requester] as the
+/// receiver, and complete once that identification is confirmed. A
+/// failure is answered `ABORT` (with the status of a
+/// [SwitchboardException], else `UNAVAILABLE`). `MeshNode` installs one
+/// (see [NamingClient.connectHandler]).
+typedef ConnectHandler = Future<void> Function(DialBackRequest request);
 
 /// A client of the naming service: registers this process's services and
 /// mirrors the service table through a `WATCH` subscription.
@@ -88,11 +99,18 @@ class NamingClient {
   /// deadlines a handler declares with [SlotRequestContext.extend] are
   /// lowered to what is left of it. [Duration.zero] removes the bound.
   ///
+  /// [watch] false makes a client that only registers (a worker whose
+  /// credential has no `watch` scope): it sends no `WATCH`, so its [table]
+  /// stays empty and it is never [synced]. A `WATCH` the naming service
+  /// refuses with `PERMISSION_DENIED` is not retried either: the channel
+  /// and its registrations are kept, and the table is not mirrored.
+  ///
   /// Throws [ArgumentError] if [slotHandlerMaxDuration] is negative.
   NamingClient(
     TalkConnector connect, {
     this.reconnectDelay = const Duration(seconds: 1),
     this.slotHandlerMaxDuration = const Duration(minutes: 10),
+    this.watch = true,
   }) : _connect = connect {
     if (slotHandlerMaxDuration < Duration.zero) {
       throw ArgumentError.value(
@@ -112,6 +130,9 @@ class NamingClient {
   /// the request is answered `ABORT DEADLINE_EXCEEDED`; [Duration.zero] for
   /// no bound. Default 10 minutes.
   final Duration slotHandlerMaxDuration;
+
+  /// Whether the client mirrors the table (`WATCH` on every connect).
+  final bool watch;
 
   late final _ClientSlots _slots = _ClientSlots(this);
 
@@ -186,6 +207,171 @@ class NamingClient {
   SlotHandler? get slotHandler => _slots.handler;
 
   set slotHandler(SlotHandler? handler) => _slots.handler = handler;
+
+  /// Serves the `CONNECT` requests the naming service relays to this
+  /// instance (a consumer asked it to dial back; wiki page "Switchboard
+  /// Identity and Credentials", section "Reverse connections"). Without
+  /// one, they are answered `ABORT UNIMPLEMENTED`.
+  ConnectHandler? connectHandler;
+
+  // ---------------------------------------------------------------------
+  // Identity
+
+  /// Asks the naming service for a renewed credential (`RENEW`): the same
+  /// identity, scopes and holder key, with a new expiry. [current] is sent
+  /// as the credential to renew; null renews the one that identifies this
+  /// client's channel (its connection's, or its payload's).
+  ///
+  /// Fails with the naming service's [SwitchboardException]
+  /// ([StatusCode.unimplemented] when it issues no credentials,
+  /// [StatusCode.unauthenticated] when the credential is not valid,
+  /// [StatusCode.permissionDenied] when it is not renewed),
+  /// [StatusCode.unavailable] while disconnected, [StatusCode.failedPrecondition]
+  /// after [close], and [ProtocolException] for an answer that is not a
+  /// credential.
+  Future<Credential> renew({Credential? current}) async {
+    final response = await _startRequest(
+      Procedures.renew,
+      current == null ? Uint8List(0) : current.encode(),
+    ).response;
+    try {
+      return Credential.decode(response.payload);
+    } on ProtocolException catch (e) {
+      throw ProtocolException('RENEW answered ${e.status.reason}');
+    }
+  }
+
+  /// Asks the naming service to have instance [instance] of [type], which
+  /// registered without endpoints, dial [endpoint] and identify there with
+  /// [intent] (`CONNECT`; at most 64 bytes). Completes once the instance
+  /// has done so, with the identity it presents: the caller matches the
+  /// accepted connection by that identity and [intent]. [timeout], when
+  /// given, bounds the request whatever the naming service declares (it
+  /// declares its own bound with `EXTEND`); the request is then cancelled,
+  /// and the naming service cancels its request to the instance.
+  ///
+  /// Fails with the naming service's [SwitchboardException]
+  /// ([StatusCode.notFound] for no such record, or one with endpoints;
+  /// [StatusCode.permissionDenied] without the `broker` right;
+  /// [StatusCode.unavailable] when the instance did not dial back in
+  /// time), with [StatusCode.deadlineExceeded] after [timeout], with
+  /// [StatusCode.unavailable] while disconnected,
+  /// [StatusCode.failedPrecondition] after [close], and with
+  /// [ArgumentError] or [RangeError] for an endpoint
+  /// [ServiceRecord.checkEndpoint] refuses, an intent over 64 bytes, or an
+  /// instance outside `u48`.
+  Future<String> connectTo(
+    Name type,
+    int instance,
+    Uri endpoint,
+    Uint8List intent, {
+    Duration? timeout,
+  }) async {
+    final payload = ConnectRequest(
+      type,
+      instance,
+      endpoint,
+      intent: intent,
+    ).encode();
+    final request = _startRequest(Procedures.connect, payload);
+    var response = request.response;
+    if (timeout != null && timeout > Duration.zero) {
+      response = response.timeout(
+        timeout,
+        onTimeout: () {
+          final status = Status.of(
+            StatusCode.deadlineExceeded,
+            'CONNECT not answered within $timeout',
+          );
+          request.cancel(status);
+          throw SwitchboardException(status);
+        },
+      );
+    }
+    return ConnectResponse.decode((await response).payload).identity;
+  }
+
+  /// Starts [procedure] with [payload] on the live channel. Throws
+  /// [SwitchboardException] when closed or disconnected, and like
+  /// [TalkChannel.startRequest].
+  TalkRequest _startRequest(Name procedure, Uint8List payload) {
+    if (_closed) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'naming client closed',
+      );
+    }
+    final session = _session;
+    if (session == null || !session.usable) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'not connected to the naming service',
+      );
+    }
+    return session.channel.startRequest(
+      procedure.toString(),
+      payload,
+      name: procedure,
+    );
+  }
+
+  /// Serves a `CONNECT` relayed by the naming service with
+  /// [connectHandler].
+  Future<void> _serveConnect(TalkMessage message) async {
+    final handler = connectHandler;
+    if (handler == null) {
+      _abortRequest(
+        message,
+        Status.of(StatusCode.unimplemented, 'this instance does not dial back'),
+      );
+      return;
+    }
+    final DialBackRequest request;
+    try {
+      request = DialBackRequest.decode(message.payload);
+    } on ProtocolException catch (e) {
+      _abortRequest(
+        message,
+        Status.of(StatusCode.invalidArgument, e.status.reason),
+      );
+      return;
+    }
+    // The handler's dial and identification are bounded by the node; the
+    // naming service bounds the request and cancels it when it gives up.
+    message.setReplyTimeout(Duration.zero);
+    try {
+      await handler(request);
+    } on Object catch (e, st) {
+      final status = e is SwitchboardException
+          ? e.status
+          : Status.of(StatusCode.unavailable, 'dial back failed');
+      if (e is! SwitchboardException) {
+        _log.warning('CONNECT handler failed', e, st);
+      } else {
+        _log.info('CONNECT to ${request.endpoint} failed: $status');
+      }
+      _abortRequest(message, status);
+      return;
+    }
+    if (message.canReply) {
+      try {
+        message.reply(Uint8List(0));
+      } on SwitchboardException catch (e) {
+        _log.fine('CONNECT reply failed: $e');
+      }
+    }
+  }
+
+  static void _abortRequest(TalkMessage message, Status status) {
+    if (!message.canReply) {
+      return;
+    }
+    try {
+      message.replyAbort(status);
+    } on SwitchboardException catch (e) {
+      _log.fine('abort failed: $e');
+    }
+  }
 
   /// Read-only live view of the mirrored slot tables, by type. Like
   /// [table], incomplete before the first sync and stale while not
@@ -697,7 +883,9 @@ class NamingClient {
       // SLOTS, HOLDING and the claims of served slots, for every type not
       // restored yet when its registration came back.
       _slots.restoreAll(session);
-      _startWatch(session);
+      if (watch) {
+        _startWatch(session);
+      }
     }
     await session.lost;
     if (identical(_session, session)) {
@@ -725,6 +913,12 @@ class NamingClient {
         _ClientSlots.procedures.contains(message.procedure)) {
       if (session.alive) {
         _slots.serve(session, message);
+      }
+      return;
+    }
+    if (message.canReply && message.procedure == Procedures.connect) {
+      if (session.alive) {
+        unawaited(_serveConnect(message));
       }
       return;
     }
@@ -1028,6 +1222,15 @@ class NamingClient {
             final status = e is SwitchboardException
                 ? e.status
                 : Status.of(StatusCode.unknown, '$e');
+            if (status.known == StatusCode.permissionDenied && session.usable) {
+              // The credential grants no watch scope: asking again would
+              // be refused again. The registrations stay.
+              _log.severe(
+                'the naming service refuses WATCH ($status); the table is '
+                'not mirrored',
+              );
+              return;
+            }
             session.lose(
               Status.of(StatusCode.unavailable, 'WATCH failed: $status'),
               'WATCH failed: $status',

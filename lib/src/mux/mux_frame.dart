@@ -440,23 +440,32 @@ Status decodeStatusPayload(Uint8List payload, String what) {
 }
 
 /// The payload of an IDENT control message: `u16` credential length, the
-/// credential, `len8` intent, then the proof (the rest).
+/// credential, `len8` intent, `len8` receiver, then the proof (the rest).
 ///
 /// See the wiki page "Switchboard Identity and Credentials", section
 /// "Connection identity". The credential is carried as bytes; the mux
 /// connection decodes and verifies it with its verifier.
 class MuxIdent {
-  /// An IDENT payload. [intent] defaults to empty, [proof] to empty (a
-  /// bearer credential). The lists are used as given, not copied.
-  MuxIdent({required this.credential, Uint8List? intent, Uint8List? proof})
-    : intent = intent ?? Uint8List(0),
-      proof = proof ?? Uint8List(0);
+  /// An IDENT payload. [intent], [receiver] and [proof] default to empty
+  /// (no intent, no named receiver, a bearer credential). The lists are
+  /// used as given, not copied.
+  MuxIdent({
+    required this.credential,
+    Uint8List? intent,
+    Uint8List? receiver,
+    Uint8List? proof,
+  }) : intent = intent ?? Uint8List(0),
+       receiver = receiver ?? Uint8List(0),
+       proof = proof ?? Uint8List(0);
 
   /// Length of a NONCE.
   static const int nonceLength = 32;
 
   /// Longest intent.
   static const int maxIntentLength = 64;
+
+  /// Longest receiver: an identity string of a credential.
+  static const int maxReceiverLength = 255;
 
   /// Length of a proof: an Ed25519 signature.
   static const int proofLength = 64;
@@ -471,29 +480,46 @@ class MuxIdent {
   /// connection answers a `CONNECT`.
   final Uint8List intent;
 
+  /// The identity (UTF-8) the sender expects the receiver to have, at most
+  /// [maxReceiverLength] bytes; empty when the sender names none.
+  final Uint8List receiver;
+
   /// The holder's Ed25519 signature of [proofMessage], or empty for a
   /// bearer credential.
   final Uint8List proof;
 
   /// What the holder signs: [proofLabel], the nonce the IDENT's sender sent
   /// ([senderNonce]), the nonce its receiver sent ([receiverNonce]), then
-  /// [intent].
+  /// the intent and the receiver as the IDENT carries them, each with its
+  /// `len8` length, so that no byte can move from one field to the other.
+  ///
+  /// Throws [ArgumentError] for an [intent] or [receiver] longer than a
+  /// `len8` field can carry.
   static Uint8List proofMessage(
     List<int> senderNonce,
     List<int> receiverNonce,
     List<int> intent,
-  ) =>
-      (BytesBuilder(copy: false)
-            ..add(proofLabel)
-            ..add(senderNonce)
-            ..add(receiverNonce)
-            ..add(intent))
-          .toBytes();
+    List<int> receiver,
+  ) {
+    if (intent.length > 0xFF || receiver.length > 0xFF) {
+      throw ArgumentError('intent or receiver longer than 255 bytes');
+    }
+    return (BytesBuilder(copy: false)
+          ..add(proofLabel)
+          ..add(senderNonce)
+          ..add(receiverNonce)
+          ..addByte(intent.length)
+          ..add(intent)
+          ..addByte(receiver.length)
+          ..add(receiver))
+        .toBytes();
+  }
 
   /// Encodes the payload (after the control type byte).
   ///
-  /// Throws [ArgumentError] for an intent over [maxIntentLength] bytes and
-  /// for a payload over [MuxControlMessage.maxControlPayload] bytes.
+  /// Throws [ArgumentError] for an intent over [maxIntentLength] bytes, a
+  /// receiver over [maxReceiverLength] bytes, and a payload over
+  /// [MuxControlMessage.maxControlPayload] bytes.
   Uint8List encode() {
     if (intent.length > maxIntentLength) {
       throw ArgumentError.value(
@@ -502,7 +528,21 @@ class MuxIdent {
         'at most $maxIntentLength bytes',
       );
     }
-    final length = 2 + credential.length + 1 + intent.length + proof.length;
+    if (receiver.length > maxReceiverLength) {
+      throw ArgumentError.value(
+        receiver.length,
+        'receiver',
+        'at most $maxReceiverLength bytes',
+      );
+    }
+    final length =
+        2 +
+        credential.length +
+        1 +
+        intent.length +
+        1 +
+        receiver.length +
+        proof.length;
     if (length > MuxControlMessage.maxControlPayload) {
       throw ArgumentError(
         'IDENT of $length bytes exceeds the control payload limit of '
@@ -514,6 +554,8 @@ class MuxIdent {
           ..bytes(credential)
           ..u8(intent.length)
           ..bytes(intent)
+          ..u8(receiver.length)
+          ..bytes(receiver)
           ..bytes(proof))
         .toBytes();
   }
@@ -521,8 +563,10 @@ class MuxIdent {
   /// Decodes an IDENT payload. The fields are views into [bytes].
   ///
   /// Throws [ProtocolException] on truncation and for an intent over
-  /// [maxIntentLength] bytes. The proof is whatever follows the intent;
-  /// its length is checked when the credential is verified.
+  /// [maxIntentLength] bytes. The proof is whatever follows the receiver;
+  /// its length is checked when the credential is verified, and the
+  /// receiver (any bytes) when it is compared with the receiver's
+  /// identity.
   static MuxIdent decode(Uint8List bytes) {
     final reader = ByteReader(bytes);
     try {
@@ -535,9 +579,11 @@ class MuxIdent {
         throw ProtocolException('IDENT intent of $intentLength bytes');
       }
       final intent = reader.take(intentLength, 'intent');
+      final receiver = reader.take(reader.u8('receiver length'), 'receiver');
       return MuxIdent(
         credential: credential,
         intent: intent,
+        receiver: receiver,
         proof: reader.rest(),
       );
     } on FormatException catch (e) {
@@ -548,7 +594,8 @@ class MuxIdent {
   @override
   String toString() =>
       'MuxIdent(credential of ${credential.length} bytes, '
-      'intent ${hexString(intent)}, proof of ${proof.length} bytes)';
+      'intent ${hexString(intent)}, receiver of ${receiver.length} bytes, '
+      'proof of ${proof.length} bytes)';
 }
 
 /// Advisory limits announced with the LIMITS control message.

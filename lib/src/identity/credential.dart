@@ -218,10 +218,11 @@ class Credential {
   /// The layout version this implementation reads and writes.
   static const int currentVersion = 1;
 
-  /// Largest encoded credential: 893 bytes, so that an `IDENT` carrying it
-  /// with the largest intent (64 bytes) and a proof (64 bytes) fits the
-  /// 1024-byte limit of a control payload (`2 + 893 + 1 + 64 + 64`).
-  static const int maxLength = 893;
+  /// Largest encoded credential: 637 bytes, so that an `IDENT` carrying it
+  /// with the largest intent (64 bytes), the longest receiver (255 bytes)
+  /// and a proof (64 bytes) fits the 1024-byte limit of a control payload
+  /// (`2 + 637 + 1 + 64 + 1 + 255 + 64`).
+  static const int maxLength = 637;
 
   /// Length of a holder key (an Ed25519 public key).
   static const int holderKeyLength = 32;

@@ -81,6 +81,15 @@ class Procedures {
 
   /// Event and `LOOKUP` item: the state of one slot.
   static final Name slot = Name('SLOT');
+
+  /// Ask for a renewed credential (request); see the wiki page
+  /// "Switchboard Identity and Credentials".
+  static final Name renew = Name('RENEW');
+
+  /// From a consumer: have an instance dial it (request, [ConnectRequest]).
+  /// From the naming service to the instance: dial the consumer (request,
+  /// [DialBackRequest]).
+  static final Name connect = Name('CONNECT');
 }
 
 /// Well-known service types.
@@ -1588,4 +1597,178 @@ class MovedStatus {
     final when = epoch == 0 ? '' : ', epoch $epoch';
     return 'MovedStatus($where$when${reason.isEmpty ? '' : ', $reason'})';
   }
+}
+
+/// Longest intent of a `CONNECT`: the intent of an `IDENT`.
+const int maxConnectIntentLength = 64;
+
+/// Reads a `len8` UTF-8 identity, strictly (malformed UTF-8 is an error).
+String _readIdentity(ByteReader r, String what) =>
+    utf8.decode(r.take(r.u8('$what length'), what));
+
+void _writeIdentity(ByteWriter w, String identity, String what) {
+  final bytes = utf8.encode(identity);
+  if (bytes.length > 0xFF) {
+    throw ArgumentError.value(identity, what, 'longer than 255 bytes');
+  }
+  w.u8(bytes.length);
+  w.bytes(bytes);
+}
+
+Uint8List _readIntent(ByteReader r) {
+  final length = r.u8('intent length');
+  if (length > maxConnectIntentLength) {
+    throw FormatException(
+      'intent of $length bytes, more than $maxConnectIntentLength',
+    );
+  }
+  return Uint8List.fromList(r.take(length, 'intent'));
+}
+
+void _writeIntent(ByteWriter w, Uint8List intent) {
+  if (intent.length > maxConnectIntentLength) {
+    throw ArgumentError.value(
+      intent.length,
+      'intent',
+      'more than $maxConnectIntentLength bytes',
+    );
+  }
+  w.u8(intent.length);
+  w.bytes(intent);
+}
+
+void _writeEndpoint(ByteWriter w, Uri endpoint) {
+  ServiceRecord.checkEndpoint(endpoint);
+  w.string8(endpoint.toString());
+}
+
+/// `CONNECT` request payload, from a consumer to the naming service: have
+/// instance [instance] of [type] dial [endpoint] and identify there with
+/// [intent].
+///
+/// Wire: name type, u48 instance, len8 endpoint URI, len8 intent (at most
+/// 64 bytes). See the wiki page "Switchboard Identity and Credentials",
+/// section "Reverse connections".
+class ConnectRequest {
+  /// Creates a request. A null [intent] is empty.
+  ConnectRequest(this.type, this.instance, this.endpoint, {Uint8List? intent})
+    : intent = intent ?? Uint8List(0);
+
+  /// The type of the instance.
+  final Name type;
+
+  /// The instance to dial back.
+  final int instance;
+
+  /// Where the instance dials: the consumer's listener.
+  final Uri endpoint;
+
+  /// Opaque, chosen by the consumer; the instance's `IDENT` carries it.
+  final Uint8List intent;
+
+  /// Encodes the payload. Throws [ArgumentError] for an endpoint
+  /// [ServiceRecord.checkEndpoint] refuses or an intent over 64 bytes, and
+  /// [RangeError] for an instance outside `u48`.
+  Uint8List encode() {
+    _checkU48(instance, 'instance');
+    final w = ByteWriter();
+    w.name(type);
+    w.u48(instance);
+    _writeEndpoint(w, endpoint);
+    _writeIntent(w, intent);
+    return w.toBytes();
+  }
+
+  /// Decodes the payload; trailing bytes are ignored. Throws
+  /// [ProtocolException] on truncation, an endpoint
+  /// [ServiceRecord.checkEndpoint] refuses, or an intent over 64 bytes.
+  static ConnectRequest decode(Uint8List bytes) =>
+      _guard('CONNECT request', () {
+        final r = ByteReader(bytes);
+        final type = r.name('type');
+        final instance = r.u48('instance');
+        final endpoint = _readEndpoint(r);
+        return ConnectRequest(type, instance, endpoint, intent: _readIntent(r));
+      });
+
+  @override
+  String toString() =>
+      'ConnectRequest(${ServiceAddress(type, instance)}, $endpoint, '
+      'intent of ${intent.length} bytes)';
+}
+
+/// `CONNECT` final response payload, from the naming service to the
+/// consumer: the identity of the channel that registered the instance,
+/// which the instance presents when it dials back.
+///
+/// Wire: len8 identity (UTF-8).
+class ConnectResponse {
+  /// Creates a response.
+  const ConnectResponse(this.identity);
+
+  /// The identity the instance identifies with.
+  final String identity;
+
+  /// Encodes the payload. Throws [ArgumentError] for an identity over 255
+  /// bytes of UTF-8.
+  Uint8List encode() {
+    final w = ByteWriter();
+    _writeIdentity(w, identity, 'identity');
+    return w.toBytes();
+  }
+
+  /// Decodes the payload; trailing bytes are ignored. Throws
+  /// [ProtocolException] on truncation or malformed UTF-8.
+  static ConnectResponse decode(Uint8List bytes) => _guard(
+    'CONNECT response',
+    () => ConnectResponse(_readIdentity(ByteReader(bytes), 'identity')),
+  );
+}
+
+/// `CONNECT` request payload, from the naming service to an instance over
+/// its registration channel: dial [endpoint], identify with [intent], and
+/// name [requester] as the receiver of the `IDENT`.
+///
+/// Wire: len8 requester identity (UTF-8, empty when the consumer has
+/// none), len8 endpoint URI, len8 intent (at most 64 bytes).
+class DialBackRequest {
+  /// Creates a request. A null [intent] is empty.
+  DialBackRequest(this.requester, this.endpoint, {Uint8List? intent})
+    : intent = intent ?? Uint8List(0);
+
+  /// The identity of the consumer that asked, empty when it has none.
+  final String requester;
+
+  /// Where to dial.
+  final Uri endpoint;
+
+  /// The intent of the `IDENT` to send there.
+  final Uint8List intent;
+
+  /// Encodes the payload. Throws [ArgumentError] for a requester over 255
+  /// bytes of UTF-8, an endpoint [ServiceRecord.checkEndpoint] refuses, or
+  /// an intent over 64 bytes.
+  Uint8List encode() {
+    final w = ByteWriter();
+    _writeIdentity(w, requester, 'requester');
+    _writeEndpoint(w, endpoint);
+    _writeIntent(w, intent);
+    return w.toBytes();
+  }
+
+  /// Decodes the payload; trailing bytes are ignored. Throws
+  /// [ProtocolException] on truncation, malformed UTF-8, an endpoint
+  /// [ServiceRecord.checkEndpoint] refuses, or an intent over 64 bytes.
+  static DialBackRequest decode(Uint8List bytes) =>
+      _guard('CONNECT request', () {
+        final r = ByteReader(bytes);
+        final requester = _readIdentity(r, 'requester');
+        final endpoint = _readEndpoint(r);
+        return DialBackRequest(requester, endpoint, intent: _readIntent(r));
+      });
+
+  @override
+  String toString() =>
+      'DialBackRequest("$requester", $endpoint, '
+      'intent of ${intent.length} bytes)';
 }

@@ -384,7 +384,7 @@ void main() {
       final credential = await held();
       final intent = Uint8List(0);
       final proof = await holder.sign(
-        MuxIdent.proofMessage(senderNonce, answer.payload, intent),
+        MuxIdent.proofMessage(senderNonce, answer.payload, intent, empty),
       );
       PeerIdentity? seen;
       final opened = Completer<void>();
@@ -442,6 +442,157 @@ void main() {
       expect(goAway.goAwayStatus.reason, 'identification failed');
       expect(await b.done, hasCode(StatusCode.unauthenticated));
       expect(b.peerIdentity, isNull);
+    });
+
+    group('receiver binding', () {
+      /// A mux accepting IDENTs as [identity] (null: no credential).
+      (MuxConnection, RawPeer) receiverPair(
+        CredentialVerifier verifier, {
+        String? identity = 't',
+        bool requireNamedIdent = false,
+      }) {
+        final (b, raw) = rawPair(
+          muxIsInitiator: false,
+          options: rawOptions.copyWith(
+            identityVerifier: verifier,
+            requireNamedIdent: requireNamedIdent,
+          ),
+        );
+        b.localIdentity = identity;
+        return (b, raw);
+      }
+
+      /// [a] identifies to a malicious peer `m` (naming it), which relays
+      /// the handshake live to the honest node `t`: the nonces are passed
+      /// both ways, and the IDENT goes to `t` as [rewrite] makes it.
+      Future<MuxConnection> relay(
+        MuxIdent Function(MuxIdent ident) rewrite,
+      ) async {
+        final verifier = await verifierFor([edIssuer]);
+        final (a, toA) = rawPair();
+        final (t, toT) = receiverPair(verifier);
+        final identifying = a.identify(
+          await held(),
+          holderKey: holder,
+          receiver: 'm',
+        );
+        identifying.ignore();
+        final aNonce = await toA.nextControl(MuxControlType.nonce);
+        toT.send(control(MuxControlType.nonce, aNonce.payload));
+        final tNonce = await toT.nextControl(MuxControlType.nonce);
+        toA.send(control(MuxControlType.nonce, tNonce.payload));
+        final ident = await toA.nextControl(MuxControlType.ident);
+        toT.send(
+          control(
+            MuxControlType.ident,
+            rewrite(MuxIdent.decode(ident.payload)).encode(),
+          ),
+        );
+        final goAway = await toT.nextControl(MuxControlType.goAway);
+        expect(goAway.goAwayStatus, hasCode(StatusCode.unauthenticated));
+        expect(goAway.goAwayStatus.reason, 'identification failed');
+        expect(await t.done, hasCode(StatusCode.unauthenticated));
+        expect(t.peerIdentity, isNull);
+        await a.close();
+        return t;
+      }
+
+      test('a relayed handshake is refused by the third node', () async {
+        // As sent: it names m, not t.
+        await relay((ident) => ident);
+      });
+
+      test('a relay cannot rename the receiver', () async {
+        // Naming t, or nobody: the proof covers the receiver.
+        for (final name in ['t', '']) {
+          await relay(
+            (ident) => MuxIdent(
+              credential: ident.credential,
+              intent: ident.intent,
+              receiver: Uint8List.fromList(name.codeUnits),
+              proof: ident.proof,
+            ),
+          );
+        }
+        // Nor move the name into the intent: the proof covers the lengths.
+        await relay(
+          (ident) => MuxIdent(
+            credential: ident.credential,
+            intent: Uint8List.fromList([...ident.intent, ...ident.receiver]),
+            proof: ident.proof,
+          ),
+        );
+      });
+
+      test('the named receiver accepts; another refuses', () async {
+        final verifier = await verifierFor([edIssuer, hmacIssuer]);
+        for (final credential in [await held(), await bearer()]) {
+          final (a, b) = identityPair(acceptorVerifier: verifier);
+          b.localIdentity = 'gate';
+          await a.identify(credential, holderKey: holder, receiver: 'gate');
+          expect(b.peerIdentity?.identity, credential.identity);
+          expect(b.peerIdentity?.receiver, 'gate');
+          await a.close();
+          await b.done;
+
+          final (c, d) = identityPair(acceptorVerifier: verifier);
+          d.localIdentity = 'gate';
+          await expectLater(
+            c.identify(credential, holderKey: holder, receiver: 'other'),
+            throwsStatus(StatusCode.unauthenticated),
+          );
+          expect(await d.done, hasCode(StatusCode.unauthenticated));
+          await c.done;
+        }
+      });
+
+      test('a receiver without an identity refuses a named IDENT', () async {
+        final verifier = await verifierFor([hmacIssuer]);
+        final (a, b) = identityPair(acceptorVerifier: verifier);
+        await expectLater(
+          a.identify(await bearer(), receiver: 'gate'),
+          throwsStatus(StatusCode.unauthenticated),
+        );
+        expect(await b.done, hasCode(StatusCode.unauthenticated));
+        await a.done;
+      });
+
+      test('an unnamed IDENT is accepted unless requireNamedIdent', () async {
+        final verifier = await verifierFor([hmacIssuer]);
+        final (a, b) = identityPair(acceptorVerifier: verifier);
+        b.localIdentity = 'gate';
+        await a.identify(await bearer());
+        expect(b.peerIdentity?.identity, 'npc-7');
+        expect(b.peerIdentity?.receiver, isEmpty);
+        await a.close();
+        await b.done;
+
+        final (c, d) = muxPair(
+          acceptor: quiet.copyWith(
+            identityVerifier: verifier,
+            requireNamedIdent: true,
+          ),
+        );
+        d.localIdentity = 'gate';
+        await expectLater(
+          c.identify(await bearer()),
+          throwsStatus(StatusCode.unauthenticated),
+        );
+        expect(await d.done, hasCode(StatusCode.unauthenticated));
+        await c.done;
+
+        final (e, f) = muxPair(
+          acceptor: quiet.copyWith(
+            identityVerifier: verifier,
+            requireNamedIdent: true,
+          ),
+        );
+        f.localIdentity = 'gate';
+        await e.identify(await bearer(), receiver: 'gate');
+        expect(f.peerIdentity?.receiver, 'gate');
+        await e.close();
+        await f.done;
+      });
     });
 
     test('a bearer IDENT with a proof is rejected', () async {
@@ -581,6 +732,10 @@ void main() {
       );
       expect(
         () async => a.identify(await bearer(), intent: Uint8List(65)),
+        throwsArgumentError,
+      );
+      expect(
+        () async => a.identify(await bearer(), receiver: 'x' * 256),
         throwsArgumentError,
       );
       await a.close();

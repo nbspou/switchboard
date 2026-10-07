@@ -41,6 +41,16 @@ Matcher throwsCode(StatusCode code) =>
 Matcher hasCode(StatusCode code) =>
     isA<Status>().having((s) => s.known, 'known', code);
 
+Future<void> until(bool Function() condition) async {
+  final deadline = DateTime.now().add(limit);
+  while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      fail('condition not met within $limit');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 2));
+  }
+}
+
 Future<Credential> issue(
   String identity,
   HolderKey? key,
@@ -78,9 +88,12 @@ Future<Switchboard> node({
   Duration identityTimeout = limit,
   ChannelPolicy? outgoingPolicy,
   Resolver? resolver,
+  bool requireNamedIdent = false,
+  ExpectedIdentity? expectedIdentityFor,
 }) async {
   final s = Switchboard(
-    muxOptions: fast,
+    muxOptions: fast.copyWith(requireNamedIdent: requireNamedIdent),
+    expectedIdentityFor: expectedIdentityFor,
     credential: credential,
     holderKey: holderKey,
     verifier: verify ? await verifier() : null,
@@ -125,11 +138,13 @@ Future<(Switchboard, Uri)> server(
   Credential? credential,
   HolderKey? holderKey,
   Duration identityTimeout = limit,
+  bool requireNamedIdent = false,
 }) async {
   final s = await node(
     credential: credential,
     holderKey: holderKey,
     identityTimeout: identityTimeout,
+    requireNamedIdent: requireNamedIdent,
   );
   for (final type in [npc, chat, naming]) {
     s.registerService(type, answer);
@@ -517,6 +532,94 @@ void main() {
       expect(() => Switchboard().identifyOn(connection), throwsStateError);
     });
 
+    test('expectedIdentityFor names the receiver', () async {
+      final (_, uri) = await server(
+        'mem',
+        credential: await issue('gate', gateKey, const []),
+        holderKey: gateKey,
+        requireNamedIdent: true,
+      );
+      final asked = <(Uri, ServiceRecord?)>[];
+      Future<Switchboard> client(String? expected) async => node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        expectedIdentityFor: (endpoint, record) {
+          asked.add((endpoint, record));
+          return expected;
+        },
+      );
+      final named = await client('gate');
+      expect(await open(named, uri, npc), 'npc for npc-7');
+      expect(asked.single, (uri, null));
+      // Another receiver, or none at a host that requires one: refused.
+      for (final expected in ['other', null]) {
+        await expectLater(
+          (await client(expected)).connect(uri),
+          throwsCode(StatusCode.unauthenticated),
+        );
+      }
+      // An explicit receiver wins over the hook.
+      final explicit = await client('other');
+      final connection = await explicit.dial(uri, receiver: 'gate');
+      expect(connection.isOpen, isTrue);
+      final failing = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        expectedIdentityFor: (endpoint, record) => throw StateError('no'),
+      );
+      await expectLater(
+        failing.connect(uri),
+        throwsCode(StatusCode.unauthenticated),
+      );
+    });
+
+    test('dial with an intent and a receiver; updateCredential presents '
+        'the renewed credential where the node identified', () async {
+      final (b, bUri) = await server(
+        'mem',
+        credential: await issue('gate', gateKey, const []),
+        holderKey: gateKey,
+      );
+      final (c, cUri) = await server('mem', policy: ChannelPolicies.scoped());
+      final seen = <MuxConnection>[];
+      b.connections.listen(seen.add);
+      c.connections.listen(seen.add);
+      final a = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        identifyFor: (endpoint) => endpoint == bUri,
+      );
+      final plain = await node();
+      await expectLater(
+        plain.dial(bUri, intent: Uint8List(1)),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      expect(() => a.dial(bUri, intent: Uint8List(65)), throwsArgumentError);
+      final toB = await a.dial(
+        bUri,
+        intent: Uint8List.fromList([7]),
+        receiver: 'gate',
+      );
+      // identifyFor says no for c: not identified there.
+      final toC = await a.connect(cUri);
+      await until(() => seen.length == 2);
+      final atB = seen.firstWhere((s) => s.peerIdentity != null);
+      expect(atB.peerIdentity!.intent, [7]);
+      expect(atB.peerIdentity!.receiver, 'gate');
+      final renewed = await issue('npc-7', npcKey, [
+        Scope.of(Right.open, 'npc'),
+        Scope.of(Right.open, 'chat'),
+      ]);
+      await a.updateCredential(renewed);
+      expect(a.credential, renewed);
+      expect(atB.peerIdentity!.credential, renewed);
+      expect(atB.peerIdentity!.intent, [7]);
+      expect(atB.peerIdentity!.receiver, 'gate');
+      expect(seen.where((s) => s.peerIdentity != null), hasLength(1));
+      expect(toB.isOpen && toC.isOpen, isTrue);
+      expect(toB.localIdentity, 'npc-7');
+    });
+
     test('PeerSet connections identify', () async {
       final b = await node();
       final seen = Completer<String?>();
@@ -528,6 +631,7 @@ void main() {
         seen.complete(incoming.peerIdentity?.identity);
       }, acceptAnyInstance: true);
       final uri = await b.listenMemory();
+      final records = <ServiceRecord?>[];
       final consumer = await node(
         credential: await npcCredential(),
         holderKey: npcKey,
@@ -535,6 +639,10 @@ void main() {
         resolver: StaticResolver([
           ServiceRecord(ServiceAddress(npc, 5), endpoints: [uri]),
         ]),
+        expectedIdentityFor: (endpoint, record) {
+          records.add(record);
+          return null;
+        },
       );
       final set = PeerSet.watch(
         consumer,
@@ -546,6 +654,8 @@ void main() {
       await set.events
           .firstWhere((e) => e.type == PeerEventType.online)
           .timeout(limit);
+      // The PeerSet tells the hook which record it dials.
+      expect(records.single?.address, ServiceAddress(npc, 5));
     });
   });
 }

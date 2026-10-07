@@ -6,6 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../address/service_address.dart';
 import '../name.dart';
@@ -84,6 +85,28 @@ abstract interface class SlotResolver implements Resolver {
   /// migrating), or null when the slot stays free. Fails like the
   /// underlying request (for example `UNAVAILABLE` while disconnected).
   Future<SlotEntry?> locateSlot(Name type, int slot);
+}
+
+/// A [Resolver] that can have an instance which registered without
+/// endpoints dial the caller: the naming service's `CONNECT` (wiki page
+/// "Switchboard Identity and Credentials", section "Reverse
+/// connections").
+///
+/// `Switchboard` brokers a connection through it to an instance whose
+/// record has no endpoints, when the resolver implements this interface
+/// (`Switchboard.broker`); `NamingResolver` implements it over its
+/// client's [connectTo].
+abstract interface class BrokeringResolver implements Resolver {
+  /// Has the instance at [address] dial [endpoint] and identify there with
+  /// [intent] (at most 64 bytes). Completes once it has, with the identity
+  /// it presents. [timeout], when given, bounds the whole request. Fails
+  /// like `NamingClient.connectTo`.
+  Future<String> connectTo(
+    ServiceAddress address,
+    Uri endpoint,
+    Uint8List intent, {
+    Duration? timeout,
+  });
 }
 
 /// A configured, in-memory table. Used by tests, embedded style peers and

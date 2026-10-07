@@ -64,11 +64,14 @@ final senderNonce = Uint8List(32)..fillRange(0, 32, 0x11);
 final receiverNonce = Uint8List(32)..fillRange(0, 32, 0x22);
 final intent = hexBytes('01 02 03 04');
 
+/// The receiver `consumer`, in UTF-8.
+final receiver = hexBytes('63 6F 6E 73 75 6D 65 72');
+
 const proof =
-    'D1 EB 55 75 B5 78 AB DB E4 B5 41 48 40 0A B1 72 '
-    'E8 46 F5 FD 1B 43 F9 F1 F6 44 3A BF DD 95 C9 DC '
-    '40 76 60 95 E9 08 C1 B5 9C 17 F2 B9 54 F8 7F B2 '
-    '44 BD F5 0D 8B 39 15 67 17 B6 9D 9E E2 D0 64 0A';
+    '4A 11 15 AE FE D7 6E 3A 3E 00 0A FA C8 64 73 BC '
+    'D5 16 3C 32 7E 54 80 8F 44 A2 34 9E 33 C5 36 DF '
+    '05 A5 BA 33 FD 04 F2 81 E3 11 11 25 45 23 48 37 '
+    'B3 6B DB 22 CA 8A 17 45 00 23 9F D7 1D EC 8B 0B';
 
 final at = DateTime.fromMillisecondsSinceEpoch(
   (issuedAt + 60) * 1000,
@@ -220,7 +223,7 @@ void main() {
         () => Uint8List.fromList([...hexBytes(hmacCredential), 0x00]),
       );
       negative('empty', () => Uint8List(0));
-      negative('longer than 893 bytes', () => Uint8List(894));
+      negative('longer than 637 bytes', () => Uint8List(638));
     });
 
     group('negative (signature)', () {
@@ -330,34 +333,44 @@ void main() {
       );
     });
 
-    test('IDENT, bearer credential, no intent, no proof', () {
+    test('IDENT, bearer credential, no intent, no receiver, no proof', () {
       final ident = MuxIdent(credential: hexBytes(hmacCredential));
       expect(
         hexString(MuxControlMessage.ident(ident).toFrame().encode()),
-        '02 00 00 06 56 00 $hmacCredential 00',
+        '02 00 00 06 56 00 $hmacCredential 00 00',
       );
-      final decoded = MuxIdent.decode(hexBytes('56 00 $hmacCredential 00'));
+      final decoded = MuxIdent.decode(hexBytes('56 00 $hmacCredential 00 00'));
       expect(hexString(decoded.credential), hmacCredential);
       expect(decoded.intent, isEmpty);
+      expect(decoded.receiver, isEmpty);
       expect(decoded.proof, isEmpty);
     });
 
-    test('IDENT, holder-key credential, intent, proof', () async {
-      final message = MuxIdent.proofMessage(senderNonce, receiverNonce, intent);
+    test('IDENT, holder-key credential, intent, receiver, proof', () async {
+      final message = MuxIdent.proofMessage(
+        senderNonce,
+        receiverNonce,
+        intent,
+        receiver,
+      );
       expect(
         hexString(message),
         '53 57 42 49 44 45 4E 54 ${hexString(senderNonce)} '
-        '${hexString(receiverNonce)} 01 02 03 04',
+        '${hexString(receiverNonce)} 04 01 02 03 04 '
+        '08 63 6F 6E 73 75 6D 65 72',
       );
+      expect(message, hasLength(86));
       final holder = await HolderKey.fromSeed(holderSeed);
       expect(hexString(await holder.sign(message)), proof);
       final ident = MuxIdent(
         credential: hexBytes(ed25519Credential),
         intent: intent,
+        receiver: receiver,
         proof: hexBytes(proof),
       );
       const frame =
-          '02 00 00 06 88 00 $ed25519Credential 04 01 02 03 04 $proof';
+          '02 00 00 06 88 00 $ed25519Credential 04 01 02 03 04 '
+          '08 63 6F 6E 73 75 6D 65 72 $proof';
       expect(
         hexString(MuxControlMessage.ident(ident).toFrame().encode()),
         frame,
@@ -368,7 +381,29 @@ void main() {
       );
       expect(hexString(decoded.credential), ed25519Credential);
       expect(hexString(decoded.intent), '01 02 03 04');
+      expect(hexString(decoded.receiver), hexString(receiver));
       expect(hexString(decoded.proof), proof);
+    });
+
+    test('the proof covers the field lengths', () {
+      // The same bytes split differently between intent and receiver sign
+      // differently: an IDENT naming `consumer` cannot be passed off as
+      // one naming nobody, with the name moved into the intent.
+      expect(
+        hexString(
+          MuxIdent.proofMessage(
+            senderNonce,
+            receiverNonce,
+            Uint8List.fromList([...intent, ...receiver]),
+            Uint8List(0),
+          ),
+        ),
+        isNot(
+          hexString(
+            MuxIdent.proofMessage(senderNonce, receiverNonce, intent, receiver),
+          ),
+        ),
+      );
     });
 
     group('negative (protocol error)', () {
@@ -378,6 +413,8 @@ void main() {
         ('missing intent length', '02 00 AA BB'),
         ('intent longer than the payload', '00 00 05 01 02'),
         ('intent of 65 bytes', '00 00 41 ${List.filled(65, '00').join(' ')}'),
+        ('missing receiver length', '00 00 01 AA'),
+        ('receiver longer than the payload', '00 00 00 04 61 62'),
       ]) {
         test(name, () {
           expect(

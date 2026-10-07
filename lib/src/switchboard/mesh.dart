@@ -9,9 +9,11 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:math';
 
+import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 
 import '../address/service_address.dart';
+import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../naming/naming_client.dart';
 import '../naming/naming_client_io.dart';
@@ -19,6 +21,7 @@ import '../naming/naming_protocol.dart';
 import '../naming/naming_resolver.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
+import 'channel_policy.dart';
 import 'incoming_channel.dart';
 import 'slot_gate.dart';
 import 'switchboard.dart';
@@ -54,8 +57,26 @@ const int _leaveWindow = 64;
 /// its slot space and installs a [SlotGate]; [claimSlot], [releaseSlot],
 /// [migrateSlot] and [slotOwners] work on its slots. See the wiki page
 /// "Switchboard Sharding".
+///
+/// Identity (wiki page "Switchboard Identity and Credentials"): the node
+/// serves the `CONNECT` requests the naming service relays to it (a
+/// consumer wants an instance this node registered without endpoints to
+/// dial it): it dials the consumer with [Switchboard.dial], identifying
+/// with the consumer's intent and naming the consumer as the receiver,
+/// under [brokeredPolicy]; it keeps those connections until they end or it
+/// leaves. And it renews the node's [Switchboard.credential] through the
+/// naming service (`RENEW`) at two thirds of its lifetime, presenting the
+/// renewed credential on every connection the node identified on
+/// ([Switchboard.updateCredential]).
 class MeshNode {
-  MeshNode._(this.switchboard, this.client, this.resolver, this.leaveTimeout);
+  MeshNode._(
+    this.switchboard,
+    this.client,
+    this.resolver,
+    this.leaveTimeout,
+    this.brokeredPolicy,
+    this.renewCredential,
+  );
 
   /// Joins the mesh whose naming service listens at [namingEndpoint].
   ///
@@ -67,6 +88,18 @@ class MeshNode {
   /// once the table is mirrored. [leaveTimeout] bounds what [leave] waits
   /// for the naming service, once for the hand-overs and once for the
   /// releases.
+  ///
+  /// [brokeredPolicy] is the policy of the connections the node dials when
+  /// the naming service relays a `CONNECT` (default
+  /// [ChannelPolicies.scoped]: the consumer, which identifies in turn, may
+  /// open the types its `open` scopes grant; the node needs a verifier for
+  /// that). [watch] false joins without mirroring the table (see
+  /// [NamingClient.watch]), for a node whose credential has no `watch`
+  /// scope, such as a worker. With [renewCredential] (the default) a node
+  /// that has a
+  /// credential with an expiry when it joins renews it at two thirds of
+  /// its lifetime, again after every renewal, and retries a failed renewal
+  /// until the credential expires.
   factory MeshNode.join(
     Switchboard switchboard,
     Uri namingEndpoint, {
@@ -74,17 +107,31 @@ class MeshNode {
     Duration resolveTimeout = const Duration(seconds: 5),
     TalkOptions? talkOptions,
     Duration leaveTimeout = const Duration(seconds: 5),
+    ChannelPolicy? brokeredPolicy,
+    bool renewCredential = true,
+    bool watch = true,
   }) {
     final client = namingClientFor(
       switchboard,
       namingEndpoint,
       reconnectDelay: reconnectDelay,
       talkOptions: talkOptions,
+      watch: watch,
     );
     final resolver = NamingResolver(client, resolveTimeout: resolveTimeout);
     switchboard.resolver = resolver;
+    final node = MeshNode._(
+      switchboard,
+      client,
+      resolver,
+      leaveTimeout,
+      brokeredPolicy ?? ChannelPolicies.scoped(),
+      renewCredential,
+    );
+    client.connectHandler = node._dialBack;
     unawaited(client.start());
-    return MeshNode._(switchboard, client, resolver, leaveTimeout);
+    node._scheduleRenewal();
+    return node;
   }
 
   /// The node this joined to the mesh.
@@ -99,6 +146,25 @@ class MeshNode {
   /// Longest time [leave] spends handing this node's slots over to other
   /// instances, and then again releasing those it could not hand over.
   final Duration leaveTimeout;
+
+  /// The policy of the connections the node dials for `CONNECT`.
+  final ChannelPolicy brokeredPolicy;
+
+  /// Whether the node renews its credential through the naming service.
+  final bool renewCredential;
+
+  final Set<MuxConnection> _brokered = {};
+  Timer? _renewTimer;
+
+  /// The connections the node dialled for `CONNECT` requests that are
+  /// still open.
+  Iterable<MuxConnection> get brokeredConnections =>
+      List.unmodifiable(_brokered);
+
+  /// When the node renews its credential next (UTC, by the time of
+  /// `package:clock`), while a renewal is scheduled.
+  DateTime? get nextRenewalAt => _nextRenewalAt;
+  DateTime? _nextRenewalAt;
 
   /// The slot gates of the types published with [publishSharded]; the
   /// [client]'s slot handler once one is published.
@@ -355,6 +421,115 @@ class MeshNode {
     }
   }
 
+  // Identity ----------------------------------------------------------------
+
+  /// Serves a `CONNECT` relayed by the naming service: dials the consumer
+  /// with its intent, naming it as the receiver.
+  Future<void> _dialBack(DialBackRequest request) async {
+    if (_leaving) {
+      throw SwitchboardException.of(StatusCode.failedPrecondition, 'left mesh');
+    }
+    if (switchboard.credential == null) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'no credential to identify with',
+      );
+    }
+    final connection = await switchboard.dial(
+      request.endpoint,
+      policy: brokeredPolicy,
+      intent: request.intent,
+      receiver: request.requester,
+    );
+    if (_leaving) {
+      unawaited(connection.goAway());
+      throw SwitchboardException.of(StatusCode.failedPrecondition, 'left mesh');
+    }
+    _brokered.add(connection);
+    connection.done.whenComplete(() => _brokered.remove(connection)).ignore();
+    _log.info(
+      'dialled back ${request.endpoint} for '
+      '"${request.requester.isEmpty ? 'an unidentified consumer' : request.requester}"',
+    );
+  }
+
+  /// Schedules the renewal of the node's credential at two thirds of its
+  /// lifetime, or at once when that is past.
+  void _scheduleRenewal({Duration? retryIn}) {
+    _renewTimer?.cancel();
+    _renewTimer = null;
+    _nextRenewalAt = null;
+    final credential = switchboard.credential;
+    if (!renewCredential || _leaving || credential == null) {
+      return;
+    }
+    final expires = credential.expiresAtTime;
+    if (expires == null) {
+      return;
+    }
+    final now = clock.now();
+    final Duration delay;
+    if (retryIn != null) {
+      delay = retryIn;
+    } else {
+      final lifetime = (credential.expiresAt - credential.issuedAt) * 1000;
+      final at = DateTime.fromMillisecondsSinceEpoch(
+        credential.issuedAt * 1000 + lifetime * 2 ~/ 3,
+        isUtc: true,
+      );
+      final until = at.difference(now);
+      delay = until.isNegative ? Duration.zero : until;
+    }
+    _nextRenewalAt = now.add(delay).toUtc();
+    _renewTimer = Timer(delay, () {
+      _renewTimer = null;
+      _nextRenewalAt = null;
+      unawaited(_renew());
+    });
+  }
+
+  Future<void> _renew() async {
+    final current = switchboard.credential;
+    if (_leaving || current == null) {
+      return;
+    }
+    try {
+      final renewed = await client.renew(current: current);
+      if (_leaving) {
+        return;
+      }
+      await switchboard.updateCredential(renewed);
+      _log.info(
+        'credential of "${renewed.identity}" renewed until '
+        '${renewed.expiresAtTime}',
+      );
+      _scheduleRenewal();
+    } on Object catch (e) {
+      if (_leaving) {
+        return;
+      }
+      final expires = current.expiresAtTime;
+      final left = expires == null
+          ? Duration.zero
+          : expires.difference(clock.now());
+      if (left <= Duration.zero) {
+        _log.severe(
+          'credential of "${current.identity}" expired without renewal: $e',
+        );
+        return;
+      }
+      // Again in a quarter of the time left, at least a second later.
+      var retry = left ~/ 4;
+      if (retry < const Duration(seconds: 1)) {
+        retry = left < const Duration(seconds: 1)
+            ? left
+            : const Duration(seconds: 1);
+      }
+      _log.warning('renewing the credential failed, again in $retry: $e');
+      _scheduleRenewal(retryIn: retry);
+    }
+  }
+
   /// Leaves the mesh: hands over or gives up the slots of the types
   /// published with [publishSharded], closes the resolver and with it the
   /// client (the naming service then drops every registration of this
@@ -390,12 +565,23 @@ class MeshNode {
   /// with its storage (a reboot) should rather not leave, so that its
   /// holder-only slots wait for it.
   ///
-  /// Call this before closing [switchboard]. Calling it again returns the
-  /// same future.
+  /// Leaving first stops renewing the credential and serving `CONNECT`,
+  /// and sends GOAWAY on the [brokeredConnections].
+  ///
+  /// Call this before closing [switchboard] (it also cancels the renewal
+  /// timer, which a node that is closed without leaving keeps until it
+  /// fires). Calling it again returns the same future.
   Future<LeaveReport> leave() => _leaveFuture ??= _leave();
 
   Future<LeaveReport> _leave() async {
     _leaving = true;
+    _renewTimer?.cancel();
+    _renewTimer = null;
+    _nextRenewalAt = null;
+    client.connectHandler = null;
+    for (final connection in List.of(_brokered)) {
+      unawaited(connection.goAway());
+    }
     final served = {
       for (final gate in gates.gates.values)
         gate.type: gate.servedSlots.keys.toSet(),

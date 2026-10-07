@@ -17,11 +17,13 @@ import 'credential.dart';
 /// "Connection identity".
 class PeerIdentity {
   /// An identity from [credential], verified at [verifiedAt], with the
-  /// opaque [intent] the `IDENT` carried.
+  /// opaque [intent] the `IDENT` carried and the [receiver] it named
+  /// (empty: none).
   PeerIdentity({
     required this.credential,
     required this.intent,
     required this.verifiedAt,
+    this.receiver = '',
   });
 
   /// The verified credential.
@@ -33,6 +35,11 @@ class PeerIdentity {
 
   /// When the `IDENT` was verified.
   final DateTime verifiedAt;
+
+  /// The receiver the `IDENT` named: this side's identity
+  /// (`MuxConnection.localIdentity`), since an `IDENT` naming another is
+  /// refused, or empty when it named none.
+  final String receiver;
 
   /// The credential's identity string.
   String get identity => credential.identity;
@@ -57,5 +64,6 @@ class PeerIdentity {
   @override
   String toString() =>
       'PeerIdentity(${kind.name} "$identity"'
-      '${intent.isEmpty ? '' : ', intent of ${intent.length} bytes'})';
+      '${intent.isEmpty ? '' : ', intent of ${intent.length} bytes'}'
+      '${receiver.isEmpty ? '' : ', to "$receiver"'})';
 }
