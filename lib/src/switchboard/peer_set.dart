@@ -257,7 +257,9 @@ class PeerSet {
   /// policy: every peer may open channels to the node's services), and
   /// when the node's [Switchboard.defaultPayload] is not empty and it has
   /// no [Switchboard.credentialFor] (every peer receives the node's
-  /// credential).
+  /// credential), and when the node identifies with a bearer
+  /// [Switchboard.credential] on every connection it initiates (every peer
+  /// receives that credential in `IDENT`).
   ///
   /// Throws [ArgumentError] when there is no resolver, when [onOpen] is
   /// given without [channel], for a negative [removalHoldDown], and for a
@@ -326,6 +328,17 @@ class PeerSet {
       _log.warning(
         'peer set $type: the node has a defaultPayload and no '
         'credentialFor, so every peer receives the node\'s credential',
+      );
+    }
+    final identity = switchboard.credential;
+    if (identity != null &&
+        identity.isBearer &&
+        switchboard.identifyFor == null &&
+        switchboard.identifyOutgoing) {
+      _log.warning(
+        'peer set $type: the node identifies with a bearer credential on '
+        'every connection it initiates, so every peer receives it; restrict '
+        'identification with identifyFor',
       );
     }
     set._start();

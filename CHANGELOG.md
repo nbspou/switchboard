@@ -189,6 +189,20 @@ The protocol specification lives in the project wiki (section
   held OPEN payloads, a cap on unconfirmed CLOSEs, output high-water marks,
   a per-client limit on proxied channels, and host hint relaying only on
   request.
+- Identity (stage A): signed credentials (`Credential`, scopes with
+  `register`, `open`, `watch`, `claim`, `migrate`, `broker` and `admin`
+  rights over name patterns), `CredentialIssuer` (HMAC-SHA256 bearer
+  credentials, or Ed25519 with holder keys), `CredentialVerifier` (keys by
+  id for rotation, a cache by credential bytes), `HolderKey`; connection
+  identity with the `NONCE` and `IDENT` control messages
+  (`MuxConnection.identify`, `peerIdentity`, `MuxOptions.identityVerifier`;
+  a refused `IDENT` ends the connection with GOAWAY `UNAUTHENTICATED`);
+  `Switchboard(credential:, holderKey:, verifier:, identifyOutgoing:,
+  identifyFor:, identityTimeout:)`, which identifies on the connections it
+  initiates before using them, `identifyOn`, `ChannelPolicies.scoped`,
+  `requireIdentity` and `all`, channels held until their peer identifies,
+  `IncomingChannel.peerIdentity`. New dependency: `cryptography` (its pure
+  Dart Ed25519, the same on the VM and the web).
 - Tests: over 1000 tests, including the wiki test vectors (the codec tests also
   run on Node.js with `dart test -P node`) and integration tests over TCP
   and WebSocket.

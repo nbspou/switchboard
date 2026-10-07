@@ -9,10 +9,17 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
+import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
+import '../identity/credential.dart';
+import '../identity/credential_verifier.dart';
+import '../identity/ed25519.dart';
+import '../identity/holder_key.dart';
+import '../identity/peer_identity.dart';
+import '../identity/secure_random.dart';
 import '../status.dart';
 import '../transport/transport_capabilities.dart';
 import 'mux_channel.dart';
@@ -36,6 +43,8 @@ class MuxOptions {
     this.receiveHighWaterMarkBytes = defaultReceiveHighWaterMarkBytes,
     this.closeConfirmTimeout = const Duration(seconds: 30),
     this.maxOpenPayloadBytes = defaultMaxOpenPayloadBytes,
+    this.identityVerifier,
+    this.identityTimeout = const Duration(seconds: 10),
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -149,6 +158,17 @@ class MuxOptions {
   /// (half the high-water mark still applies when set). Default 16 MiB.
   final int maxOpenPayloadBytes;
 
+  /// Verifies the credential of an `IDENT` from the peer, which then sets
+  /// [MuxConnection.peerIdentity]. Null: nothing can verify a credential,
+  /// so an `IDENT` is ignored (and logged). A `NONCE` is answered either
+  /// way.
+  final CredentialVerifier? identityVerifier;
+
+  /// How long [MuxConnection.identify] waits for the peer's `NONCE` and the
+  /// confirmation of its `IDENT`, unless given a timeout of its own.
+  /// [Duration.zero] waits without bound. Default 10 s.
+  final Duration identityTimeout;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -165,6 +185,8 @@ class MuxOptions {
     int? receiveHighWaterMarkBytes,
     Duration? closeConfirmTimeout,
     int? maxOpenPayloadBytes,
+    CredentialVerifier? identityVerifier,
+    Duration? identityTimeout,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -181,6 +203,8 @@ class MuxOptions {
         receiveHighWaterMarkBytes ?? this.receiveHighWaterMarkBytes,
     closeConfirmTimeout: closeConfirmTimeout ?? this.closeConfirmTimeout,
     maxOpenPayloadBytes: maxOpenPayloadBytes ?? this.maxOpenPayloadBytes,
+    identityVerifier: identityVerifier ?? this.identityVerifier,
+    identityTimeout: identityTimeout ?? this.identityTimeout,
   );
 }
 
@@ -296,6 +320,21 @@ class MuxConnection {
   Completer<void>? _idle;
   Future<void>? _closeFuture;
 
+  // Identity (wiki "Switchboard Identity and Credentials").
+  Uint8List? _localNonce;
+  Uint8List? _peerNonce;
+  Completer<Uint8List>? _peerNonceWaiter;
+  final Completer<void> _identityRequested = Completer<void>();
+  PeerIdentity? _peerIdentity;
+  final Completer<PeerIdentity> _peerIdentified = Completer<PeerIdentity>();
+  Completer<void>? _identityEvent;
+  // Frames that arrived while an IDENT was being verified; handled after
+  // it, in order, so that they see its outcome.
+  final Queue<Uint8List> _heldFrames = Queue<Uint8List>();
+  bool _verifyingIdent = false;
+  // The peer's GOAWAY status as sent, for identify().
+  Status? _peerGoAwayReceived;
+
   Timer? _keepAliveTimer;
   final Stopwatch _sinceReceive = Stopwatch()..start();
   bool _keepAliveProbing = false;
@@ -314,9 +353,10 @@ class MuxConnection {
   /// The status is `GOING_AWAY` if the peer sent GOAWAY (the peer's status
   /// is in the reason if it was not `GOING_AWAY`); the status sent with our
   /// GOAWAY if we ended the connection because the peer broke the protocol
-  /// (`PROTOCOL_ERROR`, `FRAME_TOO_LARGE` or `UNSUPPORTED`) or left too
+  /// (`PROTOCOL_ERROR`, `FRAME_TOO_LARGE` or `UNSUPPORTED`), left too
   /// many CLOSEs unconfirmed (`RESOURCE_EXHAUSTED`, see
-  /// [MuxOptions.maxPendingRejections]); otherwise `CONNECTION_LOST`.
+  /// [MuxOptions.maxPendingRejections]) or sent an `IDENT` that failed
+  /// verification (`UNAUTHENTICATED`); otherwise `CONNECTION_LOST`.
   Future<Status> get done => _done.future;
 
   /// Whether the transport is open and no local close (including
@@ -379,6 +419,178 @@ class MuxConnection {
   /// for which the peer's CLOSE has not arrived yet; bounded by
   /// [MuxOptions.maxPendingRejections].
   int get unconfirmedCloseCount => _awaitingClose.length;
+
+  /// Who the peer proved to be with its last valid `IDENT`, or null if it
+  /// has not identified (or [MuxOptions.identityVerifier] is null, so its
+  /// `IDENT` was ignored). Null again once the credential has expired, by
+  /// the time of `package:clock`, until a valid `IDENT` with a renewed one
+  /// arrives.
+  ///
+  /// Frames the peer sends after an `IDENT` are handled only once that
+  /// `IDENT` is verified, so a channel opened right after it already sees
+  /// the identity it establishes.
+  PeerIdentity? get peerIdentity {
+    final identity = _peerIdentity;
+    return identity == null || identity.isExpired() ? null : identity;
+  }
+
+  /// Completes with the first valid `IDENT` of the peer. Never completes
+  /// if the connection ends without one, and never completes with an
+  /// error.
+  Future<PeerIdentity> get peerIdentified => _peerIdentified.future;
+
+  /// Completes when the peer's `NONCE` arrives before this side sent one:
+  /// the peer intends to identify, or asks this side to (the two cannot be
+  /// told apart). The connection has answered with its own `NONCE`
+  /// already; whether to [identify] in return is the application's choice.
+  /// Never completes otherwise, and never with an error.
+  Future<void> get identityRequested => _identityRequested.future;
+
+  /// Completes at the next valid `IDENT` of the peer, or when the
+  /// connection ends. For holding channels until the peer identifies.
+  @internal
+  Future<void> get identityChanged =>
+      (_identityEvent ??= Completer<void>()).future;
+
+  /// Identifies this side to the peer with [credential] (wiki page
+  /// "Switchboard Identity and Credentials", section "Connection
+  /// identity"): sends `NONCE` unless this side has sent one, waits for
+  /// the peer's `NONCE`, sends `IDENT` with [intent] (at most 64 bytes,
+  /// default empty) and, for a credential with a holder key, the proof
+  /// signed with [holderKey] over `"SWBIDENT" ‖ our nonce ‖ the peer's
+  /// nonce ‖ intent`. A bearer credential carries no proof, and
+  /// [holderKey] is not used for it.
+  ///
+  /// Completes once the peer has handled the `IDENT`: a PING sent right
+  /// after it has been answered. A peer handles the frames after an
+  /// `IDENT` only once it has verified it, so the answer means it accepted
+  /// the credential (or does not check identity); a peer that refuses it
+  /// ends the connection with GOAWAY `UNAUTHENTICATED`. Calling again sends
+  /// another `IDENT`, which replaces the first at the peer (to present a
+  /// renewed credential).
+  ///
+  /// [timeout] (default [MuxOptions.identityTimeout]; [Duration.zero]: no
+  /// bound) bounds the whole exchange. Fails with [SwitchboardException]:
+  /// [StatusCode.unauthenticated] when the peer refused the credential,
+  /// [StatusCode.deadlineExceeded] when the peer's `NONCE` or the
+  /// confirmation did not arrive in time, [StatusCode.failedPrecondition]
+  /// when the connection is closed, and the connection's end status when it
+  /// ends meanwhile. Throws [ArgumentError] when the credential names a
+  /// holder key and [holderKey] is missing or another, and when the intent
+  /// or the `IDENT` is too long.
+  Future<void> identify(
+    Credential credential, {
+    HolderKey? holderKey,
+    Uint8List? intent,
+    Duration? timeout,
+  }) async {
+    final holder = credential.holderKey;
+    if (holder != null) {
+      if (holderKey == null) {
+        throw ArgumentError.value(
+          holderKey,
+          'holderKey',
+          'the credential names a holder key, the proof needs its key pair',
+        );
+      }
+      if (!_bytesEqual(holderKey.publicKey, holder)) {
+        throw ArgumentError.value(
+          holderKey,
+          'holderKey',
+          'not the holder key the credential names',
+        );
+      }
+    }
+    final intentBytes = intent == null
+        ? Uint8List(0)
+        : Uint8List.fromList(intent);
+    final credentialBytes = credential.encode();
+    // Checks the lengths before anything is sent.
+    MuxIdent(
+      credential: credentialBytes,
+      intent: intentBytes,
+      proof: holder == null ? null : Uint8List(MuxIdent.proofLength),
+    ).encode();
+    if (_closing) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'connection is closed',
+      );
+    }
+    final limit = timeout ?? options.identityTimeout;
+    final watch = Stopwatch()..start();
+    Future<T> bounded<T>(Future<T> future, String what) {
+      if (limit <= Duration.zero) {
+        return future;
+      }
+      final left = limit - watch.elapsed;
+      return future.timeout(
+        left > Duration.zero ? left : Duration.zero,
+        onTimeout: () => throw SwitchboardException.of(
+          StatusCode.deadlineExceeded,
+          '$what within $limit',
+        ),
+      );
+    }
+
+    final localNonce = _localNonce ?? _sendNonce();
+    final Uint8List peerNonce;
+    try {
+      peerNonce =
+          _peerNonce ??
+          await bounded(
+            (_peerNonceWaiter ??= Completer<Uint8List>()..future.ignore())
+                .future,
+            'no NONCE from the peer',
+          );
+    } on SwitchboardException catch (e) {
+      throw e.code == StatusCode.deadlineExceeded ? e : _identifyFailure();
+    }
+    final proof = holder == null
+        ? null
+        : await bounded(
+            holderKey!.sign(
+              MuxIdent.proofMessage(localNonce, peerNonce, intentBytes),
+            ),
+            'proof not signed',
+          );
+    if (_closing) {
+      throw _identifyFailure();
+    }
+    _log.fine('$this: identifying as "${credential.identity}"');
+    _sendFrame(
+      MuxControlMessage.ident(
+        MuxIdent(
+          credential: credentialBytes,
+          intent: intentBytes,
+          proof: proof,
+        ),
+      ).toFrame(),
+    );
+    try {
+      await bounded(ping(), 'IDENT not confirmed');
+    } on SwitchboardException catch (e) {
+      throw e.code == StatusCode.deadlineExceeded ? e : _identifyFailure();
+    }
+  }
+
+  /// Why [identify] failed once the connection ended.
+  SwitchboardException _identifyFailure() {
+    final peer = _peerGoAwayReceived;
+    if (peer != null && peer.known == StatusCode.unauthenticated) {
+      return SwitchboardException.of(
+        StatusCode.unauthenticated,
+        'the peer refused the credential',
+      );
+    }
+    if (_done.isCompleted || _closing) {
+      return SwitchboardException(_closeStatus ?? _lostStatus());
+    }
+    return SwitchboardException.of(
+      StatusCode.failedPrecondition,
+      'connection is closed',
+    );
+  }
 
   /// Opens a channel carrying [openPayload] in its OPEN frame.
   ///
@@ -620,6 +832,16 @@ class MuxConnection {
     }
     _receivedBytes += bytes.length;
     _noteReceive();
+    if (_verifyingIdent) {
+      // The transport is paused; a frame it delivered all the same waits
+      // for the IDENT like the rest.
+      _heldFrames.add(bytes);
+      return;
+    }
+    _processFrame(bytes);
+  }
+
+  void _processFrame(Uint8List bytes) {
     try {
       _handleFrame(bytes);
     } on SwitchboardException catch (e) {
@@ -783,6 +1005,7 @@ class MuxConnection {
           return;
         }
         _log.fine('$this: peer sent GOAWAY $status');
+        _peerGoAwayReceived = status;
         _peerGoAway = status.known == StatusCode.goingAway
             ? status
             : Status.of(StatusCode.goingAway, status.toString());
@@ -791,9 +1014,142 @@ class MuxConnection {
       case MuxControlType.limits:
         _peerLimits = MuxLimits.decode(message.payload);
         _log.fine('$this: peer limits $_peerLimits');
+      case MuxControlType.nonce:
+        _onPeerNonce(message.payload);
+      case MuxControlType.ident:
+        _onIdent(message.payload);
       case null:
         _log.fine('$this: ignoring control type ${message.type}');
     }
+  }
+
+  // Identity ------------------------------------------------------------
+
+  /// Sends our NONCE (once per connection) and returns it.
+  Uint8List _sendNonce() {
+    final nonce = secureRandomBytes(MuxIdent.nonceLength);
+    _localNonce = nonce;
+    _sendFrame(MuxControlMessage.nonce(nonce).toFrame());
+    return nonce;
+  }
+
+  void _onPeerNonce(Uint8List payload) {
+    if (payload.length != MuxIdent.nonceLength) {
+      throw ProtocolException('NONCE of ${payload.length} bytes');
+    }
+    if (_peerNonce != null) {
+      throw ProtocolException('second NONCE');
+    }
+    final nonce = Uint8List.fromList(payload);
+    _peerNonce = nonce;
+    final requested = _localNonce == null;
+    if (requested) {
+      _sendNonce();
+    }
+    final waiter = _peerNonceWaiter;
+    _peerNonceWaiter = null;
+    waiter?.complete(nonce);
+    if (requested && !_identityRequested.isCompleted) {
+      _identityRequested.complete();
+    }
+  }
+
+  void _onIdent(Uint8List payload) {
+    final verifier = options.identityVerifier;
+    if (verifier == null) {
+      _log.fine('$this: ignoring IDENT, no identity verifier');
+      return;
+    }
+    final localNonce = _localNonce;
+    final peerNonce = _peerNonce;
+    if (localNonce == null || peerNonce == null) {
+      throw ProtocolException('IDENT before both nonces were exchanged');
+    }
+    final ident = MuxIdent.decode(payload);
+    // Frames after the IDENT wait for its verification, so that they see
+    // the identity it establishes (or never run if it fails).
+    _verifyingIdent = true;
+    _subscription.pause();
+    unawaited(_verifyIdent(verifier, ident, peerNonce, localNonce));
+  }
+
+  /// Verifies [ident], sent by the peer with [senderNonce] (the peer's) and
+  /// [receiverNonce] (ours); then sets the identity or ends the connection
+  /// with GOAWAY `UNAUTHENTICATED`, and handles the frames held meanwhile.
+  /// Never fails.
+  Future<void> _verifyIdent(
+    CredentialVerifier verifier,
+    MuxIdent ident,
+    Uint8List senderNonce,
+    Uint8List receiverNonce,
+  ) async {
+    PeerIdentity? identity;
+    var failure = '';
+    try {
+      final credential = await verifier.verify(
+        Uint8List.fromList(ident.credential),
+      );
+      final holder = credential.holderKey;
+      if (holder == null) {
+        if (ident.proof.isNotEmpty) {
+          failure = 'a proof with a bearer credential';
+        }
+      } else if (ident.proof.length != MuxIdent.proofLength ||
+          !await ed25519Verify(
+            holder,
+            MuxIdent.proofMessage(senderNonce, receiverNonce, ident.intent),
+            ident.proof,
+          )) {
+        failure = 'proof of possession does not verify';
+      }
+      if (failure.isEmpty) {
+        identity = PeerIdentity(
+          credential: credential,
+          intent: Uint8List.fromList(ident.intent),
+          verifiedAt: clock.now(),
+        );
+      }
+    } on SwitchboardException catch (e) {
+      failure = e.status.reason;
+    } on Object catch (e, st) {
+      _log.warning('$this: IDENT verification failed', e, st);
+      failure = 'verification failed';
+    }
+    _verifyingIdent = false;
+    if (_closing) {
+      _heldFrames.clear();
+      return;
+    }
+    if (identity == null) {
+      _log.info('$this: IDENT refused: $failure');
+      _heldFrames.clear();
+      _fail(_unauthenticated);
+      return;
+    }
+    _log.fine('$this: peer identified as $identity');
+    _peerIdentity = identity;
+    if (!_peerIdentified.isCompleted) {
+      _peerIdentified.complete(identity);
+    }
+    _signalIdentity();
+    while (_heldFrames.isNotEmpty && !_verifyingIdent && !_closing) {
+      _processFrame(_heldFrames.removeFirst());
+    }
+    if (!_closing) {
+      _subscription.resume();
+    }
+  }
+
+  /// The status of the GOAWAY sent for an `IDENT` that fails verification.
+  static final Status _unauthenticated = Status.of(
+    StatusCode.unauthenticated,
+    'identification failed',
+  );
+
+  void _signalIdentity() {
+    final event = _identityEvent;
+    _identityEvent = null;
+    event?.complete();
   }
 
   void _completePing(Uint8List payload) {
@@ -980,7 +1336,7 @@ class MuxConnection {
     if (_closing || interval == null) {
       return;
     }
-    if (_receivePaused || _outputProgressed()) {
+    if (_receivePaused || _verifyingIdent || _outputProgressed()) {
       // We are not reading, so silence says nothing about the peer; or the
       // transport stopped reading because of our output, which the peer
       // is still consuming.
@@ -1044,8 +1400,12 @@ class MuxConnection {
   /// Ends the connection with [status]; channels end with [channelStatus]
   /// (default [status]). Idempotent; never throws.
   Future<void> _shutdown(Status status, Status? channelStatus) {
+    _closeStatus ??= status;
     return _closeFuture ??= _doShutdown(status, channelStatus ?? status);
   }
+
+  /// The status the connection ended (or is ending) with.
+  Status? _closeStatus;
 
   Future<void> _doShutdown(Status status, Status channelStatus) async {
     _closing = true;
@@ -1091,6 +1451,11 @@ class MuxConnection {
     for (final pending in pings) {
       pending.completer.completeError(SwitchboardException(status));
     }
+    _heldFrames.clear();
+    final nonceWaiter = _peerNonceWaiter;
+    _peerNonceWaiter = null;
+    nonceWaiter?.completeError(SwitchboardException(status));
+    _signalIdentity();
     final idle = _idle;
     _idle = null;
     if (idle != null && !idle.isCompleted) {

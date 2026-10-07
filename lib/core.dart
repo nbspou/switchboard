@@ -7,9 +7,10 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 /// Platform independent core of Switchboard: status codes, names, byte
 /// helpers, the in-memory and WebSocket transports, the stream binding's
-/// wire format, the mux and talk layers, addressing, the naming service and
-/// client, resolvers, the reference key-to-slot function, and the
-/// reconnecting client for frontends.
+/// wire format, the mux and talk layers, credentials and connection
+/// identity, addressing, the naming service and client, resolvers, the
+/// reference key-to-slot function, and the reconnecting client for
+/// frontends.
 ///
 /// Nothing in this library imports `dart:io`. Use
 /// `package:switchboard/switchboard.dart` for the full library including the
@@ -20,10 +21,21 @@ export 'src/address/channel_address.dart';
 export 'src/address/service_address.dart';
 export 'src/bytes.dart' show hexBytes, hexString;
 export 'src/client/reconnecting_client.dart';
+export 'src/identity/credential.dart';
+export 'src/identity/credential_issuer.dart' show CredentialIssuer;
+export 'src/identity/credential_verifier.dart';
+export 'src/identity/holder_key.dart';
+export 'src/identity/peer_identity.dart';
 export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState;
 export 'src/mux/mux_connection.dart';
 export 'src/mux/mux_frame.dart'
-    show MuxCommand, MuxControlMessage, MuxControlType, MuxFrame, MuxLimits;
+    show
+        MuxCommand,
+        MuxControlMessage,
+        MuxControlType,
+        MuxFrame,
+        MuxIdent,
+        MuxLimits;
 export 'src/name.dart';
 export 'src/naming/naming_client.dart';
 export 'src/naming/naming_protocol.dart';

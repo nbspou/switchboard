@@ -8,6 +8,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 import 'dart:async';
 
 import '../address/channel_address.dart';
+import '../identity/peer_identity.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../status.dart';
@@ -65,6 +66,13 @@ class IncomingChannel {
   /// The connection the channel arrived on. Channels opened on it reach
   /// the peer's own dispatcher (symmetric dispatch).
   MuxConnection get connection => channel.connection;
+
+  /// Who the peer of [connection] proved to be with `IDENT`, or null
+  /// ([MuxConnection.peerIdentity]). A channel proxied through an endpoint
+  /// arrives on the proxy's connection, so this is the proxy's identity,
+  /// not the client's: clients present their credentials in the
+  /// application payload.
+  PeerIdentity? get peerIdentity => connection.peerIdentity;
 
   /// The channel wrapped as a [TalkChannel]. Wraps on the first call and
   /// returns the same instance afterwards; [options] (default: the
