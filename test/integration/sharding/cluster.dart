@@ -112,23 +112,27 @@ class Cluster {
     return node;
   }
 
-  /// Joins [node] to the mesh.
-  MeshNode join(Switchboard node) {
+  /// Joins [node] to the mesh; [options] are those of its naming channel.
+  MeshNode join(Switchboard node, {TalkOptions options = talkOptions}) {
     final mesh = MeshNode.join(
       node,
       namingUri,
       reconnectDelay: reconnectDelay,
       resolveTimeout: limit,
-      talkOptions: talkOptions,
+      talkOptions: options,
       leaveTimeout: const Duration(seconds: 2),
     );
     _meshes.add(mesh);
     return mesh;
   }
 
-  /// A new node joined to the mesh, synced.
-  Future<MeshNode> member({bool listen = true}) async {
-    final mesh = join(await node(listen: listen));
+  /// A new node joined to the mesh, synced; [options] are those of its
+  /// naming channel.
+  Future<MeshNode> member({
+    bool listen = true,
+    TalkOptions options = talkOptions,
+  }) async {
+    final mesh = join(await node(listen: listen), options: options);
     await mesh.synced.timeout(limit);
     return mesh;
   }

@@ -71,6 +71,7 @@ class Harness {
     Duration assignBackoffMax = const Duration(seconds: 10),
     Duration holdingSettle = Duration.zero,
     Duration handoverMaxDuration = const Duration(minutes: 10),
+    int resumeAttempts = 5,
   }) : service = NamingService(
          assignmentHold: assignmentHold,
          holderGrace: holderGrace,
@@ -79,6 +80,7 @@ class Harness {
          assignBackoffMax: assignBackoffMax,
          holdingSettle: holdingSettle,
          handoverMaxDuration: handoverMaxDuration,
+         resumeAttempts: resumeAttempts,
        );
 
   /// The service's default `holdingSettle`, for tests that run with it.
@@ -95,11 +97,14 @@ class Harness {
   /// Opens a link: the server side is served, both sides are returned.
   /// With [sync] the link delivers synchronously, so that everything the
   /// service sends in one step reaches the client's channel in one burst,
-  /// as the mux delivers a batch of frames.
-  (TalkChannel client, TalkChannel server) link({bool sync = false}) {
+  /// as the mux delivers a batch of frames. [options] are the client's.
+  (TalkChannel client, TalkChannel server) link({
+    bool sync = false,
+    TalkOptions options = clientOptions,
+  }) {
     final controller = StreamChannelController<Uint8List>(sync: sync);
     final server = TalkChannel(controller.local, options: serverOptions);
-    final client = TalkChannel(controller.foreign, options: clientOptions);
+    final client = TalkChannel(controller.foreign, options: options);
     servers.add(server);
     clients.add(client);
     service.serve(server);
@@ -113,13 +118,16 @@ class Harness {
 }
 
 /// A [TalkConnector] over a [Harness] that can be switched off. With
-/// [sync], its links deliver synchronously (see [Harness.link]).
+/// [sync], its links deliver synchronously (see [Harness.link]); [options]
+/// are the client's.
 class Connector {
-  Connector(this.harness, {this.sync = false});
+  Connector(this.harness, {this.sync = false, this.options = clientOptions});
 
   Harness harness;
 
   final bool sync;
+
+  final TalkOptions options;
 
   /// While true, connecting fails.
   bool down = false;
@@ -134,7 +142,7 @@ class Connector {
     if (down) {
       throw SwitchboardException.of(StatusCode.unavailable, 'service down');
     }
-    final (client, server) = harness.link(sync: sync);
+    final (client, server) = harness.link(sync: sync, options: options);
     servers.add(server);
     return client;
   }

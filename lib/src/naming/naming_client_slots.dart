@@ -382,9 +382,10 @@ class _ClientSlots {
   /// Sends what is remembered for [type] on [session], once per session:
   /// `SLOTS` and `HOLDING`, then a `CLAIM` of every slot this instance
   /// serves, pipelined (all in the same turn). Waits for the registration
-  /// of [type] on [session] if this client registers that type; without
+  /// of [type] on [session] if this client registers that type. Without
   /// any registration of it (a router or an operator tool) only `SLOTS` is
-  /// sent.
+  /// sent, and the `HOLDING` of the [declareHolding] calls waiting to be
+  /// sent, which the naming service refuses.
   ///
   /// The `HOLDING` also lists the served slots whose storage this instance
   /// holds. It is a single request, so it reaches a restarted naming
@@ -400,8 +401,14 @@ class _ClientSlots {
   /// `HOLDING` would fail) `SLOTS` goes first, with `HOLDING` right behind
   /// it; the naming service's settle window after `SLOTS` covers the gap
   /// (`NamingService.holdingSettle`).
+  ///
+  /// A request refused before it was sent (the channel's
+  /// `TalkOptions.maxOutgoingRequests`) stops the restoration there, so
+  /// that nothing overtakes it, and [_retry] resumes it later without
+  /// sending again what went out. [type] counts as restored on [session]
+  /// once everything went out.
   void restore(_Session session, Name type) {
-    if (!session.usable) {
+    if (!session.usable || session.retrying.contains(type)) {
       return;
     }
     final registered = client._registeredOn(session, type);
@@ -412,45 +419,79 @@ class _ClientSlots {
     if (previous != null && (previous || !registered)) {
       return;
     }
-    session.restored[type] = registered;
     final definition = definitions[type];
-    if (!registered) {
-      if (definition != null) {
-        _sendSlots(session, definition);
+    bool slots() {
+      final sent = session.sentSlots[type];
+      if (definition == null ||
+          (sent != null &&
+              identical(sent.$1, definition) &&
+              sent.$2 == registered)) {
+        return true;
       }
+      return _sendSlots(session, definition);
+    }
+
+    final bool sent;
+    if (!registered) {
+      sent = slots() && _flushHolding(session, type, const {});
+    } else {
+      final declared = holdings[type];
+      final bySlot = served[type];
+      final held = {
+        ...?declared?.slots,
+        for (final MapEntry(key: slot, value: state)
+            in (bySlot ?? const <int, _Served>{}).entries)
+          if (state.holding) slot,
+      };
+      final declare =
+          (declared?.pending.isNotEmpty ?? false) ||
+          (held.isNotEmpty && !session.sentHolding.contains(type));
+      bool holding() {
+        if (!declare) {
+          return true;
+        }
+        if (!_flushHolding(session, type, held)) {
+          return false;
+        }
+        session.sentHolding.add(type);
+        return true;
+      }
+
+      final holdingFirst =
+          declare &&
+          definition != null &&
+          !session.syncing &&
+          mirrors[type]?.space == definition.request.space;
+      sent = holdingFirst ? holding() && slots() : slots() && holding();
+      if (sent && session.reclaimed.add(type) && bySlot != null) {
+        for (final MapEntry(key: slot, value: state) in bySlot.entries) {
+          session.reclaims.add((type, slot, state));
+        }
+        _pumpReclaims(session);
+      }
+    }
+    if (sent) {
+      session.restored[type] = registered;
+    } else {
+      _retry(session, type);
+    }
+  }
+
+  /// A request restoring [type] on [session] was refused before it was
+  /// sent: [type] is not restored there, and [restore] sends the rest after
+  /// [NamingClient.reconnectDelay], again until it all went out. Nothing is
+  /// left of it when the session is lost: the next one restores everything.
+  void _retry(_Session session, Name type) {
+    session.restored.remove(type);
+    if (!session.usable || !session.retrying.add(type)) {
       return;
     }
-    final declared = holdings[type];
-    final bySlot = served[type];
-    final held = {
-      ...?declared?.slots,
-      for (final MapEntry(key: slot, value: state)
-          in (bySlot ?? const <int, _Served>{}).entries)
-        if (state.holding) slot,
-    };
-    final pending = List.of(declared?.pending ?? const <_PendingHolding>[]);
-    declared?.pending.clear();
-    final declare = held.isNotEmpty || pending.isNotEmpty;
-    final holdingFirst =
-        declare &&
-        definition != null &&
-        !session.syncing &&
-        mirrors[type]?.space == definition.request.space;
-    if (holdingFirst) {
-      _sendHolding(session, type, held.toList()..sort(), pending);
-    }
-    if (definition != null) {
-      _sendSlots(session, definition);
-    }
-    if (declare && !holdingFirst) {
-      _sendHolding(session, type, held.toList()..sort(), pending);
-    }
-    if (bySlot != null) {
-      for (final MapEntry(key: slot, value: state) in bySlot.entries) {
-        session.reclaims.add((type, slot, state));
-      }
-      _pumpReclaims(session);
-    }
+    final delay = client.reconnectDelay;
+    _log.info('slot state of $type not sent yet, retrying in $delay');
+    session.later(delay, () {
+      session.retrying.remove(type);
+      restore(session, type);
+    });
   }
 
   /// Sends queued claims of served slots, at most [_reclaimWindow] at a
@@ -458,7 +499,8 @@ class _ClientSlots {
   /// service after its assignment hold are served first come, first
   /// served rather than by epoch.
   void _pumpReclaims(_Session session) {
-    while (session.reclaiming < _reclaimWindow &&
+    while (!session.reclaimsPaused &&
+        session.reclaiming < _reclaimWindow &&
         session.reclaims.isNotEmpty &&
         session.usable) {
       final (type, slot, state) = session.reclaims.removeFirst();
@@ -471,6 +513,21 @@ class _ClientSlots {
         _pumpReclaims(session);
       });
     }
+  }
+
+  /// A claim was refused before it was sent: the claims left wait
+  /// [NamingClient.reconnectDelay], in order.
+  void _pauseReclaims(_Session session) {
+    if (session.reclaimsPaused) {
+      return;
+    }
+    session.reclaimsPaused = true;
+    final delay = client.reconnectDelay;
+    _log.info('claims of served slots not sent yet, retrying in $delay');
+    session.later(delay, () {
+      session.reclaimsPaused = false;
+      _pumpReclaims(session);
+    });
   }
 
   void restoreAll(_Session session) {
@@ -488,7 +545,9 @@ class _ClientSlots {
       session.usable &&
       (client._registeredOn(session, type) || !client._registers(type));
 
-  void _sendSlots(_Session session, _SpaceDefinition definition) {
+  /// Sends [definition] on [session]. Returns false if the request was
+  /// refused before it was sent.
+  bool _sendSlots(_Session session, _SpaceDefinition definition) {
     final type = definition.request.space.type;
     final Future<TalkMessage> response;
     try {
@@ -498,8 +557,9 @@ class _ClientSlots {
       );
     } on SwitchboardException catch (e) {
       _log.fine('SLOTS $type not sent: $e');
-      return;
+      return false;
     }
+    session.sentSlots[type] = (definition, client._registeredOn(session, type));
     response.then(
       (_) => definition.complete(),
       onError: (Object e, StackTrace st) {
@@ -514,9 +574,32 @@ class _ClientSlots {
         definition.fail(e, st);
       },
     );
+    return true;
   }
 
-  void _sendHolding(
+  /// Sends one `HOLDING` of [type] on [session] for [slots] and the
+  /// [declareHolding] calls waiting to be sent, unless both are empty.
+  /// Returns false if the request was refused before it was sent; the
+  /// calls then wait for the next attempt.
+  bool _flushHolding(_Session session, Name type, Set<int> slots) {
+    final declared = holdings[type];
+    final pending = List.of(declared?.pending ?? const <_PendingHolding>[]);
+    declared?.pending.clear();
+    if (slots.isEmpty && pending.isEmpty) {
+      return true;
+    }
+    return _sendHolding(
+      session,
+      type,
+      {...slots, for (final p in pending) ...p.slots}.toList()..sort(),
+      pending,
+    );
+  }
+
+  /// Sends `HOLDING` of [slots] of [type] on [session], answering
+  /// [pending]. Returns false if the request was refused before it was
+  /// sent; [pending] then waits for the next attempt.
+  bool _sendHolding(
     _Session session,
     Name type,
     List<int> slots,
@@ -530,8 +613,8 @@ class _ClientSlots {
       );
     } on SwitchboardException catch (e) {
       _log.fine('HOLDING $type not sent: $e');
-      holdings[type]?.pending.addAll(pending);
-      return;
+      holdings[type]?.pending.insertAll(0, pending);
+      return false;
     }
     response.then(
       (message) {
@@ -575,6 +658,7 @@ class _ClientSlots {
         }
       },
     );
+    return true;
   }
 
   Future<void> _reclaim(
@@ -596,6 +680,12 @@ class _ClientSlots {
       );
     } on SwitchboardException catch (e) {
       _log.fine('CLAIM $type/$slot not sent: $e');
+      if (session.usable) {
+        // Refused before it was sent (the request limit): first in line
+        // when the claims go on.
+        session.reclaims.addFirst((type, slot, state));
+        _pauseReclaims(session);
+      }
       return;
     }
     await response.then<void>(
@@ -635,8 +725,12 @@ class _ClientSlots {
     previous?.supersede(definition);
     final session = client._session;
     if (session != null && _ready(session, type)) {
-      session.restored[type] ??= client._registeredOn(session, type);
-      _sendSlots(session, definition);
+      if (session.restored[type] == null) {
+        // Sent with the rest of the slot state of the type.
+        restore(session, type);
+      } else if (!_sendSlots(session, definition)) {
+        _retry(session, type);
+      }
     }
     return definition.completer.future;
   }
@@ -646,15 +740,73 @@ class _ClientSlots {
     declared.slots.addAll(slots);
     final pending = _PendingHolding(slots.toSet());
     final session = client._session;
-    if (session != null &&
-        session.usable &&
-        client._registeredOn(session, type) &&
-        session.restored[type] == true) {
-      _sendHolding(session, type, slots, [pending]);
-    } else {
+    if (session == null || !_ready(session, type)) {
+      // Sent with the slot state of the type, after the next connect or
+      // once its registration is back.
       declared.pending.add(pending);
+    } else if (session.restored[type] == null) {
+      declared.pending.add(pending);
+      restore(session, type);
+    } else if (!_sendHolding(session, type, slots, [pending])) {
+      _retry(session, type);
     }
     return pending.completer.future;
+  }
+
+  /// Sends a request of the client's slot API on [session] and returns
+  /// its response. The channel's request limit
+  /// (`TalkOptions.maxOutgoingRequests`) never fails it: a request the
+  /// channel refuses for it waits here, with the requests made after it,
+  /// and goes out once one of these requests completes, or after
+  /// [NamingClient.reconnectDelay] when none is in flight (other requests
+  /// hold the limit). Waiting requests fail with [StatusCode.unavailable]
+  /// when the channel is lost.
+  Future<TalkMessage> call(_Session session, Name procedure, Uint8List data) {
+    final call = _Call(procedure, data);
+    session.calls.add(call);
+    _pumpCalls(session);
+    return call.completer.future;
+  }
+
+  void _pumpCalls(_Session session) {
+    while (session.calls.isNotEmpty && !session.callsPaused) {
+      final call = session.calls.first;
+      final Future<TalkMessage> response;
+      try {
+        response = session.channel.request(
+          call.procedure.toString(),
+          call.payload,
+        );
+      } on SwitchboardException catch (e) {
+        if (e.code == StatusCode.resourceExhausted && session.usable) {
+          if (session.calling == 0) {
+            // Nothing of these to wait for: try again later.
+            session.callsPaused = true;
+            session.later(client.reconnectDelay, () {
+              session.callsPaused = false;
+              _pumpCalls(session);
+            });
+          }
+          return;
+        }
+        session.calls.removeFirst();
+        call.completer.completeError(e);
+        continue;
+      }
+      session.calls.removeFirst();
+      session.calling++;
+      unawaited(
+        response
+            .then(
+              call.completer.complete,
+              onError: call.completer.completeError,
+            )
+            .whenComplete(() {
+              session.calling--;
+              _pumpCalls(session);
+            }),
+      );
+    }
   }
 
   _Session usableSession() {
@@ -676,8 +828,9 @@ class _ClientSlots {
 
   Future<int> claim(Name type, int slot, {required bool holding}) async {
     final session = usableSession();
-    final response = await session.channel.request(
-      Procedures.claim.toString(),
+    final response = await call(
+      session,
+      Procedures.claim,
       ClaimRequest(
         type,
         slot,
@@ -692,8 +845,9 @@ class _ClientSlots {
 
   Future<void> release(Name type, int slot, {required bool keepStorage}) async {
     final session = usableSession();
-    await session.channel.request(
-      Procedures.release.toString(),
+    await call(
+      session,
+      Procedures.release,
       ReleaseRequest(type, slot, keepStorage: keepStorage).encode(),
     );
     served[type]?.remove(slot);
@@ -707,8 +861,9 @@ class _ClientSlots {
 
   Future<LocateResponse> locate(Name type, int slot) async {
     final session = usableSession();
-    final response = await session.channel.request(
-      Procedures.locate.toString(),
+    final response = await call(
+      session,
+      Procedures.locate,
       LocateRequest(type, slot).encode(),
     );
     return LocateResponse.decode(response.payload);
@@ -886,6 +1041,15 @@ class _SpaceDefinition {
       );
     }
   }
+}
+
+/// A request of the client's slot API waiting for the channel to take it.
+class _Call {
+  _Call(this.procedure, this.payload);
+
+  final Name procedure;
+  final Uint8List payload;
+  final Completer<TalkMessage> completer = Completer<TalkMessage>();
 }
 
 /// The remembered `HOLDING` declarations of one type.

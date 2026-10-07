@@ -15,6 +15,7 @@ import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/switchboard/incoming_channel.dart';
 import 'package:switchboard/src/switchboard/slot_gate.dart';
 import 'package:switchboard/src/switchboard/switchboard.dart';
+import 'package:switchboard/src/talk/talk_channel.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:test/test.dart';
 
@@ -635,6 +636,251 @@ void main() {
       async.flushMicrotasks();
       async.elapse(ms50 * 2);
       expect(async.pendingTimers, isEmpty);
+    });
+  });
+
+  test('a definition sent before the registration is sent again with it, '
+      'with the capacity', () async {
+    final client = newClient(Connector(h).call);
+    client.slotHandler = RecordingHandler('A', log);
+    await client.start();
+    await client.synced.timeout(timeout);
+    // Not registering kv yet: defines the space only.
+    await client.defineSlots(kv, count: 2).timeout(timeout);
+    expect(h.service.slotTable(kv)!.count, 2);
+    expect(log, isEmpty);
+    await client.register(kv, [], instance: 1).timeout(timeout);
+    await until(() => client.servedSlots(kv).length == 2);
+    expect(log, ['A ASSIGN 0 e1 h0', 'A ASSIGN 1 e1 h0']);
+  });
+
+  test('declareHolding of a type this client does not register is sent at '
+      'once and refused', () async {
+    final router = newClient(Connector(h).call);
+    await router.start();
+    await router.synced.timeout(timeout);
+    await expectLater(
+      router.declareHolding(room, [1]).timeout(timeout),
+      throwsStatus(StatusCode.notFound),
+    );
+    await router.defineSlots(room, count: 4, mode: SlotMode.static);
+    await expectLater(
+      router.declareHolding(room, [1]).timeout(timeout),
+      throwsStatus(StatusCode.failedPrecondition),
+    );
+    // Made while disconnected: sent after the connect.
+    final later = newClient(Connector(h).call);
+    final declared = later.declareHolding(room, [2]);
+    await later.start();
+    await expectLater(
+      declared.timeout(timeout),
+      throwsStatus(StatusCode.failedPrecondition),
+    );
+    expect(h.service.slotTable(room)!.entries, isEmpty);
+  });
+
+  group('the channel\'s request limit', () {
+    void closeWithoutTimers(FakeAsync async, NamingClient client) {
+      unawaited(client.close());
+      async.flushMicrotasks();
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    test('a router\'s SLOTS refused for it is sent once it allows', () {
+      fakeAsync((async) {
+        // The WATCH holds the only request the channel takes.
+        final naming = ScriptedNaming(maxOutgoingRequests: 1);
+        final client = NamingClient(
+          naming.connect,
+          reconnectDelay: reconnectDelay,
+        );
+        unawaited(client.start());
+        async.elapse(ms10);
+        expect(naming.log, ['WATCH']);
+        var defined = false;
+        client
+            .defineSlots(room, count: 4, mode: SlotMode.static, capacity: 0)
+            .then((_) => defined = true);
+        async.elapse(ms50);
+        expect(naming.log, ['WATCH']);
+        expect(defined, isFalse);
+        naming.watch.complete();
+        async.elapse(ms50);
+        // Sent by itself, once, on the same channel.
+        expect(naming.log, ['WATCH', 'SLOTS room']);
+        expect(defined, isTrue);
+        expect(client.isSynced, isTrue);
+        expect(naming.connects, 1);
+        closeWithoutTimers(async, client);
+      });
+    });
+
+    test('the slot state is restored in order, what was refused sent '
+        'later and only once', () {
+      fakeAsync((async) {
+        final naming = ScriptedNaming(maxOutgoingRequests: 2);
+        final client = NamingClient(
+          naming.connect,
+          reconnectDelay: reconnectDelay,
+        );
+        client.slotHandler = RecordingHandler('A', log);
+        unawaited(client.start());
+        async.elapse(ms10);
+        // Served before the registration, as after a naming service
+        // restart.
+        for (final slot in [0, 1, 2]) {
+          naming.server
+              .request('ASSIGN', AssignRequest(zone, slot, epoch: 4).encode())
+              .ignore();
+        }
+        async.elapse(ms10);
+        expect(client.servedSlots(zone), {0: 4, 1: 4, 2: 4});
+        // With the WATCH in flight, one request at a time goes out.
+        unawaited(client.register(zone, [], instance: 1));
+        var defined = false;
+        client
+            .defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0)
+            .then((_) => defined = true);
+        List<int>? discard;
+        client.declareHolding(zone, [3]).then((d) => discard = d);
+        async.elapse(const Duration(milliseconds: 200));
+        expect(naming.log, [
+          'WATCH',
+          'REGISTER zone/1',
+          'SLOTS zone',
+          'HOLDING zone 0,1,2,3',
+          'CLAIM zone/0 e4',
+          'CLAIM zone/1 e4',
+          'CLAIM zone/2 e4',
+        ]);
+        expect(defined, isTrue);
+        expect(discard, isEmpty);
+        expect(client.servedSlots(zone), {0: 4, 1: 4, 2: 4});
+        expect(log.where((l) => l.contains('REVOKE')), isEmpty);
+        naming.watch.complete();
+        async.elapse(ms10);
+        expect(client.isSynced, isTrue);
+        expect(naming.connects, 1);
+        closeWithoutTimers(async, client);
+      });
+    });
+
+    test('a WATCH refused for it waits instead of dropping the channel', () {
+      fakeAsync((async) {
+        final h = Harness();
+        final connector = Connector(
+          h,
+          options: const TalkOptions(maxOutgoingRequests: 1),
+        );
+        final client = NamingClient(
+          connector.call,
+          reconnectDelay: reconnectDelay,
+        );
+        // Restored before the WATCH, which then finds the limit reached.
+        var defined = false;
+        client
+            .defineSlots(room, count: 4, mode: SlotMode.static, capacity: 0)
+            .then((_) => defined = true);
+        unawaited(client.start());
+        async.elapse(ms50);
+        expect(defined, isTrue);
+        expect(client.isSynced, isTrue);
+        expect(client.slotTable(room)?.count, 4);
+        expect(connector.calls, 1);
+        closeWithoutTimers(async, client);
+        unawaited(h.close());
+        async.flushMicrotasks();
+      });
+    });
+
+    test('claims, releases and locates beyond it wait for their turn', () {
+      fakeAsync((async) {
+        final h = Harness();
+        final client = NamingClient(
+          Connector(h, options: const TalkOptions(maxOutgoingRequests: 4)).call,
+          reconnectDelay: reconnectDelay,
+        );
+        client.slotHandler = RecordingHandler('A', log);
+        unawaited(client.start());
+        unawaited(client.register(zone, [], instance: 1));
+        async.elapse(ms10);
+        unawaited(
+          client.defineSlots(
+            zone,
+            count: 16,
+            mode: SlotMode.static,
+            capacity: 0,
+          ),
+        );
+        async.elapse(ms10);
+        List<int>? epochs;
+        Future.wait([
+          for (var slot = 0; slot < 16; slot++) client.claim(zone, slot),
+        ]).then((e) => epochs = e);
+        async.elapse(ms50);
+        expect(epochs, List.filled(16, 1));
+        expect(client.servedSlots(zone), hasLength(16));
+        List<LocateResponse>? located;
+        Future.wait([
+          for (var slot = 0; slot < 16; slot++) client.locate(zone, slot),
+        ]).then((l) => located = l);
+        async.elapse(ms50);
+        expect(
+          located,
+          List.filled(16, const LocateResponse(SlotState.owned, 1, 1)),
+        );
+        var released = false;
+        Future.wait([
+          for (var slot = 0; slot < 16; slot++)
+            client.release(zone, slot, keepStorage: true),
+        ]).then((_) => released = true);
+        async.elapse(ms50);
+        expect(released, isTrue);
+        expect(h.service.slotTable(zone)!.owners, isEmpty);
+        closeWithoutTimers(async, client);
+        unawaited(h.close());
+        async.flushMicrotasks();
+      });
+    });
+
+    test('calls waiting for it fail with UNAVAILABLE when the channel is '
+        'lost', () {
+      fakeAsync((async) {
+        final naming = ScriptedNaming(maxOutgoingRequests: 2)
+          ..answerClaims = false;
+        final client = NamingClient(
+          naming.connect,
+          reconnectDelay: const Duration(seconds: 10),
+        );
+        unawaited(client.start());
+        async.elapse(ms10);
+        // One in flight beside the WATCH, two waiting.
+        final outcomes = <int, Object>{};
+        for (final slot in [0, 1, 2]) {
+          client
+              .claim(zone, slot)
+              .then<void>(
+                (epoch) => outcomes[slot] = epoch,
+                onError: (Object e) {
+                  outcomes[slot] = e;
+                },
+              );
+        }
+        async.elapse(ms50);
+        expect(naming.log, ['WATCH', 'CLAIM zone/0 e0']);
+        expect(outcomes, isEmpty);
+        unawaited(naming.server.close());
+        async.elapse(ms10);
+        // The one in flight with the channel's end, the others with
+        // UNAVAILABLE, never sent.
+        expect(outcomes, hasLength(3));
+        expect(outcomes[0], isA<SwitchboardException>());
+        expect(outcomes[1], isStatus(StatusCode.unavailable));
+        expect(outcomes[2], isStatus(StatusCode.unavailable));
+        expect(naming.log, hasLength(2));
+        closeWithoutTimers(async, client);
+      });
     });
   });
 
