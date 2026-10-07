@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // The reconnecting client against an in-memory endpoint, driven with
 // fake_async so that the backoff schedule is exact and the tests are fast.
 // No `dart:io`: this file also runs on Node.js (`dart test -P node`).

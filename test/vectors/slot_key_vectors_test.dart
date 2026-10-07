@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // The reference key-to-slot function: FNV-1a 32 of the key bytes modulo
 // the slot count. Runs on the VM and, with `dart test -P node`, compiled
 // to JavaScript, where the 32-bit multiplication must stay exact.

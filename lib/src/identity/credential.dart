@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:convert';
@@ -40,7 +42,7 @@ enum CredentialKind {
 
 /// A right a [Scope] grants for the service types its pattern matches.
 ///
-/// See the wiki page "Switchboard Identity and Credentials".
+/// See the wiki page "Polyverse Switchboard Identity and Credentials".
 enum Right {
   /// May register records of matching types, its own endpoints or others',
   /// and define or confirm their slot spaces (`SLOTS`).
@@ -160,7 +162,7 @@ class Scope {
 /// A signed statement of the mesh authority: who the holder is
 /// ([identity], [kind]) and what it may do ([scopes]), until [expiresAt].
 ///
-/// The binary layout is the one of the wiki page "Switchboard Identity and
+/// The binary layout is the one of the wiki page "Polyverse Switchboard Identity and
 /// Credentials", section "Credential": every field in order, then the
 /// signature over every preceding byte. [CredentialIssuer] signs
 /// credentials and [CredentialVerifier] checks them; this class is the

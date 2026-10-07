@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Shared setup of the sharding use case tests: a naming service and mesh
 // nodes on 127.0.0.1 (TCP or WebSocket, port 0) or in this isolate (mem),
 // with short timeouts, torn down in a fixed order.

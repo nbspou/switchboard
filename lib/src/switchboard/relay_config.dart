@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:convert';
@@ -13,7 +15,7 @@ import '../naming/naming_protocol.dart';
 
 /// How a node that listens nowhere reaches the instances registered
 /// without endpoints: through a relay (`RelayService`), the `relay` of a
-/// `Switchboard` (wiki page "Switchboard Identity and Credentials",
+/// `Switchboard` (wiki page "Polyverse Switchboard Identity and Credentials",
 /// section "Relay").
 ///
 /// The relays are the records of [type] in the node's resolver (round

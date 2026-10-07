@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // The byte pipes and WebSockets below are closed through the transports
 // under test, which the close_sinks lint cannot see.
 // ignore_for_file: close_sinks

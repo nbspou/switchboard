@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:convert';
@@ -12,7 +15,7 @@ import 'dart:typed_data';
 ///
 /// Codes 0 to 16 are numerically identical to the gRPC status codes.
 /// Codes from 32 upward are Switchboard specific.
-/// See the wiki page "Switchboard Status Codes".
+/// See the wiki page "Polyverse Switchboard Status Codes".
 enum StatusCode {
   ok(0),
   cancelled(1),

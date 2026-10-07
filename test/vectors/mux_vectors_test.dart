@@ -1,4 +1,13 @@
-// Test vectors from the wiki page "Switchboard Test Vectors", section
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Test vectors from the wiki page "Polyverse Switchboard Test Vectors", section
 // "Mux frames", plus the decoding rules of the "Switchboard Mux" page.
 // Platform independent: runs on the VM and, compiled to JavaScript, with
 // `dart test -p node test/vectors/`, which checks the 48-bit channel ids.

@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
@@ -6,7 +15,7 @@ import 'package:async/async.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
-/// The minimal round trip of the wiki page "Switchboard Embedded Profile",
+/// The minimal round trip of the wiki page "Polyverse Switchboard Embedded Profile",
 /// byte for byte, from a raw TCP socket to a listening Switchboard.
 void main() {
   const preamble = '53 57 42 44 01 00 00 00';

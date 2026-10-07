@@ -1,4 +1,13 @@
-// Use case 5 of the wiki page "Switchboard Sharding": chat rooms (`room`,
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 5 of the wiki page "Polyverse Switchboard Sharding": chat rooms (`room`,
 // eager managed, shared recovery). The wiki has N = 256; 16 rooms keep
 // the test fast. Room history is in shared storage (a map shared by the
 // servers), so a crashed server's rooms are reassigned at once. Members

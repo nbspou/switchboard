@@ -1,4 +1,13 @@
-// Test vectors from the wiki page "Switchboard Test Vectors", section
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Test vectors from the wiki page "Polyverse Switchboard Test Vectors", section
 // "Credentials" and the NONCE and IDENT rows of "Mux frames". Platform
 // independent: runs on the VM and, compiled to JavaScript, with
 // `dart test -P node`, which checks the u32 times and the pure Dart Ed25519

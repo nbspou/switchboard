@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -32,7 +34,7 @@ final Logger _log = Logger('Switchboard.Transport');
 /// what the network has carried. On `dart:io`, `WebSocketServerTransport`
 /// does observe its output.
 ///
-/// See the wiki page "Switchboard Transport", section "WebSocket binding".
+/// See the wiki page "Polyverse Switchboard Transport", section "WebSocket binding".
 abstract final class WebSocketTransport {
   /// The WebSocket subprotocol name.
   static const String subprotocol = 'switchboard';

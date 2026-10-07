@@ -1,4 +1,13 @@
-// Use case 4 of the wiki page "Switchboard Sharding": AI zone servers
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 4 of the wiki page "Polyverse Switchboard Sharding": AI zone servers
 // (`zone`, static with explicit MIGRATE, holder-only). An operator moves a
 // zone to a fresh instance during play. The NPC state (a counter advanced
 // by a timer) moves over a direct channel during DRAIN. Players attached

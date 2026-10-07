@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import '../address/channel_address.dart';
@@ -85,7 +87,7 @@ abstract final class ChannelPolicies {
   }
 
   /// Admits a channel only if the peer's credential has an [Right.open]
-  /// scope for its type (wiki page "Switchboard Identity and
+  /// scope for its type (wiki page "Polyverse Switchboard Identity and
   /// Credentials", section "Where credentials are checked"); refuses the
   /// others with `PERMISSION_DENIED`. A channel without a service type is
   /// checked as the empty name, which only a `*` pattern matches. The

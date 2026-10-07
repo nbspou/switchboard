@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 part of 'naming_client.dart';
@@ -68,7 +70,7 @@ abstract class SlotRequestContext {
 
 /// Serves the requests the naming service sends to a sharded instance over
 /// its registration channel. Set it with [NamingClient.slotHandler]. See
-/// the wiki page "Switchboard Sharding", section "Requests from the naming
+/// the wiki page "Polyverse Switchboard Sharding", section "Requests from the naming
 /// service to instances".
 ///
 /// Each method receives the request's [SlotRequestContext], through which

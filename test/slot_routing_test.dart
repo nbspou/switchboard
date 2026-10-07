@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Slot-aware routing in the Switchboard: (type, slot) to the owner, the
 // old owner while migrating, LOCATE on a miss in a managed space,
 // UNAVAILABLE in a static one, and the MOVED retry of openChannelToSlot

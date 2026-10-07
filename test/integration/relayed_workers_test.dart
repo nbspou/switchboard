@@ -1,4 +1,13 @@
-// Outbound-only on both ends (wiki page "Switchboard Use Cases", entry
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Outbound-only on both ends (wiki page "Polyverse Switchboard Use Cases", entry
 // 5c) over tcp: a naming service that requires credentials and named
 // IDENTs; two relay nodes that listen, require named IDENTs and publish
 // `_relay` with their identities; a worker that listens nowhere and holds

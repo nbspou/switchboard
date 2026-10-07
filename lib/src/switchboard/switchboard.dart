@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -52,7 +55,7 @@ final Logger _log = Logger('Switchboard.Router');
 /// dispatches incoming channels to local services and opens channels to
 /// services anywhere in the mesh through a [Resolver].
 ///
-/// Dispatch and resolution follow the wiki page "Switchboard Addressing
+/// Dispatch and resolution follow the wiki page "Polyverse Switchboard Addressing
 /// and Dispatch". Dispatch is symmetric: channels the peer opens on a
 /// connection this node initiated are dispatched exactly like channels on
 /// accepted connections, under that connection's policy
@@ -99,7 +102,7 @@ class Switchboard {
   /// initiated connection is trusted like an internal listener's and every
   /// channel carries [defaultPayload].
   ///
-  /// Identity (wiki page "Switchboard Identity and Credentials"): with a
+  /// Identity (wiki page "Polyverse Switchboard Identity and Credentials"): with a
   /// [credential] (and the [holderKey] it names, if it names one), the
   /// node identifies with `NONCE`/`IDENT` on every connection it initiates
   /// ([connect], [dial], and through them the open methods, `PeerSet` and
@@ -1316,7 +1319,7 @@ class Switchboard {
   }
 
   /// Identifies the node with [credential] on [connection], with [intent]
-  /// (wiki page "Switchboard Identity and Credentials"): for a connection
+  /// (wiki page "Polyverse Switchboard Identity and Credentials"): for a connection
   /// this node accepted, whose peer wants it to identify
   /// ([MuxConnection.identityRequested]), or to present a renewed
   /// [credential] on a live connection. Bounded by [identityTimeout].
@@ -1455,7 +1458,7 @@ class Switchboard {
 
   /// Has the instance at [address], whose record has no endpoints, dial
   /// this node, and returns that connection: the naming service's
-  /// `CONNECT` (wiki page "Switchboard Identity and Credentials", section
+  /// `CONNECT` (wiki page "Polyverse Switchboard Identity and Credentials", section
   /// "Reverse connections"), through [resolver] (default: the node's),
   /// which must be a [BrokeringResolver].
   ///
@@ -1918,7 +1921,7 @@ class Switchboard {
   /// chosen instance are tried in order; if none can be connected, the
   /// following instances are tried in turn.
   ///
-  /// Slot routing (wiki page "Switchboard Sharding", section "Routing"):
+  /// Slot routing (wiki page "Polyverse Switchboard Sharding", section "Routing"):
   /// when [address] names any instance, a [shard] is given and the
   /// resolver is a [SlotResolver] with a slot table for the type, the
   /// channel goes to the slot's owner and nowhere else: the owner from the
@@ -2458,7 +2461,7 @@ class Switchboard {
   }
 
   /// Opens a channel to the owner of [slot] of [type], with the `MOVED`
-  /// retry of the wiki page "Switchboard Sharding", section "Routing".
+  /// retry of the wiki page "Polyverse Switchboard Sharding", section "Routing".
   ///
   /// The first channel is opened as [openChannel] with `shard: slot` does
   /// (slot routing through a [SlotResolver]; through any other resolver,

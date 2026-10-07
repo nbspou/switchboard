@@ -1,4 +1,13 @@
-// Use case 2 of the wiki page "Switchboard Sharding": Discord frontends
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 2 of the wiki page "Polyverse Switchboard Sharding": Discord frontends
 // (`discord`, static, stateless, N = the shard count from configuration).
 // Each frontend claims the shards it is configured for; other services
 // route a guild to its shard by `(guild_id >> 22) mod N` through the

@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+*/
+
 // A native (AOT) smoke check: the JIT test suite cannot catch optimiser
 // bugs of `dart compile exe`. Compile and run it with tool/aot_smoke.sh.
 //

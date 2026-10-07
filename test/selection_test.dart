@@ -1,8 +1,17 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Instance selection on the consumer side (a `where` filter over the
 // records, also on the MOVED retry; the node's selection policy) and the
 // dispatch of a registration
 // that accepts any instance: the naming side of the untrusted worker fleet
-// (wiki page "Switchboard Use Cases", entry 5).
+// (wiki page "Polyverse Switchboard Use Cases", entry 5).
 
 import 'dart:async';
 import 'dart:convert';

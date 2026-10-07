@@ -1,4 +1,13 @@
-// Use case 1 of the wiki page "Switchboard Sharding": a key-value store
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 1 of the wiki page "Polyverse Switchboard Sharding": a key-value store
 // (`kv`, eager managed, holder-only). The wiki has N = 1024; 64 slots
 // keep the test fast and exercise the same paths (every migration is the
 // same hand-over, only more of them).

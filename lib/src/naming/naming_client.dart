@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -64,7 +66,7 @@ typedef ConnectHandler = Future<void> Function(DialBackRequest request);
 /// registers the remembered set again. Neither a phantom record nor an
 /// untracked one is left behind.
 ///
-/// Sharding (wiki page "Switchboard Sharding"): the client mirrors the slot
+/// Sharding (wiki page "Polyverse Switchboard Sharding"): the client mirrors the slot
 /// tables too ([slotTables], [slotEvents]), and a sharded instance uses
 /// [defineSlots], [declareHolding], [claim], [release], [locate] and
 /// [migrate], and sets [slotHandler] to serve the `ASSIGN`, `DRAIN`,
@@ -82,7 +84,7 @@ typedef ConnectHandler = Future<void> Function(DialBackRequest request);
 /// is unlocked through [SlotHandler.onResume]. Every `HOLDING` response's
 /// list of slots to discard reaches [SlotHandler.onDiscard].
 ///
-/// See the wiki page "Switchboard Naming Service", section "Mirror
+/// See the wiki page "Polyverse Switchboard Naming Service", section "Mirror
 /// behaviour".
 class NamingClient {
   /// Creates a client. Nothing happens until [start].

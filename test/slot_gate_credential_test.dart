@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Requests a slot gate forwards to the new owner (queued at DRAIN, or
 // arriving during the forwarding grace) present the credential of the
 // channel they arrived on, the application payload of its OPEN, and never

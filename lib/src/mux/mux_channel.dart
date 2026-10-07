@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -19,7 +22,7 @@ import 'mux_frame.dart';
 
 /// State of a channel as seen by the local side.
 ///
-/// See the wiki page "Switchboard Mux", section "State summary per
+/// See the wiki page "Polyverse Switchboard Mux", section "State summary per
 /// channel". There is no "half closed remote" state: receiving CLOSE on an
 /// open channel sends the confirming CLOSE at once and moves to [closed].
 enum MuxChannelState {

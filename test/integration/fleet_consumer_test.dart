@@ -1,4 +1,13 @@
-// The untrusted worker fleet (wiki page "Switchboard Use Cases", entry 5)
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// The untrusted worker fleet (wiki page "Polyverse Switchboard Use Cases", entry 5)
 // in one isolate over mem:// endpoints: a naming service; a scaler that
 // registers eight workers on its own `_ns` channel with requested ids, their
 // endpoints and metadata (models and key); workers that only accept

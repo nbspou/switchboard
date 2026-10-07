@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:typed_data';
@@ -13,7 +15,7 @@ import '../status.dart';
 /// preamble and the frames prefixed with a `u32` little-endian length.
 ///
 /// Platform independent. `StreamTransport` (which needs `dart:io` for its
-/// TCP helpers) builds on it. See the wiki page "Switchboard Transport",
+/// TCP helpers) builds on it. See the wiki page "Polyverse Switchboard Transport",
 /// section "Stream binding".
 abstract final class StreamFraming {
   /// Default upper limit on an incoming frame body: 1 MiB.

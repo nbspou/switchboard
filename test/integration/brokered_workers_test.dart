@@ -1,4 +1,13 @@
-// Outbound-only trusted workers (wiki page "Switchboard Use Cases", entry
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Outbound-only trusted workers (wiki page "Polyverse Switchboard Use Cases", entry
 // 5b) over tcp: a naming service that requires credentials, and named
 // IDENTs on its listener; a worker that listens nowhere, dials the naming
 // service, and holds a credential with `register` only; a consumer with

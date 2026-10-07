@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Credentials (issuer, verifier, key rotation, the cache) and connection
 // identity on the mux control channel (NONCE and IDENT), over
 // MemoryTransport. Platform independent: also runs on Node.js with

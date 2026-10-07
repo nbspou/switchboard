@@ -1,4 +1,13 @@
-// The `_relay` service (wiki page "Switchboard Identity and Credentials",
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// The `_relay` service (wiki page "Polyverse Switchboard Identity and Credentials",
 // section "Relay"; use case 5c) over mem:// nodes: a naming service that
 // requires credentials, outbound-only workers registered without
 // endpoints, a relay node publishing `_relay` with its identity, and

@@ -1,10 +1,19 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Connections a node initiates: their policy (outgoingPolicy, the
 // endpointPolicy hook, asked about the endpoint as the pool keys it,
 // connect's and dial's policy, in that order of precedence from last to
 // first), un-pooled dials, and the application
 // payload chosen per destination (credentialFor), which never falls back to
 // the node's default payload. The consumer side of the untrusted worker
-// fleet (wiki page "Switchboard Use Cases", entry 5).
+// fleet (wiki page "Polyverse Switchboard Use Cases", entry 5).
 
 import 'dart:async';
 import 'dart:convert';

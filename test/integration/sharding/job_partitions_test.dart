@@ -1,4 +1,13 @@
-// Use case 6 of the wiki page "Switchboard Sharding": queue partitions
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 6 of the wiki page "Polyverse Switchboard Sharding": queue partitions
 // (`jobs`, static, shared recovery). Workers claim the partitions their
 // configuration names; a standby worker configured for every partition
 // claims whatever is free. The partition logs and consumer positions are

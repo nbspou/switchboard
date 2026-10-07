@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 import 'dart:typed_data';
 
 import 'package:switchboard/src/bytes.dart';
@@ -6,7 +15,7 @@ import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:test/test.dart';
 
-/// Positive vectors from the wiki page "Switchboard Test Vectors", section
+/// Positive vectors from the wiki page "Polyverse Switchboard Test Vectors", section
 /// "Talk messages", with the frame each one must decode to.
 final List<(String, String, TalkFrame)> positive = [
   (

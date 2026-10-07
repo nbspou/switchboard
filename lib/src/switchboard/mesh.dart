@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -61,7 +64,7 @@ const int _leaveWindow = 64;
 /// [migrateSlot] and [slotOwners] work on its slots. See the wiki page
 /// "Switchboard Sharding".
 ///
-/// Identity (wiki page "Switchboard Identity and Credentials"): the node
+/// Identity (wiki page "Polyverse Switchboard Identity and Credentials"): the node
 /// serves the `CONNECT` requests the naming service relays to it (a
 /// consumer wants an instance this node registered without endpoints to
 /// dial it): it dials the consumer with [Switchboard.dial], identifying
@@ -223,7 +226,7 @@ class MeshNode {
   /// instances must be able to reach) and dispatches `_relay` channels to
   /// [RelayService.handler]. The record's metadata is the identity string
   /// (UTF-8) of the node's [Switchboard.credential], which consumers name
-  /// as the receiver of their `IDENT` (wiki page "Switchboard Identity and
+  /// as the receiver of their `IDENT` (wiki page "Polyverse Switchboard Identity and
   /// Credentials", section "Finding a relay"); a node without a credential
   /// publishes empty metadata, and a warning is logged, since consumers
   /// then cannot name it (and it cannot broker). The credential needs

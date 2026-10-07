@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 part of 'naming_service.dart';
@@ -19,7 +21,7 @@ Status _statusOf(Object error) => error is SwitchboardException
 
 /// The slot tables of the naming service and everything that changes them:
 /// the slot procedures, the hand-over orchestration and the allocator. See
-/// the wiki page "Switchboard Sharding".
+/// the wiki page "Polyverse Switchboard Sharding".
 class _SlotManager {
   _SlotManager(this.service);
 

@@ -1,8 +1,12 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
+  Claude Sonnet 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:convert';
@@ -103,7 +107,7 @@ class Services {
   /// that listen nowhere either: the application payload of a `_relay`
   /// channel is the complete open payload of the channel to relay, and
   /// the metadata of a `_relay` record is the relay's identity string
-  /// (UTF-8). See the wiki page "Switchboard Identity and Credentials",
+  /// (UTF-8). See the wiki page "Polyverse Switchboard Identity and Credentials",
   /// section "Relay", and `RelayService`.
   static final Name relay = Name('_relay');
 }
@@ -512,7 +516,7 @@ class ServiceEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Sharding (wiki page "Switchboard Sharding")
+// Sharding (wiki page "Polyverse Switchboard Sharding")
 
 void _checkU32(int value, String name) {
   if (value < 0 || value > 0xFFFFFFFF) {
@@ -1655,7 +1659,7 @@ void _writeEndpoint(ByteWriter w, Uri endpoint) {
 /// [intent].
 ///
 /// Wire: name type, u48 instance, len8 endpoint URI, len8 intent (at most
-/// 64 bytes). See the wiki page "Switchboard Identity and Credentials",
+/// 64 bytes). See the wiki page "Polyverse Switchboard Identity and Credentials",
 /// section "Reverse connections".
 class ConnectRequest {
   /// Creates a request. A null [intent] is empty.

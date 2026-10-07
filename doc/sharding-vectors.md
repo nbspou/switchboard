@@ -1,8 +1,8 @@
 # Sharding payloads (test vectors)
 
-Hand-computed from the layouts on the wiki page "Switchboard Sharding",
+Hand-computed from the layouts on the wiki page "Polyverse Switchboard Sharding",
 little endian. Asserted by `test/vectors/sharding_vectors_test.dart`. For the
-integrator: copy this section into the wiki page "Switchboard Test Vectors"
+integrator: copy this section into the wiki page "Polyverse Switchboard Test Vectors"
 after "Naming service payloads". The `CLAIM` layout includes the `u32 epoch`
 field after the flags (see the amendment proposed with this change).
 

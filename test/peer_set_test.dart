@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // PeerSet: a consumer kept connected to every instance of a type, over
 // mem:// workers and a StaticResolver (no naming service): membership (the
 // initial records, the events around them, the removal hold-down), online
@@ -6,7 +15,7 @@
 // every re-open), endpoint fallback within the connect timeout, the backoff
 // schedule (fake_async), the outgoing policy and the per-worker credential,
 // resolver errors, and close. The consumer side of the untrusted worker
-// fleet (wiki page "Switchboard Use Cases", entry 5).
+// fleet (wiki page "Polyverse Switchboard Use Cases", entry 5).
 
 import 'dart:async';
 import 'dart:convert';

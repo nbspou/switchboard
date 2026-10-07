@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -35,7 +38,7 @@ final Logger _log = Logger('Switchboard.Naming');
 
 /// The naming service (`_ns`): hands out instance ids, keeps the
 /// authoritative table of live service instances, and pushes changes to
-/// the channels subscribed to them. See the wiki page "Switchboard Naming
+/// the channels subscribed to them. See the wiki page "Polyverse Switchboard Naming
 /// Service".
 ///
 /// The service speaks Talk over channels handed to [serve], one per client.
@@ -67,7 +70,7 @@ final Logger _log = Logger('Switchboard.Naming');
 /// is no heartbeat: a watcher detects a lost naming service through its
 /// connection (mux keep-alive).
 ///
-/// Sharding (wiki page "Switchboard Sharding"): the service keeps a slot
+/// Sharding (wiki page "Polyverse Switchboard Sharding"): the service keeps a slot
 /// table per sharded type ([slotTables]), publishes it to watchers as
 /// `SLOTSPC` and `SLOT` events, assigns the slots of managed spaces, and
 /// orchestrates hand-overs by sending `ASSIGN`, `DRAIN`, `FORWARD` and
@@ -89,7 +92,7 @@ final Logger _log = Logger('Switchboard.Naming');
 /// responder timeout is off for such requests, since it answers each of
 /// them when what it waits for ends.
 ///
-/// Identity (wiki page "Switchboard Identity and Credentials"): each served
+/// Identity (wiki page "Polyverse Switchboard Identity and Credentials"): each served
 /// channel is identified by the peer identity of the connection it arrived
 /// on (`IDENT`), else by a bearer credential in its open payload, verified
 /// with [verifier]; see [serve]. An identified channel may do what its

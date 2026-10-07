@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -112,7 +114,7 @@ class PeerEvent {
 /// re-established with backoff after every loss.
 ///
 /// For a consumer that keeps a connection to every worker of a fleet (the
-/// wiki page "Switchboard Use Cases", entry 5) and load-balances over the
+/// wiki page "Polyverse Switchboard Use Cases", entry 5) and load-balances over the
 /// ones that are online with its own policy.
 ///
 /// ```dart
@@ -173,7 +175,7 @@ class PeerEvent {
 ///
 /// On a node that cannot broker ([Switchboard.canBroker] false: it listens
 /// nowhere) but has a [Switchboard.relay], a record without endpoints is
-/// reached through a relay instead (wiki page "Switchboard Identity and
+/// reached through a relay instead (wiki page "Polyverse Switchboard Identity and
 /// Credentials", section "Relay", "Staying connected"): each attempt
 /// dials the relays [Switchboard.resolveRelays] gives, in that order and
 /// within [connectTimeout] as for a record's endpoints, naming each

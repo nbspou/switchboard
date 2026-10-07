@@ -1,8 +1,11 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -15,7 +18,7 @@ import '../naming/slot_table.dart';
 
 /// How `Switchboard.selectAndConnect` picks among the candidate instances
 /// of a type when the caller gives no shard slot (with a shard slot the
-/// choice is fixed by the slot, see the wiki page "Switchboard Addressing
+/// choice is fixed by the slot, see the wiki page "Polyverse Switchboard Addressing
 /// and Dispatch", section "Opening channels").
 ///
 /// Either way, if the chosen instance cannot be reached, the others are
@@ -31,7 +34,7 @@ enum SelectionPolicy {
 /// Maps a service type to the live instances of that type and where they
 /// listen, and reports changes.
 ///
-/// See the wiki page "Switchboard Addressing and Dispatch", section
+/// See the wiki page "Polyverse Switchboard Addressing and Dispatch", section
 /// "Resolvers".
 abstract interface class Resolver {
   /// All known live instances of [type], in no particular order.
@@ -56,7 +59,7 @@ abstract interface class Resolver {
 
 /// A [Resolver] that also knows the slot tables of sharded types, so that
 /// a router can send a channel for a shard slot to the slot's owner. See
-/// the wiki page "Switchboard Sharding", section "Routing".
+/// the wiki page "Polyverse Switchboard Sharding", section "Routing".
 ///
 /// `Switchboard.selectAndConnect` routes `(type, slot)` through
 /// [slotOwner] when the resolver implements this interface and

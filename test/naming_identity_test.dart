@@ -1,4 +1,13 @@
-// The naming service and identity (wiki page "Switchboard Identity and
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// The naming service and identity (wiki page "Polyverse Switchboard Identity and
 // Credentials", stage B): scope enforcement per `_ns` channel (connection
 // identity, or a credential in the open payload), RENEW and the renewal of
 // a MeshNode's credential (with fake time), the end of a channel whose

@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:typed_data';
@@ -34,7 +36,7 @@ enum MuxCommand {
 
 /// One mux frame: a flags byte, a 2 or 6 byte channel id and a payload.
 ///
-/// See the wiki page "Switchboard Mux", section "Frame header".
+/// See the wiki page "Polyverse Switchboard Mux", section "Frame header".
 class MuxFrame {
   /// Creates a frame. [payload] is used as is, not copied.
   MuxFrame(
@@ -442,7 +444,7 @@ Status decodeStatusPayload(Uint8List payload, String what) {
 /// The payload of an IDENT control message: `u16` credential length, the
 /// credential, `len8` intent, `len8` receiver, then the proof (the rest).
 ///
-/// See the wiki page "Switchboard Identity and Credentials", section
+/// See the wiki page "Polyverse Switchboard Identity and Credentials", section
 /// "Connection identity". The credential is carried as bytes; the mux
 /// connection decodes and verifies it with its verifier.
 class MuxIdent {

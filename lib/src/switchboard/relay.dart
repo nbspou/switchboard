@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -26,7 +28,7 @@ final Logger _log = Logger('Switchboard.Relay');
 
 /// The `_relay` service ([Services.relay]): forwards channels to instances
 /// registered without endpoints, which listen nowhere, on behalf of
-/// consumers that listen nowhere either (wiki page "Switchboard Identity
+/// consumers that listen nowhere either (wiki page "Polyverse Switchboard Identity
 /// and Credentials", section "Relay"; use case 5c).
 ///
 /// A consumer opens a channel of type `_relay` whose application payload

@@ -1,4 +1,13 @@
-// Use case 3 of the wiki page "Switchboard Sharding": per-user workers
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Use case 3 of the wiki page "Polyverse Switchboard Sharding": per-user workers
 // (`userq`, lazy managed, holder-only, N = 65536), with the layered
 // deployment of the same page: a web frontend and a Discord frontend both
 // route user actions by user id and land on the same worker.

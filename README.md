@@ -1,6 +1,6 @@
-# Switchboard
+# Polyverse Switchboard
 
-A protocol for a mesh of services, and its reference implementation in Dart.
+Polyverse Switchboard is a protocol for a mesh of services, and this package is its reference implementation in Dart.
 
 Services in a mesh often need one particular instance of another service: the server that runs a game zone, the shard that holds a chat room, the process that owns a session. Browsers, apps and devices need to reach those same instances through a public endpoint. Common RPC stacks address hosts or load-balanced pools, and the frontend speaks a second protocol.
 
@@ -468,7 +468,7 @@ Future<void> main() async {
 * **Backpressure.** A transport whose peer does not read queues at most 16 MiB of output, then stops reading its input. A close that cannot drain in time destroys the connection.
 * **Liveness and timeouts.** The mux sends PING after 10 s of silence and drops the connection if nothing arrives within 10 s more. A Talk request fails after 15 s without a response, `EXTEND` or stream item, and a responder has 10 s to reply before the request is aborted for it, unless the responder declares a longer deadline with `TalkMessage.extend`.
 
-Every limit is an option. The wiki page "Switchboard Dart Reference Implementation" has the full table.
+Every limit is an option. The wiki page "Polyverse Switchboard Dart Reference Implementation" has the full table.
 
 ## Platforms
 
@@ -541,7 +541,7 @@ final talk = await node.openTalkToSlot(kv, slotForText(key, slots));
 await talk.request('PUT', utf8.encode('PUT $key hello'));
 ```
 
-The wiki page "Switchboard Sharding" has the protocol and six worked use cases, each an integration test in `test/integration/sharding/`.
+The wiki page "Polyverse Switchboard Sharding" has the protocol and six worked use cases, each an integration test in `test/integration/sharding/`.
 
 ## License
 

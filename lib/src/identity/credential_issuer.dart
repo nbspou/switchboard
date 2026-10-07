@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:typed_data';
@@ -18,7 +20,7 @@ import 'ed25519.dart';
 
 /// The mesh authority's signing key: issues signed [Credential]s.
 ///
-/// Two kinds, chosen per mesh (wiki page "Switchboard Identity and
+/// Two kinds, chosen per mesh (wiki page "Polyverse Switchboard Identity and
 /// Credentials"): [CredentialIssuer.hmac] with a key shared by the mesh,
 /// cheapest, but anyone holding the key can mint and the credentials are
 /// bearer only; [CredentialIssuer.ed25519] with the authority's key pair,

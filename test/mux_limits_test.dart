@@ -1,3 +1,12 @@
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
 // Resource limits of the mux: rejected OPENs, undelivered channels, receive
 // buffers and the connection high-water mark, output backpressure over TCP,
 // reason truncation, application codes from the peer, the close

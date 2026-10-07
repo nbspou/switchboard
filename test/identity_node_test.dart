@@ -1,4 +1,13 @@
-// Identity on Switchboard nodes (wiki page "Switchboard Identity and
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Identity on Switchboard nodes (wiki page "Polyverse Switchboard Identity and
 // Credentials"): nodes identifying on the connections they initiate,
 // verifiers on accepted and initiated connections, ChannelPolicies.scoped
 // and requireIdentity, channels held until the peer identifies, and the

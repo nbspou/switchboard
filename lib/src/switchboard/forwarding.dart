@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 /// Channel forwarding shared by `proxyHandler` and `RelayService`: the
@@ -26,7 +28,7 @@ import 'switchboard.dart';
 final Logger _log = Logger('Switchboard.Router');
 
 /// Counts the channels being forwarded for each client connection,
-/// bounded by [max] (0: no bound), wiki page "Switchboard Proxying": all
+/// bounded by [max] (0: no bound), wiki page "Polyverse Switchboard Proxying": all
 /// clients share the forwarding node's connections to a destination, so
 /// without a bound one client could use up the channels a destination
 /// accepts for everyone.

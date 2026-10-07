@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:typed_data';
@@ -13,7 +15,7 @@ import 'credential.dart';
 /// Who the peer of a connection proved to be: the verified credential of
 /// its last valid `IDENT` (`MuxConnection.peerIdentity`).
 ///
-/// See the wiki page "Switchboard Identity and Credentials", section
+/// See the wiki page "Polyverse Switchboard Identity and Credentials", section
 /// "Connection identity".
 class PeerIdentity {
   /// An identity from [credential], verified at [verifiedAt], with the

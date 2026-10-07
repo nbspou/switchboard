@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -25,7 +27,7 @@ final Logger _log = Logger('Switchboard.Transport');
 /// frames prefixed with a `u32` little-endian length.
 ///
 /// Used for TCP, TLS, Unix domain sockets, serial lines and any other
-/// ordered byte stream. See the wiki page "Switchboard Transport". The
+/// ordered byte stream. See the wiki page "Polyverse Switchboard Transport". The
 /// wire format itself is in [StreamFraming] and [StreamFrameDecoder],
 /// which do not need `dart:io`.
 abstract final class StreamTransport {

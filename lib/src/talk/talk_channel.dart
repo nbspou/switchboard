@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -112,7 +114,7 @@ class TalkAbortException extends SwitchboardException {
 
 /// Talk message chains over one channel: plain messages, requests,
 /// responses, stream responses, aborts, timeout extension and
-/// cancellation. See the wiki page "Switchboard Talk". [forwardMessage]
+/// cancellation. See the wiki page "Polyverse Switchboard Talk". [forwardMessage]
 /// forwards message chains between channels.
 ///
 /// Works over a mux channel or any `StreamChannel<Uint8List>` whose events

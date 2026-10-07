@@ -1,6 +1,6 @@
-# Dart reference implementation: design and API contract
+# Polyverse Switchboard Dart reference implementation: design and API contract
 
-> This is the design record used while building the package: the contract between the layers, kept for the reasoning behind them. It is not the user guide. For using the package, read the README and the wiki page "Switchboard Dart Reference Implementation". Where this file and the code disagree, the code (and its doc comments) wins.
+> This is the design record used while building the package: the contract between the layers, kept for the reasoning behind them. It is not the user guide. For using the package, read the README and the wiki page "Polyverse Switchboard Dart Reference Implementation". Where this file and the code disagree, the code (and its doc comments) wins.
 
 This file is the contract between the layers of the Dart package while it is
 being built. The protocol itself is specified in the wiki
@@ -769,7 +769,7 @@ Dispatch order is as in the wiki "Addressing" page, after the listener policy. R
 
 ## Identity
 
-The wiki page "Switchboard Identity and Credentials". Stage A: credentials, connection identity, scoped policies. Stage B: the receiver binding of `IDENT`, scope enforcement at the naming service, `RENEW` and automatic renewal, `CONNECT` brokering, brokered peers in `PeerSet`. Then the relay: `RelayService`, `MeshNode.publishRelay`, `Switchboard.relay`, relayed peers in `PeerSet`.
+The wiki page "Polyverse Switchboard Identity and Credentials". Stage A: credentials, connection identity, scoped policies. Stage B: the receiver binding of `IDENT`, scope enforcement at the naming service, `RENEW` and automatic renewal, `CONNECT` brokering, brokered peers in `PeerSet`. Then the relay: `RelayService`, `MeshNode.publishRelay`, `Switchboard.relay`, relayed peers in `PeerSet`.
 
 ```dart
 enum CredentialKind { node(1), client(2), device(3) }
@@ -1050,4 +1050,4 @@ The first four were adopted by the wiki since.
 * `test/selection_test.dart` (over `mem://`): `where` filters over record metadata (also on the `MOVED` retry: a new owner it refuses ends the channel with `NOT_FOUND`), `SelectionPolicy.random` with a seeded `Random`, and `acceptAnyInstance` dispatch; the registrar pattern and metadata re-registration are in `test/naming_test.dart`.
 * `test/memory_endpoint_test.dart`: `listenMemory` and `mem://` connections (dispatch, policy, pooling, GOAWAY, `UNAVAILABLE`, own endpoints, timers not starved); the tests that use `mem` endpoints check that the registry is empty at the end.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0, and `naming_mesh_test.dart` over `mem://` endpoints too; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, a naming service that stops answering detected by the mux keep-alive through a TCP relay that freezes its connections, graceful GOAWAY).
-* `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup, over `tcp`, `ws` or `mem`; the kv store runs over `tcp` and `mem`). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing, `test/slot_gate_credential_test.dart` (over `mem://`) the credential of forwarded requests.
+* `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Polyverse Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup, over `tcp`, `ws` or `mem`; the kv store runs over `tcp` and `mem`). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing, `test/slot_gate_credential_test.dart` (over `mem://`) the credential of forwarded requests.

@@ -1,8 +1,10 @@
 /*
-Switchboard
+Polyverse Switchboard
 Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Author: Jan Boon <jan.boon@kaetemi.be>
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 import 'dart:typed_data';
@@ -36,7 +38,7 @@ enum TalkKind {
 /// a valid id on the wire). A null [procedure] means the procedure field is
 /// absent, which receivers treat as the all-zero name.
 ///
-/// See the wiki page "Switchboard Talk" for the layout and the flag rules.
+/// See the wiki page "Polyverse Switchboard Talk" for the layout and the flag rules.
 class TalkFrame {
   /// Creates a frame. Nothing is validated until [encode].
   TalkFrame({

@@ -1,4 +1,13 @@
-// Byte vectors of the sharding payloads (wiki page "Switchboard Sharding";
+/*
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+*/
+
+// Byte vectors of the sharding payloads (wiki page "Polyverse Switchboard Sharding";
 // table in doc/sharding-vectors.md), plus round trips and truncation. No
 // dart:io: also runs compiled to JavaScript (`dart test -P node`).
 
