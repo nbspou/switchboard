@@ -10,8 +10,9 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 /// Everything in `package:switchboard/core.dart` plus the `dart:io` parts:
 /// the TCP stream transport, the server side WebSocket transports, the
 /// `Switchboard` mesh node, `MeshNode` (a node joined to a naming service),
-/// `namingClientFor`, and the instance side of sharding (`SlotGate`,
-/// `SlotLifecycle`, `SlotGates`, `SlotChannel`).
+/// `namingClientFor`, `PeerSet` (a connected set of the instances of a
+/// type), and the instance side of sharding (`SlotGate`, `SlotLifecycle`,
+/// `SlotGates`, `SlotChannel`).
 ///
 /// See the wiki section "Switchboard" for the protocol specification.
 library;
@@ -19,6 +20,8 @@ library;
 export 'core.dart';
 export 'src/naming/naming_client_io.dart';
 export 'src/switchboard/mesh.dart';
+export 'src/switchboard/outgoing_policy.dart';
+export 'src/switchboard/peer_set.dart';
 export 'src/switchboard/proxy.dart';
 export 'src/switchboard/slot_channel.dart';
 export 'src/switchboard/slot_gate.dart';

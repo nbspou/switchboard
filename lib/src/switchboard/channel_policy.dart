@@ -9,18 +9,22 @@ import '../address/channel_address.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
 
-/// The listener policy: decides whether a peer that connected to a
-/// listener may address [address] at all.
+/// The policy of a connection: decides whether the peer may address
+/// [address] at all.
 ///
-/// Evaluated for every channel arriving on a connection accepted by the
-/// listener, after the address header is parsed and before any handler is
-/// chosen (local services, the default service and the catch-all alike).
-/// A channel the policy refuses is closed with `PERMISSION_DENIED` and a
-/// generic reason. [connection] is the connection the channel arrived on.
+/// A listener's policy applies to every connection it accepts; an outgoing
+/// policy (`Switchboard.outgoingPolicy`, `Switchboard.endpointPolicy`, or
+/// the `policy` of `Switchboard.connect` and `Switchboard.dial`) to a
+/// connection this node initiates. Evaluated for every channel the peer
+/// opens on the connection, after the address header is parsed and before
+/// any handler is chosen (local services, the default service and the
+/// catch-all alike). A channel the policy refuses is closed with
+/// `PERMISSION_DENIED` and a generic reason. [connection] is the
+/// connection the channel arrived on.
 ///
 /// A policy that throws refuses the channel. See the wiki page
-/// "Switchboard Addressing and Dispatch", section "Dispatch of incoming
-/// channels".
+/// "Switchboard Addressing and Dispatch", sections "Dispatch of incoming
+/// channels" and "Connections and identity".
 typedef ChannelPolicy = bool Function(
   ChannelAddress address,
   MuxConnection connection,
@@ -37,6 +41,13 @@ abstract final class ChannelPolicies {
   /// internal listeners only.
   static bool allowAll(ChannelAddress address, MuxConnection connection) =>
       true;
+
+  /// Refuses every channel. For connections to untrusted peers that have
+  /// no business opening channels towards this node, such as the
+  /// connections a consumer initiates to workers it does not trust (see
+  /// `Switchboard.outgoingPolicy`).
+  static bool denyAll(ChannelAddress address, MuxConnection connection) =>
+      false;
 
   /// Refuses channels to reserved types (names starting with `_`, such as
   /// the naming service `_ns`); allows everything else, including channels

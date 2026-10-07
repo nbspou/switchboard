@@ -6,7 +6,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
-import 'dart:math' show Random, pow;
+import 'dart:math' show Random;
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -19,6 +19,7 @@ import '../mux/mux_connection.dart';
 import '../status.dart';
 import '../switchboard/incoming_channel.dart';
 import '../talk/talk_channel.dart';
+import 'backoff.dart';
 
 part 'persistent_channel.dart';
 
@@ -223,38 +224,20 @@ class ReconnectingClient {
        muxOptions = muxOptions ?? const MuxOptions(),
        talkOptions = talkOptions ?? const TalkOptions(),
        defaultPayload = defaultPayload ?? Uint8List(0),
-       _random = random ?? Random() {
-    if (initialBackoff.isNegative) {
-      throw ArgumentError.value(
-        initialBackoff,
-        'initialBackoff',
-        'must not be negative',
-      );
-    }
-    if (maxBackoff < initialBackoff) {
-      throw ArgumentError.value(
-        maxBackoff,
-        'maxBackoff',
-        'must not be below initialBackoff',
-      );
-    }
-    if (!(backoffFactor >= 1) || backoffFactor.isInfinite) {
-      throw ArgumentError.value(
-        backoffFactor,
-        'backoffFactor',
-        'must be a finite number of at least 1',
-      );
-    }
-    if (!(jitter >= 0 && jitter <= 1)) {
-      throw ArgumentError.value(jitter, 'jitter', 'must be between 0 and 1');
-    }
+       _schedule = Backoff(
+         initial: initialBackoff,
+         max: maxBackoff,
+         factor: backoffFactor,
+         jitter: jitter,
+         random: random,
+       ) {
     if (autoStart) {
       start();
     }
   }
 
   final TransportConnector _connect;
-  final Random _random;
+  final Backoff _schedule;
 
   /// Mux configuration of every connection.
   final MuxOptions muxOptions;
@@ -673,21 +656,7 @@ class ReconnectingClient {
   }
 
   /// The delay after [failures] consecutive failures, with jitter.
-  Duration _backoff(int failures) {
-    final initial = initialBackoff.inMicroseconds;
-    if (initial == 0) {
-      return Duration.zero;
-    }
-    final max = maxBackoff.inMicroseconds.toDouble();
-    var base = initial * pow(backoffFactor, failures).toDouble();
-    if (!(base <= max)) {
-      base = max;
-    }
-    if (jitter > 0) {
-      base *= 1 + jitter * (2 * _random.nextDouble() - 1);
-    }
-    return Duration(microseconds: base.round());
-  }
+  Duration _backoff(int failures) => _schedule.delay(failures);
 
   void _onTransport(StreamChannel<Uint8List> transport) {
     final MuxConnection connection;

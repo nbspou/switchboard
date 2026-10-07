@@ -9,11 +9,15 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 /// `proxyHandler`. Internal to the package; not exported.
 library;
 
+import 'dart:async';
+import 'dart:typed_data';
+
 import 'package:logging/logging.dart';
 
 import '../address/channel_address.dart';
 import '../address/service_address.dart';
 import '../mux/mux_channel.dart';
+import '../mux/mux_connection.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
 import 'resolver.dart';
@@ -34,7 +38,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// same address again (instance 0).
 ///
 /// The replacement carries [header] with the instance set to the selected
-/// one and no host hint; the application payload is unchanged. [resolver]
+/// one and no host hint; the application payload is unchanged unless
+/// [payloadFor] is given, which then chooses it for the connection and
+/// record selected (the per-destination credential of
+/// `Switchboard.openChannelToSlot`). [resolver]
 /// defaults to the node's; [excludeOwnEndpoints] as in
 /// [Switchboard.selectAndConnect]. [mayLocate], when given, is asked
 /// before a `LOCATE`; false gives up (null). [where] filters the records
@@ -49,6 +56,8 @@ Future<MuxChannel?> reopenAtSlotOwner(
   bool excludeOwnEndpoints = false,
   bool Function()? mayLocate,
   bool Function(ServiceRecord record)? where,
+  FutureOr<Uint8List> Function(MuxConnection connection, ServiceRecord record)?
+  payloadFor,
 }) async {
   final type = header.type!;
   final slot = header.shard!;
@@ -90,10 +99,15 @@ Future<MuxChannel?> reopenAtSlotOwner(
       excludeOwnEndpoints: excludeOwnEndpoints,
       where: where,
     );
-    final replacement = header.copyWith(
+    var replacement = header.copyWith(
       instance: record.address.instance,
       clearHost: true,
     );
+    if (payloadFor != null) {
+      replacement = replacement.copyWith(
+        payload: await payloadFor(connection, record),
+      );
+    }
     try {
       return connection.open(replacement.encode());
     } on SwitchboardException catch (e) {

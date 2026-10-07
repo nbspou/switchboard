@@ -81,14 +81,26 @@ The protocol specification lives in the project wiki (section
   by default); `registerService(acceptAnyInstance: true)` for a service
   registered under an id it was never told; the registrar pattern (one
   client registering records for endpoints that never talk to the naming
-  service, alive as long as its channel).
+  service, alive as long as its channel). On the consumer side: a policy
+  on the connections a node initiates (`Switchboard(outgoingPolicy:)`, an
+  `endpointPolicy` hook per endpoint, `connect(policy:)`, and
+  `ChannelPolicies.denyAll`), so that a peer the node dialled cannot push
+  channels into it; the credential chosen per destination
+  (`Switchboard(credentialFor:)`, given the endpoint and the selected
+  record, so a per-worker key can come from its metadata), after which the
+  node's default payload is never attached implicitly; `Switchboard.dial`
+  for an un-pooled connection and `payloadFor`; and `PeerSet.watch(type)`,
+  a connection kept to every instance of a type with backoff per peer,
+  `added`, `online`, `offline`, `updated` and `removed` events, an
+  `onConnect` hook, and a per-peer channel re-opened on every connection
+  with an `onOpen` hook for the capability exchange.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for
   held OPEN payloads, a cap on unconfirmed CLOSEs, output high-water marks,
   a per-client limit on proxied channels, and host hint relaying only on
   request.
-- Tests: over 950 tests, including the wiki test vectors (the codec tests also
+- Tests: over 1000 tests, including the wiki test vectors (the codec tests also
   run on Node.js with `dart test -P node`) and integration tests over TCP
   and WebSocket.
 - Documentation: README with quick start programs (`example/`), and the

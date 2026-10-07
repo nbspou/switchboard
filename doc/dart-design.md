@@ -36,6 +36,7 @@ lib/src/talk/talk_stream.dart  TalkStream (handle for an outgoing stream request
 lib/src/address/service_address.dart   ServiceAddress
 lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
 lib/src/client/reconnecting_client.dart  ReconnectingClient, ClientState, ClientPhase, TransportConnector (frontend client, core)
+lib/src/client/backoff.dart              Backoff: the reconnect schedule shared by ReconnectingClient and PeerSet (internal, not exported)
 lib/src/client/persistent_channel.dart   PersistentChannel, PersistentTalk (part of reconnecting_client.dart)
 lib/src/naming/naming_protocol.dart    ServiceRecord, codecs for REGISTER/UNREGSTR/WATCH/LOOKUP/UP/DOWN/SYNCED and the sharding payloads, MovedStatus
 lib/src/naming/naming_service.dart     NamingService (server side handler)
@@ -47,7 +48,8 @@ lib/src/naming/naming_client_io.dart   namingClientFor: a NamingClient connectin
 lib/src/naming/naming_resolver.dart    NamingResolver (resolves through a NamingClient's mirrored table)
 lib/src/switchboard/resolver.dart      Resolver, SlotResolver, StaticResolver (with a configurable slot map), EndpointResolver
 lib/src/switchboard/slot_key.dart      fnv1a32, slotForKey, slotForText: the reference key-to-slot function (core)
-lib/src/switchboard/channel_policy.dart  ChannelPolicy, ChannelPolicies (listener policies)
+lib/src/switchboard/channel_policy.dart  ChannelPolicy, ChannelPolicies (listener and outgoing policies)
+lib/src/switchboard/outgoing_policy.dart EndpointPolicy, EndpointCredential: the hook types of Switchboard's endpointPolicy and credentialFor (no dart:io; exported from switchboard.dart)
 lib/src/switchboard/generic_status.dart  genericStatus: rejection statuses for peers (internal, not exported)
 lib/src/switchboard/incoming_channel.dart  IncomingChannel, ChannelHandler (core)
 lib/src/switchboard/switchboard.dart   Switchboard (dart:io)
@@ -57,11 +59,12 @@ lib/src/switchboard/slot_channel.dart  SlotChannel: a channel to a slot's owner 
 lib/src/switchboard/slot_reopen.dart   reopenAtSlotOwner: the re-resolution after MOVED shared by openChannelToSlot and proxyHandler (internal, not exported)
 lib/src/switchboard/slot_gate.dart     SlotGate, SlotLifecycle, SlotGates, SlotGateState: the instance side of sharding
 lib/src/switchboard/mesh.dart          MeshNode: a Switchboard joined to a naming service (dart:io)
+lib/src/switchboard/peer_set.dart      PeerSet, Peer, PeerState, PeerEvent, PeerEventType: a connection kept to every instance of a type (builds on Switchboard)
 ```
 
 Rules:
 
-* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. `proxy.dart`, `mesh.dart`, `slot_gate.dart`, `slot_channel.dart` and `naming_client_io.dart` build on `Switchboard` and are exported from `switchboard.dart` only. Everything else must compile for the web.
+* `dart:io` only in `stream_transport.dart`, `web_socket_transport_io.dart`, `web_socket_server.dart`, `switchboard.dart`, and the TCP/WebSocket connect helpers. `proxy.dart`, `mesh.dart`, `slot_gate.dart`, `slot_channel.dart`, `peer_set.dart` and `naming_client_io.dart` build on `Switchboard` and are exported from `switchboard.dart` only, as is `outgoing_policy.dart` (its hooks only mean something to a `Switchboard`). Everything else must compile for the web.
 * The wire codecs must be correct when compiled to JavaScript, where bitwise operations are 32-bit: use `ByteReader`/`ByteWriter` (or the same split arithmetic) for `u32` and `u48`. `dart test -P node` runs the codec tests on Node.js (see `dart_test.yaml`).
 * All wire codecs are pure functions over `Uint8List` and are unit tested against the wiki test vectors.
 * Logging through `package:logging`, logger names `Switchboard.Mux`, `Switchboard.Talk`, `Switchboard.Router`, `Switchboard.Naming`, `Switchboard.Transport`, `Switchboard.Client`.
@@ -432,7 +435,7 @@ class PersistentTalk    { ChannelAddress address; TalkChannel? current; Stream<T
 
 Behaviour notes:
 
-* Backoff: first attempt immediate; after `n` consecutive failures the delay is `min(initial * factor^n, max)` times a uniform factor in `[1 - jitter, 1 + jitter]` (a delay may exceed `max` by the jitter). A connection that ends is a failure unless it lived longer than `maxBackoff`, which resets the sequence. `start()` resets it too. Connect timeout and connector errors report `UNAVAILABLE` (a `SwitchboardException` from the connector keeps its own status).
+* Backoff: first attempt immediate; after `n` consecutive failures the delay is `min(initial * factor^n, max)` times a uniform factor in `[1 - jitter, 1 + jitter]` (a delay may exceed `max` by the jitter); the schedule is `Backoff` in `lib/src/client/backoff.dart`, shared with `PeerSet`. A connection that ends is a failure unless it lived longer than `maxBackoff`, which resets the sequence. `start()` resets it too. Connect timeout and connector errors report `UNAVAILABLE` (a `SwitchboardException` from the connector keeps its own status).
 * On connect: state `connected`, `connected` completes, every persistent channel is opened (all at once, in creation order; `onOpen` exceptions and failed futures are logged), then waiting `openChannel` calls proceed. Peer OPENs go to `incoming` as `IncomingChannel`; a malformed address is closed with `PROTOCOL_ERROR`, and after the listener cancels, OPENs are closed with `UNAVAILABLE`.
 * On loss (any status): state `disconnected` with the status first, then each persistent channel's `onClosed` with its channel's end status, then the backoff. Nothing is opened on a connection that received GOAWAY; `openChannel` waits for the next one. A peer GOAWAY `GOING_AWAY` is not waited out: the client closes the persistent channels on that connection with `GOING_AWAY`, leaves it to the application's own channels (the mux closes it once idle), and connects again at once, state `connecting` with the GOAWAY status (the backoff applies only if that attempt fails, or if the connection was itself made after a GOAWAY and did not last `maxBackoff`), so persistent channels and waiting opens move to the new connection; a GOAWAY with an error status is left to end as a loss.
 * Persistent channels: every `onOpen` is followed by exactly one `onClosed`. A channel that ends while the connection stays up (closed by the peer, or by the application through `current`) is opened again after a backoff kept per persistent channel (same schedule, reset by a channel that lived longer than `maxBackoff`), except after `PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED` or `NOT_FOUND`: the persistent channel then ends for good (`done` completes with that status) and the application decides. A refused OPEN: `FAILED_PRECONDITION` (GOAWAY) waits for the next connection, `RESOURCE_EXHAUSTED` backs off, anything else ends it. `onOpen` is never called synchronously from `openPersistent`.
@@ -487,12 +490,15 @@ Sharding decoders throw `ProtocolException` on truncation, an unknown mode, stat
 ```dart
 typedef ChannelHandler = FutureOr<void> Function(IncomingChannel channel);   // a throw or a failed future closes the channel with INTERNAL
 
-/// Listener policy (channel_policy.dart, core): evaluated for every channel on a connection
-/// accepted by the listener, after the header is parsed and before any handler (local service,
-/// default service, catch-all). Refused or throwing: CLOSE PERMISSION_DENIED 'permission denied'.
+/// Connection policy (channel_policy.dart, core): a listener's applies to every connection it
+/// accepts, an outgoing one (see Switchboard) to a connection the node initiates. Evaluated for
+/// every channel the peer opens on the connection, after the header is parsed and before any
+/// handler (local service, default service, catch-all). Refused or throwing: CLOSE
+/// PERMISSION_DENIED 'permission denied'.
 typedef ChannelPolicy = bool Function(ChannelAddress address, MuxConnection connection);
 abstract final class ChannelPolicies {
   static bool allowAll(ChannelAddress, MuxConnection);
+  static bool denyAll(ChannelAddress, MuxConnection);                // for connections to peers that may not open channels back
   static bool denyReserved(ChannelAddress, MuxConnection);           // refuses `_` types, allows the rest and untyped
   static ChannelPolicy allowTypes(Set<Name> types, {bool untyped = false});   // only these types (a listed reserved type is allowed)
 }
@@ -523,16 +529,34 @@ class NamingResolver implements SlotResolver { NamingResolver(NamingClient clien
 
 int fnv1a32(List<int> bytes); int slotForKey(List<int> key, int count); int slotForText(String key, int count);   // slot_key.dart (core)
 
+// outgoing_policy.dart
+typedef EndpointPolicy = ChannelPolicy? Function(Uri endpoint);                     // null: leave it to outgoingPolicy; a throw: denyAll
+typedef EndpointCredential = FutureOr<Uint8List?> Function(Uri endpoint, ServiceRecord? record);   // null: empty payload (never defaultPayload)
+
 class Switchboard {
   Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions,
       Duration connectTimeout = 10 s, bool allowHostHint = false, int maxConnectionsPerEndpoint = 4,
-      Duration slotRefreshTimeout = 5 s, SelectionPolicy selection = roundRobin, Random? random});   // random: source of SelectionPolicy.random
+      Duration slotRefreshTimeout = 5 s, SelectionPolicy selection = roundRobin, Random? random,   // random: source of SelectionPolicy.random
+      ChannelPolicy? outgoingPolicy, EndpointPolicy? endpointPolicy, EndpointCredential? credentialFor});
   Resolver? resolver; Uint8List defaultPayload; SelectionPolicy selection;
+  // The policy of an initiated connection is chosen once, when it is established: connect's or
+  // dial's policy, else endpointPolicy(endpoint) if non-null, else outgoingPolicy; null allows
+  // everything (as before). Applied in dispatch exactly like a listener policy.
+  final ChannelPolicy? outgoingPolicy; final EndpointPolicy? endpointPolicy;
+  // The application payload of an open without one from the caller (openChannel's payload null,
+  // openChannelAt/openChannelOn's address payload empty): credentialFor(endpoint, record) when set
+  // (record: the selected record for the resolving opens, null for openChannelAt/openChannelOn;
+  // endpoint: the one the connection was established to), else defaultPayload. With the hook set,
+  // defaultPayload is never attached implicitly; on an accepted connection (no destination) the
+  // payload is empty. openChannelToSlot's MOVED retry asks again for the new owner. proxyHandler and
+  // SlotGate forward their client's payload and never consult it. A throw fails the open.
+  final EndpointCredential? credentialFor;
 
   // WebSocket listeners use WebSocketServerTransport, and dials IOWebSocketTransport.connect (no
   // compression offered), both with maxFrameSize = muxOptions.maxFrameSize (0: the 1 MiB transport default).
   // policy: null allows everything (internal listeners only); internet-facing listeners MUST set one
-  // that refuses reserved types. Connections this node initiates (connect) have no policy.
+  // that refuses reserved types. Connections this node initiates take their policy from
+  // connect/dial, endpointPolicy and outgoingPolicy (see above).
   // Other paths get 403, or with onOtherRequest are handed to it: the callback owns the response; if it
   // throws before starting it, logged SEVERE and answered 500. close() waits for callbacks in progress
   // like upgrades (at most connectTimeout).
@@ -572,13 +596,16 @@ class Switchboard {
   // where (on every open method below that resolves): records it refuses are not candidates; none left: NOT_FOUND
   Future<MuxChannel> openChannel(ServiceAddress address, {int? shard, Uint8List? payload, bool Function(ServiceRecord)? where});    // resolve + pool + OPEN
   Future<TalkChannel> openTalk(ServiceAddress address, {int? shard, Uint8List? payload, TalkOptions? options, bool Function(ServiceRecord)? where});
-  Future<MuxChannel> openChannelAt(Uri endpoint, ChannelAddress address);                       // explicit endpoint
+  Future<MuxChannel> openChannelAt(Uri endpoint, ChannelAddress address);                       // explicit endpoint; empty payload: credentialFor(endpoint, null) or defaultPayload
+  MuxChannel openChannelOn(MuxConnection connection, ChannelAddress address);                   // on a given connection; empty payload as above (accepted: empty with the hook); StateError if the hook answers with a future
+  Future<Uint8List> payloadFor(MuxConnection connection, {ServiceRecord? record});             // the payload an open on connection gets without one (for PeerSet, and before openChannelOn with an asynchronous hook)
   Future<TalkChannel> openTalkAt(Uri endpoint, ChannelAddress address, {TalkOptions? options});
   Future<(ServiceRecord, MuxConnection)> selectAndConnect(ServiceAddress address, {int? shard, Resolver? resolver, bool excludeOwnEndpoints = false, bool Function(ServiceRecord)? where});   // slot routing: see "Sharding"
   Future<SlotChannel> openChannelToSlot(Name type, int slot, {Uint8List? payload, bool Function(ServiceRecord)? where});   // openChannel(type/0, shard: slot) + one MOVED retry (where applies to both)
   Future<TalkChannel> openTalkToSlot(Name type, int slot, {Uint8List? payload, TalkOptions? options, bool Function(ServiceRecord)? where});
   Future<ServiceAddress> resolveSlotOwner(Name type, int slot, {bool refresh = false});          // for callers handling MOVED themselves
-  Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp, mem; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
+  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy});   // pooled; ws, wss, tcp, mem; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint; pooled per explicit policy (==) too
+  Future<MuxConnection> dial(Uri endpoint, {ChannelPolicy? policy});      // same path, not pooled: adopted for dispatch, on connections, GOAWAY on close; the caller owns it
   Stream<MuxConnection> get connections;              // every accepted or initiated connection
   Future<void> close();                               // stop listening (mem ids released at once), goAway on all connections; connections established meanwhile (upgrades and dials in progress, at most connectTimeout; accept calls) get GOAWAY at once and are waited for too
 }
@@ -617,7 +644,28 @@ ChannelHandler proxyHandler(Switchboard switchboard, {bool Function(ChannelAddre
 /// slot_channel.dart: a StreamChannel<Uint8List> and StatusClosable forwarding to the current MuxChannel.
 class SlotChannel { Name type; int slot; MuxChannel get channel; bool get retried; bool get canSend;
   Stream<Uint8List> stream; StreamSink<Uint8List> sink; Future<Status> done; void send(Uint8List); Future<void> close([Status]); }
+
+/// peer_set.dart: one connection kept to every instance of a type (wiki use case 5, the consumer).
+enum PeerState { added, connecting, online, offline, removed }
+enum PeerEventType { added, online, offline, updated, removed }
+class PeerEvent { PeerEventType type; Peer peer; Status? status; }   // status: offline's cause; removed: CANCELLED on close
+class Peer { ServiceAddress address; ServiceRecord record; PeerState state; Status? lastStatus; DateTime? since;
+  DateTime? nextAttemptAt; int attempt; Uri? endpoint; MuxConnection? connection; MuxChannel? channel; bool isOnline; }   // a live view
+class PeerSet {
+  factory PeerSet.watch(Switchboard switchboard, Name type, {Resolver? resolver /* default: the node's */,
+      FutureOr<void> Function(Peer)? onConnect, ChannelAddress? channel, FutureOr<void> Function(Peer, MuxChannel)? onOpen,
+      Duration initialBackoff = 500 ms, Duration maxBackoff = 30 s, double backoffFactor = 2, double jitter = 0.2,
+      Duration connectTimeout = 10 s, ChannelPolicy? policy, Random? random});   // ArgumentError: no resolver, onOpen without channel, bad schedule
+  Map<int, Peer> get peers; Iterable<Peer> get online; Stream<PeerEvent> get events; Future<void> get ready; bool get isClosed;
+  Future<MuxChannel> openChannel(int instance, {Uint8List? payload});    // NOT_FOUND unknown, FAILED_PRECONDITION without a usable connection
+  Future<TalkChannel> openTalk(int instance, {Uint8List? payload, TalkOptions? options});
+  Future<void> close();
+}
 ```
+
+Outgoing policies and credentials (wiki "Addressing", "Connections and identity"): a node that dials peers it does not trust (workers on rented machines) gives those connections a policy, so that the peer cannot push channels into it, and presents each destination its own credential, so that the mesh credential (`defaultPayload`) never reaches it. Pooled connections are keyed by endpoint and, for `connect(policy:)`, by the policy object too, so that an explicit policy never hands out a connection established under another one; `endpointPolicy` is evaluated per dial, which is why it must be a function of the endpoint alone.
+
+`PeerSet` (peer_set.dart): membership is the resolver's records of the type (after `ready`, `resolve(type)`, then `events`, buffered meanwhile and replayed in order). One connection per peer through `Switchboard.dial` (never pooled: a worker that reboots disturbs nothing else, and each peer has its own backoff), to the first endpoint of the record that answers, all of them within `connectTimeout`. After connecting: `onConnect`, then the per-peer channel (instance filled with the peer's id when 0; empty payload replaced by `payloadFor(connection, record)`), a mux PING round trip (a refusal the peer sends on arrival arrives before the PONG, so such a peer never shows online), `onOpen`, then online; each step waited for at most `connectTimeout` and a failing hook only logged. Backoff and GOAWAY handling mirror `ReconnectingClient` (the schedule is the shared `Backoff`): a connection that ends counts as a failure unless it lasted `maxBackoff`; a peer GOAWAY `GOING_AWAY` leaves the connection to the application's channels and reconnects at once (backoff only if that fails or the connection itself followed a GOAWAY and did not last). The per-peer channel follows `PersistentChannel`: re-opened after its own backoff when it ends on a live connection (the peer stays online, `channel` null meanwhile), except that a terminal status (`PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED`, `NOT_FOUND`) or an OPEN the mux refuses fails the connection: GOAWAY, offline with that status, next attempt after the backoff. Events: `added`; then `online` and `offline` alternating (`offline` also when the first attempt fails, reported once until online again); `updated` when the record changes (other endpoints move the peer: its connection is left with GOAWAY if its endpoint was withdrawn, a waiting retry is made at once, the failure count reset); `removed` last (record gone: GOAWAY on its connection; `close`: `CANCELLED`). `close` waits for attempts in progress and for every connection of the set to close, so no timer is left.
 
 Rejections sent to peers by the node and the proxy (policy refusals, no handler, resolution and connection failures, per-client limit) carry the status code and a generic reason only (`'permission denied'`, `'not found'`, `'unavailable'`, ...); the details (instance ids, endpoints, resolver state) are logged locally at FINE or INFO. Statuses a backend sends pass through the proxy unchanged, except `MOVED` and `RELOCATED`, whose owner and epoch are zeroed (and reason dropped) unless `revealOwners`; a lost connection on one side reaches the other as `UNAVAILABLE` `'connection lost'`.
 
@@ -801,6 +849,8 @@ The first four were adopted by the wiki since.
 
 * `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`, the name and status tests, and `test/reconnecting_client_test.dart` (fake_async over `MemoryTransport`).
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
+* `test/outgoing_test.dart` (over `mem://`): the policy of initiated connections and its precedence, pooling per explicit policy, `dial`, and `credentialFor` (per endpoint, per record and from its metadata, synchronous and asynchronous, the explicit payload winning, `openChannelOn`, the `MOVED` retry, the proxy unaffected), sniffing the raw OPEN payloads for the mesh credential.
+* `test/peer_set_test.dart` (over `mem://` and a `StaticResolver`): `PeerSet` membership and events, a worker's reboot, the per-peer channel and the hooks, refusals, moved endpoints, the outgoing policy and credentials, `close`; the backoff schedule, the GOAWAY reconnect and the hook bound under fake_async, which also checks that no timer is left. `test/integration/fleet_consumer_test.dart`: use case 5 end to end (naming service, a registrar for eight workers, a consumer joined to the mesh).
 * `test/selection_test.dart` (over `mem://`): `where` filters over record metadata, `SelectionPolicy.random` with a seeded `Random`, and `acceptAnyInstance` dispatch; the registrar pattern and metadata re-registration are in `test/naming_test.dart`.
 * `test/memory_endpoint_test.dart`: `listenMemory` and `mem://` connections (dispatch, policy, pooling, GOAWAY, `UNAVAILABLE`, own endpoints, timers not starved); the tests that use `mem` endpoints check that the registry is empty at the end.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0, and `naming_mesh_test.dart` over `mem://` endpoints too; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).

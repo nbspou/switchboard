@@ -30,6 +30,7 @@ import 'channel_policy.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'memory_endpoints.dart';
+import 'outgoing_policy.dart';
 import 'resolver.dart';
 import 'slot_channel.dart';
 import 'slot_reopen.dart';
@@ -43,7 +44,8 @@ final Logger _log = Logger('Switchboard.Router');
 /// Dispatch and resolution follow the wiki page "Switchboard Addressing
 /// and Dispatch". Dispatch is symmetric: channels the peer opens on a
 /// connection this node initiated are dispatched exactly like channels on
-/// accepted connections.
+/// accepted connections, under that connection's policy
+/// ([outgoingPolicy]).
 ///
 /// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`,
 /// `tcp://host:port` and, within one isolate, `mem://id` (see
@@ -77,6 +79,14 @@ class Switchboard {
   /// [selection] is how [selectAndConnect] picks an instance when no shard
   /// slot is given; [random] is the source of [SelectionPolicy.random]
   /// (default: a new [Random]), to be seeded in tests.
+  ///
+  /// [outgoingPolicy], [endpointPolicy] and [credentialFor] govern the
+  /// connections this node initiates, for meshes that reach peers they do
+  /// not trust (workers on rented machines, say): the policy of the
+  /// channels such a peer opens back towards this node, and the
+  /// credential this node presents to it. All null (the default), an
+  /// initiated connection is trusted like an internal listener's and every
+  /// channel carries [defaultPayload].
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -88,6 +98,9 @@ class Switchboard {
     this.slotRefreshTimeout = const Duration(seconds: 5),
     this.selection = SelectionPolicy.roundRobin,
     Random? random,
+    this.outgoingPolicy,
+    this.endpointPolicy,
+    this.credentialFor,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        muxOptions = muxOptions ?? const MuxOptions(),
        talkOptions = talkOptions ?? const TalkOptions(),
@@ -105,7 +118,8 @@ class Switchboard {
   Resolver? resolver;
 
   /// Application payload attached to every channel this node opens unless
-  /// the caller supplies one. Empty by default.
+  /// the caller supplies one. Empty by default. Not used implicitly once
+  /// [credentialFor] is set.
   Uint8List defaultPayload;
 
   /// Mux configuration of every connection.
@@ -138,6 +152,49 @@ class Switchboard {
 
   final Random _random;
 
+  /// The policy of the connections this node initiates ([connect], [dial],
+  /// and through them the open methods), applied to every channel the peer
+  /// opens on such a connection exactly like a listener policy: a refused
+  /// channel is closed with `PERMISSION_DENIED` and a generic reason. Null
+  /// (the default) allows everything, as on an internal listener.
+  ///
+  /// The policy of a connection is chosen once, when it is established:
+  /// the `policy` passed to [connect] or [dial] if any, else what
+  /// [endpointPolicy] returns for the endpoint if it returns one, else
+  /// this. A node that dials peers it does not trust, which have no
+  /// business opening channels towards it, sets
+  /// [ChannelPolicies.denyAll], here or for those endpoints.
+  final ChannelPolicy? outgoingPolicy;
+
+  /// Chooses the policy of each connection this node initiates by its
+  /// endpoint, consulted when the connection is established: a non-null
+  /// result overrides [outgoingPolicy] (an explicit `policy` of [connect]
+  /// or [dial] overrides both). Lets an application trust its own mesh
+  /// (`mem://`, the private network) and refuse everything from other
+  /// endpoints. A hook that throws gives the connection
+  /// [ChannelPolicies.denyAll]. See [EndpointPolicy].
+  final EndpointPolicy? endpointPolicy;
+
+  /// Chooses the application payload of every channel this node opens
+  /// without one from the caller, per destination: the open methods
+  /// attach its result (null: an empty payload) instead of
+  /// [defaultPayload], which is then never attached implicitly. The hook
+  /// receives the endpoint the channel goes to and, for [openChannel] and
+  /// the other opens that resolve, the resolver's record of the selected
+  /// instance, whose [ServiceRecord.metadata] may carry a per-instance key
+  /// published by a trusted registrar. A channel
+  /// opened on a connection this node accepted ([openChannelOn]) has no
+  /// destination endpoint and carries an empty payload. Null (the
+  /// default): [defaultPayload] everywhere.
+  ///
+  /// A payload the caller passes always wins: the `payload` of
+  /// [openChannel], a non-empty [ChannelAddress.payload] for
+  /// [openChannelAt] and [openChannelOn]. The proxy (`proxyHandler`) and
+  /// the slot gate forward their client's payload and never consult this.
+  /// A hook that throws, or whose future fails, fails the open. See
+  /// [EndpointCredential].
+  final EndpointCredential? credentialFor;
+
   final Map<Name, Map<int, ChannelHandler>> _services = {};
 
   /// Per type, the instances whose registration also serves channels
@@ -157,8 +214,12 @@ class Switchboard {
   final Set<Future<void>> _inFlight = {};
   final Expando<String> _remotes = Expando<String>('remote');
   final Expando<ChannelPolicy> _policies = Expando<ChannelPolicy>('policy');
-  final Map<String, List<MuxConnection>> _pool = {};
-  final Map<String, Future<MuxConnection>> _dialing = {};
+  // The endpoint each initiated connection was established to.
+  final Expando<Uri> _dialled = Expando<Uri>('endpoint');
+  // Keyed by the endpoint's pool key, or by the pool key and the policy
+  // for a connect() with an explicit policy.
+  final Map<Object, List<MuxConnection>> _pool = {};
+  final Map<Object, Future<MuxConnection>> _dialing = {};
   final Map<Name, int> _roundRobin = {};
   final StreamController<MuxConnection> _connections =
       StreamController<MuxConnection>.broadcast();
@@ -683,6 +744,14 @@ class Switchboard {
   /// A `mem://id` endpoint ([listenMemory]) is reached in this isolate
   /// over a [MemoryTransport] pair, at once.
   ///
+  /// Channels the peer opens on the connection are dispatched to the local
+  /// services under the connection's policy: [policy] if given, else
+  /// [endpointPolicy] for [endpoint], else [outgoingPolicy] (see
+  /// [outgoingPolicy]). A call with a [policy] shares pooled connections
+  /// only with calls passing the same policy (`==`, so the same function
+  /// object), never with calls without one; pass one stable policy object
+  /// per purpose rather than a new closure per call.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.unavailable] if the
   /// connection cannot be established within [connectTimeout] (for a `mem`
   /// URI: no listener of this isolate has that id, or it has closed), with
@@ -690,11 +759,12 @@ class Switchboard {
   /// [StatusCode.invalidArgument] for a `tcp` URI without host or port or
   /// a `mem` URI without id, and with [StatusCode.failedPrecondition]
   /// after [close].
-  Future<MuxConnection> connect(Uri endpoint) {
+  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy}) {
     if (_closing) {
       return Future.error(_closedException());
     }
-    final key = _poolKey(endpoint);
+    final endpointKey = _poolKey(endpoint);
+    final Object key = policy == null ? endpointKey : (endpointKey, policy);
     final pooled = _pool[key];
     if (pooled != null) {
       pooled.removeWhere((c) => !c.isOpen || c.peerGoingAway);
@@ -718,9 +788,33 @@ class Switchboard {
     if (existing != null) {
       return existing;
     }
-    final dial = _dialing[key] = _dialPooled(endpoint, key);
+    final dial = _dialing[key] = _dialPooled(endpoint, key, policy);
     _track(dial.then<void>((_) {}, onError: (_) {}));
     return dial;
+  }
+
+  /// A new connection to [endpoint] that is not pooled: established
+  /// through the same path as [connect] (schemes, [connectTimeout], the
+  /// connection's policy chosen from [policy], [endpointPolicy] and
+  /// [outgoingPolicy], [credentialFor] for the channels opened on it with
+  /// [openChannelOn]), adopted for dispatch, reported on [connections] and
+  /// sent GOAWAY by [close], but never handed out by [connect] or used by
+  /// the open methods.
+  ///
+  /// The caller owns it: it opens channels on it ([openChannelOn] applies
+  /// the node's payload rules) and ends it with [MuxConnection.goAway]
+  /// when done. For keeping one connection per peer with its own lifetime,
+  /// such as `PeerSet` does, so that a peer that reboots does not disturb
+  /// the pooled connections other parts of the application use.
+  ///
+  /// Throws like [connect].
+  Future<MuxConnection> dial(Uri endpoint, {ChannelPolicy? policy}) {
+    if (_closing) {
+      return Future.error(_closedException());
+    }
+    final attempt = _dial(endpoint, policy);
+    _track(attempt.then<void>((_) {}, onError: (_) {}));
+    return attempt;
   }
 
   /// Whether [connection] can take another channel within the limit its
@@ -757,9 +851,13 @@ class Switchboard {
     return '$scheme://$host:$port$path$query';
   }
 
-  Future<MuxConnection> _dialPooled(Uri endpoint, String key) async {
+  Future<MuxConnection> _dialPooled(
+    Uri endpoint,
+    Object key,
+    ChannelPolicy? policy,
+  ) async {
     try {
-      final connection = await _dial(endpoint);
+      final connection = await _dial(endpoint, policy);
       final pooled = _pool[key] ??= [];
       pooled.add(connection);
       unawaited(
@@ -778,7 +876,7 @@ class Switchboard {
     }
   }
 
-  Future<MuxConnection> _dial(Uri endpoint) async {
+  Future<MuxConnection> _dial(Uri endpoint, ChannelPolicy? policy) async {
     final StreamChannel<Uint8List> transport;
     switch (endpoint.scheme.toLowerCase()) {
       case 'ws' || 'wss':
@@ -797,13 +895,30 @@ class Switchboard {
       transport,
       isInitiator: true,
       remote: endpoint.toString(),
+      policy: policy ?? _endpointPolicyOf(endpoint) ?? outgoingPolicy,
     );
+    _dialled[connection] = endpoint;
     if (_closing) {
       // Adopted while closing: it goes away at once and close() waits for
       // it.
       throw _closedException();
     }
     return connection;
+  }
+
+  /// What [endpointPolicy] says for [endpoint]; a hook that throws refuses
+  /// everything.
+  ChannelPolicy? _endpointPolicyOf(Uri endpoint) {
+    final hook = endpointPolicy;
+    if (hook == null) {
+      return null;
+    }
+    try {
+      return hook(endpoint);
+    } on Object catch (e, st) {
+      _log.warning('endpoint policy failed for $endpoint', e, st);
+      return ChannelPolicies.denyAll;
+    }
   }
 
   Future<StreamChannel<Uint8List>> _connectTcp(Uri endpoint) async {
@@ -1324,27 +1439,31 @@ class Switchboard {
 
   /// Opens a channel to a service anywhere in the mesh: resolves and
   /// connects with [selectAndConnect], then sends OPEN with the header
-  /// `{type, selected instance, shard}` and [payload] (default:
-  /// [defaultPayload]) as the application payload.
+  /// `{type, selected instance, shard}` and [payload] as the application
+  /// payload (default: what [credentialFor] gives for the endpoint and the
+  /// selected record, or [defaultPayload] without that hook).
   ///
   /// The channel is returned at once; a rejection by the peer arrives as
   /// its close status ([MuxChannel.done]). Only records [where] accepts
   /// are candidates (see [selectAndConnect]). Throws like
-  /// [selectAndConnect], and like [MuxConnection.open] (for example
-  /// [StatusCode.resourceExhausted]).
+  /// [selectAndConnect], like [MuxConnection.open] (for example
+  /// [StatusCode.resourceExhausted]), and like [credentialFor].
   Future<MuxChannel> openChannel(
     ServiceAddress address, {
     int? shard,
     Uint8List? payload,
     bool Function(ServiceRecord record)? where,
   }) async {
-    final application = payload ?? defaultPayload;
     for (var attempt = 0; ; attempt++) {
       final (record, connection) = await selectAndConnect(
         address,
         shard: shard,
         where: where,
       );
+      final implicit = payload ?? _implicitPayload(connection, record);
+      final application = implicit is Future<Uint8List>
+          ? await implicit
+          : implicit;
       final header = ChannelAddress(
         type: address.type,
         instance: record.address.instance,
@@ -1369,11 +1488,12 @@ class Switchboard {
   /// such as the [EndpointResolver] of a frontend client, the endpoint
   /// routes). If the owner rejects it with CLOSE `MOVED` before anything
   /// was sent or received, it is retried once, with the same [payload]
-  /// (default: [defaultPayload]): to the owner the rejection names
-  /// (`MovedStatus`), unless the resolver's table has a more recent one;
-  /// when it names none, to the owner the resolver finds by asking
-  /// ([SlotResolver.locateSlot], bounded by [slotRefreshTimeout]); through
-  /// a resolver without slot tables, the same address again. When the
+  /// (default: the payload [openChannel] gives the new destination): to
+  /// the owner the rejection names (`MovedStatus`), unless the resolver's
+  /// table has a more recent one; when it names none, to the owner the
+  /// resolver finds by asking ([SlotResolver.locateSlot], bounded by
+  /// [slotRefreshTimeout]); through a resolver without slot tables, the
+  /// same address again. When the
   /// refresh finds no owner other than the instance that rejected, or the
   /// retry fails, the returned channel ends with the `MOVED` status. See
   /// [SlotChannel] for why a `MOVED` after the first subframe is not
@@ -1381,19 +1501,24 @@ class Switchboard {
   /// processed) and why a `RELOCATED` never is.
   ///
   /// [where] applies to the first channel and to the retry: an owner it
-  /// refuses is not found (see [selectAndConnect]). Throws like
-  /// [openChannel].
+  /// refuses is not found (see [selectAndConnect]).
+  ///
+  /// Without a [payload], each channel carries the payload [openChannel]
+  /// would give its destination: the retry asks [credentialFor] again for
+  /// the new owner, so a per-destination credential never reaches the
+  /// other instance.
+  ///
+  /// Throws like [openChannel].
   Future<SlotChannel> openChannelToSlot(
     Name type,
     int slot, {
     Uint8List? payload,
     bool Function(ServiceRecord record)? where,
   }) async {
-    final application = payload ?? defaultPayload;
     final first = await openChannel(
       ServiceAddress(type),
       shard: slot,
-      payload: application,
+      payload: payload,
       where: where,
     );
     final rejectedBy = ChannelAddress.decode(first.openPayload).instance;
@@ -1403,10 +1528,11 @@ class Switchboard {
       first,
       (moved) => reopenAtSlotOwner(
         this,
-        ChannelAddress(type: type, shard: slot, payload: application),
+        ChannelAddress(type: type, shard: slot, payload: payload),
         rejectedBy,
         moved,
         where: where,
+        payloadFor: payload == null ? _implicitPayload : null,
       ),
     );
   }
@@ -1443,14 +1569,22 @@ class Switchboard {
   /// its endpoint and how a service reaches the naming service.
   ///
   /// The header (including a host hint, for relays) is sent as given. If
-  /// [ChannelAddress.payload] is empty, [defaultPayload] is sent instead;
-  /// to send an empty application payload from a node that has a default
-  /// payload, use [connect] and [MuxConnection.open]. Throws like [connect]
-  /// and [MuxConnection.open].
+  /// [ChannelAddress.payload] is empty, the payload [credentialFor] gives
+  /// for [endpoint] (with no record) is sent instead, or [defaultPayload]
+  /// without that hook; to send an empty application payload from a node
+  /// that has a default payload, use [connect] and [MuxConnection.open].
+  /// Throws like [connect], [MuxConnection.open] and [credentialFor].
   Future<MuxChannel> openChannelAt(Uri endpoint, ChannelAddress address) async {
-    final bytes = _withDefaultPayload(address).encode();
+    var bytes = address.payload.isEmpty ? null : address.encode();
     for (var attempt = 0; ; attempt++) {
       final connection = await connect(endpoint);
+      if (bytes == null) {
+        final implicit = _credential(endpoint, null);
+        final application = implicit is Future<Uint8List>
+            ? await implicit
+            : implicit;
+        bytes = address.copyWith(payload: application).encode();
+      }
       try {
         return connection.open(bytes);
       } on SwitchboardException catch (e) {
@@ -1474,15 +1608,74 @@ class Switchboard {
 
   /// Opens a channel on an existing [connection], for example one an
   /// incoming channel arrived on, to reach a service the peer registered
-  /// locally (symmetric dispatch). [defaultPayload] is applied as in
-  /// [openChannelAt]. Throws like [MuxConnection.open].
-  MuxChannel openChannelOn(MuxConnection connection, ChannelAddress address) =>
-      connection.open(_withDefaultPayload(address).encode());
+  /// locally (symmetric dispatch). An empty [ChannelAddress.payload] is
+  /// replaced as for [openChannelAt]: by [defaultPayload], or with
+  /// [credentialFor] set, by the hook's payload for the endpoint a
+  /// connection this node initiated goes to, and by an empty payload on a
+  /// connection this node accepted (it has no destination endpoint).
+  ///
+  /// Throws like [MuxConnection.open]. Throws [StateError] when the
+  /// payload would come from [credentialFor] and the hook answers with a
+  /// future: this call cannot wait, so pass the payload in [address] (see
+  /// [payloadFor]).
+  MuxChannel openChannelOn(MuxConnection connection, ChannelAddress address) {
+    if (address.payload.isNotEmpty) {
+      return connection.open(address.encode());
+    }
+    final implicit = _implicitPayload(connection, null);
+    if (implicit is Future<Uint8List>) {
+      implicit.ignore();
+      throw StateError(
+        'credentialFor answered asynchronously; openChannelOn needs the '
+        'payload in the address',
+      );
+    }
+    return connection.open(address.copyWith(payload: implicit).encode());
+  }
 
-  ChannelAddress _withDefaultPayload(ChannelAddress address) =>
-      address.payload.isEmpty && defaultPayload.isNotEmpty
-      ? address.copyWith(payload: defaultPayload)
-      : address;
+  /// The application payload this node attaches to a channel it opens on
+  /// [connection] when the caller supplies none: with [credentialFor], the
+  /// hook's result for the endpoint [connection] was established to
+  /// ([connect], [dial]) and [record] (null: an empty payload), or an
+  /// empty payload for a connection this node accepted; without the hook,
+  /// [defaultPayload].
+  ///
+  /// For opening channels on a connection directly (`PeerSet` does, and
+  /// an application can before [openChannelOn] when the hook is
+  /// asynchronous). Fails like [credentialFor].
+  Future<Uint8List> payloadFor(
+    MuxConnection connection, {
+    ServiceRecord? record,
+  }) async => _implicitPayload(connection, record);
+
+  FutureOr<Uint8List> _implicitPayload(
+    MuxConnection connection,
+    ServiceRecord? record,
+  ) {
+    if (credentialFor == null) {
+      return defaultPayload;
+    }
+    final endpoint = _dialled[connection];
+    if (endpoint == null) {
+      // Accepted: there is no destination endpoint to choose for.
+      return Uint8List(0);
+    }
+    return _credential(endpoint, record);
+  }
+
+  /// The payload for [endpoint] by [credentialFor], or [defaultPayload]
+  /// without the hook.
+  FutureOr<Uint8List> _credential(Uri endpoint, ServiceRecord? record) {
+    final hook = credentialFor;
+    if (hook == null) {
+      return defaultPayload;
+    }
+    final result = hook(endpoint, record);
+    if (result is Future<Uint8List?>) {
+      return result.then((payload) => payload ?? Uint8List(0));
+    }
+    return result ?? Uint8List(0);
+  }
 
   /// A pooled connection may receive GOAWAY, or fill up to its peer's
   /// channel limit, between [connect] and the OPEN; one retry replaces it.
