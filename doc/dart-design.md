@@ -151,6 +151,7 @@ class IOWebSocketTransport {   // dart:io, exported from switchboard.dart only
 
 class WebSocketServerTransport {   // dart:io, exported from switchboard.dart only
   static const int defaultMaxFrameSize = 1 MiB;
+  static const int maxMessageFragments = 4096;   // frames per message, first and continuations
   /// Own handshake (RFC 6455 4.2) and frame reader on the detached socket.
   /// Not an upgrade (GET, HTTP/1.1, Upgrade: websocket, Connection: Upgrade): 426 + Upgrade: websocket;
   /// version != 13: 426 + Sec-WebSocket-Version: 13; missing or malformed key, or only other
@@ -159,10 +160,13 @@ class WebSocketServerTransport {   // dart:io, exported from switchboard.dart on
   /// Reader: masking required, RSV bits, reserved opcodes, fragmented or > 125 byte control frames,
   /// stray continuations: ProtocolException + close 1002; text: ProtocolException + close 1003;
   /// the sum of a message's fragments is checked against maxFrameSize (0 = none) on each fragment
-  /// header, before buffering it: SwitchboardException(frameTooLarge) + close 1009; ping -> pong;
-  /// client close echoed with its code, stream ends. Writer: unmasked frames; closing the sink
-  /// sends close 1000. Output queue, throttling, closeTimeout and linger as for fromSocket.
-  /// pingInterval: ping after a silent interval, abort after two more silent intervals.
+  /// header, before buffering it, and so is the fragment count against maxMessageFragments:
+  /// SwitchboardException(frameTooLarge) + close 1009; fragments are buffered together in pieces
+  /// (at least 64 KiB while more follow, at most 1 MiB), so a message costs about its size however
+  /// it is fragmented; ping -> pong; client close echoed with its code, stream ends. Writer: unmasked
+  /// frames; closing the sink sends close 1000. Output queue, throttling, closeTimeout and linger as
+  /// for fromSocket. pingInterval: ping after a silent interval, abort after two more silent
+  /// intervals; intervals before the stream is listened to, or while reading is paused, count as alive.
   static Future<WebSocketServerChannel> upgrade(HttpRequest request,
       {int maxFrameSize, Duration? pingInterval, int outputHighWaterMark, Duration closeTimeout});
   static Set<String> offeredProtocols(HttpRequest request);
@@ -271,7 +275,7 @@ Text for the integrator, suitable for the "Switchboard Mux" wiki page:
 > * **Rejected OPENs.** A rejected OPEN (over the channel cap, after GOAWAY, or when no longer accepting channels) costs only its id until the peer's confirming CLOSE arrives; no channel state or open payload is kept. If more than a cap of such ids (default 1024) are unconfirmed, the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. A second OPEN on a rejected id before its confirmation is a protocol error.
 > * **Reason truncation.** Reasons in CLOSE and GOAWAY are shortened at a UTF-8 character boundary so that the status payload is at most 1024 bytes and the frame fits the limit the peer announced with LIMITS (GOAWAY must anyway, as a control payload over 1024 bytes is a protocol error).
 > * **Close confirmation timeout.** If the peer does not confirm a CLOSE within a timeout (default 30 s), the channel is reported closed locally with its first status. Nothing is sent; the id stays reserved until the peer's CLOSE arrives after all or the connection ends, because the peer may still consider the channel open and its late frames must not land on a new channel with the same id. Such ids count toward the rejected-OPEN cap.
-> * **WebSocket messages.** The server side WebSocket transport checks the size of a message, all its fragments counted, on each fragment's header, before buffering the fragment, so a message of many fragments that are each within the limit is refused as early as a single oversized frame (close 1009, GOAWAY `FRAME_TOO_LARGE`). It never negotiates permessage-deflate.
+> * **WebSocket messages.** The server side WebSocket transport checks the size of a message, all its fragments counted, on each fragment's header, before buffering the fragment, so a message of many fragments that are each within the limit is refused as early as a single oversized frame (close 1009, GOAWAY `FRAME_TOO_LARGE`). Fragments share buffers of at least 64 KiB, so a message costs about its size however finely it is cut, and a message in more than 4096 frames is refused the same way. It never negotiates permessage-deflate.
 > * **Output.** A transport queues output the connection has not accepted (a peer that does not read). Above a high-water mark (default 16 MiB) it stops reading input, so a peer that sends PINGs without reading cannot make it produce unbounded PONGs; reading resumes once half has drained. While throttled this way, the peer reading our output counts as liveness for keep-alive. A close that cannot drain within the keep-alive timeout destroys the connection.
 
 ## Talk

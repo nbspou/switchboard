@@ -308,6 +308,75 @@ void main() {
       await a.close();
     });
 
+    test('LIMITS mid-connection applies to later frames', () async {
+      final (mux, raw) = rawPair();
+      void announce(int maxFrameSize, int maxChannels) =>
+          raw.transport.sink.add(
+            MuxControlMessage.limits(
+              MuxLimits(maxFrameSize: maxFrameSize, maxChannels: maxChannels),
+            ).toFrame().encode(),
+          );
+      // Frames are handled in order: once the PONG is back, so is LIMITS.
+      Future<void> settle() async {
+        raw.send('02 00 00 01 5E');
+        expect(await raw.nextHex(), '02 00 00 02 5E');
+      }
+
+      final channel = mux.open(empty);
+      expect(await raw.nextHex(), '12 02 00');
+      channel.send(Uint8List(200));
+      expect((await raw.next()).payload, hasLength(200));
+
+      announce(64, 1);
+      await settle();
+      expect(mux.peerLimits, const MuxLimits(maxFrameSize: 64, maxChannels: 1));
+      expect(
+        () => channel.send(Uint8List(62)),
+        throwsStatus(StatusCode.frameTooLarge),
+      );
+      channel.send(Uint8List(61));
+      expect((await raw.next()).encode(), hasLength(64));
+      expect(() => mux.open(empty), throwsStatus(StatusCode.resourceExhausted));
+      // The CLOSE reason is cut to the new limit.
+      final closing = channel.close(Status.of(StatusCode.cancelled, 'z' * 100));
+      final close = await raw.next();
+      expect(close.command, MuxCommand.close);
+      expect(close.encode(), hasLength(64));
+      expect(
+        Status.decode(close.payload),
+        Status.of(StatusCode.cancelled, 'z' * 59),
+      );
+      raw.send('22 02 00');
+      await closing;
+
+      // Raised again: larger frames and more channels are back.
+      announce(4096, 8);
+      await settle();
+      final second = mux.open(Uint8List(1000));
+      expect((await raw.next()).payload, hasLength(1000));
+      second.send(Uint8List(4000));
+      expect((await raw.next()).payload, hasLength(4000));
+      unawaited(second.close());
+      expect(await raw.nextHex(), '22 04 00');
+      raw.send('22 04 00');
+      await second.done;
+
+      // And GOAWAY fits the latest limit too.
+      announce(32, 8);
+      await settle();
+      final goingAway = mux.goAway(
+        Status.of(StatusCode.unavailable, 'w' * 100),
+      );
+      final goAway = await raw.next();
+      expect(goAway.encode(), hasLength(32));
+      expect(
+        MuxControlMessage.decode(goAway.payload).goAwayStatus,
+        Status.of(StatusCode.unavailable, 'w' * 26),
+      );
+      await goingAway;
+      expect(await raw.rest(), isEmpty);
+    });
+
     test('peer channel limit caps open() locally', () async {
       final (a, b) = muxPair(acceptor: quiet.copyWith(maxChannels: 1));
       await a.ping();
@@ -698,6 +767,31 @@ void main() {
         expect(pong.knownType, MuxControlType.pong);
         expect(pong.payload, payload);
       }
+      expect(mux.isOpen, isTrue);
+      await mux.close();
+    });
+
+    test('keep-alive PONGs over 125 bytes are accepted', () async {
+      // The 125 byte PING limit binds senders; a receiver accepts control
+      // payloads up to 1024 bytes, and any frame is a sign of life.
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(
+          keepAliveInterval: const Duration(milliseconds: 20),
+          keepAliveTimeout: const Duration(milliseconds: 200),
+        ),
+      );
+      for (final size in [126, 1024]) {
+        final ping = await raw.next();
+        expect(isControl(ping, MuxControlType.ping), isTrue);
+        raw.transport.sink.add(
+          MuxControlMessage.pong(
+            Uint8List.fromList(List.generate(size, (i) => i & 0xFF)),
+          ).toFrame().encode(),
+        );
+      }
+      // Neither a protocol error nor a missed answer: the next frame is
+      // the next probe, not GOAWAY or the end of the connection.
+      expect(isControl(await raw.next(), MuxControlType.ping), isTrue);
       expect(mux.isOpen, isTrue);
       await mux.close();
     });
@@ -1266,6 +1360,59 @@ void main() {
       );
       await exercise(client, server);
       await listener.close();
+    });
+
+    test('TCP: GOAWAY reaches a peer that is still sending', () async {
+      // The server sends GOAWAY behind 4 MB of data and closes at once,
+      // while the client keeps its socket full. Closing a socket with
+      // unread input resets the connection, and the reset destroys the
+      // GOAWAY in flight; fromSocket lingers (reads and discards until the
+      // client closes) so the client ends with GOING_AWAY, not
+      // CONNECTION_LOST.
+      final listener = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final accepted = listener.first;
+      final clientTransport = await StreamTransport.connectTcp(
+        '127.0.0.1',
+        listener.port,
+      );
+      final client = MuxConnection(
+        clientTransport,
+        isInitiator: true,
+        options: quiet,
+      );
+      final server = MuxConnection(
+        StreamTransport.fromSocket(await accepted),
+        isInitiator: false,
+        options: quiet,
+      );
+      await listener.close();
+      final channel = client.open(empty);
+      final chunk = Uint8List(64 * 1024);
+      // At most 1 MiB queued: the socket stays full, memory bounded.
+      final flood = Timer.periodic(const Duration(milliseconds: 1), (_) {
+        for (var i = 0; i < 32; i++) {
+          if (!channel.canSend ||
+              clientTransport.bufferedOutputBytes > 1 << 20) {
+            return;
+          }
+          channel.send(chunk);
+        }
+      });
+      addTearDown(flood.cancel);
+      final fromServer = channel.stream.drain<void>();
+      final serverSide = await server.incoming.first;
+      final toServer = serverSide.stream.drain<void>();
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      for (var i = 0; i < 64; i++) {
+        serverSide.send(chunk);
+      }
+      final goingAway = server.goAway();
+      await server.close();
+      expect(await client.done, hasCode(StatusCode.goingAway));
+      expect(client.peerGoingAway, isTrue);
+      expect(await channel.done, hasCode(StatusCode.goingAway));
+      await goingAway;
+      await Future.wait([fromServer, toServer]);
     });
 
     test('WebSocket', () async {

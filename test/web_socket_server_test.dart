@@ -540,6 +540,81 @@ void main() {
       expect((await client.next()).closeCode, 1009);
     });
 
+    test('a message in many small fragments costs about its size', () async {
+      final big = await Harness.start(maxFrameSize: 1024 * 1024);
+      final (client, server) = await big.pair();
+      final received = eager(server.stream);
+      // 3000 fragments of 1 to 600 bytes, 900 kB in all: buffered together,
+      // not one buffer per fragment.
+      final expected = BytesBuilder();
+      for (var i = 0; i < 3000; i++) {
+        final fragment = pattern((i * 97) % 600 + 1, i);
+        expected.add(fragment);
+        client.send(
+          clientFrame(i == 0 ? opBinary : opContinuation, fragment, fin: false),
+        );
+      }
+      // The pong comes once the server has read every fragment before it.
+      client.send(clientFrame(opPing, [1]));
+      expect((await client.frames.next).opcode, opPong);
+      final total = expected.length;
+      final buffers = server.messageBuffersForTesting;
+      expect(buffers.pieces, lessThanOrEqualTo(total ~/ (64 * 1024) + 1));
+      expect(buffers.bytes, lessThanOrEqualTo(total + 64 * 1024));
+      client.send(clientFrame(opContinuation, [7]));
+      expected.addByte(7);
+      expect(await received.next, expected.takeBytes());
+      expect(server.messageBuffersForTesting, (pieces: 0, bytes: 0));
+      // Small fragments then a large one fill the piece they share first.
+      final large = pattern(300000, 9);
+      client
+        ..send(clientFrame(opBinary, [1], fin: false))
+        ..send(clientFrame(opContinuation, [2], fin: false))
+        ..send(clientFrame(opContinuation, large));
+      expect(await received.next, [1, 2, ...large]);
+      // A message in one frame is delivered as it was buffered.
+      client.send(clientFrame(opBinary, pattern(3, 5)));
+      expect(await received.next, pattern(3, 5));
+    });
+
+    test('a message in more fragments than the cap: 1009 and '
+        'FRAME_TOO_LARGE', () async {
+      const cap = WebSocketServerTransport.maxMessageFragments;
+      final big = await Harness.start(maxFrameSize: 1024 * 1024);
+      final (client, server) = await big.pair();
+      final received = eager(server.stream);
+      Uint8List fragments(int count, {required bool fin}) {
+        final builder = BytesBuilder();
+        for (var i = 0; i < count; i++) {
+          builder.add(
+            clientFrame(i == 0 ? opBinary : opContinuation, [
+              i & 0xFF,
+            ], fin: fin && i == count - 1),
+          );
+        }
+        return builder.takeBytes();
+      }
+
+      // Exactly at the cap, twice: one piece each, counted per message.
+      for (var round = 0; round < 2; round++) {
+        client.send(fragments(cap - 1, fin: false));
+        client.send(clientFrame(opPing, [round]));
+        expect((await client.frames.next).opcode, opPong);
+        expect(server.messageBuffersForTesting.pieces, 1);
+        client.send(clientFrame(opContinuation, [(cap - 1) & 0xFF]));
+        expect(await received.next, [for (var i = 0; i < cap; i++) i & 0xFF]);
+      }
+      // One more, even empty: refused at its header.
+      client
+        ..send(fragments(cap, fin: false))
+        ..send(clientFrame(opContinuation, const []));
+      await expectLater(
+        received.next,
+        throwsA(isStatusError(StatusCode.frameTooLarge)),
+      );
+      expect((await client.next()).closeCode, 1009);
+    });
+
     test('a fragment is refused on its header, before its payload', () async {
       // The reviewer's case: fragments each within the limit, adding up to
       // far more. The second header alone is enough to refuse it.
@@ -665,14 +740,38 @@ void main() {
       final client = await RawClient.connect(h.port);
       addTearDown(client.destroy);
       final server = await h.accepted.next;
+      final drained = server.stream.drain<void>();
       final ping = await client.frames.next;
       expect(ping.opcode, opPing);
       // Never answered: the server aborts after two more intervals.
       final watch = Stopwatch()..start();
-      await server.stream.drain<void>();
+      await drained;
       await client.closed.future;
       expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
     });
+
+    test(
+      'a stream not listened to yet is neither pinged nor dropped',
+      () async {
+        final h = await Harness.start(
+          pingInterval: const Duration(milliseconds: 30),
+        );
+        final client = await RawClient.connect(h.port);
+        addTearDown(client.destroy);
+        final server = await h.accepted.next;
+        // Ten intervals without reading: silence says nothing about the
+        // client.
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        expect(client.closed.isCompleted, isFalse);
+        client.send(clientFrame(opBinary, [1, 2, 3]));
+        final received = eager(server.stream);
+        expect(await received.next, [1, 2, 3]);
+        // Pings start once the stream is read.
+        final ping = await client.frames.next;
+        expect(ping.opcode, opPing);
+        await server.sink.close();
+      },
+    );
 
     test('a client that answers stays', () async {
       final h = await Harness.start(

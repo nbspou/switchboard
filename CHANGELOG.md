@@ -12,7 +12,8 @@ The protocol specification lives in the project wiki (section
   output backpressure, close timeout and linger; the WebSocket binding
   (subprotocol `switchboard`) for clients on every platform, with a
   connect timeout, and on `dart:io`; `WebSocketServerTransport`, a server side that bounds whole
-  messages before buffering them and never negotiates compression; an
+  messages (size and fragment count) before buffering them, buffers a
+  fragmented message at about its size, and never negotiates compression; an
   in-memory pair; the optional capabilities `FrameLimited`,
   `AbortableTransport` and `OutputBufferedTransport`.
 - Mux: channels opened by either side, short and long ids reused after

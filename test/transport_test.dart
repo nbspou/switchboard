@@ -199,6 +199,18 @@ void main() {
       await expectLater(a.sink.done, throwsStateError);
       expect(await b.stream.isEmpty, isTrue);
     });
+
+    test('done after addError is one future, failed once', () async {
+      final (a, _) = MemoryTransport.pair();
+      a.sink.addError(StateError('boom'));
+      // Reading done again, or closing, gives the same future, and leaving
+      // it unobserved is not an unhandled error.
+      final done = a.sink.done;
+      expect(identical(a.sink.done, done), isTrue);
+      expect(identical(a.sink.close(), done), isTrue);
+      await pumpEventQueue();
+      await expectLater(done, throwsStateError);
+    });
   });
 
   group('StreamTransport over byte pipes', () {

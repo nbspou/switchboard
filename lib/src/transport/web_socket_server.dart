@@ -13,6 +13,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../status.dart';
@@ -41,6 +42,12 @@ abstract final class WebSocketServerTransport {
   /// `MuxOptions.defaultMaxFrameSize`.
   static const int defaultMaxFrameSize = WebSocketTransport.defaultMaxFrameSize;
 
+  /// Most frames an incoming message may arrive in, its first frame and
+  /// continuations counted. Clients fragment at the size of a buffer, at
+  /// least kilobytes, so only a client cutting a message into slivers
+  /// reaches it.
+  static const int maxMessageFragments = 4096;
+
   /// The GUID of RFC 6455 section 1.3, appended to the client's key.
   static const String _acceptGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -67,9 +74,11 @@ abstract final class WebSocketServerTransport {
   /// * A text message is a [ProtocolException] (close code 1003).
   /// * Binary messages, fragmented or not, become frames. The sum of the
   ///   fragments of a message is checked against [maxFrameSize] (0 = no
-  ///   limit) before each fragment is buffered; a message over it fails the
-  ///   stream with a [SwitchboardException] carrying
-  ///   [StatusCode.frameTooLarge] and closes with code 1009.
+  ///   limit) before each fragment is buffered; a message over it, or in
+  ///   more than [maxMessageFragments] frames, fails the stream with a
+  ///   [SwitchboardException] carrying [StatusCode.frameTooLarge] and
+  ///   closes with code 1009. Fragments are buffered together, so a message
+  ///   costs about its size however it is fragmented.
   /// * Pings are answered with pongs; pongs are noted as signs of life.
   /// * A close frame from the client is echoed with its code, and the
   ///   stream ends.
@@ -85,9 +94,10 @@ abstract final class WebSocketServerTransport {
   /// interval: after an interval in which nothing arrived from the client,
   /// a ping is sent, and when two further intervals pass without anything
   /// arriving (pongs included), the connection is aborted. Intervals in
-  /// which reading was paused, or the client was reading output that held
-  /// back our reading, count as signs of life. Null (the default) leaves
-  /// liveness to the mux keep-alive.
+  /// which reading had not started (the stream was not listened to yet) or
+  /// was paused, or the client was reading output that held back our
+  /// reading, count as signs of life. Null (the default) leaves liveness to
+  /// the mux keep-alive.
   ///
   /// Output is buffered and throttled as for `StreamTransport.wrap`, with
   /// [outputHighWaterMark] and [closeTimeout].
@@ -316,6 +326,14 @@ final class WebSocketServerChannel
     _core.abort();
   }
 
+  /// The buffers holding the message being assembled: how many, and their
+  /// total size.
+  @visibleForTesting
+  ({int pieces, int bytes}) get messageBuffersForTesting => (
+    pieces: _framing._pieces.length,
+    bytes: _framing._pieces.fold(0, (sum, piece) => sum + piece.length),
+  );
+
   void _onPingTimer(Timer timer) {
     if (_core.isEnded) {
       _stopPing();
@@ -324,8 +342,10 @@ final class WebSocketServerChannel
     final accepted = _core.acceptedOutputBytes;
     final alive =
         _framing.takeActivity() ||
-        // Not reading, so silence says nothing about the client; or the
-        // client is reading output that holds back our reading.
+        // Not reading (not yet, or paused), so silence says nothing about
+        // the client; or the client is reading output that holds back our
+        // reading.
+        !_core.isInputStarted ||
         (_core.isInputPaused && !_core.isInputThrottled) ||
         (_core.isInputThrottled && accepted != _lastAcceptedOutput);
     _lastAcceptedOutput = accepted;
@@ -368,6 +388,11 @@ class _WebSocketFraming extends ByteFraming {
   /// claimed length is only backed by memory as the bytes arrive.
   static const int _pieceSize = 1024 * 1024;
 
+  /// Smallest buffer allocated for a fragment that is not the last of its
+  /// message: later fragments fill it, so that a message costs about its
+  /// size however finely it is fragmented.
+  static const int _minPieceSize = 64 * 1024;
+
   final int maxMessageSize;
 
   // Header of the frame being read.
@@ -386,11 +411,13 @@ class _WebSocketFraming extends ByteFraming {
   Uint8List? _piece;
   int _pieceFill = 0;
 
-  // Data message being assembled.
+  // Data message being assembled: its payload so far fills [_pieces], each
+  // full but the last ([_piece], [_pieceFill] bytes used).
   bool _inMessage = false;
   int _messageLength = 0;
+  int _fragmentCount = 0;
   int _buffered = 0;
-  final List<Uint8List> _fragments = [];
+  final List<Uint8List> _pieces = [];
 
   bool _stopped = false;
   bool _closeSent = false;
@@ -563,10 +590,17 @@ class _WebSocketFraming extends ByteFraming {
           'limit of $limit',
         );
       }
+      const maxFragments = WebSocketServerTransport.maxMessageFragments;
+      if (++_fragmentCount > maxFragments) {
+        _closeCode = closeMessageTooBig;
+        throw SwitchboardException.of(
+          StatusCode.frameTooLarge,
+          'message in more than $maxFragments fragments',
+        );
+      }
       _inMessage = true;
       _messageLength += length;
       _control = null;
-      _piece = null;
     } else {
       _control = Uint8List(length);
     }
@@ -589,13 +623,17 @@ class _WebSocketFraming extends ByteFraming {
     } else {
       var piece = _piece;
       if (piece == null || _pieceFill == piece.length) {
-        piece = _piece = Uint8List(min(remaining, _pieceSize));
+        piece = _piece = Uint8List(_nextPieceSize(remaining));
         _pieceFill = 0;
-        _fragments.add(piece);
+        _pieces.add(piece);
       }
       target = piece;
       targetOffset = _pieceFill;
-      take = min(piece.length - _pieceFill, chunk.length - offset);
+      // The piece may have room beyond this frame, for the next fragments.
+      take = min(
+        min(remaining, piece.length - _pieceFill),
+        chunk.length - offset,
+      );
       _pieceFill += take;
       _buffered += take;
     }
@@ -611,6 +649,27 @@ class _WebSocketFraming extends ByteFraming {
     return offset + take;
   }
 
+  /// Size of the next piece, for a data frame with [remaining] bytes still
+  /// to read: all of them, at most [_pieceSize]; room for later fragments
+  /// too if more follow, at least [_minPieceSize]; never more than the
+  /// message may still hold.
+  int _nextPieceSize(int remaining) {
+    var size = remaining;
+    if (!_fin && size < _minPieceSize) {
+      size = _minPieceSize;
+    }
+    if (size > _pieceSize) {
+      size = _pieceSize;
+    }
+    final limit = maxMessageSize;
+    if (limit > 0) {
+      size = min(size, limit - _buffered);
+    }
+    // The message length was checked on the header.
+    assert(size >= min(remaining, _pieceSize));
+    return size;
+  }
+
   void _endFrame(FramedByteTransport transport) {
     _inPayload = false;
     final control = _control;
@@ -623,11 +682,13 @@ class _WebSocketFraming extends ByteFraming {
       case opClose:
         _onClose(control!, transport);
       default:
-        _piece = null;
         if (_fin) {
           final message = _assemble();
-          _fragments.clear();
+          _pieces.clear();
+          _piece = null;
+          _pieceFill = 0;
           _messageLength = 0;
+          _fragmentCount = 0;
           _buffered = 0;
           _inMessage = false;
           transport.deliver(message);
@@ -635,15 +696,20 @@ class _WebSocketFraming extends ByteFraming {
     }
   }
 
+  /// The message in [_pieces]: the piece itself when it holds exactly the
+  /// message, else a copy, so that a short message never keeps a larger
+  /// piece alive.
   Uint8List _assemble() {
-    if (_fragments.length == 1) {
-      return _fragments.single;
+    final length = _buffered;
+    if (_pieces.length == 1 && _pieces.single.length == length) {
+      return _pieces.single;
     }
-    final out = Uint8List(_messageLength);
+    final out = Uint8List(length);
     var at = 0;
-    for (final fragment in _fragments) {
-      out.setRange(at, at + fragment.length, fragment);
-      at += fragment.length;
+    for (final piece in _pieces) {
+      final take = min(piece.length, length - at);
+      out.setRange(at, at + take, piece);
+      at += take;
     }
     return out;
   }

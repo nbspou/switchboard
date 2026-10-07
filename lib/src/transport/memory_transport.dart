@@ -179,7 +179,9 @@ class _MemorySink implements StreamSink<Uint8List> {
 
   final _MemoryEndpoint endpoint;
   bool _closed = false;
-  Object? _error;
+
+  /// [done] after [addError]: one future, failed with the error.
+  Future<void>? _failed;
 
   @override
   void add(Uint8List event) {
@@ -195,7 +197,8 @@ class _MemorySink implements StreamSink<Uint8List> {
       throw StateError('memory transport sink is closed');
     }
     _closed = true;
-    _error = error;
+    // Reported to whoever awaits done, not as an unhandled error.
+    _failed = Future<void>.error(error, stackTrace)..ignore();
     endpoint.link.close(endpoint, immediate: true);
   }
 
@@ -217,11 +220,5 @@ class _MemorySink implements StreamSink<Uint8List> {
   }
 
   @override
-  Future<void> get done {
-    final error = _error;
-    if (error != null) {
-      return Future<void>.error(error);
-    }
-    return endpoint._done.future;
-  }
+  Future<void> get done => _failed ?? endpoint._done.future;
 }
