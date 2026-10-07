@@ -399,7 +399,9 @@ class NamingClient {
   /// the instance id the naming service assigned ([instance] 0) or
   /// accepted. [metadata] (copied; null is empty, at most
   /// [maxMetadataLength] bytes) is published with the record for consumers
-  /// to select on ([ServiceRecord.metadata]).
+  /// to select on ([ServiceRecord.metadata]). Every watcher of the naming
+  /// table sees it, so a key placed there authenticates the mesh to the
+  /// instance, not the instance to the mesh.
   ///
   /// The endpoints need not be this process's: a registrar (a scaler, an
   /// operator tool) may register any number of records for endpoints that

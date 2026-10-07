@@ -21,7 +21,9 @@ import '../status_closable.dart';
 final Logger _log = Logger('Switchboard.Router');
 
 /// Opens the replacement channel after a `MOVED` rejection, or returns
-/// null when there is nowhere else to go.
+/// null when there is nowhere else to go. Fails with a
+/// [SwitchboardException] [StatusCode.notFound] when the caller's filter
+/// refuses the new owner: the [SlotChannel] then ends with that status.
 typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 
 /// A channel to the owner of a shard slot, opened with
@@ -234,16 +236,21 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _streamEnded = false;
     await old?.cancel();
     MuxChannel? next;
+    Status? refused;
     try {
       next = await _reopen(moved);
     } on Object catch (e) {
       _log.fine('$type/$slot: retry after $moved failed: $e');
+      if (e is SwitchboardException && e.code == StatusCode.notFound) {
+        refused = e.status;
+      }
     }
     _reopening = false;
     if (next == null) {
-      // Reported as the rejection itself: the caller re-resolves.
+      // Reported as the rejection itself, so that the caller re-resolves;
+      // or, when its filter refused the new owner, as that.
       _streamEnded = true;
-      _finish(moved);
+      _finish(refused ?? moved);
       return;
     }
     _log.fine('$type/$slot moved ($moved), retried on $next');

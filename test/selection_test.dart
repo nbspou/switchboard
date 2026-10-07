@@ -1,5 +1,6 @@
 // Instance selection on the consumer side (a `where` filter over the
-// records, the node's selection policy) and the dispatch of a registration
+// records, also on the MOVED retry; the node's selection policy) and the
+// dispatch of a registration
 // that accepts any instance: the naming side of the untrusted worker fleet
 // (wiki page "Switchboard Use Cases", entry 5).
 
@@ -252,6 +253,80 @@ void main() {
         client.openTalkToSlot(gpu, 1, where: offers('a')),
         throwsCode(StatusCode.notFound),
       );
+    });
+  });
+
+  group('where on the MOVED retry', () {
+    late StaticResolver resolver;
+    late List<String> seen;
+
+    setUp(() async {
+      // Instance 1 rejects every channel with MOVED to 2; 2 answers.
+      final one = node();
+      final two = node();
+      seen = [];
+      one.registerService(gpu, (incoming) {
+        seen.add('1');
+        unawaited(incoming.reject(MovedStatus(owner: 2, epoch: 2).toStatus()));
+      }, instance: 1);
+      two.registerService(gpu, (incoming) {
+        seen.add('2');
+        answering('w')(incoming);
+      }, instance: 2);
+      resolver = StaticResolver([
+        ServiceRecord(
+          ServiceAddress(gpu, 1),
+          endpoints: [await one.listenMemory()],
+          metadata: offering(['a']),
+        ),
+        ServiceRecord(
+          ServiceAddress(gpu, 2),
+          endpoints: [await two.listenMemory()],
+          metadata: offering(['b']),
+        ),
+      ]);
+      resolver
+        ..defineSlots(SlotSpace(gpu, count: 4, mode: SlotMode.static))
+        ..setSlot(gpu, 1, const SlotEntry.owned(1, epoch: 1));
+    });
+
+    test('a new owner the filter accepts is retried', () async {
+      final client = node(resolver: resolver);
+      final channel = await client.openChannelToSlot(
+        gpu,
+        1,
+        where: (_) => true,
+      );
+      expect(utf8.decode((await channel.stream.toList()).single), 'w 2');
+      expect(channel.retried, isTrue);
+      expect(seen, ['1', '2']);
+    });
+
+    test('a new owner the filter refuses: the channel ends with NOT_FOUND, '
+        'the owner is never reached', () async {
+      final client = node(resolver: resolver);
+      final channel = await client.openChannelToSlot(
+        gpu,
+        1,
+        where: offers('a'),
+      );
+      expect(await channel.stream.toList(), isEmpty);
+      final status = await channel.done;
+      expect(status.known, StatusCode.notFound);
+      expect(channel.retried, isTrue);
+      expect(seen, ['1']);
+    });
+
+    test('a new owner the resolver does not know: MOVED, as before', () async {
+      resolver.remove(ServiceAddress(gpu, 2));
+      final client = node(resolver: resolver);
+      final channel = await client.openChannelToSlot(
+        gpu,
+        1,
+        where: offers('a'),
+      );
+      expect((await channel.done).known, StatusCode.moved);
+      expect(seen, ['1']);
     });
   });
 

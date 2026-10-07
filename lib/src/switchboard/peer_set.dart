@@ -33,15 +33,24 @@ enum PeerState {
   added,
 
   /// A connection attempt is in progress: dialling the record's endpoints,
-  /// or connected and running the `onConnect` hook and opening the
-  /// per-peer channel ([Peer.connection] is set then).
+  /// or connected and running the `onConnect` hook and setting up the
+  /// per-peer channel ([Peer.connection] is set then); or, on a live
+  /// connection, re-opening the per-peer channel.
   connecting,
 
-  /// Connected and set up: [Peer.connection] is live.
+  /// Connected and set up: [Peer.connection] is live, its hooks succeeded
+  /// and the per-peer channel (if any) is open.
   online,
 
-  /// Not connected; the next attempt is due at [Peer.nextAttemptAt].
+  /// Not usable: not connected, or connected with the per-peer channel
+  /// closed. The next attempt (a connection, or the channel on the live
+  /// connection) is due at [Peer.nextAttemptAt].
   offline,
+
+  /// The record left the resolver less than the set's removal hold-down
+  /// ago: the connection is kept, in case the record comes back (a naming
+  /// service or registrar restart). Not counted [PeerSet.online].
+  held,
 
   /// Gone from the resolver, or the set was closed. Final.
   removed,
@@ -56,16 +65,22 @@ enum PeerEventType {
   online,
 
   /// The peer stopped being online (its connection was lost, the peer sent
-  /// GOAWAY, its per-peer channel was refused), or its first connection
-  /// attempt failed. Reported once until the peer is online again.
+  /// GOAWAY, its per-peer channel ended or was refused, a hook failed), or
+  /// its first connection attempt failed. Reported once until the peer is
+  /// online again.
   offline,
 
   /// The resolver's record of the peer changed ([Peer.record]): other
   /// endpoints, or other metadata.
   updated,
 
-  /// The record left the resolver, or the set was closed. The last event
-  /// of the peer.
+  /// The record left the resolver: the peer is [PeerState.held] for the
+  /// set's removal hold-down, then removed, unless its record comes back
+  /// first (then `online` or `offline` follows, as the peer stands).
+  held,
+
+  /// The record left the resolver (after the hold-down), or the set was
+  /// closed. The last event of the peer.
   removed,
 }
 
@@ -121,12 +136,21 @@ class PeerEvent {
 /// ```
 ///
 /// Membership is the resolver's records of the type: the records
-/// [Resolver.resolve] returns once the resolver is [Resolver.ready], then
-/// its [Resolver.events]. A record that appears is added and connected;
-/// one that leaves is removed: its connection is sent GOAWAY (the channels
-/// the application opened on it get the grace period) and the peer ends
-/// in [PeerState.removed]. A record that changes is updated; if its
-/// endpoints changed, the peer moves to the new ones.
+/// [Resolver.resolve] returns once the resolver is [Resolver.ready], with
+/// the events that arrived while it answered folded in, then its
+/// [Resolver.events]. A record that appears is added and connected. A
+/// record that changes is updated; if its endpoints changed, the peer
+/// moves to the new ones. A record that leaves is held for
+/// [removalHoldDown] ([PeerState.held]): the peer's connection stays up,
+/// and if a record with the same address comes back in time at the
+/// endpoint the peer is connected to (or the peer is not connected), the
+/// peer is adopted again as it stands, connection and channel included.
+/// Otherwise the peer is removed: its connection is sent GOAWAY (the
+/// channels the application opened on it get the grace period) and the
+/// peer ends in [PeerState.removed]. The hold-down exists because a
+/// naming service or a registrar that restarts makes every record of the
+/// fleet disappear for a moment; without it every job in flight would be
+/// cut after the GOAWAY grace period.
 ///
 /// Connections: the set owns one connection per peer, established with
 /// [Switchboard.dial] and never pooled, so that a worker that reboots
@@ -135,38 +159,45 @@ class PeerEvent {
 /// [Switchboard.endpointPolicy], else [Switchboard.outgoingPolicy]), and
 /// [Switchboard.credentialFor] chooses the payload of the channels opened
 /// on it. Each attempt dials the record's endpoints in order and keeps the
-/// first that answers, within [connectTimeout].
+/// first that answers, within [connectTimeout]: each endpoint gets the
+/// time left divided by the endpoints left, so that one that does not
+/// answer at all leaves time for the next.
 ///
-/// Once connected, `onConnect` runs, then the per-peer [channel] (if any)
-/// is opened, a PING round trip on the connection makes sure the peer did
-/// not refuse it on arrival, and `onOpen` runs with it; only then is the
-/// peer [PeerState.online]. A hook that throws or fails is logged and the
-/// peer still goes online; each step is waited for at most
-/// [connectTimeout] (then a warning is logged and the peer goes online all
-/// the same). The hooks run again after every reconnect.
+/// A peer is online only once it is usable: once connected, `onConnect`
+/// runs, then the per-peer [channel] (if any) is opened, a PING round trip
+/// on the connection makes sure the peer did not refuse it on arrival, and
+/// `onOpen` runs with it; only then is the peer [PeerState.online]. A hook
+/// that throws, fails or does not complete within [connectTimeout], and a
+/// per-peer channel the peer refuses or closes before the peer is online
+/// (with any status), fail the attempt: the set leaves the connection with
+/// GOAWAY and the peer is offline (with [StatusCode.internal] for a hook,
+/// the channel's close status for the channel) until the next attempt
+/// after the backoff. The hooks run again after every reconnect.
 ///
 /// The per-peer channel behaves like a `PersistentChannel` of a
-/// `ReconnectingClient`: opened on every connection; when it ends while
-/// the connection stays up, opened again after a backoff kept per peer
-/// (reset by a channel that lasted longer than [maxBackoff]) and `onOpen`
-/// runs again, while the peer stays online with [Peer.channel] null in
-/// between. A refusal that will not change on its own
-/// (`PERMISSION_DENIED`, `UNAUTHENTICATED`, `UNIMPLEMENTED`, `NOT_FOUND`)
-/// is a failed connection instead: the set leaves the connection with
-/// GOAWAY and the peer goes offline with that status until the next
+/// `ReconnectingClient`: when it ends while the connection stays up, the
+/// peer goes offline with its close status and the channel is set up again
+/// on that connection after a backoff kept per peer (reset by a channel
+/// that lasted longer than [maxBackoff]), with the same PING round trip
+/// and `onOpen`, bounded the same way; a re-open that fails is tried again
+/// after the backoff, and the peer is online again once one succeeds. A
+/// status that will not change on its own (`PERMISSION_DENIED`,
+/// `UNAUTHENTICATED`, `UNIMPLEMENTED`, `NOT_FOUND`) fails the connection
+/// instead: GOAWAY, offline with that status until the next connection
 /// attempt after the backoff.
 ///
 /// Backoff, as for `ReconnectingClient`: the first attempt is immediate;
 /// after `n` consecutive failures the delay is
 /// `min(initialBackoff * backoffFactor^n, maxBackoff)` times a random
 /// factor in `[1 - jitter, 1 + jitter]`. A connection that ends counts as
-/// a failure unless it lasted longer than [maxBackoff]. A GOAWAY
-/// `GOING_AWAY` from the peer (a worker shutting down or rebooting) is not
-/// waited out: the peer goes offline, its channel on the old connection is
-/// closed with `GOING_AWAY`, the old connection is left to the
-/// application's channels on it, and a new attempt is made at once (with
-/// the backoff only if it fails, or if the connection was itself made
-/// after a GOAWAY and did not last [maxBackoff]).
+/// a failure unless the peer went online on it and it lasted longer than
+/// [maxBackoff]. A GOAWAY `GOING_AWAY` from the peer (a worker shutting
+/// down or rebooting) is not waited out: the peer goes offline, its
+/// channel on the old connection is closed with `GOING_AWAY`, the old
+/// connection is left to the application's channels on it, and a new
+/// attempt is made at once (with the backoff only if it fails, or if the
+/// connection was itself made after a GOAWAY and did not last
+/// [maxBackoff]).
 ///
 /// Close the set before the [Switchboard]: once the node is closed every
 /// attempt fails and the set keeps retrying.
@@ -183,6 +214,7 @@ class PeerSet {
     required this.backoffFactor,
     required this.jitter,
     required this.connectTimeout,
+    required this.removalHoldDown,
     required this.policy,
     required Random? random,
   }) : _schedule = Backoff(
@@ -212,14 +244,24 @@ class PeerSet {
   /// [initialBackoff], [maxBackoff], [backoffFactor] and [jitter] are the
   /// backoff schedule of each peer, as for `ReconnectingClient`.
   /// [connectTimeout] bounds each connection attempt (dialling the
-  /// endpoints one after the other) and each hook; [Duration.zero] waits
-  /// for ever. [policy] is the policy of the set's connections, overriding
-  /// the node's [Switchboard.endpointPolicy] and
+  /// endpoints one after the other) and each step of the set-up (each
+  /// hook, the PING round trip); [Duration.zero] waits for ever.
+  /// [removalHoldDown] is how long a peer whose record left the resolver
+  /// is kept ([PeerState.held]) before it is removed; [Duration.zero]
+  /// removes it at once. [policy] is the policy of the set's connections,
+  /// overriding the node's [Switchboard.endpointPolicy] and
   /// [Switchboard.outgoingPolicy]. [random] drives the jitter (for tests).
   ///
+  /// Logs a warning when no policy applies to the set's connections (no
+  /// [policy], and the node has neither an outgoing nor an endpoint
+  /// policy: every peer may open channels to the node's services), and
+  /// when the node's [Switchboard.defaultPayload] is not empty and it has
+  /// no [Switchboard.credentialFor] (every peer receives the node's
+  /// credential).
+  ///
   /// Throws [ArgumentError] when there is no resolver, when [onOpen] is
-  /// given without [channel], and for a backoff schedule
-  /// `ReconnectingClient` would refuse.
+  /// given without [channel], for a negative [removalHoldDown], and for a
+  /// backoff schedule `ReconnectingClient` would refuse.
   factory PeerSet.watch(
     Switchboard switchboard,
     Name type, {
@@ -232,6 +274,7 @@ class PeerSet {
     double backoffFactor = 2,
     double jitter = 0.2,
     Duration connectTimeout = const Duration(seconds: 10),
+    Duration removalHoldDown = const Duration(seconds: 15),
     ChannelPolicy? policy,
     Random? random,
   }) {
@@ -246,6 +289,13 @@ class PeerSet {
     if (onOpen != null && channel == null) {
       throw ArgumentError.value(onOpen, 'onOpen', 'needs a channel');
     }
+    if (removalHoldDown < Duration.zero) {
+      throw ArgumentError.value(
+        removalHoldDown,
+        'removalHoldDown',
+        'must not be negative',
+      );
+    }
     final set = PeerSet._(
       switchboard,
       type,
@@ -258,9 +308,26 @@ class PeerSet {
       backoffFactor: backoffFactor,
       jitter: jitter,
       connectTimeout: connectTimeout,
+      removalHoldDown: removalHoldDown,
       policy: policy,
       random: random,
     );
+    if (policy == null &&
+        switchboard.outgoingPolicy == null &&
+        switchboard.endpointPolicy == null) {
+      _log.warning(
+        'peer set $type: no policy applies to its connections, so every '
+        'peer may open channels to the services of this node; give the set '
+        'a policy, or the node an outgoingPolicy or endpointPolicy',
+      );
+    }
+    if (switchboard.credentialFor == null &&
+        switchboard.defaultPayload.isNotEmpty) {
+      _log.warning(
+        'peer set $type: the node has a defaultPayload and no '
+        'credentialFor, so every peer receives the node\'s credential',
+      );
+    }
     set._start();
     return set;
   }
@@ -296,9 +363,13 @@ class PeerSet {
   /// Random spread of each delay, as a fraction of it.
   final double jitter;
 
-  /// Bound on each connection attempt and each hook; [Duration.zero] for
-  /// none.
+  /// Bound on each connection attempt and each step of the set-up;
+  /// [Duration.zero] for none.
   final Duration connectTimeout;
+
+  /// How long a peer whose record left the resolver is held before it is
+  /// removed; [Duration.zero] for not at all.
+  final Duration removalHoldDown;
 
   /// The policy of the set's connections, or null for the node's.
   final ChannelPolicy? policy;
@@ -325,8 +396,8 @@ class PeerSet {
     return completer;
   }
 
-  /// The peers by instance id, in the order they were added. A live,
-  /// unmodifiable view; empty after [close].
+  /// The peers by instance id, in the order they were added, held ones
+  /// included. A live, unmodifiable view; empty after [close].
   Map<int, Peer> get peers => UnmodifiableMapView(_peers);
 
   /// The peers that are [PeerState.online].
@@ -346,31 +417,41 @@ class PeerSet {
   bool get isClosed => _closed;
 
   void _start() {
+    // Until the initial records are read: the events of the type. Those
+    // that came before resolve() was called are in its answer and are
+    // dropped; those that come while it answers are folded into it.
     final buffered = <ServiceEvent>[];
     var initial = true;
-    _subscription = resolver.events.listen((event) {
-      if (event.record.address.type != type || _closed) {
-        return;
-      }
-      if (initial) {
-        buffered.add(event);
-      } else {
-        _apply(event);
-      }
-    });
+    _subscription = resolver.events.listen(
+      (event) {
+        if (event.record.address.type != type || _closed) {
+          return;
+        }
+        if (initial) {
+          buffered.add(event);
+        } else {
+          _apply(event);
+        }
+      },
+      onError: (Object e, StackTrace st) {
+        // A broadcast or single-subscription stream alike goes on after
+        // an error event; so does the set.
+        _log.warning('peer set $type: resolver event error', e, st);
+      },
+    );
     Future<void> load() async {
       Object? error;
       StackTrace? stack;
+      var records = const <ServiceRecord>[];
       try {
         await resolver.ready;
-        final records = await resolver.resolve(type);
         if (_closed) {
           return;
         }
-        for (final record in records) {
-          if (record.address.type == type) {
-            _upsert(record);
-          }
+        buffered.clear();
+        records = await resolver.resolve(type);
+        if (_closed) {
+          return;
         }
       } on Object catch (e, st) {
         if (_closed) {
@@ -380,13 +461,25 @@ class PeerSet {
         error = e;
         stack = st;
       }
-      // Events that came meanwhile may predate the records just read;
-      // applied in order, they end in the resolver's current state.
-      initial = false;
+      // The answer may or may not include the events that came meanwhile;
+      // UP replaces a record and DOWN removes it, so applying all of them
+      // to the answer, in order, gives the resolver's current table. Each
+      // record of it is added once; one that came and went never is.
+      final table = <int, ServiceRecord>{
+        for (final record in records)
+          if (record.address.type == type) record.address.instance: record,
+      };
       for (final event in buffered) {
-        _apply(event);
+        final instance = event.record.address.instance;
+        if (event.up) {
+          table[instance] = event.record;
+        } else {
+          table.remove(instance);
+        }
       }
       buffered.clear();
+      initial = false;
+      table.values.forEach(_upsert);
       if (!_ready.isCompleted) {
         if (error == null) {
           _ready.complete();
@@ -407,21 +500,49 @@ class PeerSet {
       _upsert(event.record);
       return;
     }
-    final peer = _peers.remove(event.record.address.instance);
-    peer?._remove(null);
+    final instance = event.record.address.instance;
+    final peer = _peers[instance];
+    if (peer == null || peer._isHeld) {
+      return;
+    }
+    if (removalHoldDown > Duration.zero) {
+      peer._hold();
+    } else {
+      _peers.remove(instance);
+      peer._remove(null);
+    }
   }
 
   void _upsert(ServiceRecord record) {
-    final existing = _peers[record.address.instance];
-    if (existing == null) {
-      final peer = Peer._(this, record);
-      _peers[record.address.instance] = peer;
-      _log.fine('peer set $type: ${record.address} added');
-      _emit(PeerEvent(PeerEventType.added, peer));
-      peer._attemptConnect();
-    } else if (existing.record != record) {
-      existing._update(record);
+    final instance = record.address.instance;
+    final existing = _peers[instance];
+    if (existing != null && existing._isHeld) {
+      if (existing._readopt(record)) {
+        return;
+      }
+      // Elsewhere now: the held peer goes, a new one comes.
+      _peers.remove(instance);
+      existing._remove(null);
+    } else if (existing != null) {
+      if (existing.record != record) {
+        existing._update(record);
+      }
+      return;
     }
+    final peer = Peer._(this, record);
+    _peers[instance] = peer;
+    _log.fine('peer set $type: ${record.address} added');
+    _emit(PeerEvent(PeerEventType.added, peer));
+    peer._attemptConnect();
+  }
+
+  /// The hold-down of [peer] ran out: it goes.
+  void _expire(Peer peer) {
+    final instance = peer.address.instance;
+    if (identical(_peers[instance], peer)) {
+      _peers.remove(instance);
+    }
+    peer._remove(null);
   }
 
   void _emit(PeerEvent event) {
@@ -474,9 +595,10 @@ class PeerSet {
   ///
   /// Throws [SwitchboardException] with [StatusCode.notFound] if the set
   /// has no such peer, with [StatusCode.failedPrecondition] if the peer
-  /// has no usable connection (offline, or its connection received
-  /// GOAWAY; it works while the peer is connecting with its hooks
-  /// running) or the set is closed, and like [MuxConnection.open] and
+  /// has no usable connection (not connected, or its connection received
+  /// GOAWAY; it works while the peer is connecting with its hooks running,
+  /// while its per-peer channel is being re-opened, and while it is held)
+  /// or the set is closed, and like [MuxConnection.open] and
   /// [Switchboard.credentialFor].
   Future<MuxChannel> openChannel(int instance, {Uint8List? payload}) async {
     if (_closed) {
@@ -559,8 +681,11 @@ class PeerSet {
     }
     try {
       await unsubscribed;
-      // A connection that lands now is sent GOAWAY at once.
-      await Future.wait(List.of(_dials));
+      // A connection that lands now is sent GOAWAY at once. A dial given
+      // up on is tracked when it is given up on, so look again.
+      while (_dials.isNotEmpty) {
+        await Future.wait(List.of(_dials));
+      }
       await Future.wait(List.of(_retiring));
     } on Object catch (e, st) {
       _log.warning('error while closing the peer set', e, st);
@@ -603,51 +728,63 @@ class Peer {
   MuxConnection? _connection;
   MuxChannel? _channel;
 
-  /// The last online or offline event reported (null: neither yet).
+  /// The last event of the online, offline and held kind reported (null:
+  /// none yet).
   PeerEventType? _reported;
   bool _removed = false;
+
+  /// The connection attempt in progress (dialling), else null.
   Object? _token;
   int _failures = 0;
+
+  /// Whether the peer went online on the current connection (set-up done
+  /// once): only then does the connection count as a success.
+  bool _established = false;
   bool _livedLong = false;
   bool _restartedOnGoAway = false;
-  Timer? _connectTimer;
   Timer? _retryTimer;
   Timer? _lifetimeTimer;
   Timer? _hookTimer;
-  Completer<void>? _hookWait;
+  Completer<Status?>? _hookWait;
   int _channelFailures = 0;
   bool _channelLivedLong = false;
   Timer? _channelRetry;
   Timer? _channelLifetime;
+  Timer? _holdTimer;
+  DateTime? _heldSince;
 
   /// The type and instance id.
   ServiceAddress get address => _record.address;
 
-  /// The resolver's current record of the peer.
+  /// The resolver's current record of the peer (while held, the last one).
   ServiceRecord get record => _record;
 
   /// Where the peer stands.
-  PeerState get state => _state;
+  PeerState get state => _holdTimer != null ? PeerState.held : _state;
 
-  /// Why the last connection or connection attempt ended: the status the
-  /// connection ended with, the peer's GOAWAY status, the refusal of the
-  /// per-peer channel, or the failure of the last attempt (with several
-  /// endpoints, of the last one tried). Null until something has ended.
-  /// Kept through [PeerState.connecting] and [PeerState.online].
+  /// Why the last connection, connection attempt or per-peer channel
+  /// ended: the status the connection ended with, the peer's GOAWAY
+  /// status, the close status of the per-peer channel, a hook's failure
+  /// ([StatusCode.internal]), or the failure of the last attempt (with
+  /// several endpoints, of the last one tried). Null until something has
+  /// ended. Kept through [PeerState.connecting] and [PeerState.online].
   Status? get lastStatus => _lastStatus;
 
   /// When [state] began, by the local wall clock.
-  DateTime? get since => _since;
+  DateTime? get since => _heldSince ?? _since;
 
-  /// When the next connection attempt is due while [PeerState.offline], by
-  /// the local wall clock; null in every other state. Driven by a timer:
-  /// the attempt may come later.
-  DateTime? get nextAttemptAt => _nextAttemptAt;
+  /// When the next attempt (a connection, or the per-peer channel on the
+  /// live connection) is due while [PeerState.offline], by the local wall
+  /// clock; null in every other state. Driven by a timer: the attempt may
+  /// come later.
+  DateTime? get nextAttemptAt =>
+      _holdTimer != null || _state != PeerState.offline ? null : _nextAttemptAt;
 
-  /// Connection attempts since the peer was last connected: while
+  /// Connection attempts since the peer was last online: while
   /// [PeerState.connecting] the attempt in progress (from 1), while online
   /// the attempt that succeeded, while offline the attempts that failed (0
-  /// right after a connection ended).
+  /// right after a connection it was online on ended, and while the
+  /// per-peer channel is re-opened on such a connection).
   int get attempt => _attempt;
 
   /// The endpoint of [connection] while it is set.
@@ -662,7 +799,9 @@ class Peer {
   MuxChannel? get channel => _channel;
 
   /// Whether [state] is [PeerState.online].
-  bool get isOnline => _state == PeerState.online;
+  bool get isOnline => state == PeerState.online;
+
+  bool get _isHeld => _holdTimer != null;
 
   /// The connection, if channels may be opened on it.
   MuxConnection? get _usable {
@@ -692,7 +831,9 @@ class Peer {
   }
 
   void _report(PeerEventType type, Status? status) {
-    if (_reported == type) {
+    if (_reported == type || _holdTimer != null) {
+      // While held, what happens to the connection is reported when the
+      // peer is adopted again.
       return;
     }
     _reported = type;
@@ -720,7 +861,7 @@ class Peer {
       }
     } else if (_token != null) {
       // Dialling the old endpoints: start over with the new ones.
-      _cancelAttempt();
+      _token = null;
       _attemptConnect();
     } else if (_retryTimer != null) {
       _retryTimer!.cancel();
@@ -740,13 +881,59 @@ class Peer {
     return true;
   }
 
+  /// The record left the resolver: held for the set's hold-down, its
+  /// connection kept.
+  void _hold() {
+    final holdDown = _set.removalHoldDown;
+    _log.fine('$this: record gone, held for $holdDown');
+    _heldSince = DateTime.now();
+    _reported = PeerEventType.held;
+    _set._emit(PeerEvent(PeerEventType.held, this));
+    _holdTimer = Timer(holdDown, () {
+      _holdTimer = null;
+      _heldSince = null;
+      _log.fine('$this: not back within $holdDown');
+      _set._expire(this);
+    });
+  }
+
+  /// A record of the held peer came back: adopted again if it can still
+  /// reach the peer where it is connected (or it is not connected). Returns
+  /// false, leaving the peer held, when the record is elsewhere.
+  bool _readopt(ServiceRecord record) {
+    final endpoint = _endpoint;
+    if (endpoint != null && !record.endpoints.contains(endpoint)) {
+      return false;
+    }
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _heldSince = null;
+    _since = DateTime.now();
+    _log.fine('$this: record back, adopted again');
+    switch (_state) {
+      case PeerState.online:
+        _report(PeerEventType.online, null);
+      case PeerState.offline:
+        _report(PeerEventType.offline, _lastStatus);
+      default:
+      // Connecting: the outcome is reported.
+    }
+    if (record != _record) {
+      _update(record);
+    }
+    return true;
+  }
+
   /// The record is gone (null) or the set closes ([status]).
   void _remove(Status? status) {
     if (_removed) {
       return;
     }
     _removed = true;
-    _cancelAttempt();
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _heldSince = null;
+    _token = null;
     _retryTimer?.cancel();
     _retryTimer = null;
     final connection = _connection;
@@ -777,41 +964,37 @@ class Peer {
     final token = Object();
     _token = token;
     _setState(PeerState.connecting, lastStatus ?? _lastStatus);
-    final timeout = _set.connectTimeout;
-    if (timeout > Duration.zero) {
-      _connectTimer = Timer(timeout, () {
-        _connectTimer = null;
-        if (identical(_token, token)) {
-          _token = null;
-          _connectFailed(
-            Status.of(
-              StatusCode.unavailable,
-              'cannot connect: timed out after $timeout',
-            ),
-          );
-        }
-      });
-    }
     _set._track(_dialFirst(token));
   }
 
-  void _cancelAttempt() {
-    _token = null;
-    _connectTimer?.cancel();
-    _connectTimer = null;
-  }
-
   /// Dials the endpoints of the record in order; the first that answers
-  /// is the connection.
+  /// is the connection. With [PeerSet.connectTimeout], each endpoint gets
+  /// the time left divided by the endpoints left.
   Future<void> _dialFirst(Object token) async {
+    final endpoints = List.of(_record.endpoints);
+    final budget = _set.connectTimeout;
+    final clock = Stopwatch()..start();
     Status? failure;
-    for (final endpoint in List.of(_record.endpoints)) {
+    for (var i = 0; i < endpoints.length; i++) {
       if (!identical(_token, token)) {
         return;
       }
+      final endpoint = endpoints[i];
+      Duration? bound;
+      if (budget > Duration.zero) {
+        final left = budget - clock.elapsed;
+        if (left <= Duration.zero) {
+          failure = Status.of(
+            StatusCode.unavailable,
+            'cannot connect: timed out after $budget',
+          );
+          break;
+        }
+        bound = left ~/ (endpoints.length - i);
+      }
       final MuxConnection connection;
       try {
-        connection = await _set.switchboard.dial(endpoint, policy: _set.policy);
+        connection = await _dial(endpoint, bound);
       } on Object catch (e) {
         failure = e is SwitchboardException
             ? e.status
@@ -824,16 +1007,36 @@ class Peer {
         _set._retire(connection);
         return;
       }
-      _cancelAttempt();
+      _token = null;
       _onConnected(connection, endpoint);
       return;
     }
     if (!identical(_token, token)) {
       return;
     }
-    _cancelAttempt();
+    _token = null;
     _connectFailed(
       failure ?? Status.of(StatusCode.unavailable, 'record has no endpoints'),
+    );
+  }
+
+  /// Dials [endpoint], giving up after [bound] if given; a connection that
+  /// lands after that is sent GOAWAY at once ([PeerSet.close] waits for
+  /// it).
+  Future<MuxConnection> _dial(Uri endpoint, Duration? bound) {
+    final dialing = _set.switchboard.dial(endpoint, policy: _set.policy);
+    if (bound == null) {
+      return dialing;
+    }
+    return dialing.timeout(
+      bound,
+      onTimeout: () {
+        _set._track(dialing.then<void>(_set._retire, onError: (Object _) {}));
+        throw SwitchboardException.of(
+          StatusCode.unavailable,
+          'cannot connect to $endpoint: timed out after $bound',
+        );
+      },
     );
   }
 
@@ -857,6 +1060,7 @@ class Peer {
   void _onConnected(MuxConnection connection, Uri endpoint) {
     _connection = connection;
     _endpoint = endpoint;
+    _established = false;
     _livedLong = false;
     _lifetimeTimer = Timer(_set.maxBackoff, () {
       _lifetimeTimer = null;
@@ -872,94 +1076,104 @@ class Peer {
     unawaited(_setUp(connection));
   }
 
-  /// Runs the hooks and opens the per-peer channel on [connection], then
-  /// reports the peer online, unless the connection is left meanwhile.
+  /// Runs `onConnect` and sets up the per-peer channel on [connection],
+  /// then reports the peer online; a step that fails fails the attempt.
+  /// Stops when the connection is left meanwhile.
   Future<void> _setUp(MuxConnection connection) async {
     final onConnect = _set.onConnect;
     if (onConnect != null) {
-      await _bounded('onConnect', () => onConnect(this));
+      final failure = await _bounded('onConnect', () => onConnect(this));
       if (!identical(_connection, connection)) {
         return;
       }
-    }
-    if (_set.channel != null) {
-      final opened = await _openChannel(connection);
-      if (!identical(_connection, connection)) {
+      if (failure != null) {
+        _failConnection(connection, failure);
         return;
       }
-      if (opened != null) {
-        // A refusal the peer sends on arrival (its policy, no such
-        // service, a credential checked at once) comes before the answer to
-        // a PING sent after the OPEN: such a peer never shows online.
-        await _bounded('PING', connection.ping, quiet: true);
-        if (!identical(_connection, connection)) {
-          return;
-        }
-      }
-      final onOpen = _set.onOpen;
-      if (opened != null && identical(_channel, opened) && onOpen != null) {
-        await _bounded('onOpen', () => onOpen(this, opened));
-        if (!identical(_connection, connection)) {
-          return;
-        }
-      }
     }
+    if (_set.channel != null && !await _openPerPeerChannel(connection)) {
+      return;
+    }
+    _established = true;
     _log.info('$this: online at $_endpoint');
     _setState(PeerState.online, _lastStatus);
   }
 
-  /// Runs [hook]: logs a throw or a failed future (unless [quiet]), and
-  /// waits for it at most [PeerSet.connectTimeout], or until the
-  /// connection is left.
-  Future<void> _bounded(
+  /// Runs one step of the set-up, [hook], for at most
+  /// [PeerSet.connectTimeout] or until the connection or the per-peer
+  /// channel is left ([_endHook]). Returns null when it completed (or was
+  /// left: the caller checks), else a status with [code] saying it failed
+  /// or timed out (logged, as a warning unless [quiet]).
+  Future<Status?> _bounded(
     String name,
     FutureOr<Object?> Function() hook, {
+    StatusCode code = StatusCode.internal,
     bool quiet = false,
   }) async {
-    void failed(Object e, StackTrace st) => quiet
-        ? _log.fine('$this: $name failed: $e')
-        : _log.warning('$this: $name failed', e, st);
+    Status failed(Object e, StackTrace st) {
+      if (quiet || _failures > 0 || _channelFailures > 0) {
+        // Once per series of failures is enough.
+        _log.fine('$this: $name failed: $e');
+      } else {
+        _log.warning('$this: $name failed', e, st);
+      }
+      return Status.of(code, '$name failed');
+    }
+
     final FutureOr<Object?> result;
     try {
       result = hook();
     } on Object catch (e, st) {
-      failed(e, st);
-      return;
+      return failed(e, st);
     }
     if (result is! Future<Object?>) {
-      return;
+      return null;
     }
-    final wait = Completer<void>();
+    final wait = Completer<Status?>();
     _hookWait = wait;
     final timeout = _set.connectTimeout;
     if (timeout > Duration.zero) {
       _hookTimer = Timer(timeout, () {
+        _hookTimer = null;
         final message = '$this: $name did not complete within $timeout';
         quiet ? _log.fine(message) : _log.warning(message);
         if (!wait.isCompleted) {
-          wait.complete();
+          wait.complete(Status.of(code, '$name timed out'));
         }
       });
     }
-    result.then<void>((_) {}, onError: failed).whenComplete(() {
-      if (!wait.isCompleted) {
-        wait.complete();
-      }
-    }).ignore();
-    await wait.future;
+    result
+        .then<void>(
+          (_) {
+            if (!wait.isCompleted) {
+              wait.complete(null);
+            }
+          },
+          onError: (Object e, StackTrace st) {
+            if (wait.isCompleted) {
+              // Left, or timed out, already.
+              _log.fine('$this: $name failed late: $e');
+              return;
+            }
+            wait.complete(failed(e, st));
+          },
+        )
+        .ignore();
+    final outcome = await wait.future;
     if (identical(_hookWait, wait)) {
       _endHook();
     }
+    return outcome;
   }
 
-  /// Stops waiting for the hook in progress, if any.
+  /// Stops waiting for the step in progress, if any.
   void _endHook() {
     _hookTimer?.cancel();
     _hookTimer = null;
     final wait = _hookWait;
     _hookWait = null;
     if (wait != null && !wait.isCompleted) {
-      wait.complete();
+      wait.complete(null);
     }
   }
 
@@ -1000,13 +1214,17 @@ class Peer {
     _attemptConnect(status);
   }
 
-  /// [connection] failed the set-up (the per-peer channel was refused for
-  /// good): leave it and retry after the backoff.
+  /// [connection] failed: its set-up failed, or the per-peer channel was
+  /// refused for good. Leave it with GOAWAY and retry after the backoff.
   void _failConnection(MuxConnection connection, Status status) {
     if (!identical(_connection, connection)) {
       return;
     }
-    _log.info('$this: leaving the connection: $status');
+    if (_failures == 0) {
+      _log.info('$this: leaving the connection: $status');
+    } else {
+      _log.fine('$this: leaving the connection: $status');
+    }
     _leave(connection, channelStatus: status);
     _set._retire(connection);
     _retryLater(status);
@@ -1019,13 +1237,17 @@ class Peer {
     assert(identical(_connection, connection));
     _connection = null;
     _endpoint = null;
-    _attempt = 0;
     _lifetimeTimer?.cancel();
     _lifetimeTimer = null;
-    if (_livedLong) {
-      _failures = 0;
-      _restartedOnGoAway = false;
+    if (_established) {
+      // The attempts count again from the next one.
+      _attempt = 0;
+      if (_livedLong) {
+        _failures = 0;
+        _restartedOnGoAway = false;
+      }
     }
+    _established = false;
     _endHook();
     _channelRetry?.cancel();
     _channelRetry = null;
@@ -1040,10 +1262,12 @@ class Peer {
 
   // The per-peer channel ----------------------------------------------------
 
-  /// Opens the per-peer channel on [connection]. Returns it, or null if it
-  /// could not be opened (handled: a retry is scheduled, or the connection
-  /// left).
-  Future<MuxChannel?> _openChannel(MuxConnection connection) async {
+  /// Opens the per-peer channel on [connection], makes sure with a PING
+  /// round trip that the peer did not refuse it on arrival, and runs
+  /// `onOpen` with it. Returns true when all of that succeeded; otherwise
+  /// the failure is handled ([_channelFailed]), or the connection or the
+  /// channel was left meanwhile, and returns false.
+  Future<bool> _openPerPeerChannel(MuxConnection connection) async {
     final template = _set.channel!;
     var payload = template.payload;
     if (payload.isEmpty) {
@@ -1058,10 +1282,10 @@ class Peer {
           connection,
           Status.of(StatusCode.internal, 'credential failed'),
         );
-        return null;
+        return false;
       }
       if (!identical(_connection, connection) || _channel != null) {
-        return null;
+        return false;
       }
     }
     final address = template.copyWith(
@@ -1074,18 +1298,9 @@ class Peer {
     try {
       channel = connection.open(address.encode());
     } on SwitchboardException catch (e) {
-      switch (e.code) {
-        case StatusCode.failedPrecondition:
-          // Going away: opened again on the next connection.
-          _log.fine('$this: connection going away, channel not opened');
-        case StatusCode.resourceExhausted:
-          _log.info('$this: cannot open the channel: ${e.status}');
-          _scheduleChannelRetry();
-        default:
-          _log.warning('$this: cannot open the channel: ${e.status}');
-          _failConnection(connection, e.status);
-      }
-      return null;
+      _log.info('$this: cannot open the channel: ${e.status}');
+      _channelFailed(connection, e.status);
+      return false;
     }
     _channel = channel;
     _channelLivedLong = false;
@@ -1095,7 +1310,56 @@ class Peer {
     });
     channel.done.then((status) => _onChannelEnded(channel, status)).ignore();
     _log.fine('$this: opened channel ${channel.id}');
-    return channel;
+    // A refusal the peer sends on arrival (its policy, no such service, a
+    // credential checked at once, a handler that throws) comes before the
+    // answer to a PING sent after the OPEN, and is handled by
+    // _onChannelEnded before this goes on.
+    final noPong = await _bounded(
+      'PING',
+      connection.ping,
+      code: StatusCode.unavailable,
+      quiet: true,
+    );
+    if (!identical(_connection, connection) || !identical(_channel, channel)) {
+      return false;
+    }
+    if (noPong != null) {
+      _channelFailed(connection, noPong);
+      return false;
+    }
+    final onOpen = _set.onOpen;
+    if (onOpen != null) {
+      final failure = await _bounded('onOpen', () => onOpen(this, channel));
+      if (!identical(_connection, connection) ||
+          !identical(_channel, channel)) {
+        return false;
+      }
+      if (failure != null) {
+        _channelFailed(connection, failure);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// The per-peer channel on [connection], the current connection, could
+  /// not be set up, or ended, with [status]. Before the peer went online
+  /// on [connection], and for a status that would repeat, the connection
+  /// fails; otherwise the peer is offline and the channel is set up again
+  /// after its backoff.
+  void _channelFailed(MuxConnection connection, Status status) {
+    if (!_established || _isTerminal(status)) {
+      _failConnection(connection, status);
+      return;
+    }
+    final channel = _channel;
+    if (channel != null) {
+      _channelEnded();
+      _closeQuietly(channel, status);
+    }
+    // A re-open waiting for its PING or onOpen gives up.
+    _endHook();
+    _scheduleChannelRetry(status);
   }
 
   /// The per-peer channel ended or was dropped: its lifetime counts.
@@ -1121,17 +1385,16 @@ class Peer {
       _log.fine('$this: channel ${channel.id} ended with $status');
       return;
     }
-    if (_isTerminal(status)) {
-      _failConnection(connection, status);
-      return;
-    }
-    _log.fine('$this: channel ${channel.id} ended with $status, re-opening');
-    _scheduleChannelRetry();
+    _log.fine('$this: channel ${channel.id} ended with $status');
+    _channelFailed(connection, status);
   }
 
-  void _scheduleChannelRetry() {
+  /// Offline with [status] on the live connection; the per-peer channel
+  /// is set up again after its backoff.
+  void _scheduleChannelRetry(Status status) {
     _channelRetry?.cancel();
     final delay = _set._schedule.delay(_channelFailures++);
+    _log.fine('$this: channel set up again in $delay');
     _channelRetry = Timer(delay, () {
       _channelRetry = null;
       final connection = _usable;
@@ -1140,22 +1403,18 @@ class Peer {
       }
       unawaited(_reopen(connection));
     });
+    _setState(PeerState.offline, status, retryDelay: delay);
   }
 
+  /// Sets the per-peer channel up again on [connection], on which the peer
+  /// was online, as on a new connection.
   Future<void> _reopen(MuxConnection connection) async {
-    final channel = await _openChannel(connection);
-    final onOpen = _set.onOpen;
-    if (channel == null || onOpen == null) {
+    _setState(PeerState.connecting, _lastStatus);
+    if (!await _openPerPeerChannel(connection)) {
       return;
     }
-    try {
-      final result = onOpen(this, channel);
-      if (result is Future<void>) {
-        await result;
-      }
-    } on Object catch (e, st) {
-      _log.warning('$this: onOpen failed', e, st);
-    }
+    _log.fine('$this: channel set up again, online');
+    _setState(PeerState.online, _lastStatus);
   }
 
   static void _closeQuietly(MuxChannel channel, Status status) {
@@ -1173,5 +1432,5 @@ class Peer {
   }
 
   @override
-  String toString() => 'Peer($address, ${_state.name})';
+  String toString() => 'Peer($address, ${state.name})';
 }

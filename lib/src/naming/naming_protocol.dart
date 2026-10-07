@@ -225,6 +225,10 @@ class ServiceRecord {
   /// may be empty. The naming service stores and publishes it without
   /// reading it; consumers select on it (`Switchboard.openChannel`'s
   /// `where`). Not to be modified.
+  ///
+  /// Every watcher of the naming table sees it, so a key placed here
+  /// authenticates the mesh to the instance (a consumer presents it with
+  /// `Switchboard.credentialFor`), not the instance to the mesh.
   final Uint8List metadata;
 
   /// Throws [ArgumentError] unless [endpoint] can be carried in a record:

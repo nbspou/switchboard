@@ -85,15 +85,30 @@ The protocol specification lives in the project wiki (section
   on the connections a node initiates (`Switchboard(outgoingPolicy:)`, an
   `endpointPolicy` hook per endpoint, `connect(policy:)`, and
   `ChannelPolicies.denyAll`), so that a peer the node dialled cannot push
-  channels into it; the credential chosen per destination
-  (`Switchboard(credentialFor:)`, given the endpoint and the selected
-  record, so a per-worker key can come from its metadata), after which the
-  node's default payload is never attached implicitly; `Switchboard.dial`
-  for an un-pooled connection and `payloadFor`; and `PeerSet.watch(type)`,
-  a connection kept to every instance of a type with backoff per peer,
-  `added`, `online`, `offline`, `updated` and `removed` events, an
-  `onConnect` hook, and a per-peer channel re-opened on every connection
-  with an `onOpen` hook for the capability exchange.
+  channels into it, evaluated on the endpoint as the pool keys it so every
+  spelling of an endpoint gets the same policy; the credential chosen per
+  destination (`Switchboard(credentialFor:)`, given the endpoint and the
+  selected record, so a per-worker key can come from its metadata, which
+  every watcher of the naming table sees: it authenticates the mesh to the
+  worker, not the reverse), after which the node's default payload is
+  never attached implicitly; `Switchboard.dial` for an un-pooled
+  connection and `payloadFor`; a `MOVED` retry whose new owner the `where`
+  filter refuses ends with `NOT_FOUND`; and `PeerSet.watch(type)`, a
+  connection kept to every instance of a type with backoff per peer,
+  `added`, `online`, `offline`, `updated`, `held` and `removed` events,
+  an `onConnect` hook, and a per-peer channel re-opened on every
+  connection with an `onOpen` hook for the capability exchange. A peer is
+  online only once usable: a hook that throws, fails or times out, or a
+  per-peer channel the worker refuses, fails the attempt (GOAWAY, backoff),
+  and a re-open goes through the same PING and bounded `onOpen`, the peer
+  offline meanwhile. The endpoints of a record share the connect timeout,
+  so one that never answers leaves time for the next. A record that
+  leaves is held for `removalHoldDown` (15 s) with its connection kept and
+  adopted again if it comes back, so that a naming service or registrar
+  restart does not cut the jobs in flight. Events that arrive while the
+  initial records are read are folded into them; resolver errors are
+  logged; `watch` warns when no policy applies to its connections or the
+  node's default payload would reach every peer.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for

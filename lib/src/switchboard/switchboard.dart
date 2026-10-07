@@ -171,8 +171,13 @@ class Switchboard {
   /// result overrides [outgoingPolicy] (an explicit `policy` of [connect]
   /// or [dial] overrides both). Lets an application trust its own mesh
   /// (`mem://`, the private network) and refuse everything from other
-  /// endpoints. A hook that throws gives the connection
-  /// [ChannelPolicies.denyAll]. See [EndpointPolicy].
+  /// endpoints. The hook is asked about the endpoint as the pool tells
+  /// endpoints apart, not as the caller spelled it: scheme and host
+  /// lower-cased, the default port filled in, the path (`/` when empty)
+  /// and query kept for WebSocket URIs only, no fragment, and a `mem` URI
+  /// by its id alone; so two spellings of one endpoint, which share pooled
+  /// connections, always get the same policy. A hook that throws gives
+  /// the connection [ChannelPolicies.denyAll]. See [EndpointPolicy].
   final EndpointPolicy? endpointPolicy;
 
   /// Chooses the application payload of every channel this node opens
@@ -839,16 +844,30 @@ class Switchboard {
           };
   }
 
-  static String _poolKey(Uri endpoint) {
+  static String _poolKey(Uri endpoint) => _normalised(endpoint).toString();
+
+  /// [endpoint] as the pool tells endpoints apart (see [connect]): scheme
+  /// and host lower-cased, the default port filled in, the path (`/` when
+  /// empty) and query kept for WebSocket URIs only, no fragment; a `mem`
+  /// URI is its id alone. What [endpointPolicy] is asked about, so that
+  /// every spelling of one endpoint gets the same policy.
+  static Uri _normalised(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
     final host = endpoint.host.toLowerCase();
+    if (scheme == MemoryEndpoints.scheme) {
+      return Uri(scheme: scheme, host: host);
+    }
     final port = _portOf(endpoint);
     if (scheme != 'ws' && scheme != 'wss') {
-      return '$scheme://$host:$port';
+      return Uri(scheme: scheme, host: host, port: port);
     }
-    final path = endpoint.path.isEmpty ? '/' : endpoint.path;
-    final query = endpoint.hasQuery ? '?${endpoint.query}' : '';
-    return '$scheme://$host:$port$path$query';
+    return Uri(
+      scheme: scheme,
+      host: host,
+      port: port,
+      path: endpoint.path.isEmpty ? '/' : endpoint.path,
+      query: endpoint.hasQuery ? endpoint.query : null,
+    );
   }
 
   Future<MuxConnection> _dialPooled(
@@ -895,7 +914,8 @@ class Switchboard {
       transport,
       isInitiator: true,
       remote: endpoint.toString(),
-      policy: policy ?? _endpointPolicyOf(endpoint) ?? outgoingPolicy,
+      policy:
+          policy ?? _endpointPolicyOf(_normalised(endpoint)) ?? outgoingPolicy,
     );
     _dialled[connection] = endpoint;
     if (_closing) {
@@ -1332,8 +1352,15 @@ class Switchboard {
         }
         try {
           final connection = await connect(endpoint);
+          // A record for any instance (an endpoint resolver's) stands for
+          // the instance asked for, metadata included (credentialFor reads
+          // it).
           final selected = record.address.isAny && !address.isAny
-              ? ServiceRecord(address, endpoints: record.endpoints)
+              ? ServiceRecord(
+                  address,
+                  endpoints: record.endpoints,
+                  metadata: record.metadata,
+                )
               : record;
           return (selected, connection);
         } on SwitchboardException catch (e) {
@@ -1501,7 +1528,9 @@ class Switchboard {
   /// processed) and why a `RELOCATED` never is.
   ///
   /// [where] applies to the first channel and to the retry: an owner it
-  /// refuses is not found (see [selectAndConnect]).
+  /// refuses is not found (see [selectAndConnect]); on the retry, the
+  /// returned channel then ends with that [StatusCode.notFound] status
+  /// instead of `MOVED`.
   ///
   /// Without a [payload], each channel carries the payload [openChannel]
   /// would give its destination: the retry asks [credentialFor] again for

@@ -58,6 +58,11 @@ abstract final class ChannelPolicies {
   /// Allows only channels to the service types in [types] (any instance).
   /// Channels without a service type (for the default service) are allowed
   /// only with [untyped]. A reserved type is allowed only if it is listed.
+  ///
+  /// Returns a new closure on every call, and closures are equal only to
+  /// themselves: create one and reuse it when passing it to
+  /// `Switchboard.connect(policy:)`, which pools connections per policy
+  /// object, or every call gets a connection of its own.
   static ChannelPolicy allowTypes(Set<Name> types, {bool untyped = false}) {
     final allowed = Set<Name>.of(types);
     return (address, connection) {

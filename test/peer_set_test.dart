@@ -1,16 +1,21 @@
 // PeerSet: a consumer kept connected to every instance of a type, over
-// mem:// workers and a StaticResolver (no naming service): membership,
-// online and offline events, a worker's reboot, the per-peer channel and
-// its hook, the backoff schedule (fake_async), the outgoing policy and the
-// per-worker credential, and close. The consumer side of the untrusted
-// worker fleet (wiki page "Switchboard Use Cases", entry 5).
+// mem:// workers and a StaticResolver (no naming service): membership (the
+// initial records, the events around them, the removal hold-down), online
+// and offline events, a worker's reboot, the per-peer channel and its hooks
+// (a peer is online only once both succeeded, on every connection and on
+// every re-open), endpoint fallback within the connect timeout, the backoff
+// schedule (fake_async), the outgoing policy and the per-worker credential,
+// resolver errors, and close. The consumer side of the untrusted worker
+// fleet (wiki page "Switchboard Use Cases", entry 5).
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:fake_async/fake_async.dart';
+import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -79,6 +84,9 @@ class Worker {
   /// Rejects the channels it receives with this status instead of serving.
   Status? reject;
 
+  /// Handles the channels it receives instead of serving them, if set.
+  void Function(IncomingChannel incoming)? handler;
+
   Uri get uri => Uri.parse('mem://$name');
 
   /// The application payloads received, as text.
@@ -110,6 +118,11 @@ class Worker {
 
   void _serve(IncomingChannel incoming) {
     raw.add(incoming.channel.openPayload);
+    final handle = handler;
+    if (handle != null) {
+      handle(incoming);
+      return;
+    }
     final status = reject;
     if (status != null) {
       unawaited(incoming.reject(status));
@@ -144,10 +157,14 @@ void main() {
 
   /// The consumer: its default payload is the mesh credential, and each
   /// worker's key is in its record's metadata.
-  Switchboard consumerNode({ChannelPolicy? outgoingPolicy}) {
+  Switchboard consumerNode({
+    ChannelPolicy? outgoingPolicy,
+    Duration connectTimeout = const Duration(seconds: 10),
+  }) {
     final node = Switchboard(
       muxOptions: fast,
       defaultPayload: meshSecret,
+      connectTimeout: connectTimeout,
       outgoingPolicy: outgoingPolicy,
       credentialFor: (endpoint, record) =>
           record != null && record.metadata.isNotEmpty ? record.metadata : null,
@@ -168,11 +185,13 @@ void main() {
     FutureOr<void> Function(Peer peer, MuxChannel channel)? onOpen,
     ChannelPolicy? policy,
     Duration connectTimeout = const Duration(seconds: 1),
+    Duration removalHoldDown = Duration.zero,
+    Resolver? from,
   }) {
     final set = PeerSet.watch(
       consumer,
       gpu,
-      resolver: resolver,
+      resolver: from ?? resolver,
       onConnect: onConnect,
       channel: channel,
       onOpen: onOpen,
@@ -180,6 +199,7 @@ void main() {
       maxBackoff: ms(80),
       jitter: 0,
       connectTimeout: connectTimeout,
+      removalHoldDown: removalHoldDown,
       policy: policy,
     );
     addTearDown(set.close);
@@ -299,15 +319,72 @@ void main() {
     );
     await until(() => set.peers[1]?.isOnline ?? false, 'online');
     final connection = set.peers[1]!.connection;
-    // The worker closes it (not a refusal): opened again, still online.
+    // The worker closes it (not a refusal): offline while it is closed,
+    // opened again on the same connection, online again.
     await until(() => w.accepted.isNotEmpty);
     final served = w.accepted.single.channels.single;
     await served.close(Status.of(StatusCode.unavailable, 'restarting'));
     await until(() => opened.length == 2, 'opened again');
-    expect(set.peers[1]!.isOnline, isTrue);
+    await until(() => set.peers[1]!.isOnline, 'online again');
     expect(set.peers[1]!.connection, same(connection));
     expect(set.peers[1]!.channel, same(opened.last));
-    expect(log, ['added 1', 'online 1']);
+    expect(w.accepted, hasLength(1));
+    expect(log, ['added 1', 'online 1', 'offline 1', 'online 1']);
+  });
+
+  test('a re-open the worker refuses: offline on the same connection, no '
+      'onOpen, opened again after the backoff', () async {
+    final w = await worker(1);
+    resolver.add(keyed(w));
+    final opened = <MuxChannel>[];
+    final set = watch(
+      channel: ChannelAddress(type: gpu),
+      onOpen: (peer, channel) => opened.add(channel),
+    );
+    await until(() => set.peers[1]?.isOnline ?? false, 'online');
+    final peer = set.peers[1]!;
+    final connection = peer.connection;
+    // The worker closes the channel and refuses the next ones on arrival.
+    w.reject = Status.of(StatusCode.unavailable, 'busy');
+    await w.accepted.single.channels.single.close(
+      Status.of(StatusCode.unavailable, 'restarting'),
+    );
+    await until(() => w.raw.length >= 4, 'opened again and refused');
+    expect(peer.isOnline, isFalse);
+    expect(set.online, isEmpty);
+    expect(peer.lastStatus, hasCode(StatusCode.unavailable));
+    expect(peer.connection, same(connection));
+    // onOpen never ran on a refused channel.
+    expect(opened, hasLength(1));
+    w.reject = null;
+    await until(() => peer.isOnline, 'online once accepted');
+    expect(opened, hasLength(2));
+    expect(peer.channel, same(opened.last));
+    expect(peer.connection, same(connection));
+    expect(w.accepted, hasLength(1));
+    expect(log, ['added 1', 'online 1', 'offline 1', 'online 1']);
+  });
+
+  test('onOpen on a re-open is bounded by connectTimeout', () async {
+    final w = await worker(1);
+    resolver.add(keyed(w));
+    var calls = 0;
+    final set = watch(
+      connectTimeout: ms(100),
+      channel: ChannelAddress(type: gpu),
+      // The second never completes.
+      onOpen: (peer, channel) => ++calls == 2 ? Completer<void>().future : null,
+    );
+    await until(() => set.peers[1]?.isOnline ?? false, 'online');
+    final peer = set.peers[1]!;
+    final connection = peer.connection;
+    await w.accepted.single.channels.single.close(
+      Status.of(StatusCode.unavailable, 'restarting'),
+    );
+    await until(() => calls == 3 && peer.isOnline, 'online after the third');
+    expect(w.raw, hasLength(3));
+    expect(peer.connection, same(connection));
+    expect(log, ['added 1', 'online 1', 'offline 1', 'online 1']);
   });
 
   test('a refused per-peer channel takes the peer offline and is retried '
@@ -444,23 +521,331 @@ void main() {
     expect(set.peers[1]!.attempt, 1);
   });
 
-  test('hooks that throw or hang do not keep a peer offline', () async {
+  test('an endpoint that never answers leaves time for the next', () async {
+    // Accepts TCP connections and never answers the WebSocket upgrade: a
+    // dial to it hangs until the node's connect timeout, like a dial to an
+    // unroutable address.
+    final hole = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final held = <Socket>[];
+    hole.listen(held.add);
+    addTearDown(() async {
+      for (final socket in held) {
+        socket.destroy();
+      }
+      await hole.close();
+    });
+    final w = await worker(1);
+    resolver.add(
+      w.record(
+        metadata: bytes('key-1'),
+        endpoints: [Uri.parse('ws://127.0.0.1:${hole.port}/'), w.uri],
+      ),
+    );
+    // Equal bounds for the node and the set: the first endpoint must not
+    // take all of it.
+    consumer = consumerNode(connectTimeout: ms(400));
+    final set = watch(connectTimeout: ms(400));
+    await until(() => set.peers[1]?.isOnline ?? false, 'online');
+    final peer = set.peers[1]!;
+    expect(peer.endpoint, w.uri);
+    expect(peer.attempt, 1);
+    expect(log, ['added 1', 'online 1']);
+  });
+
+  test('a hook that throws, fails or hangs fails the attempt: GOAWAY, '
+      'offline, retried after the backoff', () async {
     final w = await worker(1);
     resolver.add(keyed(w));
+    final outcomes = <FutureOr<void> Function()>[
+      () => throw StateError('broken hook'),
+      () => Future<void>.error(StateError('broken hook')),
+      () => Completer<void>().future,
+    ];
     var calls = 0;
+    final statuses = <String>[];
     final set = watch(
-      connectTimeout: ms(50),
+      connectTimeout: ms(100),
       onConnect: (peer) {
-        calls++;
-        throw StateError('broken hook');
+        if (peer.lastStatus case final status?) {
+          statuses.add(status.reason);
+        }
+        return calls < outcomes.length ? outcomes[calls++]() : null;
       },
-      channel: ChannelAddress(type: gpu),
-      // Never completes: given up after the connect timeout.
-      onOpen: (peer, channel) => Completer<void>().future,
     );
     await until(() => set.peers[1]?.isOnline ?? false, 'online');
-    expect(calls, 1);
-    expect(set.peers[1]!.channel, isNotNull);
+    expect(calls, 3);
+    expect(statuses, [
+      'onConnect failed',
+      'onConnect failed',
+      'onConnect timed out',
+    ]);
+    expect(log, ['added 1', 'offline 1', 'online 1']);
+    // Each failed attempt was a connection of its own, left with GOAWAY.
+    expect(w.accepted, hasLength(4));
+    for (final connection in w.accepted.take(3)) {
+      await connection.done.timeout(limit);
+    }
+  });
+
+  group('not online until the per-peer channel and onOpen succeeded', () {
+    /// A worker (instance 7) whose gpu channels [handler] handles, watched
+    /// with [onOpen]: the peer must stay offline with [code], retried, and
+    /// onOpen must never run on a channel the worker refused.
+    Future<void> staysOffline(
+      StatusCode code, {
+      void Function(IncomingChannel incoming)? handler,
+      Status? reject,
+      FutureOr<void> Function(Peer peer, MuxChannel channel)? onOpen,
+    }) async {
+      final w = await worker(7);
+      w
+        ..handler = handler
+        ..reject = reject;
+      resolver.add(keyed(w));
+      var onOpenCalls = 0;
+      final set = watch(
+        channel: ChannelAddress(type: gpu),
+        onOpen: (peer, channel) {
+          onOpenCalls++;
+          return onOpen?.call(peer, channel);
+        },
+      );
+      await until(() => w.accepted.length >= 3, 'retried');
+      final peer = set.peers[7]!;
+      expect(peer.isOnline, isFalse);
+      expect(set.online, isEmpty);
+      expect(peer.lastStatus, hasCode(code));
+      expect(log, ['added 7', 'offline 7']);
+      // Each attempt was a connection of its own, left with GOAWAY.
+      for (final connection in w.accepted.take(2)) {
+        await connection.done.timeout(limit);
+      }
+      if (onOpen == null) {
+        expect(onOpenCalls, 0);
+      } else {
+        expect(onOpenCalls, greaterThanOrEqualTo(2));
+      }
+    }
+
+    test('the worker\'s handler throws', () async {
+      await staysOffline(
+        StatusCode.internal,
+        handler: (incoming) => throw StateError('boom'),
+      );
+    });
+
+    test('the worker rejects the channel with UNAVAILABLE', () async {
+      await staysOffline(
+        StatusCode.unavailable,
+        reject: Status.of(StatusCode.unavailable, 'not yet'),
+      );
+    });
+
+    test('onOpen throws', () async {
+      await staysOffline(
+        StatusCode.internal,
+        onOpen: (peer, channel) => throw StateError('caps failed'),
+      );
+    });
+
+    test('onOpen\'s future fails', () async {
+      await staysOffline(
+        StatusCode.internal,
+        onOpen: (peer, channel) async => throw StateError('caps failed'),
+      );
+    });
+  });
+
+  test('events before resolve are dropped; those while it answers are '
+      'folded into its answer', () async {
+    final late = _ControlledResolver();
+    addTearDown(late.close);
+    final set = watch(from: late);
+    final seen = <String>[];
+    set.events.listen((event) {
+      if (event.type != PeerEventType.online &&
+          event.type != PeerEventType.offline) {
+        seen.add(
+          '${event.type.name} ${event.peer.address.instance} '
+          '${event.peer.record.endpoints.join(',')}',
+        );
+      }
+    });
+    final a = Uri.parse('mem://nobody-a');
+    final b = Uri.parse('mem://nobody-b');
+    final c = Uri.parse('mem://nobody-c');
+    final d = Uri.parse('mem://nobody-d');
+    ServiceRecord at(int id, Uri endpoint) =>
+        ServiceRecord(ServiceAddress(gpu, id), endpoints: [endpoint]);
+    ServiceEvent up(int id, Uri endpoint) =>
+        ServiceEvent(up: true, record: at(id, endpoint));
+    ServiceEvent down(int id) =>
+        ServiceEvent(up: false, record: ServiceRecord(ServiceAddress(gpu, id)));
+    // Before resolve is called: its answer has them, they are dropped.
+    late.events$
+      ..add(up(5, a))
+      ..add(down(5))
+      ..add(up(6, a))
+      ..add(up(6, b));
+    late.readyNow.complete();
+    await late.called.future;
+    // While it answers: folded into the answer.
+    late.events$
+      ..add(up(7, c))
+      ..add(up(6, b))
+      ..add(up(9, c))
+      ..add(down(9))
+      ..add(down(8));
+    late.answer.complete([at(6, b), at(8, d)]);
+    await set.ready;
+    expect(set.peers.keys, [6, 7]);
+    // Events are delivered one per microtask: let them all arrive.
+    await Future<void>.delayed(ms(20));
+    expect(seen, ['added 6 $b', 'added 7 $c']);
+    expect(set.peers.keys, [6, 7]);
+    // From then on, as they come.
+    late.events$.add(down(7));
+    await until(() => !set.peers.containsKey(7), 'removed');
+    expect(seen.last, 'removed 7 $c');
+  });
+
+  test(
+    'an error on the resolver\'s events is logged; the set goes on',
+    () async {
+      final records = <LogRecord>[];
+      final logs = Logger.root.onRecord.listen(records.add);
+      addTearDown(logs.cancel);
+      final source = _ControlledResolver();
+      addTearDown(source.close);
+      source.readyNow.complete();
+      source.answer.complete(const []);
+      final set = watch(from: source);
+      await set.ready;
+      source.events$.addError(StateError('naming hiccup'));
+      final w = await worker(1);
+      source.events$.add(ServiceEvent(up: true, record: keyed(w)));
+      await until(() => set.peers[1]?.isOnline ?? false, 'online');
+      expect(
+        records.where(
+          (r) =>
+              r.level == Level.WARNING &&
+              r.message.contains('resolver event error') &&
+              r.error is StateError,
+        ),
+        hasLength(1),
+      );
+      expect(set.isClosed, isFalse);
+    },
+  );
+
+  test('warnings: no policy for the connections; the default payload to '
+      'every peer', () async {
+    final records = <String>[];
+    final logs = Logger.root.onRecord.listen((r) {
+      if (r.level == Level.WARNING && r.message.startsWith('peer set')) {
+        records.add(r.message);
+      }
+    });
+    addTearDown(logs.cancel);
+    final plain = Switchboard(muxOptions: fast, defaultPayload: meshSecret);
+    addTearDown(plain.close);
+    final careless = PeerSet.watch(plain, gpu, resolver: resolver);
+    addTearDown(careless.close);
+    expect(records, hasLength(2));
+    expect(records[0], contains('no policy'));
+    expect(records[1], contains('credentialFor'));
+    records.clear();
+    // A policy, and a credential per peer: nothing to say.
+    watch(policy: ChannelPolicies.denyAll);
+    expect(records, isEmpty);
+  });
+
+  group('removal hold-down', () {
+    test('a record back within the hold-down: adopted again, connection '
+        'and channel kept', () async {
+      final w = await worker(1);
+      resolver.add(keyed(w));
+      final opened = <MuxChannel>[];
+      final set = watch(
+        channel: ChannelAddress(type: gpu),
+        onOpen: (peer, channel) => opened.add(channel),
+        removalHoldDown: const Duration(seconds: 5),
+      );
+      await until(() => set.peers[1]?.isOnline ?? false, 'online');
+      final peer = set.peers[1]!;
+      final connection = peer.connection;
+      final channel = peer.channel;
+      resolver.remove(ServiceAddress(gpu, 1));
+      await until(() => log.contains('held 1'), 'held');
+      expect(peer.state, PeerState.held);
+      expect(peer.isOnline, isFalse);
+      expect(set.online, isEmpty);
+      expect(set.peers[1], same(peer));
+      // Still usable for the jobs in flight, and for new ones.
+      final talk = await set.openTalk(1);
+      expect(text((await talk.request('ECHO', bytes('x'))).payload), '1:x');
+      await talk.close();
+      resolver.add(keyed(w));
+      await until(() => peer.isOnline, 'online again');
+      expect(peer.connection, same(connection));
+      expect(peer.channel, same(channel));
+      expect(opened, hasLength(1));
+      // No GOAWAY, no reconnect.
+      expect(w.accepted, hasLength(1));
+      expect(w.accepted.single.peerGoingAway, isFalse);
+      expect(log, ['added 1', 'online 1', 'held 1', 'online 1']);
+    });
+
+    test('a record back after the hold-down: removed, then added', () async {
+      final w = await worker(1);
+      resolver.add(keyed(w));
+      final set = watch(removalHoldDown: ms(50));
+      await until(() => set.peers[1]?.isOnline ?? false, 'online');
+      final peer = set.peers[1]!;
+      resolver.remove(ServiceAddress(gpu, 1));
+      await until(() => peer.state == PeerState.removed, 'removed');
+      expect(set.peers, isEmpty);
+      await w.accepted.single.done.timeout(limit);
+      resolver.add(keyed(w));
+      await until(() => set.peers[1]?.isOnline ?? false, 'online again');
+      expect(set.peers[1], isNot(same(peer)));
+      expect(w.accepted, hasLength(2));
+      expect(log, [
+        'added 1',
+        'online 1',
+        'held 1',
+        'removed 1',
+        'added 1',
+        'online 1',
+      ]);
+    });
+
+    test('a record back elsewhere: the held peer is removed, a new one '
+        'added', () async {
+      final w = await worker(1);
+      resolver.add(keyed(w));
+      final set = watch(removalHoldDown: const Duration(seconds: 5));
+      await until(() => set.peers[1]?.isOnline ?? false, 'online');
+      final peer = set.peers[1]!;
+      resolver.remove(ServiceAddress(gpu, 1));
+      await until(() => log.contains('held 1'), 'held');
+      final moved = Worker(1);
+      await moved.start();
+      addTearDown(moved.stop);
+      resolver.add(moved.record(metadata: bytes('key-1')));
+      await until(() => set.peers[1]?.isOnline ?? false, 'online');
+      expect(peer.state, PeerState.removed);
+      expect(set.peers[1]!.endpoint, moved.uri);
+      await w.accepted.single.done.timeout(limit);
+      expect(log, [
+        'added 1',
+        'online 1',
+        'held 1',
+        'removed 1',
+        'added 1',
+        'online 1',
+      ]);
+    });
   });
 
   test(
@@ -621,7 +1006,7 @@ void main() {
       });
     });
 
-    test('a hanging hook is waited for at most connectTimeout', () {
+    test('a hanging hook fails the attempt after connectTimeout', () {
       fakeAsync((async) {
         final resolver = StaticResolver();
         final consumer = Switchboard(muxOptions: fast);
@@ -629,17 +1014,37 @@ void main() {
         unawaited(w.start());
         async.flushMicrotasks();
         resolver.add(w.record());
+        var calls = 0;
         final set = PeerSet.watch(
           consumer,
           gpu,
           resolver: resolver,
           connectTimeout: ms(300),
-          onConnect: (_) => Completer<void>().future,
+          initialBackoff: ms(500),
+          jitter: 0,
+          onConnect: (_) {
+            calls++;
+            return Completer<void>().future;
+          },
         );
         async.elapse(ms(299));
-        expect(set.peers[1]!.state, PeerState.connecting);
+        final peer = set.peers[1]!;
+        expect(peer.state, PeerState.connecting);
+        expect(peer.connection, isNotNull);
         async.elapse(ms(2));
-        expect(set.peers[1]!.isOnline, isTrue);
+        expect(peer.state, PeerState.offline);
+        expect(peer.lastStatus, hasCode(StatusCode.internal));
+        expect(peer.lastStatus!.reason, 'onConnect timed out');
+        expect(peer.connection, isNull);
+        expect(peer.attempt, 1);
+        // Left with GOAWAY; the next attempt after the backoff.
+        async.elapse(ms(200));
+        expect(w.accepted.single.isOpen, isFalse);
+        expect(calls, 1);
+        async.elapse(ms(300));
+        expect(peer.state, PeerState.connecting);
+        expect(peer.attempt, 2);
+        expect(calls, 2);
         unawaited(set.close());
         unawaited(w.stop());
         unawaited(consumer.close());
@@ -649,6 +1054,34 @@ void main() {
       });
     });
   });
+}
+
+/// A resolver the test drives: ready when [readyNow] completes, answering
+/// [resolve] with [answer] ([called] completes when it is asked), and its
+/// events from [events$].
+class _ControlledResolver implements Resolver {
+  final Completer<void> readyNow = Completer<void>();
+  final Completer<List<ServiceRecord>> answer = Completer();
+  final Completer<void> called = Completer<void>();
+  final StreamController<ServiceEvent> events$ =
+      StreamController<ServiceEvent>.broadcast(sync: true);
+
+  @override
+  Future<void> get ready => readyNow.future;
+
+  @override
+  Stream<ServiceEvent> get events => events$.stream;
+
+  @override
+  Future<List<ServiceRecord>> resolve(Name type) {
+    if (!called.isCompleted) {
+      called.complete();
+    }
+    return answer.future;
+  }
+
+  @override
+  Future<void> close() => events$.close();
 }
 
 /// A resolver that never becomes ready.

@@ -1,12 +1,14 @@
 // Connections a node initiates: their policy (outgoingPolicy, the
-// endpointPolicy hook, connect's and dial's policy, in that order of
-// precedence from last to first), un-pooled dials, and the application
+// endpointPolicy hook, asked about the endpoint as the pool keys it,
+// connect's and dial's policy, in that order of precedence from last to
+// first), un-pooled dials, and the application
 // payload chosen per destination (credentialFor), which never falls back to
 // the node's default payload. The consumer side of the untrusted worker
 // fleet (wiki page "Switchboard Use Cases", entry 5).
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:switchboard/switchboard.dart';
@@ -169,6 +171,56 @@ void main() {
       );
       expect(await pushed(client), refused);
       expect(seen, [server.uri]);
+    });
+
+    test('endpointPolicy sees the endpoint as the pool keys it: every '
+        'spelling gets the same policy', () async {
+      final seen = <Uri>[];
+      final client = node(
+        outgoingPolicy: ChannelPolicies.denyAll,
+        endpointPolicy: (endpoint) {
+          seen.add(endpoint);
+          return endpoint == server.uri ? ChannelPolicies.allowAll : null;
+        },
+      );
+      client.registerService(back, tagged('back'));
+      // A mem endpoint is its id: port, path, query and fragment ignored.
+      final spelled = server.uri.replace(
+        port: 7,
+        path: '/x',
+        query: 'q',
+        fragment: 'svc/1',
+      );
+      await client.dial(spelled);
+      await client.connect(spelled);
+      expect(seen, [server.uri, server.uri]);
+      await expectLater(
+        Future.doWhile(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 1));
+          return server.accepted.length < 2;
+        }).timeout(limit),
+        completes,
+      );
+      expect(await server.push(0), 'back');
+      expect(await server.push(1), 'back');
+      // WebSocket: the default port and path filled in, the fragment
+      // dropped; both spellings share the pooled connection.
+      final ws = node();
+      ws.registerService(svc, tagged('ws'));
+      final uri = await ws.listenWebSocket(InternetAddress.loopbackIPv4, 0);
+      seen.clear();
+      final first = await client.connect(
+        Uri.parse('ws://127.0.0.1:${uri.port}#svc/1'),
+      );
+      final second = await client.connect(
+        Uri.parse('WS://127.0.0.1:${uri.port}/'),
+      );
+      expect(second, same(first));
+      await client.dial(Uri.parse('ws://127.0.0.1:${uri.port}/#x'));
+      expect(seen, [
+        Uri.parse('ws://127.0.0.1:${uri.port}/'),
+        Uri.parse('ws://127.0.0.1:${uri.port}/'),
+      ]);
     });
 
     test('connect(policy:) applies to that connection', () async {
@@ -445,6 +497,37 @@ void main() {
       expect(b.payloads, everyElement('meta-b'));
       expect(c.payloads, everyElement(''));
       expect(a.raw.length + b.raw.length + c.raw.length, 8);
+      expectNoMeshSecret();
+    });
+
+    test('a record for any instance stands for the instance asked for, '
+        'metadata included', () async {
+      final seen = <ServiceRecord?>[];
+      final client = node(
+        resolver: StaticResolver([
+          ServiceRecord(
+            ServiceAddress(svc),
+            endpoints: [a.uri],
+            metadata: bytes('worker-key'),
+          ),
+        ]),
+        defaultPayload: meshSecret,
+        credentialFor: (endpoint, record) {
+          seen.add(record);
+          return record == null || record.metadata.isEmpty
+              ? null
+              : record.metadata;
+        },
+      );
+      await tagOf(await client.openChannel(ServiceAddress(svc)));
+      await tagOf(await client.openChannel(ServiceAddress(svc, 5)));
+      expect(seen.map((r) => r?.address), [
+        ServiceAddress(svc),
+        ServiceAddress(svc, 5),
+      ]);
+      expect(seen.map((r) => r?.metadata), everyElement(bytes('worker-key')));
+      expect(a.payloads, ['worker-key', 'worker-key']);
+      expect(a.raw.map((open) => ChannelAddress.decode(open).instance), [0, 5]);
       expectNoMeshSecret();
     });
 

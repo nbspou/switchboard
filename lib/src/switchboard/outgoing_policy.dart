@@ -15,6 +15,11 @@ import 'channel_policy.dart';
 /// `endpointPolicy` hook of `Switchboard`, consulted once per connection,
 /// when it is established.
 ///
+/// [endpoint] is normalised as the connection pool keys it (scheme and host
+/// lower-cased, the default port filled in, the path and query kept for
+/// WebSocket URIs only, no fragment, a `mem` URI by its id alone), so the
+/// spellings of one endpoint get the same answer.
+///
 /// Returns the [ChannelPolicy] for channels the peer at [endpoint] opens
 /// on that connection, or null to leave the choice to
 /// `Switchboard.outgoingPolicy`. To mark an endpoint as trusted while the
@@ -53,6 +58,10 @@ typedef EndpointPolicy = ChannelPolicy? Function(Uri endpoint);
 /// meant for the mesh does not reach a destination the hook does not
 /// recognise. Return the node's `defaultPayload` for the destinations
 /// that should see it.
+///
+/// Record metadata is visible to every watcher of the naming table, so a
+/// key placed there authenticates the mesh to the instance, not the
+/// instance to the mesh.
 ///
 /// ```dart
 /// final node = Switchboard(

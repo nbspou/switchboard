@@ -16,8 +16,11 @@ import 'naming_protocol.dart';
 ///
 /// Every (re)connect opens a fresh channel with
 /// [Switchboard.openTalkAt] to `_ns` (any instance) at [namingEndpoint],
-/// on the node's pooled connection to that endpoint, carrying the node's
-/// [Switchboard.defaultPayload]. [talkOptions] (default: the node's
+/// on the node's pooled connection to that endpoint, carrying the payload
+/// the node gives that endpoint: `credentialFor(namingEndpoint, null)`
+/// when the node has a [Switchboard.credentialFor] hook (a hook that
+/// returns null there sends an empty credential to the naming service),
+/// else the node's [Switchboard.defaultPayload]. [talkOptions] (default: the node's
 /// [Switchboard.talkOptions]) apply to that channel; [reconnectDelay] and
 /// [watchTimeout] are passed to [NamingClient.new].
 ///

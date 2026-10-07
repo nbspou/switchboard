@@ -5,9 +5,10 @@
 // connections, behind a policy, checking their key; and a consumer joined
 // to the mesh that keeps a PeerSet over them, exchanges capabilities on a
 // per-worker channel, and load-balances over the online ones. Covered: all
-// online, a worker reboot, an unregistered worker, a refused push from a
-// worker, and credential isolation (each worker sees its own key, never the
-// mesh credential).
+// online, a worker reboot, an unregistered worker (held, then removed), a
+// refused push from a worker, and credential isolation (each worker sees
+// its own key, never the mesh credential; the naming service sees the mesh
+// credential, and refuses channels without it).
 
 import 'dart:async';
 import 'dart:convert';
@@ -142,14 +143,22 @@ void main() {
 
   test('scaler, eight workers, consumer: online, reboot, unregister, '
       'refused push, credential isolation', () async {
-    // Naming service.
+    // Naming service: only for holders of the mesh credential.
     final namingNode = newNode();
     final naming = NamingService(
       heartbeat: heartbeat,
       assignmentHold: Duration.zero,
     );
     addTearDown(naming.close);
-    namingNode.registerService(Services.naming, naming.handler, instance: 1);
+    final namingPayloads = <String>[];
+    namingNode.registerService(Services.naming, (incoming) {
+      final payload = incoming.address.payload;
+      namingPayloads.add(text(payload));
+      if (text(payload) != text(meshSecret)) {
+        return incoming.reject(Status.of(StatusCode.unauthenticated));
+      }
+      return naming.handler(incoming);
+    }, instance: 1);
     final namingUri = await namingNode.listenMemory();
     naming.registerLocal(Services.naming, [namingUri], instance: 1);
 
@@ -227,6 +236,7 @@ void main() {
       },
       initialBackoff: const Duration(milliseconds: 20),
       maxBackoff: const Duration(milliseconds: 200),
+      removalHoldDown: const Duration(milliseconds: 200),
     );
     addTearDown(fleet.close);
     final events = <String>[];
@@ -237,10 +247,20 @@ void main() {
     await until(() => fleet.online.length == 8, 'all eight online');
     expect(capabilities.keys.toSet(), {for (final w in workers) w.id});
 
+    // Online means the capability exchange is done: every online worker
+    // has its capabilities.
+    List<String> capabilitiesOf(Peer peer) {
+      final known = capabilities[peer.address.instance];
+      if (known == null) {
+        fail('${peer.address} is online without its capabilities');
+      }
+      return known;
+    }
+
     // Load balancing by the application: the online workers with `tts`.
     final tts = [
       for (final peer in fleet.online)
-        if (capabilities[peer.address.instance]!.contains('tts')) peer,
+        if (capabilitiesOf(peer).contains('tts')) peer,
     ];
     expect(tts, hasLength(4));
     for (final peer in tts) {
@@ -269,12 +289,19 @@ void main() {
       'online 3',
     ]);
 
-    // The scaler retires a worker: removed, its connection goes.
+    // The scaler retires a worker: held for the hold-down (no longer
+    // online), then removed, and its connection goes.
     final retired = workers[5];
     await scaler.unregister(gpu, retired.id);
+    await until(() => events.contains('held 5'), 'held');
+    expect(fleet.online, hasLength(7));
+    expect(fleet.peers[retired.id]!.state, PeerState.held);
     await until(() => !fleet.peers.containsKey(retired.id), 'removed');
     await retired.accepted.last.done.timeout(limit);
-    expect(events.last, 'removed 5');
+    expect(events.where((e) => e.endsWith(' 5')).skip(2), [
+      'held 5',
+      'removed 5',
+    ]);
     expect(fleet.online, hasLength(7));
 
     // A worker may not push channels into the consumer.
@@ -290,6 +317,20 @@ void main() {
         expect(containsBytes(open, meshSecret), isFalse);
       }
     }
+    // The naming service saw the mesh credential, from the scaler and the
+    // consumer alike, and nothing else.
+    expect(namingPayloads, hasLength(greaterThanOrEqualTo(2)));
+    expect(namingPayloads, everyElement(text(meshSecret)));
+    // Without it, the naming service is out of reach.
+    final stranger = newNode();
+    final refused = await stranger.openChannelAt(
+      namingUri,
+      ChannelAddress(type: Services.naming),
+    );
+    expect(
+      (await refused.done.timeout(limit)).known,
+      StatusCode.unauthenticated,
+    );
 
     await fleet.close();
     expect(fleet.peers, isEmpty);

@@ -45,8 +45,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// defaults to the node's; [excludeOwnEndpoints] as in
 /// [Switchboard.selectAndConnect]. [mayLocate], when given, is asked
 /// before a `LOCATE`; false gives up (null). [where] filters the records
-/// as in [Switchboard.selectAndConnect]. Throws like
-/// [Switchboard.selectAndConnect] and [SlotResolver.locateSlot].
+/// as in [Switchboard.selectAndConnect]: a target it refuses fails with
+/// [StatusCode.notFound], whereas a target the resolver does not know
+/// gives up (null). Throws like [Switchboard.selectAndConnect] and
+/// [SlotResolver.locateSlot].
 Future<MuxChannel?> reopenAtSlotOwner(
   Switchboard switchboard,
   ChannelAddress header,
@@ -92,13 +94,32 @@ Future<MuxChannel?> reopenAtSlotOwner(
     }
   }
   for (var attempt = 0; ; attempt++) {
-    final (record, connection) = await switchboard.selectAndConnect(
-      ServiceAddress(type, target),
-      shard: slot,
-      resolver: r,
-      excludeOwnEndpoints: excludeOwnEndpoints,
-      where: where,
-    );
+    var refused = false;
+    final filter = where == null
+        ? null
+        : (ServiceRecord record) {
+            final accepted = where(record);
+            refused |= !accepted;
+            return accepted;
+          };
+    final ServiceRecord record;
+    final MuxConnection connection;
+    try {
+      (record, connection) = await switchboard.selectAndConnect(
+        ServiceAddress(type, target),
+        shard: slot,
+        resolver: r,
+        excludeOwnEndpoints: excludeOwnEndpoints,
+        where: filter,
+      );
+    } on SwitchboardException catch (e) {
+      if (e.code != StatusCode.notFound || refused) {
+        rethrow;
+      }
+      // Not in the resolver's table (yet): nowhere to go.
+      _log.fine('$type/$slot: MOVED by $rejectedBy, ${e.status}');
+      return null;
+    }
     var replacement = header.copyWith(
       instance: record.address.instance,
       clearHost: true,
