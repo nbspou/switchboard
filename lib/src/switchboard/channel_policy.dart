@@ -6,8 +6,10 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import '../address/channel_address.dart';
+import '../identity/credential.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
+import '../status.dart';
 
 /// The policy of a connection: decides whether the peer may address
 /// [address] at all.
@@ -22,9 +24,19 @@ import '../name.dart';
 /// `PERMISSION_DENIED` and a generic reason. [connection] is the
 /// connection the channel arrived on.
 ///
-/// A policy that throws refuses the channel. See the wiki page
-/// "Switchboard Addressing and Dispatch", sections "Dispatch of incoming
-/// channels" and "Connections and identity".
+/// A policy that throws refuses the channel: with the status code of a
+/// [SwitchboardException] it throws (`UNAUTHENTICATED` for a peer that has
+/// not identified, as [ChannelPolicies.requireIdentity] does; the reason
+/// sent is generic), with `PERMISSION_DENIED` for anything else (logged).
+/// A refusal with `UNAUTHENTICATED` on a connection whose peer has no
+/// [MuxConnection.peerIdentity] yet holds the channel until the peer
+/// identifies, for at most the node's `identityTimeout`, and evaluates the
+/// policy again then.
+///
+/// The peer's identity is [MuxConnection.peerIdentity] of [connection].
+/// See the wiki pages "Switchboard Addressing and Dispatch", sections
+/// "Dispatch of incoming channels" and "Connections and identity", and
+/// "Switchboard Identity and Credentials".
 typedef ChannelPolicy = bool Function(
   ChannelAddress address,
   MuxConnection connection,
@@ -68,6 +80,93 @@ abstract final class ChannelPolicies {
     return (address, connection) {
       final type = address.type;
       return type == null ? untyped : allowed.contains(type);
+    };
+  }
+
+  /// The naming service type, which [scoped] admits for every identified
+  /// peer.
+  static final Name _naming = Name('_ns');
+
+  /// Admits a channel only if the peer's credential has an [Right.open]
+  /// scope for its type (wiki page "Switchboard Identity and
+  /// Credentials", section "Where credentials are checked"); refuses the
+  /// others with `PERMISSION_DENIED`. A channel without a service type is
+  /// checked as the empty name, which only a `*` pattern matches. The
+  /// naming service `_ns` is admitted for every identified peer: it checks
+  /// the credential's naming rights (`register`, `watch`, ...) itself, and
+  /// a worker that may open nothing must still register.
+  ///
+  /// A peer that has not identified (or whose credential expired) is
+  /// refused with `UNAUTHENTICATED` when [requireIdentity] (the default),
+  /// which makes the node hold its channels until it identifies (see
+  /// [ChannelPolicy]); without [requireIdentity] it passes unchecked, for
+  /// a mesh moving to identities (combine with another policy, see [all],
+  /// to restrict it).
+  ///
+  /// Returns one of two fixed functions, so that the results of calls with
+  /// the same argument are equal (pooling in `Switchboard.connect` compares
+  /// policies).
+  static ChannelPolicy scoped({bool requireIdentity = true}) =>
+      requireIdentity ? _scopedStrict : _scopedLenient;
+
+  static bool _scopedStrict(ChannelAddress address, MuxConnection connection) =>
+      _scoped(address, connection, requireIdentity: true);
+
+  static bool _scopedLenient(
+    ChannelAddress address,
+    MuxConnection connection,
+  ) => _scoped(address, connection, requireIdentity: false);
+
+  static bool _scoped(
+    ChannelAddress address,
+    MuxConnection connection, {
+    required bool requireIdentity,
+  }) {
+    final identity = connection.peerIdentity;
+    if (identity == null) {
+      if (requireIdentity) {
+        throw _unidentified();
+      }
+      return true;
+    }
+    final type = address.type ?? Name.empty;
+    return type == _naming || identity.allows(Right.open, type);
+  }
+
+  /// Admits every channel of an identified peer, and refuses a peer that
+  /// has not identified (or whose credential expired) with
+  /// `UNAUTHENTICATED`, holding its channels until it identifies (see
+  /// [ChannelPolicy]). Always returns the same function.
+  static ChannelPolicy requireIdentity() => _requireIdentity;
+
+  static bool _requireIdentity(
+    ChannelAddress address,
+    MuxConnection connection,
+  ) {
+    if (connection.peerIdentity == null) {
+      throw _unidentified();
+    }
+    return true;
+  }
+
+  static SwitchboardException _unidentified() => SwitchboardException.of(
+    StatusCode.unauthenticated,
+    'the peer has not identified',
+  );
+
+  /// Admits a channel only if every policy of [policies] admits it,
+  /// evaluated in order; the first refusal (false or a throw) decides. An
+  /// empty list admits everything. Returns a new closure on every call (see
+  /// [allowTypes] about reusing it).
+  static ChannelPolicy all(List<ChannelPolicy> policies) {
+    final list = List<ChannelPolicy>.of(policies);
+    return (address, connection) {
+      for (final policy in list) {
+        if (!policy(address, connection)) {
+          return false;
+        }
+      }
+      return true;
     };
   }
 }

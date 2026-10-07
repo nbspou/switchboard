@@ -15,6 +15,9 @@ import 'package:stream_channel/stream_channel.dart';
 
 import '../address/channel_address.dart';
 import '../address/service_address.dart';
+import '../identity/credential.dart';
+import '../identity/credential_verifier.dart';
+import '../identity/holder_key.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
@@ -87,6 +90,25 @@ class Switchboard {
   /// credential this node presents to it. All null (the default), an
   /// initiated connection is trusted like an internal listener's and every
   /// channel carries [defaultPayload].
+  ///
+  /// Identity (wiki page "Switchboard Identity and Credentials"): with a
+  /// [credential] (and the [holderKey] it names, if it names one), the
+  /// node identifies with `NONCE`/`IDENT` on every connection it initiates
+  /// ([connect], [dial], and through them the open methods, `PeerSet` and
+  /// the proxy), before the connection is used, unless [identifyOutgoing]
+  /// is false or [identifyFor] says otherwise for the endpoint; on other
+  /// connections when the application asks ([identifyOn]). [verifier]
+  /// checks the credentials peers present on any connection of the node,
+  /// accepted or initiated, which sets [MuxConnection.peerIdentity] for
+  /// the policies (see [ChannelPolicies.scoped]); it becomes the
+  /// [MuxOptions.identityVerifier] of [muxOptions]. [identityTimeout]
+  /// bounds each identification and how long a channel that its policy
+  /// refused with `UNAUTHENTICATED` is held for the peer to identify
+  /// (zero: no bound on identification, and no holding).
+  ///
+  /// Throws [ArgumentError] when [credential] names a holder key and
+  /// [holderKey] is missing or another, and for a negative
+  /// [identityTimeout].
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -101,8 +123,19 @@ class Switchboard {
     this.outgoingPolicy,
     this.endpointPolicy,
     this.credentialFor,
+    Credential? credential,
+    this.holderKey,
+    CredentialVerifier? verifier,
+    this.identifyOutgoing = true,
+    this.identifyFor,
+    this.identityTimeout = const Duration(seconds: 10),
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
-       muxOptions = muxOptions ?? const MuxOptions(),
+       _identity = credential,
+       muxOptions = verifier == null
+           ? muxOptions ?? const MuxOptions()
+           : (muxOptions ?? const MuxOptions()).copyWith(
+               identityVerifier: verifier,
+             ),
        talkOptions = talkOptions ?? const TalkOptions(),
        _random = random ?? Random() {
     RangeError.checkValueInInterval(
@@ -111,7 +144,84 @@ class Switchboard {
       1 << 16,
       'maxConnectionsPerEndpoint',
     );
+    if (identityTimeout < Duration.zero) {
+      throw ArgumentError.value(
+        identityTimeout,
+        'identityTimeout',
+        'must not be negative',
+      );
+    }
+    if (credential != null) {
+      _checkHolderKey(credential);
+    }
   }
+
+  /// The credential this node identifies with (wiki page "Switchboard
+  /// Identity and Credentials"), or null for none. May be replaced, for
+  /// example by a renewed credential: connections established afterwards
+  /// use the new one; [identifyOn] presents it on a live connection.
+  /// Throws [ArgumentError] when the new credential names a holder key
+  /// other than [holderKey]'s.
+  Credential? get credential => _identity;
+
+  set credential(Credential? value) {
+    if (value != null) {
+      _checkHolderKey(value);
+    }
+    _identity = value;
+  }
+
+  Credential? _identity;
+
+  void _checkHolderKey(Credential credential) {
+    final holder = credential.holderKey;
+    if (holder == null) {
+      return;
+    }
+    final key = holderKey?.publicKey;
+    var same = key != null && key.length == holder.length;
+    for (var i = 0; same && i < holder.length; i++) {
+      same = key![i] == holder[i];
+    }
+    if (!same) {
+      throw ArgumentError.value(
+        holderKey,
+        'holderKey',
+        'the credential names a holder key; pass its key pair',
+      );
+    }
+  }
+
+  /// The key pair of the holder key [credential] names; null for a bearer
+  /// credential.
+  final HolderKey? holderKey;
+
+  /// Checks the credentials peers present with `IDENT` on the node's
+  /// connections; null when the node does not check identity (an `IDENT`
+  /// is then ignored). [MuxOptions.identityVerifier] of [muxOptions].
+  CredentialVerifier? get verifier => muxOptions.identityVerifier;
+
+  /// Whether the node identifies with [credential] on the connections it
+  /// initiates, for endpoints [identifyFor] does not decide. Default true.
+  ///
+  /// The node presents its credential to every such peer: a bearer
+  /// credential can be replayed by whoever receives it, and even a
+  /// holder-key credential lets a peer that relays the handshake to a third
+  /// node pass as this node there (the proof binds the nonces, not the
+  /// peer). A node that dials peers outside its trust domain identifies
+  /// only to its own mesh, through [identifyFor].
+  final bool identifyOutgoing;
+
+  /// Whether the node identifies on a connection it initiates to
+  /// `endpoint`, asked when the connection is established, about the
+  /// endpoint as the pool keys it (as [endpointPolicy] is). Null (the
+  /// default): [identifyOutgoing]. A hook that throws means no (logged).
+  final bool Function(Uri endpoint)? identifyFor;
+
+  /// Bound on each identification of the node ([MuxConnection.identify]),
+  /// and on how long a channel refused with `UNAUTHENTICATED` by its
+  /// connection's policy is held for the peer to identify. Default 10 s.
+  final Duration identityTimeout;
 
   /// Resolves service types for [openChannel] and [openTalk]. May be
   /// replaced at any time; channels already open are unaffected.
@@ -923,7 +1033,64 @@ class Switchboard {
       // it.
       throw _closedException();
     }
+    final credential = _identity;
+    if (credential != null && _identifiesTo(_normalised(endpoint))) {
+      try {
+        await connection.identify(
+          credential,
+          holderKey: holderKey,
+          timeout: identityTimeout,
+        );
+      } on Object catch (e) {
+        _log.info('identification to $endpoint failed: $e');
+        unawaited(connection.goAway());
+        if (_closing) {
+          throw _closedException();
+        }
+        throw SwitchboardException.of(
+          StatusCode.unauthenticated,
+          'identification to $endpoint failed: '
+          '${e is SwitchboardException ? e.status : e}',
+        );
+      }
+    }
     return connection;
+  }
+
+  /// Whether the node identifies on a connection to [endpoint] (normalised):
+  /// [identifyFor], else [identifyOutgoing].
+  bool _identifiesTo(Uri endpoint) {
+    final hook = identifyFor;
+    if (hook == null) {
+      return identifyOutgoing;
+    }
+    try {
+      return hook(endpoint);
+    } on Object catch (e, st) {
+      _log.warning('identifyFor failed for $endpoint', e, st);
+      return false;
+    }
+  }
+
+  /// Identifies the node with [credential] on [connection], with [intent]
+  /// (wiki page "Switchboard Identity and Credentials"): for a connection
+  /// this node accepted, whose peer wants it to identify
+  /// ([MuxConnection.identityRequested]), or to present a renewed
+  /// [credential] on a live connection. Bounded by [identityTimeout].
+  ///
+  /// Fails like [MuxConnection.identify]. Throws [StateError] when the
+  /// node has no credential.
+  Future<void> identifyOn(MuxConnection connection, {Uint8List? intent}) {
+    final credential = _identity;
+    if (credential == null) {
+      throw StateError('the node has no credential');
+    }
+    return connection.identify(
+      credential,
+      holderKey: holderKey,
+      intent: intent,
+      timeout: identityTimeout,
+    );
   }
 
   /// What [endpointPolicy] says for [endpoint]; a hook that throws refuses
@@ -1103,14 +1270,83 @@ class Switchboard {
       return;
     }
     final policy = _policies[connection];
-    if (policy != null && !_permitted(policy, address, connection)) {
-      _log.info(
-        'channel ${channel.id} from $remote: $address refused by the '
-        'policy',
-      );
-      unawaited(channel.close(genericStatus(StatusCode.permissionDenied)));
-      return;
+    if (policy != null) {
+      final refusal = _refusal(policy, address, connection);
+      if (refusal == StatusCode.unauthenticated &&
+          connection.peerIdentity == null &&
+          identityTimeout > Duration.zero) {
+        unawaited(_holdForIdentity(connection, channel, address, policy));
+        return;
+      }
+      if (refusal != null) {
+        _refuse(channel, address, remote, refusal);
+        return;
+      }
     }
+    _deliver(channel, address, remote);
+  }
+
+  void _refuse(
+    MuxChannel channel,
+    ChannelAddress address,
+    String? remote,
+    StatusCode code,
+  ) {
+    _log.info(
+      'channel ${channel.id} from $remote: $address refused by the '
+      'policy (${code.name})',
+    );
+    unawaited(channel.close(genericStatus(code)));
+  }
+
+  /// Holds [channel], which [policy] refused because the peer has not
+  /// identified, until the peer identifies (then evaluates the policy
+  /// again), the channel or the connection ends, or [identityTimeout]
+  /// passes (then refuses it with `UNAUTHENTICATED`). Never fails.
+  Future<void> _holdForIdentity(
+    MuxConnection connection,
+    MuxChannel channel,
+    ChannelAddress address,
+    ChannelPolicy policy,
+  ) async {
+    final remote = _remotes[connection];
+    _log.fine(
+      'channel ${channel.id} from $remote: $address held until the peer '
+      'identifies',
+    );
+    final watch = Stopwatch()..start();
+    while (true) {
+      final left = identityTimeout - watch.elapsed;
+      if (left <= Duration.zero) {
+        break;
+      }
+      await Future.any<void>([connection.identityChanged, channel.done])
+          .timeout(left, onTimeout: () {});
+      if (channel.state != MuxChannelState.open) {
+        // Closed by the peer, or the connection ended.
+        return;
+      }
+      final refusal = _refusal(policy, address, connection);
+      if (refusal == null) {
+        _deliver(channel, address, remote);
+        return;
+      }
+      if (refusal != StatusCode.unauthenticated ||
+          connection.peerIdentity != null) {
+        _refuse(channel, address, remote, refusal);
+        return;
+      }
+    }
+    _log.info(
+      'channel ${channel.id} from $remote: $address refused, the peer did '
+      'not identify within $identityTimeout',
+    );
+    unawaited(channel.close(genericStatus(StatusCode.unauthenticated)));
+  }
+
+  /// Hands [channel] to the handler [address] selects, or refuses it with
+  /// `NOT_FOUND`.
+  void _deliver(MuxChannel channel, ChannelAddress address, String? remote) {
     final handler = _select(address);
     if (handler == null) {
       _log.fine('channel ${channel.id} from $remote: no handler for $address');
@@ -1139,16 +1375,28 @@ class Switchboard {
     }
   }
 
-  static bool _permitted(
+  /// Null when [policy] admits [address], else the code to refuse it with:
+  /// that of a [SwitchboardException] the policy throws (a code a CLOSE
+  /// may carry), else `PERMISSION_DENIED`.
+  static StatusCode? _refusal(
     ChannelPolicy policy,
     ChannelAddress address,
     MuxConnection connection,
   ) {
     try {
-      return policy(address, connection);
+      return policy(address, connection) ? null : StatusCode.permissionDenied;
+    } on SwitchboardException catch (e) {
+      final code = e.code;
+      if (code == null ||
+          code == StatusCode.ok ||
+          code == StatusCode.connectionLost) {
+        _log.warning('policy failed for $address: ${e.status}');
+        return StatusCode.permissionDenied;
+      }
+      return code;
     } on Object catch (e, st) {
       _log.warning('policy failed for $address', e, st);
-      return false;
+      return StatusCode.permissionDenied;
     }
   }
 

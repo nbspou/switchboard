@@ -3,13 +3,15 @@
 # `dart test -P node` (or `dart test -p node test/vectors/`) runs the
 # platform independent codec tests compiled to JavaScript on Node.js, which
 # checks the 32 and 48-bit arithmetic of the wire codecs on the web, and the
-# reconnecting client, which is meant for web frontends.
+# reconnecting client, which is meant for web frontends, and the identity
+# tests (credentials, Ed25519 in pure Dart, the NONCE/IDENT handshake).
 presets:
   node:
     platforms: [node]
     paths:
       - test/vectors
       - test/bytes_test.dart
+      - test/identity_test.dart
       - test/name_test.dart
       - test/status_test.dart
       - test/reconnecting_client_test.dart

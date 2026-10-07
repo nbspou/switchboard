@@ -36,6 +36,13 @@ lib/src/talk/talk_request.dart TalkRequest (handle for an outgoing single-respon
 lib/src/talk/talk_stream.dart  TalkStream (handle for an outgoing stream request)
 lib/src/address/service_address.dart   ServiceAddress
 lib/src/address/channel_address.dart   ChannelAddress (open payload codec)
+lib/src/identity/credential.dart       Credential (codec), CredentialKind, Right, SignatureKind, Scope (pattern matching)
+lib/src/identity/credential_issuer.dart  CredentialIssuer (HMAC-SHA256 with package:crypto, Ed25519); hmacSha256, checkHmacKey (internal)
+lib/src/identity/credential_verifier.dart  CredentialVerifier (keys by id, LRU cache by credential bytes)
+lib/src/identity/holder_key.dart       HolderKey (the holder's Ed25519 key pair)
+lib/src/identity/peer_identity.dart    PeerIdentity (MuxConnection.peerIdentity)
+lib/src/identity/ed25519.dart          ed25519Sign/Verify/PublicKey over package:cryptography's DartEd25519 + DartSha512, constantTimeEquals (internal)
+lib/src/identity/secure_random.dart    secureRandomBytes: Random.secure on the VM, globalThis.crypto.getRandomValues on the web (internal, conditional import)
 lib/src/client/reconnecting_client.dart  ReconnectingClient, ClientState, ClientPhase, TransportConnector (frontend client, core)
 lib/src/client/backoff.dart              Backoff: the reconnect schedule shared by ReconnectingClient and PeerSet (internal, not exported)
 lib/src/client/persistent_channel.dart   PersistentChannel, PersistentTalk (part of reconnecting_client.dart)
@@ -212,6 +219,8 @@ class MuxOptions {
   final int receiveHighWaterMarkBytes; // all channel buffers; default 16 MiB (0 = never); above: stop reading the transport until half
   final Duration closeConfirmTimeout;  // MuxChannel.close() wait for the peer's CLOSE; default 30 s (Duration.zero = forever)
   final int maxOpenPayloadBytes;       // OPEN payloads held for the peer's open channels; default 16 MiB, at most half of receiveHighWaterMarkBytes (so 8 MiB with the defaults); 0 = no budget of its own; beyond: CLOSE resourceExhausted
+  final CredentialVerifier? identityVerifier;   // checks the peer's IDENT; null: IDENT ignored (NONCE still answered)
+  final Duration identityTimeout;      // identify()'s default bound; default 10 s; zero = none
 }
 
 class MuxConnection {
@@ -234,6 +243,11 @@ class MuxConnection {
   int get openPayloadBytes;                 // OPEN payloads held for the peer's open channels
   bool get isReceivePaused;                 // transport reading paused by receiveHighWaterMarkBytes
   int get unconfirmedCloseCount;            // ids awaiting the peer's CLOSE without a channel
+  Future<void> identify(Credential credential, {HolderKey? holderKey, Uint8List? intent, Duration? timeout});   // see "Identity"
+  PeerIdentity? get peerIdentity;           // last valid IDENT; null before, without a verifier, and once its credential expired
+  Future<PeerIdentity> get peerIdentified;  // first valid IDENT; never completes without one, never fails
+  Future<void> get identityRequested;       // the peer's NONCE arrived before ours; never fails
+  @internal Future<void> get identityChanged;   // next valid IDENT or the end (Switchboard's holding)
 }
 
 enum MuxChannelState { open, halfClosedLocal, closed }
@@ -262,6 +276,7 @@ Behaviour notes:
 * Reasons sent in CLOSE and GOAWAY are shortened on a UTF-8 boundary so the status payload is at most 1024 bytes and the frame fits the peer's announced frame limit; `done` reports the status as given. The cut is made in the encoded bytes, so fixed fields before a reason (`MOVED`) survive.
 * `Status.decode` keeps the bytes after the code as received (`reason` is their lossy UTF-8 decoding) and `encode` writes them back unchanged, so a status relayed by `pipeChannels` or `forwardMessage` (the `MOVED` and `RELOCATED` fields) reaches the far side byte for byte. `Status` itself does not interpret fields; `MovedStatus` does.
 * Channel streams and `incoming` are fed from queues the mux owns and only while the listener is active and not paused, so every buffered byte and channel is accounted for.
+* NONCE and IDENT: see "Identity". While an IDENT is verified (asynchronous: Ed25519 is), the transport subscription is paused and frames the transport still delivers are queued; they are handled in order once the IDENT has taken effect, so policies see the identity on an OPEN sent right after it. Keep-alive counts that pause as local.
 
 ## Resource limits
 
@@ -507,18 +522,24 @@ typedef ChannelHandler = FutureOr<void> Function(IncomingChannel channel);   // 
 /// Connection policy (channel_policy.dart, core): a listener's applies to every connection it
 /// accepts, an outgoing one (see Switchboard) to a connection the node initiates. Evaluated for
 /// every channel the peer opens on the connection, after the header is parsed and before any
-/// handler (local service, default service, catch-all). Refused or throwing: CLOSE
-/// PERMISSION_DENIED 'permission denied'.
+/// handler (local service, default service, catch-all). Refused: CLOSE PERMISSION_DENIED
+/// 'permission denied'; throwing a SwitchboardException: its code (not OK or CONNECTION_LOST),
+/// generic reason; any other throw: PERMISSION_DENIED (logged). UNAUTHENTICATED while the peer
+/// has no identity: the channel is held (see "Identity").
 typedef ChannelPolicy = bool Function(ChannelAddress address, MuxConnection connection);
 abstract final class ChannelPolicies {
   static bool allowAll(ChannelAddress, MuxConnection);
   static bool denyAll(ChannelAddress, MuxConnection);                // for connections to peers that may not open channels back
   static bool denyReserved(ChannelAddress, MuxConnection);           // refuses `_` types, allows the rest and untyped
   static ChannelPolicy allowTypes(Set<Name> types, {bool untyped = false});   // only these types (a listed reserved type is allowed); a new closure per call: reuse one for connect(policy:)
+  static ChannelPolicy scoped({bool requireIdentity = true});        // open scope for the type (untyped = empty name), _ns for any identified peer; unidentified: UNAUTHENTICATED (or pass); fixed functions
+  static ChannelPolicy requireIdentity();                            // identified peers only; a fixed function
+  static ChannelPolicy all(List<ChannelPolicy> policies);            // in order, first refusal wins; a new closure
 }
 
 class IncomingChannel {
   MuxChannel get channel; ChannelAddress get address; MuxConnection get connection;
+  PeerIdentity? get peerIdentity;                 // connection.peerIdentity
   TalkChannel talk({TalkOptions? options});       // wrap once; cached
   Future<void> reject(Status status);
 }
@@ -551,8 +572,14 @@ class Switchboard {
   Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions,
       Duration connectTimeout = 10 s, bool allowHostHint = false, int maxConnectionsPerEndpoint = 4,
       Duration slotRefreshTimeout = 5 s, SelectionPolicy selection = roundRobin, Random? random,   // random: source of SelectionPolicy.random
-      ChannelPolicy? outgoingPolicy, EndpointPolicy? endpointPolicy, EndpointCredential? credentialFor});
+      ChannelPolicy? outgoingPolicy, EndpointPolicy? endpointPolicy, EndpointCredential? credentialFor,
+      Credential? credential, HolderKey? holderKey, CredentialVerifier? verifier, bool identifyOutgoing = true,
+      bool Function(Uri endpoint)? identifyFor, Duration identityTimeout = 10 s});   // ArgumentError: holder key missing/other, negative timeout
   Resolver? resolver; Uint8List defaultPayload; SelectionPolicy selection;
+  Credential? credential;   // settable (renewal; ArgumentError for another holder key); final HolderKey? holderKey;
+  CredentialVerifier? get verifier;   // muxOptions.identityVerifier (the constructor's verifier is copied into muxOptions)
+  final bool identifyOutgoing; final bool Function(Uri endpoint)? identifyFor; final Duration identityTimeout;
+  Future<void> identifyOn(MuxConnection connection, {Uint8List? intent});   // StateError without a credential; see "Identity"
   // The policy of an initiated connection is chosen once, when it is established: connect's or
   // dial's policy, else endpointPolicy(endpoint) if non-null, else outgoingPolicy; null allows
   // everything (as before). Applied in dispatch exactly like a listener policy.
@@ -686,6 +713,65 @@ Outgoing policies and credentials (wiki "Addressing", "Connections and identity"
 Rejections sent to peers by the node and the proxy (policy refusals, no handler, resolution and connection failures, per-client limit) carry the status code and a generic reason only (`'permission denied'`, `'not found'`, `'unavailable'`, ...); the details (instance ids, endpoints, resolver state) are logged locally at FINE or INFO. Statuses a backend sends pass through the proxy unchanged, except `MOVED` and `RELOCATED`, whose owner and epoch are zeroed (and reason dropped) unless `revealOwners`; a lost connection on one side reaches the other as `UNAVAILABLE` `'connection lost'`.
 
 Dispatch order is as in the wiki "Addressing" page, after the listener policy. Resolution: `resolver.resolve(type)`, filter by instance if non-zero, then by `where` (an exception it throws reaches the caller), pick by shard (the slot's owner for a type with a slot table, see "Sharding", NOT_FOUND if `where` refuses the owner; otherwise `sorted[s % n]` of the remaining) or by the node's `selection` (round robin: a per-type counter shared by all filters; random: `random.nextInt(n)`), connect to `endpoints.first` (try next on failure, then the following instances in sorted order), OPEN with header `{type, selectedInstance, shard, payload}`. `proxyHandler` gets the node's selection policy through `selectAndConnect` and passes no filter.
+
+## Identity
+
+Stage A of the wiki page "Switchboard Identity and Credentials": credentials, connection identity, scoped policies. Stage B (naming service enforcement, `RENEW`, `CONNECT` brokering, brokered peers in `PeerSet`) builds on it.
+
+```dart
+enum CredentialKind { node(1), client(2), device(3) }
+enum Right { register(1), open(2), watch(3), claim(4), migrate(5), broker(6), admin(7) }   // fromCode: null for unknown
+enum SignatureKind { hmacSha256(1, 32), ed25519(2, 64) }   // code, signatureLength
+class Scope { const Scope(Right right, Name pattern); Scope.of(Right right, String pattern);
+  bool matches(Name name); static bool patternMatches(Name pattern, Name name); }   // trailing '*' (last non-zero byte) = any suffix, empty included; '*' alone = all
+class Credential {
+  Credential({required kind, required keyId, required identity, required issuedAt, required expiresAt,
+      List<int>? holderKey, List<Scope> scopes = const [], required signatureKind, required List<int> signature});   // ArgumentError: field ranges, > maxLength
+  static const currentVersion = 1, maxLength = 893, holderKeyLength = 32;
+  final int version; CredentialKind kind; Name keyId; String identity; int issuedAt; int expiresAt;   // unix seconds; expiresAt 0 = never
+  final Uint8List? holderKey; List<Scope> scopes; SignatureKind signatureKind; Uint8List signature;
+  bool get isBearer; DateTime get issuedAtTime; DateTime? get expiresAtTime;
+  bool isExpired([DateTime? now]);          // now >= expiresAt (clock.now() by default)
+  bool allows(Right right, Name name);      // admin allows everything
+  Uint8List get signedBytes; Uint8List encode();   // a decoded credential re-encodes to its exact bytes
+  static Credential decode(Uint8List bytes);       // ProtocolException; unknown rights dropped (bytes kept)
+}
+class CredentialIssuer {
+  CredentialIssuer.hmac(Name keyId, List<int> key);              // key >= 16 bytes
+  CredentialIssuer.ed25519(Name keyId, SimpleKeyPair keyPair);   // package:cryptography
+  static Future<CredentialIssuer> ed25519FromSeed(Name keyId, List<int> seed);
+  Future<Credential> issue({required CredentialKind kind, required String identity, List<Scope> scopes,
+      List<int>? holderKey, DateTime? issuedAt, Duration? lifetime = 8 h});   // null lifetime: never expires; HMAC + holderKey: ArgumentError
+  Future<Uint8List> publicKey();            // Ed25519; StateError for HMAC
+}
+class CredentialVerifier {
+  CredentialVerifier({Map<Name, List<int>> hmacKeys, Map<Name, List<int>> ed25519Keys, int cacheSize = 1024});
+  void addHmacKey(Name keyId, List<int> key); void addEd25519Key(Name keyId, List<int> publicKey);
+  Future<void> addIssuer(CredentialIssuer issuer); bool removeKey(Name keyId); Set<Name> get keyIds; int get cachedCount;
+  Future<Credential> verify(Uint8List bytes, {DateTime? now});   // SwitchboardException(unauthenticated, 'invalid credential'); cause at FINE on Switchboard.Identity
+}
+class HolderKey { static Future<HolderKey> generate(); static Future<HolderKey> fromSeed(List<int> seed);
+  static Future<HolderKey> fromKeyPair(SimpleKeyPair keyPair); Uint8List get publicKey; Future<Uint8List> sign(List<int> message); }
+class PeerIdentity { Credential credential; Uint8List intent; DateTime verifiedAt;
+  String get identity; CredentialKind get kind; List<Scope> get scopes; bool get provedPossession; bool allows(Right, Name); bool isExpired([DateTime?]); }
+class MuxIdent { MuxIdent({required Uint8List credential, Uint8List? intent, Uint8List? proof});   // the IDENT payload codec (mux_frame.dart)
+  static const nonceLength = 32, maxIntentLength = 64, proofLength = 64; static final Uint8List proofLabel;   // 'SWBIDENT'
+  static Uint8List proofMessage(senderNonce, receiverNonce, intent); Uint8List encode(); static MuxIdent decode(Uint8List); }
+// MuxControlType.nonce(5), ident(6); MuxControlMessage.nonce(Uint8List), MuxControlMessage.ident(MuxIdent)
+```
+
+Behaviour notes:
+
+* Credentials: the layout and decoding rules of the wiki page (version 1 only, kinds 1 to 3, strict UTF-8 identity, valid names, holder key 0 or 32 bytes, signature kind 1 or 2 with its length, nothing after the signature, at most 893 bytes). A scope with an unknown right is dropped from `scopes` (it could only grant more); the decoded credential keeps its bytes, so `encode` and `signedBytes` are exact. `issuedAt` is informational; only `expiresAt` is checked.
+* Verifier: decode, key by id, kind must match the key's, HMAC credentials must be bearer, HMAC compared in constant time, Ed25519 verified with `DartEd25519(sha512: const DartSha512())` (pure Dart: the default `Ed25519()` and `Sha512()` reach `Cryptography.instance`, whose browser implementation throws on Node.js). Cache: verified credentials by bytes, least recently used, `cacheSize` entries; concurrent checks of the same bytes share one future (which never fails; null is invalid); key changes bump an epoch, clear the cache and re-check a check that started under other keys. Expiry against `now` on every call, cached or not.
+* Random: nonces and generated holder seeds come from `secureRandomBytes`: `Random.secure()` on the VM; on the web `globalThis.crypto.getRandomValues` called directly, since `Random.secure()` reads `self.crypto`, which throws under the Node.js test runner (`self` is not the global object there and the global `crypto` accessor checks its receiver).
+* `identify`: holder key checked against the credential (`ArgumentError`); the IDENT size checked before anything is sent; NONCE sent unless sent; waits for the peer's NONCE (`DEADLINE_EXCEEDED` after the timeout); signs the proof over `SWBIDENT ‖ our nonce ‖ the peer's nonce ‖ intent`; sends IDENT, then `ping()` bounded by what is left of the timeout. The PONG confirms: the receiver handles frames after an IDENT only once it took effect. A connection that ends meanwhile fails it with `UNAUTHENTICATED` if the peer's GOAWAY said so, else the end status.
+* Receiving NONCE: exactly 32 bytes, at most one (else protocol error); answered with ours if not sent (then `identityRequested` completes); completes `identify` waiting for it.
+* Receiving IDENT: ignored without a verifier. Else protocol error before both nonces or for a malformed envelope (`MuxIdent.decode`); then the subscription is paused and verification runs: `verify` the credential; holder key: proof exactly 64 bytes verifying over `SWBIDENT ‖ the peer's nonce ‖ ours ‖ intent`; bearer: proof empty. Valid: `peerIdentity` replaced, `peerIdentified` completed once, `identityChanged` signalled, held frames handled in order, the subscription resumed. Invalid: GOAWAY `UNAUTHENTICATED` 'identification failed' and close (`done` is `UNAUTHENTICATED`); the cause is logged at INFO.
+* `Switchboard`: with a `credential`, `_dial` (so `connect`, `dial`, the opens, `PeerSet`, the proxy) identifies after `_adopt` and before returning, when `identifyFor(normalised endpoint)` (a throw: no) or else `identifyOutgoing` says so; the pool gets the connection only afterwards, so concurrent opens wait for it. Failure: GOAWAY on the connection, `UNAUTHENTICATED` naming the cause to the caller (`FAILED_PRECONDITION` when the node is closing). Accepted connections never identify on their own (`identifyOn`). The constructor's `verifier` is copied into `muxOptions`, so every connection, accepted or initiated, verifies.
+* Dispatch: policy refusal codes as in `ChannelPolicy`. `UNAUTHENTICATED` with no (unexpired) peer identity and `identityTimeout > 0`: the channel is held; on each `identityChanged` (or the channel ending, or the time left) the channel is checked: no longer open, dropped; the policy evaluated again: admitted, delivered; another refusal, or `UNAUTHENTICATED` although identified, refused with it; at the deadline CLOSE `UNAUTHENTICATED`. No GOAWAY for it (the wiki's SHOULD): a policy may require identity for some types only.
+* `ChannelPolicies.scoped` admits `_ns` for every identified peer, whatever its `open` scopes: the naming service checks the naming rights, and a worker must reach it to register.
+* `PeerSet.watch` warns when the node identifies with a bearer credential on every initiated connection.
 
 ## Naming service
 
@@ -879,6 +965,7 @@ The first four were adopted by the wiki since.
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
 * `test/outgoing_test.dart` (over `mem://`, and `ws` for endpoint normalisation): the policy of initiated connections and its precedence, `endpointPolicy` on the normalised endpoint, pooling per explicit policy, `dial`, and `credentialFor` (per endpoint, per record and from its metadata, an instance-0 record standing for a named instance, synchronous and asynchronous, the explicit payload winning, `openChannelOn`, the `MOVED` retry, the proxy unaffected), sniffing the raw OPEN payloads for the mesh credential.
 * `test/peer_set_test.dart` (over `mem://` and a `StaticResolver` or a resolver the test drives): `PeerSet` membership and events (events around the initial `resolve`, resolver errors, the removal hold-down), a worker's reboot, the per-peer channel and the hooks (online only once both succeeded: a handler that throws, a rejection, `onOpen` throwing or failing, hooks that throw, fail or hang; re-opens refused or with a hanging `onOpen`), refusals, moved endpoints, endpoint fallback past an endpoint that never answers, the outgoing policy and credentials, the warnings of `watch`, `close`; the backoff schedule, the GOAWAY reconnect, a worker's GOAWAY `GOING_AWAY` on a live connection (online again at once on a new connection with the per-peer channel there, the old connection kept until the application's channel on it closes, a second GOAWAY within `maxBackoff` backing off) and the hook bound under fake_async, which also checks that no timer is left. `test/integration/fleet_consumer_test.dart`: use case 5 end to end (naming service that requires the mesh credential, a registrar for eight workers, a consumer joined to the mesh, a retired worker held then removed).
+* `test/vectors/identity_vectors_test.dart`: the credential vectors (C1 HMAC, C2 Ed25519 from the RFC 8032 seeds), the proof P, NONCE and IDENT frames, scope patterns, the malformed cases; on Node.js too. `test/identity_test.dart` (core, also on Node.js): issuer, verifier (cache, rotation, failures), and the handshake over `MemoryTransport` (both directions, holder-key proofs, ordering of frames after an IDENT, a replayed IDENT, expired and unknown credentials, no verifier, timeouts, protocol errors). `test/identity_node_test.dart` (over `mem://` and TCP): mutual identity, `scoped`, a worker refused in both directions, bearer credentials, a credential of another authority and a forged one, holding, `requireIdentity` and `all`, `identifyFor`, a peer that never answers NONCE, a renewed credential, `PeerSet`.
 * `test/selection_test.dart` (over `mem://`): `where` filters over record metadata (also on the `MOVED` retry: a new owner it refuses ends the channel with `NOT_FOUND`), `SelectionPolicy.random` with a seeded `Random`, and `acceptAnyInstance` dispatch; the registrar pattern and metadata re-registration are in `test/naming_test.dart`.
 * `test/memory_endpoint_test.dart`: `listenMemory` and `mem://` connections (dispatch, policy, pooling, GOAWAY, `UNAVAILABLE`, own endpoints, timers not starved); the tests that use `mem` endpoints check that the registry is empty at the end.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0, and `naming_mesh_test.dart` over `mem://` endpoints too; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, a naming service that stops answering detected by the mux keep-alive through a TCP relay that freezes its connections, graceful GOAWAY).
