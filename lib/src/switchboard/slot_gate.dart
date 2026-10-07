@@ -69,11 +69,19 @@ abstract class SlotLifecycle {
   /// Throw `SwitchboardException.of(StatusCode.unavailable)` when the slot
   /// cannot be served; it then stays free. Channels for the slot that
   /// arrive while this runs are queued and served once it completes.
+  ///
+  /// [context] is the `ASSIGN` request (null when the gate is driven
+  /// without one). The naming service waits its `handoverTimeout` (60 s
+  /// by default) for the answer; a load that may take longer declares how
+  /// long with [SlotRequestContext.extend], at the steps where it knows
+  /// (the transfer started, its size is known, a phase completed), and
+  /// stops when [SlotRequestContext.onCancel] completes.
   Future<AssignResult> load(
     int slot, {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   });
 
   /// [slot] is moving to instance [to] and will have [epoch] there. The
@@ -90,7 +98,19 @@ abstract class SlotLifecycle {
   /// channels with `RELOCATED` before this is called; [SlotGate.serveRequest]
   /// handlers still running cannot be stopped and may still act on the
   /// slot's state.
-  Future<void> drain(int slot, {required int epoch, required int to}) async {}
+  ///
+  /// [context] is the `DRAIN` request (null when the gate is driven without
+  /// one). A drain that may take longer than the naming service waits
+  /// declares how long with [SlotRequestContext.extend]: its
+  /// `handoverTimeout` (60 s by default) when nothing was declared, or the
+  /// [SlotGate.drainTimeout] the gate declared when it had to wait for work
+  /// in flight.
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) async {}
 
   /// This instance no longer serves [slot]: after the forwarding grace
   /// period of a migration, after the slot was revoked or released, or
@@ -710,12 +730,18 @@ class SlotGate implements SlotHandler {
     }
   }
 
-  /// Waits until [s] has no work in flight, at most [drainTimeout].
-  /// Returns false when the wait timed out.
-  Future<bool> _waitIdle(_GateSlot s, int slot) async {
+  /// Waits until [s] has no work in flight, at most [drainTimeout], which
+  /// it declares to the naming service through [context] when it has to
+  /// wait. Returns false when the wait timed out.
+  Future<bool> _waitIdle(
+    _GateSlot s,
+    int slot,
+    SlotRequestContext? context,
+  ) async {
     if (s.isIdle) {
       return true;
     }
+    context?.extend(deadline: drainTimeout);
     final idle = s.idle = Completer<void>();
     try {
       await idle.future.timeout(drainTimeout);
@@ -739,9 +765,13 @@ class SlotGate implements SlotHandler {
   /// served (a claim confirmed after a naming service restart) only the
   /// epoch changes. A slot still being forwarded after a migration comes
   /// back: forwarding stops, [SlotLifecycle.unload] runs, then
-  /// [SlotLifecycle.load]. Refused with `UNAVAILABLE` after [close].
+  /// [SlotLifecycle.load], which receives [context]. Refused with
+  /// `UNAVAILABLE` after [close].
   @override
-  Future<AssignResult> onAssign(AssignRequest request) async {
+  Future<AssignResult> onAssign(
+    AssignRequest request, [
+    SlotRequestContext? context,
+  ]) async {
     _checkType(request.type);
     final slot = request.slot;
     if (_closed) {
@@ -777,6 +807,7 @@ class SlotGate implements SlotHandler {
         epoch: request.epoch,
         holder: request.holder,
         shared: request.shared,
+        context: context,
       );
     } catch (e) {
       if (identical(_slots[slot], s)) {
@@ -803,12 +834,16 @@ class SlotGate implements SlotHandler {
   }
 
   /// `DRAIN`: locks the slot, waits for its work in flight (at most
-  /// [drainTimeout], after which the slot's tracked channels still open
-  /// are closed with `RELOCATED` naming the new owner and epoch), then
-  /// runs [SlotLifecycle.drain]. Fails with `FAILED_PRECONDITION` for a
-  /// slot not served here.
+  /// [drainTimeout], declared to the naming service through [context] when
+  /// there is work to wait for; after it the slot's tracked channels still
+  /// open are closed with `RELOCATED` naming the new owner and epoch), then
+  /// runs [SlotLifecycle.drain], which receives [context]. Fails with
+  /// `FAILED_PRECONDITION` for a slot not served here.
   @override
-  Future<void> onDrain(DrainRequest request) async {
+  Future<void> onDrain(
+    DrainRequest request, [
+    SlotRequestContext? context,
+  ]) async {
     _checkType(request.type);
     final slot = request.slot;
     final s = _slots[slot];
@@ -823,7 +858,7 @@ class SlotGate implements SlotHandler {
       ..state = SlotGateState.locked
       ..to = request.to;
     _log.fine('$type gate: slot $slot locked for ${request.to}');
-    final idle = await _waitIdle(s, slot);
+    final idle = await _waitIdle(s, slot, context);
     if (!identical(_slots[slot], s) || s.state != SlotGateState.locked) {
       throw SwitchboardException.of(
         StatusCode.unavailable,
@@ -833,7 +868,12 @@ class SlotGate implements SlotHandler {
     if (!idle) {
       _relocateTracked(s, slot, to: request.to, epoch: request.epoch);
     }
-    await lifecycle.drain(slot, epoch: request.epoch, to: request.to);
+    await lifecycle.drain(
+      slot,
+      epoch: request.epoch,
+      to: request.to,
+      context: context,
+    );
   }
 
   /// The wait for the work in flight of [slot] timed out during `DRAIN`:
@@ -875,7 +915,10 @@ class SlotGate implements SlotHandler {
   /// order, forwards the queued requests, and keeps forwarding for
   /// [forwardGrace]; then [SlotLifecycle.unload].
   @override
-  Future<void> onForward(ForwardRequest request) async {
+  Future<void> onForward(
+    ForwardRequest request, [
+    SlotRequestContext? context,
+  ]) async {
     _checkType(request.type);
     final slot = request.slot;
     final s = _slots[slot];
@@ -913,7 +956,10 @@ class SlotGate implements SlotHandler {
   /// `RESUME`: unlocks the slot and serves its queue here. Does nothing
   /// for a slot that is not locked.
   @override
-  Future<void> onResume(ResumeRequest request) async {
+  Future<void> onResume(
+    ResumeRequest request, [
+    SlotRequestContext? context,
+  ]) async {
     _checkType(request.type);
     final slot = request.slot;
     final s = _slots[slot];
@@ -1107,7 +1153,10 @@ class SlotGates extends SlotHandler {
   SlotGate? remove(Name type) => _gates.remove(type);
 
   @override
-  Future<AssignResult> onAssign(AssignRequest request) {
+  Future<AssignResult> onAssign(
+    AssignRequest request, [
+    SlotRequestContext? context,
+  ]) {
     final gate = _gates[request.type];
     if (gate == null) {
       return Future.error(
@@ -1117,11 +1166,11 @@ class SlotGates extends SlotHandler {
         ),
       );
     }
-    return gate.onAssign(request);
+    return gate.onAssign(request, context);
   }
 
   @override
-  Future<void> onDrain(DrainRequest request) {
+  Future<void> onDrain(DrainRequest request, [SlotRequestContext? context]) {
     final gate = _gates[request.type];
     if (gate == null) {
       return Future.error(
@@ -1131,16 +1180,20 @@ class SlotGates extends SlotHandler {
         ),
       );
     }
-    return gate.onDrain(request);
+    return gate.onDrain(request, context);
   }
 
   @override
-  Future<void> onForward(ForwardRequest request) async =>
-      _gates[request.type]?.onForward(request);
+  Future<void> onForward(
+    ForwardRequest request, [
+    SlotRequestContext? context,
+  ]) async => _gates[request.type]?.onForward(request, context);
 
   @override
-  Future<void> onResume(ResumeRequest request) async =>
-      _gates[request.type]?.onResume(request);
+  Future<void> onResume(
+    ResumeRequest request, [
+    SlotRequestContext? context,
+  ]) async => _gates[request.type]?.onResume(request, context);
 
   @override
   Future<void> onRevoke(Name type, int slot) async =>

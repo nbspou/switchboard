@@ -43,6 +43,7 @@ class Worker extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     expect(shared, isTrue);
     consumers[slot] = Timer.periodic(const Duration(milliseconds: 2), (_) {

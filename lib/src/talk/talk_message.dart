@@ -119,7 +119,8 @@ abstract class TalkMessage {
   ///
   /// [timeout] is the requester timeout for the chained request (default
   /// [TalkOptions.requestTimeout], [Duration.zero] disables it). [onExtend]
-  /// is called synchronously each time the peer sends `EXTEND` for it.
+  /// is called synchronously each time the peer sends `EXTEND` for it, as
+  /// for [TalkChannel.startRequest].
   ///
   /// Throws synchronously like [reply], and with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests]
@@ -128,7 +129,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   });
 
@@ -139,7 +140,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   });
 
@@ -171,7 +172,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   });
 
@@ -183,7 +184,7 @@ abstract class TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   });
 
@@ -203,9 +204,10 @@ abstract class TalkMessage {
   /// responder timeout expired, or the channel closed) the subscription to
   /// [items] is cancelled and nothing more is sent; when the peer
   /// cancelled, the channel has already answered `ABORT CANCELLED`. Each
-  /// item restarts the responder timeout; a source slower than
-  /// [TalkOptions.replyTimeout] between items should be paired with
-  /// [setReplyTimeout] or [extend].
+  /// item restarts the responder timeout (or renews it by the declared
+  /// renewal); a source slower than [TalkOptions.replyTimeout] between
+  /// items should be paired with [setReplyTimeout] or with an [extend]
+  /// that declares a deadline or a renewal.
   ///
   /// The future completes once the answer has ended (or the subscription
   /// was cancelled); it never completes with an error. Throws
@@ -313,20 +315,46 @@ abstract class TalkMessage {
   /// success), otherwise throws like [reply].
   void replyAbort(Status status);
 
-  /// Tells the requester that work continues: sends `EXTEND`, which
-  /// restarts the requester's timeout, and restarts the local responder
-  /// timeout.
+  /// Sends `EXTEND`: tells the requester how long the answer may still
+  /// take.
   ///
-  /// Throws like [reply].
-  void extend();
+  /// With [deadline], the answer comes within [deadline] from now; with
+  /// [renew], within [renew] of the last reply (stream item or `EXTEND`).
+  /// Once either is declared, the request times out at the later of the
+  /// two (a value not given keeps what an earlier call declared, if
+  /// anything), on both sides: the default gap of the requester
+  /// ([TalkOptions.requestTimeout]) and of this responder
+  /// ([TalkOptions.replyTimeout]) no longer applies. A later call replaces
+  /// the declaration, and may shorten it.
+  ///
+  /// The requester waits [buffer] longer (default
+  /// [TalkOptions.extendBuffer]): the values on the wire carry it, the
+  /// local responder timeout does not, so that this responder gives up
+  /// first and its `ABORT DEADLINE_EXCEEDED` reaches the requester before
+  /// the requester's own timeout. The requester raises the values to its
+  /// [TalkOptions.minExtension] and lowers them to its
+  /// [TalkOptions.maxExtension].
+  ///
+  /// With neither value, sends an empty `EXTEND`, which restarts the
+  /// default gap of the requester and of this responder, keeping what was
+  /// declared.
+  ///
+  /// Send it when an estimate exists or changes (the work left a queue, a
+  /// phase completed, the estimate was revised), not from a timer:
+  /// progress travels as stream items.
+  ///
+  /// Throws like [reply], and [ArgumentError] for a negative value.
+  void extend({Duration? deadline, Duration? renew, Duration? buffer});
 
   /// Overrides the responder timeout for this request:
   /// [TalkOptions.replyTimeout] when [timeout] is null, none when it is
-  /// [Duration.zero].
+  /// [Duration.zero] (deadlines declared with [extend] are then only sent,
+  /// they set no local timeout).
   ///
   /// Applies immediately: the responder timeout restarts with the new
-  /// duration. Later restarts ([replyItem], [extend]) use it too. Does
-  /// nothing once the request is finished or for a message that expects no
-  /// reply.
+  /// duration, in the default regime (a deadline or renewal declared
+  /// earlier with [extend] no longer applies locally). Later restarts
+  /// ([replyItem], an empty [extend]) use it too. Does nothing once the
+  /// request is finished or for a message that expects no reply.
   void setReplyTimeout(Duration? timeout);
 }

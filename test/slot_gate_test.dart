@@ -71,14 +71,20 @@ class TestLifecycle extends SlotLifecycle {
   /// Called for every served channel; the default echoes `slot:data`.
   void Function(IncomingChannel channel, int slot)? onServe;
 
+  /// The contexts of the latest load and drain.
+  SlotRequestContext? loadContext;
+  SlotRequestContext? drainContext;
+
   @override
   Future<AssignResult> load(
     int slot, {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     log.add('load $slot e$epoch h$holder${shared ? ' shared' : ''}');
+    loadContext = context;
     await loadGate?.future;
     final error = loadError;
     if (error != null) {
@@ -88,8 +94,14 @@ class TestLifecycle extends SlotLifecycle {
   }
 
   @override
-  Future<void> drain(int slot, {required int epoch, required int to}) async {
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) async {
     log.add('drain $slot e$epoch to$to');
+    drainContext = context;
     await drainGate?.future;
   }
 
@@ -109,6 +121,32 @@ class TestLifecycle extends SlotLifecycle {
       (data) => channel.channel.send(bytes('$slot:${text(data)}')),
     );
   }
+}
+
+/// A request context that records what is declared through it.
+class RecordingContext implements SlotRequestContext {
+  RecordingContext(this.type, this.slot, this.epoch);
+
+  @override
+  final Name type;
+
+  @override
+  final int slot;
+
+  @override
+  final int epoch;
+
+  final List<(Duration?, Duration?)> declared = [];
+
+  @override
+  bool get isCancelled => false;
+
+  @override
+  Future<void> get onCancel => Completer<void>().future;
+
+  @override
+  void extend({Duration? deadline, Duration? renew}) =>
+      declared.add((deadline, renew));
 }
 
 /// A peer linked to the gate's dispatch over memory.
@@ -364,6 +402,36 @@ void main() {
       expect(gate.serves(1), isTrue);
       expect(text(await late.stream.first.timeout(limit)), '1:queued');
       expect(lifecycle.log.last, 'serve 1 late');
+    });
+
+    test('DRAIN declares drainTimeout once when it waits for work in '
+        'flight; load and drain get the context', () async {
+      newGate();
+      final loading = RecordingContext(kv, 1, 1);
+      await gate.onAssign(assign(1), loading);
+      expect(lifecycle.loadContext, same(loading));
+      expect(loading.declared, isEmpty);
+      final busy = peer.open(shard: 1, payload: 'busy');
+      expect(await ask(busy, 'x'), '1:x');
+      final draining = RecordingContext(kv, 1, 2);
+      final drained = gate.onDrain(
+        DrainRequest(kv, 1, epoch: 2, to: 2),
+        draining,
+      );
+      await settle();
+      expect(draining.declared, [(limit, null)]);
+      await busy.close();
+      await drained.timeout(limit);
+      expect(lifecycle.drainContext, same(draining));
+      expect(draining.declared, hasLength(1));
+      // Nothing in flight: nothing to declare.
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      final idle = RecordingContext(kv, 1, 3);
+      await gate
+          .onDrain(DrainRequest(kv, 1, epoch: 3, to: 2), idle)
+          .timeout(limit);
+      expect(idle.declared, isEmpty);
+      expect(lifecycle.drainContext, same(idle));
     });
 
     test('detached channels do not hold DRAIN', () async {

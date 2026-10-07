@@ -18,17 +18,68 @@ enum AssignResult {
   notHolding,
 }
 
+/// One request from the naming service to a sharded instance (`ASSIGN`,
+/// `DRAIN`, `FORWARD` or `RESUME`), as its [SlotHandler] method sees it.
+///
+/// The naming service waits for the answer its `handoverTimeout` (60 s by
+/// default), unless the handler declares an estimate with [extend]. Nothing
+/// is sent on the handler's behalf while it runs: a load or a drain that
+/// may take longer declares how long, at the steps where it knows (the
+/// state transfer started, a phase completed, the estimate changed).
+abstract class SlotRequestContext {
+  /// The slot's type.
+  Name get type;
+
+  /// The slot.
+  int get slot;
+
+  /// The epoch the request carries: for `ASSIGN`, `DRAIN` and `FORWARD`
+  /// the slot's epoch at its new owner, for `RESUME` its current one.
+  int get epoch;
+
+  /// True once the request is cancelled: the naming service gave up on it
+  /// (its timeout, its bound, a cancel), the handler ran past its declared
+  /// deadline or [NamingClient.slotHandlerMaxDuration], the channel to the
+  /// naming service ended, or the client closed. Work on it should stop;
+  /// its outcome is ignored.
+  bool get isCancelled;
+
+  /// Completes when [isCancelled] becomes true; never if the request is
+  /// answered first. A load can abort the query it waits for on it.
+  Future<void> get onCancel;
+
+  /// Declares how long the work may still take, with one `EXTEND` (see
+  /// `TalkMessage.extend`): the answer comes within [deadline] from now
+  /// and, with [renew], within [renew] of the last declaration. The naming
+  /// service then waits that long (plus `TalkOptions.extendBuffer`),
+  /// instead of its default timeout, and passes the estimate on to whoever
+  /// waits for the hand-over (the `MIGRATE` requester, a `LOCATE`). This
+  /// instance gives up at the declared time itself: the request is
+  /// answered `ABORT DEADLINE_EXCEEDED` and [onCancel] completes. A later
+  /// call replaces the estimate, and may shorten it.
+  ///
+  /// The values are lowered to what is left of
+  /// [NamingClient.slotHandlerMaxDuration]. With neither value, sends an
+  /// empty `EXTEND`, which restarts the naming service's default timeout.
+  /// Does nothing (logged at FINE) once the request can no longer be
+  /// answered. Throws [ArgumentError] for a negative value.
+  void extend({Duration? deadline, Duration? renew});
+}
+
 /// Serves the requests the naming service sends to a sharded instance over
 /// its registration channel. Set it with [NamingClient.slotHandler]. See
 /// the wiki page "Switchboard Sharding", section "Requests from the naming
 /// service to instances".
 ///
-/// The client keeps each request alive with `EXTEND` while the handler
-/// runs, at most [NamingClient.slotHandlerMaxDuration] (then it answers
+/// Each method receives the request's [SlotRequestContext], through which
+/// a slow handler declares how long it may take; the naming service waits
+/// its `handoverTimeout` otherwise. The client sends nothing on the
+/// handler's behalf while it runs. It bounds a handler call to
+/// [NamingClient.slotHandlerMaxDuration] (then it answers
 /// `ABORT DEADLINE_EXCEEDED` and ignores the handler's late outcome),
-/// answers it when the returned future completes, and answers `ABORT`
-/// with the status of a thrown [SwitchboardException] (`UNAVAILABLE` for
-/// any other error).
+/// answers the request when the returned future completes, and answers
+/// `ABORT` with the status of a thrown [SwitchboardException]
+/// (`UNAVAILABLE` for any other error).
 abstract class SlotHandler {
   /// Load or initialise the slot and complete once ready to serve it.
   ///
@@ -41,25 +92,28 @@ abstract class SlotHandler {
   /// May arrive for a slot this instance already serves: after a naming
   /// service restart, the claim of a slot it was serving is confirmed with
   /// an `ASSIGN` carrying the new epoch.
-  Future<AssignResult> onAssign(AssignRequest request);
+  Future<AssignResult> onAssign(
+    AssignRequest request,
+    SlotRequestContext context,
+  );
 
   /// Lock the slot: queue new work for it, let work in flight complete, and
   /// make its state available to [DrainRequest.to] (transfer it or flush it
   /// to shared storage). Complete once nothing is in flight and the state
   /// is flushed. The slot stays locked until [onForward] or [onResume].
-  Future<void> onDrain(DrainRequest request);
+  Future<void> onDrain(DrainRequest request, SlotRequestContext context);
 
   /// The new owner serves: forward the queued work to [ForwardRequest.to]
   /// and keep forwarding late arrivals for a grace period, then answer
   /// `MOVED`. Complete once the queue has been handed over. The slot is no
   /// longer served by this instance.
-  Future<void> onForward(ForwardRequest request);
+  Future<void> onForward(ForwardRequest request, SlotRequestContext context);
 
   /// The migration was abandoned, or the naming service was lost while the
   /// slot was locked: unlock and serve the queued work. Must be idempotent:
   /// it may come for a slot that was never locked, after a `DRAIN` that
   /// failed.
-  Future<void> onResume(ResumeRequest request);
+  Future<void> onResume(ResumeRequest request, SlotRequestContext context);
 
   /// This instance must stop serving [slot] of [type]: its claim was
   /// refused after a reconnect (another instance owns it), or an `ASSIGN`
@@ -125,25 +179,21 @@ class _ClientSlots {
       );
       return;
     }
-    // Loading or draining a slot may take long; the naming service's
-    // requester timeout is kept from firing with EXTEND, at most for
-    // slotHandlerMaxDuration.
-    message.setReplyTimeout(Duration.zero);
-    final extend = Timer.periodic(client.slotExtendInterval, (timer) {
-      if (!message.canReply) {
-        timer.cancel();
-        return;
-      }
-      try {
-        message.extend();
-      } on SwitchboardException {
-        timer.cancel();
-      }
-    });
+    final _SlotContext context;
+    try {
+      context = _SlotContext.of(message, client.slotHandlerMaxDuration);
+    } on ProtocolException catch (e) {
+      _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
+      return;
+    }
+    // Loading or draining a slot may take long, as long as the handler
+    // declares (context.extend); the naming service waits its own timeout
+    // otherwise. No default gap here: this side gives up at a declared
+    // deadline, and after slotHandlerMaxDuration in any case.
+    message.setReplyTimeout(client.slotHandlerMaxDuration);
     final bound = client.slotHandlerMaxDuration;
     final deadline = bound > Duration.zero
         ? Timer(bound, () {
-            extend.cancel();
             if (message.canReply) {
               _log.warning(
                 '${message.procedureName} handler still running after '
@@ -157,40 +207,41 @@ class _ClientSlots {
                 ),
               );
             }
+            context._cancel();
           })
         : null;
     void stop() {
-      extend.cancel();
       deadline?.cancel();
     }
 
     // A request that can no longer be answered (the channel closed, the
-    // client too) needs neither timer.
-    message.onCancel.then((_) => stop()).ignore();
-    unawaited(_serve(session, message, handler).whenComplete(stop));
+    // client too) needs no timer.
+    context.onCancel.then((_) => stop()).ignore();
+    unawaited(_serve(session, message, handler, context).whenComplete(stop));
   }
 
   Future<void> _serve(
     _Session session,
     TalkMessage message,
     SlotHandler handler,
+    _SlotContext context,
   ) async {
     final procedure = message.procedure;
     try {
       if (procedure == Procedures.assign) {
-        await _assign(session, message, handler);
+        await _assign(session, message, handler, context);
       } else if (procedure == Procedures.drain) {
-        await _drain(message, handler);
+        await _drain(message, handler, context);
       } else if (procedure == Procedures.forward) {
         final request = ForwardRequest.decode(message.payload);
         draining.remove((request.type, request.slot));
         served[request.type]?.remove(request.slot);
-        await handler.onForward(request);
+        await handler.onForward(request, context);
         _reply(message);
       } else {
         final request = ResumeRequest.decode(message.payload);
         draining.remove((request.type, request.slot));
-        await handler.onResume(request);
+        await handler.onResume(request, context);
         _reply(message);
       }
     } on ProtocolException catch (e) {
@@ -205,11 +256,12 @@ class _ClientSlots {
     _Session session,
     TalkMessage message,
     SlotHandler handler,
+    _SlotContext context,
   ) async {
     final request = AssignRequest.decode(message.payload);
     final type = request.type;
     final slot = request.slot;
-    final result = await handler.onAssign(request);
+    final result = await handler.onAssign(request, context);
     final bySlot = served.putIfAbsent(type, () => {});
     final before = bySlot[slot];
     // Recorded before the reply, so that the slot is served by the time
@@ -236,7 +288,11 @@ class _ClientSlots {
     }
   }
 
-  Future<void> _drain(TalkMessage message, SlotHandler handler) async {
+  Future<void> _drain(
+    TalkMessage message,
+    SlotHandler handler,
+    _SlotContext context,
+  ) async {
     final request = DrainRequest.decode(message.payload);
     final key = (request.type, request.slot);
     final drained = Completer<void>();
@@ -245,7 +301,7 @@ class _ClientSlots {
       drained.future,
     );
     try {
-      await handler.onDrain(request);
+      await handler.onDrain(request, context);
     } finally {
       drained.complete();
     }
@@ -309,6 +365,7 @@ class _ClientSlots {
             .then(
               (_) => handler.onResume(
                 ResumeRequest(type, slot, epoch: lock.epoch),
+                _SlotContext.local(type, slot, lock.epoch),
               ),
             )
             .catchError(
@@ -849,6 +906,107 @@ class _PendingHolding {
 }
 
 /// A slot this instance serves.
+/// The [SlotRequestContext] of one request from the naming service, or of
+/// a resume the client makes by itself ([_SlotContext.local]).
+class _SlotContext implements SlotRequestContext {
+  _SlotContext._(this.message, this.type, this.slot, this.epoch, this.bound)
+    : _started = monotonicNow() {
+    message?.onCancel.then((_) => _cancel()).ignore();
+  }
+
+  /// The context of a resume the client makes without a request (the
+  /// naming service was lost): nothing to answer, nothing to extend.
+  _SlotContext.local(this.type, this.slot, this.epoch)
+    : message = null,
+      bound = Duration.zero,
+      _started = monotonicNow();
+
+  /// The context of [message], whose payload starts with the slot's type
+  /// and slot and carries its epoch. Throws [ProtocolException] for a
+  /// malformed payload.
+  factory _SlotContext.of(TalkMessage message, Duration bound) {
+    final procedure = message.procedure;
+    final payload = message.payload;
+    if (procedure == Procedures.assign) {
+      final r = AssignRequest.decode(payload);
+      return _SlotContext._(message, r.type, r.slot, r.epoch, bound);
+    }
+    if (procedure == Procedures.drain) {
+      final r = DrainRequest.decode(payload);
+      return _SlotContext._(message, r.type, r.slot, r.epoch, bound);
+    }
+    if (procedure == Procedures.forward) {
+      final r = ForwardRequest.decode(payload);
+      return _SlotContext._(message, r.type, r.slot, r.epoch, bound);
+    }
+    final r = ResumeRequest.decode(payload);
+    return _SlotContext._(message, r.type, r.slot, r.epoch, bound);
+  }
+
+  /// The request; null for a local resume.
+  final TalkMessage? message;
+
+  @override
+  final Name type;
+
+  @override
+  final int slot;
+
+  @override
+  final int epoch;
+
+  /// [NamingClient.slotHandlerMaxDuration]; zero for no bound.
+  final Duration bound;
+  final Duration _started;
+  final Completer<void> _cancelled = Completer<void>();
+
+  void _cancel() {
+    if (!_cancelled.isCompleted) {
+      _cancelled.complete();
+    }
+  }
+
+  @override
+  bool get isCancelled => _cancelled.isCompleted;
+
+  @override
+  Future<void> get onCancel => _cancelled.future;
+
+  @override
+  void extend({Duration? deadline, Duration? renew}) {
+    for (final (name, value) in [('deadline', deadline), ('renew', renew)]) {
+      if (value != null && value.isNegative) {
+        throw ArgumentError.value(value, name, 'must not be negative');
+      }
+    }
+    final message = this.message;
+    if (message == null || !message.canReply) {
+      _log.fine(
+        '${message?.procedureName ?? 'local RESUME'} $type/$slot can no '
+        'longer be answered; not extended',
+      );
+      return;
+    }
+    if (bound > Duration.zero) {
+      var left = bound - (monotonicNow() - _started);
+      if (left.isNegative) {
+        left = Duration.zero;
+      }
+      if (deadline != null && deadline > left) {
+        deadline = left;
+      }
+      if (renew != null && renew > left) {
+        renew = left;
+      }
+    }
+    try {
+      message.extend(deadline: deadline, renew: renew);
+    } on SwitchboardException catch (e) {
+      _log.fine('${message.procedureName} $type/$slot not extended: $e');
+    }
+  }
+}
+
 class _Served {
   _Served(this.epoch, {required this.holding});
 

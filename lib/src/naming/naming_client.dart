@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import 'package:logging/logging.dart';
 
 import '../address/service_address.dart';
+import '../monotonic.dart';
 import '../name.dart';
 import '../status.dart';
 import '../talk/talk_channel.dart';
@@ -76,31 +77,19 @@ class NamingClient {
   /// attempts. The channel's [TalkOptions.requestTimeout] bounds every
   /// request, `WATCH` included: its reply comes after the whole snapshot.
   ///
-  /// [slotExtendInterval] is how often a request from the naming service
-  /// (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`) is answered with `EXTEND`
-  /// while the [slotHandler] works on it; it must be shorter than the
-  /// service's `handoverTimeout` (60 s by default).
-  /// [slotHandlerMaxDuration] bounds that: a handler call still running
-  /// after it is answered `ABORT DEADLINE_EXCEEDED` (the naming service
-  /// rolls the hand-over back) and its late outcome is ignored (an
-  /// `ASSIGN` answered so is revoked, [SlotHandler.onRevoke]).
-  /// [Duration.zero] removes the bound.
+  /// [slotHandlerMaxDuration] bounds a [slotHandler] call: one still
+  /// running after it is answered `ABORT DEADLINE_EXCEEDED` (the naming
+  /// service rolls the hand-over back) and its late outcome is ignored (an
+  /// `ASSIGN` answered so is revoked, [SlotHandler.onRevoke]); the
+  /// deadlines a handler declares with [SlotRequestContext.extend] are
+  /// lowered to what is left of it. [Duration.zero] removes the bound.
   ///
-  /// Throws [ArgumentError] if [slotExtendInterval] is not positive or
-  /// [slotHandlerMaxDuration] is negative.
+  /// Throws [ArgumentError] if [slotHandlerMaxDuration] is negative.
   NamingClient(
     TalkConnector connect, {
     this.reconnectDelay = const Duration(seconds: 1),
-    this.slotExtendInterval = const Duration(seconds: 4),
     this.slotHandlerMaxDuration = const Duration(minutes: 10),
   }) : _connect = connect {
-    if (slotExtendInterval <= Duration.zero) {
-      throw ArgumentError.value(
-        slotExtendInterval,
-        'slotExtendInterval',
-        'must be positive',
-      );
-    }
     if (slotHandlerMaxDuration < Duration.zero) {
       throw ArgumentError.value(
         slotHandlerMaxDuration,
@@ -115,12 +104,9 @@ class NamingClient {
   /// Delay before each reconnect attempt.
   final Duration reconnectDelay;
 
-  /// Interval of `EXTEND` while a [slotHandler] call runs.
-  final Duration slotExtendInterval;
-
-  /// Longest a [slotHandler] call is kept alive with `EXTEND` before the
-  /// request is answered `ABORT DEADLINE_EXCEEDED`; [Duration.zero] for no
-  /// bound. Default 10 minutes.
+  /// Longest a [slotHandler] call may run, whatever it declares, before
+  /// the request is answered `ABORT DEADLINE_EXCEEDED`; [Duration.zero] for
+  /// no bound. Default 10 minutes.
   final Duration slotHandlerMaxDuration;
 
   late final _ClientSlots _slots = _ClientSlots(this);

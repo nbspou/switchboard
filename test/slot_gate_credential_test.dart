@@ -71,6 +71,7 @@ class Backend extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async => AssignResult.holding;
 
   @override

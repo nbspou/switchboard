@@ -27,6 +27,7 @@ class Frontend extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     shards.add(slot);
     return AssignResult.notHolding;

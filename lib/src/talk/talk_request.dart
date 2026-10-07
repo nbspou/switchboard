@@ -33,6 +33,21 @@ abstract class TalkRequest {
   /// whose outcome does not matter can simply be dropped.
   Future<TalkMessage> get response;
 
+  /// When the requester timeout expires unless an answer arrives, as wall
+  /// clock time; null when the request has no timeout or has ended. For
+  /// observation (a progress display, a log): the timeout itself runs on a
+  /// monotonic clock.
+  ///
+  /// Until the peer declares a deadline or a renewal, it is the last reply
+  /// plus the request's timeout, a gap restarted by every reply. After an
+  /// `EXTEND` that declares one, it is the later of the declared deadline
+  /// (counted from that `EXTEND`'s arrival) and the last reply plus the
+  /// declared renewal, each raised to [TalkOptions.minExtension] and
+  /// lowered to [TalkOptions.maxExtension]; a later `EXTEND` replaces the
+  /// values it carries, and may shorten the deadline. An empty `EXTEND`
+  /// restarts the gap, keeping what was declared.
+  DateTime? get deadline;
+
   /// Cancels the request: sends a cancel carrying [status] (default
   /// [StatusCode.cancelled]) and fails [response] with it.
   ///

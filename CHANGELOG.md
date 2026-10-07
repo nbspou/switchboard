@@ -127,6 +127,31 @@ The protocol specification lives in the project wiki (section
   bounds `WATCH`). Talk requests take `ordered: true` to have their answer
   delivered in wire order with `TalkChannel.messages`; the naming client
   uses it for `WATCH`, `REGISTER` and `UNREGSTR`.
+- Protocol change, Talk: `EXTEND` declares a deadline instead of being a
+  heartbeat. Its payload is empty (restart the requester's default
+  timeout, as before) or `u32 deadline ms, u32 renew ms` (0: unchanged;
+  any other length is a channel protocol error). After a declaration the
+  request times out at the later of the deadline and the last reply plus
+  the renewal, on both sides; the responder puts
+  `TalkOptions.extendBuffer` (5 s) on the wire and not on its own timer,
+  so it gives up first; the requester raises the values to
+  `TalkOptions.minExtension` (1 s) and lowers them to
+  `TalkOptions.maxExtension` (1 h). `TalkMessage.extend({deadline, renew,
+  buffer})`; `onExtend` callbacks receive `(deadline, renew)`;
+  `TalkRequest.deadline` and `TalkStream.deadline` show the expiry;
+  `forwardMessage` passes `EXTEND` payloads through unchanged. Nothing in
+  the library sends `EXTEND` from a timer any more: `SlotHandler` methods
+  and `SlotLifecycle.load` and `drain` receive a `SlotRequestContext`
+  (`type`, `slot`, `epoch`, `extend`, `isCancelled`, `onCancel`) to declare
+  their estimates, `NamingClient` loses `slotExtendInterval` (the handler
+  call is still bounded by `slotHandlerMaxDuration`), `SlotGate` declares
+  its `drainTimeout` when a `DRAIN` waits for work in flight, and
+  `NamingService` loses `heldExtendInterval`: a request it holds is sent
+  one `EXTEND` declaring the wait (the time left in the assignment hold,
+  the hand-over timeout of the `ASSIGN` it waits for, the time left of a
+  `LOCATE` backoff wait), and the deadlines instances declare for `ASSIGN`
+  and `DRAIN` are passed on to the requests waiting for them, the
+  `MIGRATE` requester included. Adds a dependency on `package:clock`.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for

@@ -55,6 +55,7 @@ class KvStore extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     if (holder == gate.instance && disk.containsKey(slot)) {
       stats.count('reclaim');
@@ -83,8 +84,12 @@ class KvStore extends SlotLifecycle {
   /// for flushing it, so that the lock is long enough for operations to
   /// queue behind it.
   @override
-  Future<void> drain(int slot, {required int epoch, required int to}) =>
-      Future<void>.delayed(const Duration(milliseconds: 3));
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) => Future<void>.delayed(const Duration(milliseconds: 3));
 
   @override
   Future<void> unload(int slot) async {

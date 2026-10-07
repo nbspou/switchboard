@@ -14,6 +14,7 @@ import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
+import '../monotonic.dart';
 import '../name.dart';
 import '../status.dart';
 import '../status_closable.dart';
@@ -36,18 +37,25 @@ class TalkOptions {
     this.replyTimeout = const Duration(seconds: 10),
     this.maxIncomingRequests = 1024,
     this.maxOutgoingRequests = 1024,
+    this.minExtension = const Duration(seconds: 1),
+    this.maxExtension = const Duration(hours: 1),
+    this.extendBuffer = const Duration(seconds: 5),
   });
 
-  /// Requester side: how long to wait for a response, restarted by every
-  /// stream item and `EXTEND`. Overridable per request. [Duration.zero]
-  /// disables the timeout.
+  /// Requester side: the default timeout of a request, a gap restarted by
+  /// every stream item and `EXTEND`, until the peer declares a deadline or
+  /// a renewal with `EXTEND` (see [TalkRequest.deadline]). Overridable per
+  /// request. [Duration.zero] disables the timeout, declared deadlines
+  /// included.
   final Duration requestTimeout;
 
   /// Responder side: how long the application has to call a reply method,
-  /// restarted by [TalkMessage.replyItem] and [TalkMessage.extend]. On
-  /// expiry the channel sends `ABORT DEADLINE_EXCEEDED` on the
-  /// application's behalf. Overridable per request with
-  /// [TalkMessage.setReplyTimeout]. [Duration.zero] disables the timeout.
+  /// restarted by [TalkMessage.replyItem] and an empty
+  /// [TalkMessage.extend], until the application declares a deadline or a
+  /// renewal with [TalkMessage.extend]. On expiry the channel sends
+  /// `ABORT DEADLINE_EXCEEDED` on the application's behalf. Overridable per
+  /// request with [TalkMessage.setReplyTimeout]. [Duration.zero] disables
+  /// the timeout, declared deadlines included.
   final Duration replyTimeout;
 
   /// Outstanding incoming requests beyond which a new request is answered
@@ -58,6 +66,25 @@ class TalkOptions {
   /// [StatusCode.resourceExhausted] without sending anything. 0 means
   /// unlimited (the `u24` id space still applies).
   final int maxOutgoingRequests;
+
+  /// Requester side: the shortest deadline or renewal the peer's `EXTEND`
+  /// can declare; a shorter value is raised to it, so that a declaration
+  /// cannot make a request fail sooner than an answer can travel.
+  /// Default 1 s. [Duration.zero]: no floor.
+  final Duration minExtension;
+
+  /// Requester side: the longest deadline or renewal the peer's `EXTEND`
+  /// can declare; a longer value is lowered to it. Default 1 hour.
+  /// [Duration.zero]: no clamp.
+  final Duration maxExtension;
+
+  /// Responder side: added to the deadline and the renewal that
+  /// [TalkMessage.extend] puts on the wire, but not to the responder's own
+  /// timeout, so that the responder gives up (and says so with
+  /// `ABORT DEADLINE_EXCEEDED`) before the requester does, its answer
+  /// having had the buffer to arrive. Raise it on nodes whose requests
+  /// cross proxy or relay hops. Default 5 s.
+  final Duration extendBuffer;
 }
 
 /// A failure caused by the peer sending `ABORT`: an abort response to one
@@ -261,10 +288,14 @@ class TalkChannel {
   /// Sends a request and returns its handle, through which the response
   /// arrives and the request can be cancelled.
   ///
-  /// [timeout] is the requester timeout, restarted by every `EXTEND`; it
-  /// defaults to [TalkOptions.requestTimeout] and [Duration.zero] disables
-  /// it. [onExtend] is called synchronously each time the peer sends
-  /// `EXTEND` for the request; exceptions it throws are logged.
+  /// [timeout] is the requester timeout, a gap restarted by every `EXTEND`
+  /// until the peer declares a deadline or a renewal (see
+  /// [TalkRequest.deadline]); it defaults to [TalkOptions.requestTimeout]
+  /// and [Duration.zero] disables it. [onExtend] is called synchronously
+  /// each time the peer sends `EXTEND` for the request, with the deadline
+  /// and the renewal as received (null for a field that is 0, both null for
+  /// an empty `EXTEND`), before [TalkOptions.minExtension] and
+  /// [TalkOptions.maxExtension] apply; exceptions it throws are logged.
   ///
   /// [name], when given, is the procedure instead of [procedure], as for
   /// [send].
@@ -291,7 +322,7 @@ class TalkChannel {
     String procedure,
     Uint8List payload, {
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
     bool ordered = false,
   }) {
@@ -314,12 +345,13 @@ class TalkChannel {
 
   /// Sends a stream request. Items and the final response arrive through
   /// the returned [TalkStream]. Takes and throws like [startRequest]; the
-  /// requester timeout is also restarted by every item.
+  /// requester timeout is also restarted by every item (and, once the peer
+  /// declared a renewal, renewed by every item).
   TalkStream streamRequest(
     String procedure,
     Uint8List payload, {
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   }) {
     final wire = name ?? Name(procedure);
@@ -459,7 +491,7 @@ class TalkChannel {
     required bool stream,
     required Duration? timeout,
     required TalkFrame Function(int id) build,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     bool ordered = false,
   }) {
@@ -495,7 +527,7 @@ class TalkChannel {
     // can arrive while the request is still being sent.
     _outgoing[id] = pending;
     _nextRequestId = id >= TalkFrame.maxId ? 1 : id + 1;
-    _armRequestTimer(pending);
+    pending.startTimer();
     try {
       _sendChecked(frame);
     } catch (_) {
@@ -511,14 +543,6 @@ class TalkChannel {
   // ---------------------------------------------------------------------
   // Requester side
 
-  void _armRequestTimer(_Outgoing pending, [Duration? timeout]) {
-    pending.stopTimer();
-    final duration = timeout ?? pending.timeout;
-    if (duration > Duration.zero) {
-      pending.timer = Timer(duration, () => _onRequestTimeout(pending));
-    }
-  }
-
   void _onRequestTimeout(_Outgoing pending) {
     pending.timer = null;
     if (!identical(_outgoing[pending.id], pending)) {
@@ -529,13 +553,11 @@ class TalkChannel {
       _log.fine('released cancelled request ${pending.id} on timeout');
       return;
     }
-    _log.fine('request ${pending.id} timed out after ${pending.timeout}');
-    pending.fail(
-      SwitchboardException.of(
-        StatusCode.deadlineExceeded,
-        'no response within ${pending.timeout}',
-      ),
-    );
+    final reason = pending.expiry.declared
+        ? 'no response by the deadline the peer declared'
+        : 'no response within ${pending.timeout}';
+    _log.fine('request ${pending.id} timed out: $reason');
+    pending.fail(SwitchboardException.of(StatusCode.deadlineExceeded, reason));
     _trySend(
       TalkFrame(
         kind: TalkKind.abort,
@@ -566,8 +588,7 @@ class TalkChannel {
     // A request without a timeout of its own falls back to the channel
     // default here, so a peer that never answers the cancel cannot hold the
     // id for ever.
-    _armRequestTimer(
-      pending,
+    pending.armRelease(
       pending.timeout > Duration.zero
           ? pending.timeout
           : options.requestTimeout,
@@ -606,7 +627,7 @@ class TalkChannel {
       return false;
     }
     _incoming[id] = message;
-    message._restartTimer();
+    message._startTimer();
     return true;
   }
 
@@ -742,7 +763,7 @@ class TalkChannel {
       _protocolError('STREAM_ITEM for non-stream request ${pending.id}');
       return;
     }
-    _armRequestTimer(pending);
+    pending.replied();
     final message = _Message(this, frame);
     if (frame.hasRequest) {
       _register(message);
@@ -789,8 +810,7 @@ class TalkChannel {
     if (pending == null || pending.abandoned) {
       return;
     }
-    _armRequestTimer(pending);
-    pending.extended();
+    pending.extended(frame);
   }
 
   void _unknownResponse(TalkFrame frame) {
@@ -961,8 +981,94 @@ abstract interface class _ResponseSink {
   /// The request failed, for any reason.
   void fail(SwitchboardException error);
 
-  /// The peer sent `EXTEND`.
-  void extended();
+  /// The peer sent `EXTEND` carrying [payload].
+  void extended(Uint8List payload);
+}
+
+/// The timeout of one request, on either side: a gap restarted by every
+/// reply (the default regime) until a deadline or a renewal is declared,
+/// then the later of the declared deadline and the last reply plus the
+/// renewal. Instants are [monotonicNow] values.
+class _Expiry {
+  _Expiry(this.gap);
+
+  /// The default gap; [Duration.zero] for no timeout at all.
+  Duration gap;
+
+  /// A deadline or a renewal was declared.
+  bool declared = false;
+
+  /// The end of the default gap; in the declared regime, set only by an
+  /// empty `EXTEND`.
+  Duration? gapEnd;
+
+  /// The declared deadline.
+  Duration? deadline;
+
+  /// The declared renewal, counted from [lastReply].
+  Duration? renew;
+
+  /// The last reply: stream item or `EXTEND`.
+  Duration lastReply = Duration.zero;
+
+  /// Back to the default regime, the gap counted from [now].
+  void start(Duration now) {
+    declared = false;
+    deadline = null;
+    renew = null;
+    lastReply = now;
+    gapEnd = now + gap;
+  }
+
+  /// A reply at [now]: restarts the gap, or renews by the declared
+  /// renewal.
+  void reply(Duration now) {
+    lastReply = now;
+    if (!declared) {
+      gapEnd = now + gap;
+    }
+  }
+
+  /// An empty `EXTEND` at [now]: restarts the gap, keeping what was
+  /// declared.
+  void restartGap(Duration now) {
+    lastReply = now;
+    gapEnd = now + gap;
+  }
+
+  /// An `EXTEND` declaring [deadline] from [now] and [renew]; a null value
+  /// leaves that one unchanged. Replaces what was declared before, and
+  /// the gap.
+  void declare(Duration now, Duration? deadline, Duration? renew) {
+    if (deadline == null && renew == null) {
+      reply(now);
+      return;
+    }
+    lastReply = now;
+    declared = true;
+    gapEnd = null;
+    if (deadline != null) {
+      this.deadline = now + deadline;
+    }
+    if (renew != null) {
+      this.renew = renew;
+    }
+  }
+
+  /// When the request times out; null for never.
+  Duration? get end {
+    if (gap <= Duration.zero) {
+      return null;
+    }
+    final renew = this.renew;
+    return _later(
+      _later(gapEnd, deadline),
+      renew == null ? null : lastReply + renew,
+    );
+  }
+
+  static Duration? _later(Duration? a, Duration? b) =>
+      a == null ? b : (b == null || a >= b ? a : b);
 }
 
 /// One of our outstanding requests.
@@ -976,6 +1082,7 @@ class _Outgoing {
     this.sink,
     this.ordered = false,
   }) : isStream = stream,
+       expiry = _Expiry(timeout),
        items = stream && sink == null ? StreamController<TalkMessage>() : null {
     items?.onCancel = _onItemsCancelled;
     // A dropped request future must never surface as an unhandled error.
@@ -986,7 +1093,7 @@ class _Outgoing {
   final int id;
   final Duration timeout;
   final bool isStream;
-  final void Function()? onExtend;
+  final void Function(Duration? deadline, Duration? renew)? onExtend;
   final _ResponseSink? sink;
   final StreamController<TalkMessage>? items;
 
@@ -998,13 +1105,83 @@ class _Outgoing {
   final Completer<TalkMessage> completer = Completer<TalkMessage>();
   Timer? timer;
 
+  /// The requester timeout.
+  final _Expiry expiry;
+
   /// Cancelled locally; the id stays reserved until the final arrives.
   bool abandoned = false;
   bool _failed = false;
 
+  /// Answered, failed or cancelled.
+  bool get ended => _failed || completer.isCompleted || abandoned;
+
+  /// When the request times out, as wall clock time; null if it never
+  /// does, or has ended.
+  DateTime? get deadline {
+    final end = timer == null || ended ? null : expiry.end;
+    return end == null ? null : wallTimeOf(end);
+  }
+
   void stopTimer() {
     timer?.cancel();
     timer = null;
+  }
+
+  /// Starts the requester timeout, in the default regime.
+  void startTimer() {
+    expiry.start(monotonicNow());
+    _arm();
+  }
+
+  /// A stream item arrived.
+  void replied() {
+    expiry.reply(monotonicNow());
+    _arm();
+  }
+
+  /// Keeps the id of a cancelled request for [duration] at most.
+  void armRelease(Duration duration) {
+    stopTimer();
+    _armedEnd = null;
+    if (duration > Duration.zero) {
+      timer = Timer(duration, () => channel._onRequestTimeout(this));
+    }
+  }
+
+  /// When [timer] fires, if it was armed by [_arm].
+  Duration? _armedEnd;
+
+  void _arm() {
+    final end = expiry.end;
+    if (end != null && end == _armedEnd && timer != null) {
+      return;
+    }
+    stopTimer();
+    _armedEnd = end;
+    if (end == null) {
+      return;
+    }
+    var left = end - monotonicNow();
+    if (left.isNegative) {
+      left = Duration.zero;
+    }
+    timer = Timer(left, () => channel._onRequestTimeout(this));
+  }
+
+  /// [value] within [TalkOptions.minExtension] and
+  /// [TalkOptions.maxExtension].
+  Duration? _bounded(Duration? value) {
+    if (value == null) {
+      return null;
+    }
+    final options = channel.options;
+    if (options.minExtension > Duration.zero && value < options.minExtension) {
+      value = options.minExtension;
+    }
+    if (options.maxExtension > Duration.zero && value > options.maxExtension) {
+      value = options.maxExtension;
+    }
+    return value;
   }
 
   void addItem(_Message message) {
@@ -1051,15 +1228,27 @@ class _Outgoing {
     }
   }
 
-  void extended() {
+  /// The peer sent [frame], an `EXTEND`.
+  void extended(TalkFrame frame) {
+    final (:deadline, :renew) = frame.extension;
+    final now = monotonicNow();
+    if (frame.payload.isEmpty) {
+      expiry.restartGap(now);
+    } else {
+      expiry.declare(now, _bounded(deadline), _bounded(renew));
+    }
+    _arm();
     final sink = this.sink;
     if (sink != null) {
-      _guard(sink.extended, 'forwarding EXTEND');
+      _guard(() => sink.extended(frame.payload), 'forwarding EXTEND');
       return;
     }
     final callback = onExtend;
     if (callback != null) {
-      _guard(callback, 'onExtend callback of request $id');
+      _guard(
+        () => callback(deadline, renew),
+        'onExtend callback of request $id',
+      );
     }
   }
 
@@ -1100,6 +1289,9 @@ class _TalkRequest extends TalkRequest {
   Future<TalkMessage> get response => _pending.completer.future;
 
   @override
+  DateTime? get deadline => _pending.deadline;
+
+  @override
   void cancel([Status? status]) => _pending.channel._cancelOutgoing(
     _pending,
     status ?? Status.of(StatusCode.cancelled),
@@ -1122,6 +1314,9 @@ class _TalkStream extends TalkStream {
   Future<TalkMessage> get done => _pending.completer.future;
 
   @override
+  DateTime? get deadline => _pending.deadline;
+
+  @override
   void cancel([Status? status]) => _pending.channel._cancelOutgoing(
     _pending,
     status ?? Status.of(StatusCode.cancelled),
@@ -1142,6 +1337,9 @@ class _Message extends TalkMessage {
   bool _cancelled = false;
   Completer<void>? _cancelCompleter;
   Timer? _timer;
+
+  /// The responder timeout; created when the request is registered.
+  _Expiry? _expiry;
 
   /// Responder timeout override; null means the channel default.
   Duration? _replyTimeout;
@@ -1240,7 +1438,7 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   }) => _TalkRequest(
     _startReplyRequest(
@@ -1257,7 +1455,7 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   }) => _TalkStream(
     _startReplyRequest(
@@ -1274,7 +1472,7 @@ class _Message extends TalkMessage {
     Name? procedure, {
     required bool stream,
     required Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
   }) {
     _check();
@@ -1310,7 +1508,7 @@ class _Message extends TalkMessage {
         payload: payload,
       ),
     );
-    _restartTimer();
+    _replied();
   }
 
   @override
@@ -1331,7 +1529,7 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   }) => _TalkRequest(
     _startItemRequest(
@@ -1348,7 +1546,7 @@ class _Message extends TalkMessage {
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
   }) => _TalkStream(
     _startItemRequest(
@@ -1365,7 +1563,7 @@ class _Message extends TalkMessage {
     Name? procedure, {
     required bool stream,
     required Duration? timeout,
-    void Function()? onExtend,
+    void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
   }) {
     _check(item: true);
@@ -1383,7 +1581,7 @@ class _Message extends TalkMessage {
         payload: payload,
       ),
     );
-    _restartTimer();
+    _replied();
     return pending;
   }
 
@@ -1406,29 +1604,111 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void extend() {
+  void extend({Duration? deadline, Duration? renew, Duration? buffer}) {
+    for (final (name, value) in [
+      ('deadline', deadline),
+      ('renew', renew),
+      ('buffer', buffer),
+    ]) {
+      if (value != null && value.isNegative) {
+        throw ArgumentError.value(value, name, 'must not be negative');
+      }
+    }
     _check();
+    final extra = buffer ?? channel.options.extendBuffer;
     channel._sendChecked(
-      TalkFrame(kind: TalkKind.extend, responseId: requestId),
+      TalkFrame(
+        kind: TalkKind.extend,
+        responseId: requestId,
+        payload: TalkFrame.extendPayload(
+          deadline: deadline == null ? null : deadline + extra,
+          renew: renew == null ? null : renew + extra,
+        ),
+      ),
     );
-    _restartTimer();
+    final expiry = _expiry;
+    if (expiry == null) {
+      return;
+    }
+    final now = monotonicNow();
+    if (deadline == null && renew == null) {
+      expiry.restartGap(now);
+    } else {
+      expiry.declare(now, deadline, renew);
+    }
+    _arm();
+  }
+
+  /// Sends an `EXTEND` with [payload] as received from the far responder,
+  /// for forwarding: buffers already on the wire stay as they are.
+  void _extendRaw(Uint8List payload) {
+    _check();
+    final frame = TalkFrame(
+      kind: TalkKind.extend,
+      responseId: requestId,
+      payload: payload,
+    );
+    channel._sendChecked(frame);
+    final expiry = _expiry;
+    if (expiry == null) {
+      return;
+    }
+    final (:deadline, :renew) = frame.extension;
+    final now = monotonicNow();
+    if (payload.isEmpty) {
+      expiry.restartGap(now);
+    } else {
+      expiry.declare(now, deadline, renew);
+    }
+    _arm();
   }
 
   @override
   void setReplyTimeout(Duration? timeout) {
     _replyTimeout = timeout;
-    if (!_finished) {
-      _restartTimer();
+    if (!_finished && expectsReply) {
+      _startTimer();
     }
   }
 
-  void _restartTimer() {
+  /// Starts the responder timeout, in the default regime.
+  void _startTimer() {
+    final expiry = _expiry ??= _Expiry(Duration.zero);
+    expiry
+      ..gap = _replyTimeout ?? channel.options.replyTimeout
+      ..start(monotonicNow());
+    _arm();
+  }
+
+  /// A stream item (possibly a request) was sent.
+  void _replied() {
+    final expiry = _expiry;
+    if (expiry == null) {
+      return;
+    }
+    expiry.reply(monotonicNow());
+    _arm();
+  }
+
+  /// When [_timer] fires.
+  Duration? _armedEnd;
+
+  void _arm() {
+    final end = _expiry?.end;
+    if (end != null && end == _armedEnd && _timer != null) {
+      return;
+    }
     _timer?.cancel();
     _timer = null;
-    final timeout = _replyTimeout ?? channel.options.replyTimeout;
-    if (timeout > Duration.zero) {
-      _timer = Timer(timeout, _onTimeout);
+    _armedEnd = end;
+    if (end == null) {
+      return;
     }
+    var left = end - monotonicNow();
+    if (left.isNegative) {
+      left = Duration.zero;
+    }
+    _timer = Timer(left, _onTimeout);
   }
 
   void _onTimeout() {

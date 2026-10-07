@@ -14,6 +14,7 @@ import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 
 import '../address/service_address.dart';
+import '../monotonic.dart';
 import '../name.dart';
 import '../status.dart';
 import '../switchboard/incoming_channel.dart';
@@ -75,6 +76,14 @@ final Logger _log = Logger('Switchboard.Naming');
 /// allocator and migrations wait. After a restart this lets the instances
 /// that were serving slots reclaim them before anything else is decided.
 ///
+/// A request that waits (for the end of the hold, an `ASSIGN`, a step of a
+/// migration, a backoff) is sent one `EXTEND` declaring how long the wait
+/// can last when it starts waiting, and another whenever that changes: a
+/// hand-over step starts, or the instance working on it declares a
+/// deadline of its own. Nothing is sent from a timer. The service's own
+/// responder timeout is off for such requests, since it answers each of
+/// them when what it waits for ends.
+///
 /// The service registers nothing by itself. The wiki registers the naming
 /// service in its own table as `_ns/1`; the host does that with
 /// [registerLocal] once it knows its listening endpoints. Hosting it on a
@@ -93,17 +102,6 @@ final Logger _log = Logger('Switchboard.Naming');
 class NamingService {
   /// Creates an empty service.
   ///
-  /// [heldExtendInterval] is the interval at which the requests the service
-  /// holds are sent `EXTEND`: a `REGISTER` waiting for the end of
-  /// [assignmentHold], a `MIGRATE`, and the slot requests waiting on an
-  /// `ASSIGN`, a migration or the hold. These are bounded operations;
-  /// subscriptions need nothing of the kind. It must be shorter than the
-  /// [TalkOptions.replyTimeout] of every channel passed to [serve] (10 s by
-  /// default), otherwise the responder timeout of the channel aborts a held
-  /// request with `DEADLINE_EXCEEDED`, and shorter than the requesters'
-  /// timeout (15 s by default). A timer never fires early but often fires
-  /// late (event loop latency, load); the default of 4 s leaves margin.
-  ///
   /// [assignmentHold] is how long, counted from construction, a `REGISTER`
   /// that asks for any id (instance 0) waits before it is answered. After a
   /// naming service restart ids are assigned from 1 again, while surviving
@@ -111,24 +109,28 @@ class NamingService {
   /// for a moment lets them reclaim those ids before a fresh registration
   /// can take one (which would move the surviving service to a new id, see
   /// `NamingClient.register`). Requests for a specific id, [registerLocal]
-  /// and everything else are served at once. Held requests are kept alive
-  /// with `EXTEND` every [heldExtendInterval]. [Duration.zero] disables the
-  /// hold.
+  /// and everything else are served at once. A held request is sent one
+  /// `EXTEND` declaring the time left in the hold as its deadline.
+  /// [Duration.zero] disables the hold.
   ///
   /// [holderGrace] is how long a free slot of a holder-only managed space
   /// waits for its holder to come back after the holder went down; then the
   /// slot is reassigned with its holder cleared (it starts fresh).
   ///
   /// [handoverTimeout] is the requester timeout of the requests the service
-  /// sends to instances (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`); every
-  /// `EXTEND` from the instance restarts it. [Duration.zero] disables it.
+  /// sends to instances (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`): the gap
+  /// that applies until the instance declares a deadline or a renewal with
+  /// `EXTEND` (an empty `EXTEND` restarts it). [Duration.zero] disables it.
   ///
   /// [handoverMaxDuration] bounds an `ASSIGN` or `DRAIN` overall, whatever
-  /// the `EXTEND`s: one still running after it is cancelled (Talk cancel
-  /// with `DEADLINE_EXCEEDED`) and handled as a failure, so that a hung
-  /// load or drain cannot keep a slot locked or busy forever. A migration
-  /// is then rolled back with `RESUME`; an instance whose `ASSIGN` timed
-  /// out enters its `ASSIGN` backoff. [Duration.zero] removes the bound.
+  /// the instance declares: one still running after it is cancelled (Talk
+  /// cancel with `DEADLINE_EXCEEDED`) and handled as a failure, so that a
+  /// hung load or drain cannot keep a slot locked or busy forever. A
+  /// migration is then rolled back with `RESUME`; an instance whose
+  /// `ASSIGN` timed out enters its `ASSIGN` backoff. It is the requester's
+  /// clamp of the deadlines instances declare for hand-over requests, and
+  /// of those the service passes on to the requests waiting for them.
+  /// [Duration.zero] removes the bound.
   ///
   /// [maxSlotCount] bounds the slot count of a space; `SLOTS` with more is
   /// refused with `OUT_OF_RANGE`.
@@ -158,13 +160,12 @@ class NamingService {
   /// Slots with a known holder still go back to it, and `LOCATE` still
   /// assigns. [Duration.zero] disables it.
   ///
-  /// Throws [ArgumentError] if [heldExtendInterval] or [assignBackoff] is
-  /// not positive, if [assignBackoffMax] is shorter than [assignBackoff], if
+  /// Throws [ArgumentError] if [assignBackoff] is not positive, if
+  /// [assignBackoffMax] is shorter than [assignBackoff], if
   /// [assignmentHold], [holderGrace], [handoverTimeout],
   /// [handoverMaxDuration] or [holdingSettle] is negative, or if
   /// [maxSlotCount] is not positive.
   NamingService({
-    this.heldExtendInterval = const Duration(seconds: 4),
     this.assignmentHold = const Duration(seconds: 2),
     this.holderGrace = const Duration(minutes: 5),
     this.handoverTimeout = const Duration(seconds: 60),
@@ -174,13 +175,6 @@ class NamingService {
     this.holdingSettle = const Duration(seconds: 1),
     this.handoverMaxDuration = const Duration(minutes: 10),
   }) {
-    if (heldExtendInterval <= Duration.zero) {
-      throw ArgumentError.value(
-        heldExtendInterval,
-        'heldExtendInterval',
-        'must be positive',
-      );
-    }
     if (assignBackoff <= Duration.zero) {
       throw ArgumentError.value(
         assignBackoff,
@@ -210,6 +204,7 @@ class NamingService {
       throw ArgumentError.value(maxSlotCount, 'maxSlotCount', 'out of range');
     }
     if (assignmentHold > Duration.zero) {
+      _holdEnd = monotonicNow() + assignmentHold;
       _holdTimer = Timer(assignmentHold, _endHold);
     }
   }
@@ -218,9 +213,6 @@ class NamingService {
   /// may hold; a `WATCH` that would open one more is answered
   /// `ABORT RESOURCE_EXHAUSTED`.
   static const int maxWatchesPerChannel = 1024;
-
-  /// Interval at which held requests are sent `EXTEND`.
-  final Duration heldExtendInterval;
 
   /// How long after construction `REGISTER` requests for any id are held,
   /// and slot assignment waits for claims.
@@ -242,8 +234,9 @@ class NamingService {
   /// The longest [assignBackoff] grows to with repeated failures.
   final Duration assignBackoffMax;
 
-  /// Longest an `ASSIGN` or `DRAIN` may run, `EXTEND`s or not, before it
-  /// is cancelled and handled as failed; [Duration.zero] for no bound.
+  /// Longest an `ASSIGN` or `DRAIN` may run, whatever the instance
+  /// declares, before it is cancelled and handled as failed;
+  /// [Duration.zero] for no bound.
   final Duration handoverMaxDuration;
 
   /// How long the allocator waits for `HOLDING` after a `SLOTS` with
@@ -267,8 +260,15 @@ class NamingService {
   /// Runs while assignments are held.
   Timer? _holdTimer;
 
-  /// Extends the held requests while there are any.
-  Timer? _heldExtend;
+  /// When the hold ends ([monotonicNow]).
+  Duration _holdEnd = Duration.zero;
+
+  /// The time left in the assignment hold.
+  Duration get _holdLeft {
+    final left = _holdEnd - monotonicNow();
+    return left.isNegative ? Duration.zero : left;
+  }
+
   final List<_Held> _held = [];
 
   /// Read-only live view of the table: every registered record by address.
@@ -336,8 +336,7 @@ class NamingService {
   ///
   /// Channels addressed to `_ns` with any instance (0), as
   /// `namingClientFor` opens them, reach it too: it is the first registered
-  /// instance of the type. Mind the [heldExtendInterval] constraint on the
-  /// node's [TalkOptions.replyTimeout].
+  /// instance of the type.
   ChannelHandler get handler => _handle;
 
   void _handle(IncomingChannel incoming) => serve(incoming.talk());
@@ -348,23 +347,14 @@ class NamingService {
   /// Takes over [TalkChannel.messages], so each channel can be served only
   /// once: throws [StateError] if its messages are already listened to, in
   /// which case the service keeps nothing of it. The channel keeps its own
-  /// options; see [heldExtendInterval] for the constraint on
-  /// [TalkOptions.replyTimeout]. After [close] the channel is closed
-  /// immediately with [StatusCode.goingAway].
+  /// options. After [close] the channel is closed immediately with
+  /// [StatusCode.goingAway].
   void serve(TalkChannel channel) {
     if (_closed) {
       unawaited(
         channel.close(Status.of(StatusCode.goingAway, 'naming service closed')),
       );
       return;
-    }
-    final replyTimeout = channel.options.replyTimeout;
-    if (replyTimeout > Duration.zero && heldExtendInterval >= replyTimeout) {
-      _log.warning(
-        'heldExtendInterval $heldExtendInterval is not shorter than the '
-        'channel reply timeout $replyTimeout; held requests on this channel '
-        'will be aborted',
-      );
     }
     final session = _Session(channel);
     // Listen before keeping the session: if the stream is taken already,
@@ -449,8 +439,6 @@ class NamingService {
     _slots.close();
     _holdTimer?.cancel();
     _holdTimer = null;
-    _heldExtend?.cancel();
-    _heldExtend = null;
     final held = List.of(_held);
     _held.clear();
     for (final h in held) {
@@ -724,7 +712,8 @@ class NamingService {
   // ---------------------------------------------------------------------
   // Assignment hold
 
-  /// Keeps a `REGISTER` for any id until the hold ends. If the requester
+  /// Keeps a `REGISTER` for any id until the hold ends, declaring the time
+  /// left in the hold as its deadline with one `EXTEND`. If the requester
   /// cancels it meanwhile, it is answered `CANCELLED` and never registered.
   void _hold(_Session session, TalkMessage message, RegisterRequest request) {
     final held = _Held(session, message, request);
@@ -732,6 +721,7 @@ class NamingService {
     _log.fine(
       'holding REGISTER ${request.type} until the assignment hold ends',
     );
+    _slots.declare(message, _holdLeft);
     unawaited(
       message.onCancel.then((_) {
         if (_held.remove(held)) {
@@ -739,24 +729,11 @@ class NamingService {
         }
       }),
     );
-    _heldExtend ??= Timer.periodic(heldExtendInterval, (_) {
-      for (final h in _held) {
-        if (h.message.canReply) {
-          try {
-            h.message.extend();
-          } on SwitchboardException catch (e) {
-            _log.fine('held REGISTER not extended: $e');
-          }
-        }
-      }
-    });
   }
 
   /// Answers the held requests, in arrival order.
   void _endHold() {
     _holdTimer = null;
-    _heldExtend?.cancel();
-    _heldExtend = null;
     final held = List.of(_held);
     _held.clear();
     if (held.isNotEmpty) {
@@ -929,10 +906,6 @@ class NamingService {
     }
     session.active = false;
     _held.removeWhere((h) => identical(h.session, session));
-    if (_held.isEmpty) {
-      _heldExtend?.cancel();
-      _heldExtend = null;
-    }
     _endWatches(session);
     final owned = session.owned.toList();
     if (owned.isNotEmpty) {

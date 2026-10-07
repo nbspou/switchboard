@@ -59,6 +59,7 @@ class ZoneServer extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     final int counter;
     if (holder == 0 || holder == gate.instance) {
@@ -77,10 +78,17 @@ class ZoneServer extends SlotLifecycle {
   }
 
   @override
-  Future<void> drain(int slot, {required int epoch, required int to}) async {
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) async {
     await holdDrain?.future;
     final z = zones[slot]!;
     z.timer?.cancel();
+    // The transfer starts: how long it may take is known now.
+    context?.extend(deadline: const Duration(seconds: 10));
     final talk = await gate.switchboard.openTalk(ServiceAddress(zone, to));
     try {
       await talk.request('XFER', bytes('$slot ${z.counter}'));

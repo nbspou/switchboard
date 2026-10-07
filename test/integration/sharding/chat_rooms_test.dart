@@ -31,6 +31,7 @@ class RoomServer extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     expect(shared, isTrue);
     storage.putIfAbsent(slot, () => []);
@@ -43,8 +44,12 @@ class RoomServer extends SlotLifecycle {
   /// new owner (their posts in flight are answered first: the gate waited
   /// for them).
   @override
-  Future<void> drain(int slot, {required int epoch, required int to}) async =>
-      _dismiss(slot);
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) async => _dismiss(slot);
 
   @override
   Future<void> unload(int slot) async {

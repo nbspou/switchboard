@@ -82,6 +82,11 @@ class Instance {
   /// Slots this instance believes it serves, with their epochs.
   final Map<int, int> serving = {};
 
+  /// Sends an empty `EXTEND` every 50 ms while it handles a request, as an
+  /// instance written before declared deadlines did (they restart the
+  /// naming service's default timeout). Off: it sends none.
+  bool heartbeat = true;
+
   /// Receives the one-way messages (subscription events) of [channel].
   void Function(TalkMessage event)? onEvent;
 
@@ -106,7 +111,7 @@ class Instance {
     }
     m.setReplyTimeout(Duration.zero);
     final extend = Timer.periodic(ms50, (t) {
-      if (m.canReply) {
+      if (m.canReply && heartbeat) {
         m.extend();
       } else {
         t.cancel();
@@ -274,27 +279,35 @@ class RecordingHandler extends SlotHandler {
   /// Every [onDiscard], as `type: slots`.
   final List<String> discarded = [];
 
+  /// The context of the latest request of each kind and slot, by
+  /// `ASSIGN 3`, `DRAIN 3` and so on; set before the script runs.
+  final Map<String, SlotRequestContext> contexts = {};
+
   @override
-  Future<AssignResult> onAssign(AssignRequest r) {
+  Future<AssignResult> onAssign(AssignRequest r, SlotRequestContext context) {
     log.add('$name ASSIGN ${r.slot} e${r.epoch} h${r.holder}');
+    contexts['ASSIGN ${r.slot}'] = context;
     return assign(r);
   }
 
   @override
-  Future<void> onDrain(DrainRequest r) {
+  Future<void> onDrain(DrainRequest r, SlotRequestContext context) {
     log.add('$name DRAIN ${r.slot} e${r.epoch} to${r.to}');
+    contexts['DRAIN ${r.slot}'] = context;
     return drain(r);
   }
 
   @override
-  Future<void> onForward(ForwardRequest r) {
+  Future<void> onForward(ForwardRequest r, SlotRequestContext context) {
     log.add('$name FORWARD ${r.slot} e${r.epoch} to${r.to}');
+    contexts['FORWARD ${r.slot}'] = context;
     return forward(r);
   }
 
   @override
-  Future<void> onResume(ResumeRequest r) {
+  Future<void> onResume(ResumeRequest r, SlotRequestContext context) {
     log.add('$name RESUME ${r.slot} e${r.epoch}');
+    contexts['RESUME ${r.slot}'] = context;
     return resume(r);
   }
 

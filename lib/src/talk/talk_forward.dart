@@ -17,7 +17,9 @@ part of 'talk_channel.dart';
 /// new request with the same procedure, payload and `STREAM` flag, and
 /// everything that comes back for it is relayed to [incoming], in order:
 ///
-/// * stream items and `EXTEND`s are passed on as they arrive;
+/// * stream items and `EXTEND`s are passed on as they arrive, an `EXTEND`
+///   with its payload unchanged (the deadline and renewal the far
+///   responder declared, whose buffer covers the hops);
 /// * the final response is passed on as the final reply, with its trailing
 ///   payload;
 /// * an item or final response that is itself a request is forwarded the
@@ -289,7 +291,8 @@ class _Relay implements _ResponseSink {
   }
 
   @override
-  void extended() {
-    _deliver(incoming.extend);
+  void extended(Uint8List payload) {
+    // Byte for byte: the far responder's buffer covers the hops.
+    _deliver(() => incoming._extendRaw(payload));
   }
 }

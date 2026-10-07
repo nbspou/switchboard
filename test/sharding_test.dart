@@ -888,9 +888,13 @@ void main() {
       await Future<void>.delayed(ms50);
       expect(h.service.isHoldingAssignments, isTrue);
       expect(log, isEmpty);
+      // Listened to at once: the refusals reach other channels than the
+      // answer to b, in any order.
+      final refusedA = expectLater(ca, throwsStatus(StatusCode.alreadyExists));
+      final refusedC = expectLater(cc, throwsStatus(StatusCode.alreadyExists));
       expect(await cb, 8);
-      await expectLater(ca, throwsStatus(StatusCode.alreadyExists));
-      await expectLater(cc, throwsStatus(StatusCode.alreadyExists));
+      await refusedA;
+      await refusedC;
       expect(await cc5, 3);
       // HOLDING is answered after the claims.
       expect(await ha, [3]);
@@ -1305,6 +1309,175 @@ void main() {
         async.flushMicrotasks();
         async.elapse(ms50 * 2);
         expect(async.pendingTimers, isEmpty);
+      });
+    });
+  });
+
+  group('declared deadlines, no heartbeat', () {
+    final buffer = serverOptions.extendBuffer;
+    const handover = Duration(milliseconds: 300);
+
+    void closeAll(FakeAsync async, Harness h) {
+      unawaited(h.close());
+      async.flushMicrotasks();
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    test('a HOLDING waiting for an ASSIGN elsewhere is told the handover '
+        'timeout once', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final a = Instance(h, kv, 1, log);
+        final b = Instance(h, kv, 2, log)..heartbeat = false;
+        final decide = Completer<void>();
+        b.onAssign = (_) async {
+          await decide.future;
+          return const AssignResponse();
+        };
+        unawaited(a.start());
+        unawaited(b.start(space: SlotSpace(kv, count: 2)));
+        async.elapse(ms10);
+        expect(log, hasLength(2));
+        final declared = <(Duration?, Duration?)>[];
+        List<int>? discard;
+        a.channel
+            .startRequest(
+              'HOLDING',
+              HoldingRequest(kv, [0, 1]).encode(),
+              onExtend: (deadline, renew) => declared.add((deadline, renew)),
+            )
+            .response
+            .then((r) => discard = HoldingResponse.decode(r.payload).discard);
+        async.elapse(ms10);
+        // Both ASSIGNs started together: one bound covers both.
+        expect(declared, [(handover - ms10 + buffer, null)]);
+        decide.complete();
+        async.elapse(ms10);
+        expect(discard, [0, 1]);
+        expect(declared, hasLength(1));
+        closeAll(async, h);
+      });
+    });
+
+    test('a CLAIM made during the hold is told the time left in it', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: const Duration(seconds: 2));
+        final log = <String>[];
+        final a = Instance(h, zone, 1, log)..heartbeat = false;
+        unawaited(a.start(space: staticSpace(zone, 4), capacity: 0));
+        async.elapse(const Duration(milliseconds: 500));
+        final declared = <(Duration?, Duration?)>[];
+        int? epoch;
+        a.channel
+            .startRequest(
+              'CLAIM',
+              ClaimRequest(zone, 1).encode(),
+              onExtend: (deadline, renew) => declared.add((deadline, renew)),
+            )
+            .response
+            .then((r) => epoch = ClaimResponse.decode(r.payload).epoch);
+        async.elapse(ms10);
+        expect(declared, [(const Duration(milliseconds: 1500) + buffer, null)]);
+        async.elapse(const Duration(milliseconds: 1500));
+        expect(epoch, 1);
+        // Then the ASSIGN to it: one more, the handover timeout.
+        expect(declared, [
+          (const Duration(milliseconds: 1500) + buffer, null),
+          (handover + buffer, null),
+        ]);
+        closeAll(async, h);
+      });
+    });
+
+    test('a LOCATE waiting out a backoff is told the wait it knows', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final space = SlotSpace(userq, count: 16, lazy: true);
+        for (final id in [1, 2]) {
+          final i = Instance(h, userq, id, log)
+            ..heartbeat = false
+            ..onAssign = (_) async =>
+                throw SwitchboardException.of(StatusCode.unavailable);
+          unawaited(i.start(space: space));
+        }
+        async.elapse(ms10);
+        // A first LOCATE puts both candidates in their backoff (200 ms).
+        final (router, _) = h.link();
+        router.request('LOCATE', LocateRequest(userq, 3).encode()).ignore();
+        async.elapse(ms50);
+        expect(log, hasLength(2));
+        final declared = <(Duration?, Duration?)>[];
+        Object? error;
+        router
+            .startRequest(
+              'LOCATE',
+              LocateRequest(userq, 3).encode(),
+              onExtend: (deadline, renew) => declared.add((deadline, renew)),
+            )
+            .response
+            .then(
+              (_) {},
+              onError: (Object e) {
+                error = e;
+              },
+            );
+        async.elapse(ms10);
+        // It waits for a backoff, at most the handover timeout.
+        expect(log, hasLength(2));
+        expect(declared, [(handover + buffer, null)]);
+        async.elapse(const Duration(seconds: 1));
+        expect(error, isStatus(StatusCode.unavailable));
+        closeAll(async, h);
+      });
+    });
+
+    test('a MIGRATE queued behind another is told each step of it', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final a = Instance(h, zone, 1, log)..heartbeat = false;
+        final b = Instance(h, zone, 2, log)..heartbeat = false;
+        unawaited(a.start(space: staticSpace(zone, 4), capacity: 0));
+        unawaited(b.start(space: staticSpace(zone, 4), capacity: 0));
+        async.elapse(ms10);
+        unawaited(a.claim(1));
+        unawaited(a.claim(2));
+        async.elapse(ms10);
+        final draining = Completer<void>();
+        a.onDrain = (_) => draining.future;
+        final (operator, _) = h.link();
+        final first = operator.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 1, to: 2).encode(),
+        );
+        first.items.listen(null);
+        first.done.ignore();
+        async.elapse(ms10);
+        final declared = <(Duration?, Duration?)>[];
+        final second = operator.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 2, to: 2).encode(),
+          onExtend: (deadline, renew) => declared.add((deadline, renew)),
+        );
+        second.items.listen(null);
+        Object? outcome;
+        second.done.then(
+          (_) => outcome = 'done',
+          onError: (Object e) {
+            outcome = e;
+          },
+        );
+        async.elapse(ms10);
+        // Behind the first, in its DRAIN since 10 ms.
+        expect(declared, [(handover - ms10 + buffer, null)]);
+        draining.complete();
+        async.elapse(ms50);
+        expect(outcome, 'done');
+        expect(log.where((l) => l.contains('DRAIN')), hasLength(2));
+        closeAll(async, h);
       });
     });
   });

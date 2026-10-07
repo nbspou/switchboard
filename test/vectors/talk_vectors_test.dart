@@ -67,9 +67,30 @@ final List<(String, String, TalkFrame)> positive = [
     ),
   ),
   (
-    'Extend response to 1',
+    'Extend response to 1 (restart the default timeout)',
     '34 01 00 00',
     TalkFrame(kind: TalkKind.extend, responseId: 1),
+  ),
+  (
+    'Extend response to 1, deadline 900000 ms, renew 300000 ms',
+    '34 01 00 00 A0 BB 0D 00 E0 93 04 00',
+    TalkFrame(
+      kind: TalkKind.extend,
+      responseId: 1,
+      payload: TalkFrame.extendPayload(
+        deadline: const Duration(minutes: 15),
+        renew: const Duration(minutes: 5),
+      ),
+    ),
+  ),
+  (
+    'Extend response to 1, deadline 900000 ms, renew unchanged',
+    '34 01 00 00 A0 BB 0D 00 00 00 00 00',
+    TalkFrame(
+      kind: TalkKind.extend,
+      responseId: 1,
+      payload: TalkFrame.extendPayload(deadline: const Duration(minutes: 15)),
+    ),
   ),
   (
     'Cancel own request 2',
@@ -116,6 +137,7 @@ const List<(String, String)> negative = [
   ('Request id 0', '03 48 45 4C 4C 4F 00 00 00 00 00 00'),
   ('STREAM_ITEM without HAS_RESPONSE', '11 48 45 4C 4C 4F 00 00 00'),
   ('EXTEND with HAS_REQUEST', '36 01 00 00 02 00 00'),
+  ('EXTEND with a 4-byte payload', '34 01 00 00 A0 BB 0D 00'),
   ('ABORT with both ids', '26 01 00 00 02 00 00 01 00'),
   ('Plain message without procedure', '00 01'),
   ('Truncated procedure', '01 48 45'),
@@ -130,6 +152,8 @@ const List<(String, String)> negativeExtra = [
   ('Chained with response id 0', '06 01 00 00 00 00 00'),
   ('EXTEND without HAS_RESPONSE', '30'),
   ('EXTEND with STREAM and no request', '3C 01 00 00'),
+  ('EXTEND with a 2-byte payload', '34 01 00 00 AA BB'),
+  ('EXTEND with a 9-byte payload', '34 01 00 00 01 00 00 00 01 00 00 00 00'),
   ('STREAM_ITEM with only a request id', '13 48 45 4C 4C 4F 00 00 00 01 00 00'),
   ('Request without procedure', '02 01 00 00'),
   ('ABORT with a one byte payload', '24 01 00 00 05'),
@@ -199,12 +223,63 @@ void main() {
       });
     }
 
-    test('EXTEND payload is ignored', () {
-      final frame = TalkFrame.decode(hexBytes('34 01 00 00 AA BB'));
-      expect(frame.kind, TalkKind.extend);
-      expect(frame.responseId, 1);
-      expect(frame.payload, isEmpty);
-      expect(hexString(frame.encode()), '34 01 00 00');
+    test('EXTEND values decode', () {
+      expect(
+        TalkFrame.decode(hexBytes('34 01 00 00 A0 BB 0D 00 E0 93 04 00'))
+            .extension,
+        (
+          deadline: const Duration(minutes: 15),
+          renew: const Duration(minutes: 5),
+        ),
+      );
+      expect(
+        TalkFrame.decode(hexBytes('34 01 00 00 00 00 00 00 E0 93 04 00'))
+            .extension,
+        (deadline: null, renew: const Duration(minutes: 5)),
+      );
+      // An empty payload and two zero fields both declare nothing; the
+      // payload tells a restart of the default timeout from "unchanged".
+      expect(TalkFrame.decode(hexBytes('34 01 00 00')).extension, (
+        deadline: null,
+        renew: null,
+      ));
+      final zeros = TalkFrame.decode(
+        hexBytes('34 01 00 00 00 00 00 00 00 00 00 00'),
+      );
+      expect(zeros.extension, (deadline: null, renew: null));
+      expect(zeros.payload, hasLength(8));
+      expect(
+        TalkFrame.decode(hexBytes('34 01 00 00 FF FF FF FF 01 00 00 00'))
+            .extension,
+        (
+          deadline: const Duration(milliseconds: 0xFFFFFFFF),
+          renew: const Duration(milliseconds: 1),
+        ),
+      );
+      expect(
+        () => TalkFrame(kind: TalkKind.message, responseId: 1).extension,
+        throwsStateError,
+      );
+    });
+
+    test('EXTEND values encode in whole milliseconds, rounded up', () {
+      String payload({Duration? deadline, Duration? renew}) =>
+          hexString(TalkFrame.extendPayload(deadline: deadline, renew: renew));
+      expect(payload(), '');
+      expect(
+        payload(deadline: const Duration(microseconds: 1500)),
+        '02 00 00 00 00 00 00 00',
+      );
+      // Under 1 ms is 1 ms: 0 would mean "unchanged".
+      expect(payload(renew: Duration.zero), '00 00 00 00 01 00 00 00');
+      expect(
+        payload(deadline: const Duration(days: 60)),
+        'FF FF FF FF 00 00 00 00',
+      );
+      expect(
+        () => payload(deadline: const Duration(seconds: -1)),
+        throwsArgumentError,
+      );
     });
 
     test('a missing procedure reads as the empty name', () {
@@ -264,7 +339,7 @@ void main() {
         () => TalkFrame(kind: TalkKind.extend, requestId: 1, responseId: 1),
       ),
       (
-        'extend with payload',
+        'extend with a 1-byte payload',
         () => TalkFrame(
           kind: TalkKind.extend,
           responseId: 1,

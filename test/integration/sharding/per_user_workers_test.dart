@@ -52,6 +52,7 @@ class Worker extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async {
     var completed = 0;
     if (holder != 0 && holder != gate.instance) {
@@ -127,19 +128,22 @@ class Recording extends SlotHandler {
   final List<String> log;
 
   @override
-  Future<AssignResult> onAssign(AssignRequest r) => inner.onAssign(r);
+  Future<AssignResult> onAssign(AssignRequest r, SlotRequestContext c) =>
+      inner.onAssign(r, c);
 
   @override
-  Future<void> onDrain(DrainRequest r) {
+  Future<void> onDrain(DrainRequest r, SlotRequestContext c) {
     log.add('$name DRAIN ${r.slot}');
-    return inner.onDrain(r);
+    return inner.onDrain(r, c);
   }
 
   @override
-  Future<void> onForward(ForwardRequest r) => inner.onForward(r);
+  Future<void> onForward(ForwardRequest r, SlotRequestContext c) =>
+      inner.onForward(r, c);
 
   @override
-  Future<void> onResume(ResumeRequest r) => inner.onResume(r);
+  Future<void> onResume(ResumeRequest r, SlotRequestContext c) =>
+      inner.onResume(r, c);
 
   @override
   Future<void> onRevoke(Name type, int slot) => inner.onRevoke(type, slot);
@@ -335,6 +339,7 @@ class _Shard extends SlotLifecycle {
     required int epoch,
     required int holder,
     required bool shared,
+    SlotRequestContext? context,
   }) async => AssignResult.notHolding;
 
   @override

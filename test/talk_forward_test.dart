@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:clock/clock.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/core.dart';
@@ -412,6 +413,40 @@ void main() {
   }
 
   group('timeouts', () {
+    test('a deadline the backend declares reaches the client with the '
+        "backend's buffer only, through every hop", () {
+      fakeAsync((async) {
+        final chain = Chain(proxies: 2);
+        final held = <TalkMessage>[];
+        serve(chain.backend, held.add);
+        final seen = <(Duration?, Duration?)>[];
+        final r = chain.client.startRequest(
+          'SLOW',
+          Uint8List(0),
+          onExtend: (deadline, renew) => seen.add((deadline, renew)),
+        );
+        final result = Outcome(r.response);
+        async.flushMicrotasks();
+        final t0 = clock.now();
+        held.single.extend(
+          deadline: const Duration(minutes: 1),
+          renew: const Duration(seconds: 20),
+        );
+        async.flushMicrotasks();
+        expect(seen, [
+          (const Duration(seconds: 65), const Duration(seconds: 25)),
+        ]);
+        expect(r.deadline, t0.add(const Duration(seconds: 65)));
+        // The backend gives up at its own deadline; its abort passes the
+        // proxies, which time nothing out themselves.
+        async.elapse(const Duration(seconds: 60));
+        expect(result.error, isRemote(StatusCode.deadlineExceeded));
+        chain.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     test('EXTEND from the backend keeps the client waiting', () {
       fakeAsync((async) {
         final chain = Chain(
@@ -426,7 +461,7 @@ void main() {
         final r = chain.client.startRequest(
           'SLOW',
           Uint8List(0),
-          onExtend: () => extends_++,
+          onExtend: (_, _) => extends_++,
         );
         final result = Outcome(r.response);
         final s = chain.client.streamRequest('TICK', Uint8List(0));
@@ -575,6 +610,39 @@ void main() {
           responseId: 5,
           payload: bytes([4]),
         ),
+      ]);
+      await p.proxy.close();
+    });
+
+    test('EXTEND payloads pass through byte for byte', () async {
+      final p = RawProxy();
+      p.fromClient(
+        TalkFrame(kind: TalkKind.message, procedure: odd, requestId: 5),
+      );
+      await pumpEventQueue();
+      final id = p.atBackend.single.requestId;
+      final payloads = [
+        hexBytes('A0 BB 0D 00 E0 93 04 00'),
+        hexBytes('A0 BB 0D 00 00 00 00 00'),
+        hexBytes('00 00 00 00 00 00 00 00'),
+        Uint8List(0),
+        hexBytes('01 00 00 00 FF FF FF FF'),
+      ];
+      for (final payload in payloads) {
+        p.backend.sink.add(
+          TalkFrame(
+            kind: TalkKind.extend,
+            responseId: id,
+            payload: payload,
+          ).encode(),
+        );
+      }
+      await pumpEventQueue();
+      expect(p.atClient.map((f) => (f.kind, f.responseId)), [
+        for (final _ in payloads) (TalkKind.extend, 5),
+      ]);
+      expect(p.atClient.map((f) => hexString(f.payload)), [
+        for (final payload in payloads) hexString(payload),
       ]);
       await p.proxy.close();
     });

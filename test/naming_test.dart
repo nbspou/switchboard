@@ -783,18 +783,6 @@ void main() {
         expect(async.pendingTimers, isEmpty);
       });
     });
-
-    test('heldExtendInterval: positive, and by default shorter than the '
-        'default reply timeout', () {
-      expect(
-        NamingService(assignmentHold: Duration.zero).heldExtendInterval,
-        lessThan(const TalkOptions().replyTimeout),
-      );
-      expect(
-        () => NamingService(heldExtendInterval: Duration.zero),
-        throwsArgumentError,
-      );
-    });
   });
 
   group('assignment hold', () {
@@ -841,6 +829,44 @@ void main() {
         register(b, 'npc').then((id) => later = id);
         async.elapse(ms10);
         expect(later, 3);
+        unawaited(h.close());
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('a held REGISTER gets one EXTEND, declaring the time left in the '
+        'hold', () {
+      fakeAsync((async) {
+        final h = Harness(assignmentHold: hold);
+        async.elapse(const Duration(milliseconds: 500));
+        final (a, _) = h.link();
+        final declared = <(Duration?, Duration?)>[];
+        int? id;
+        a
+            .startRequest(
+              'REGISTER',
+              RegisterRequest(Name('npc')).encode(),
+              onExtend: (deadline, renew) => declared.add((deadline, renew)),
+            )
+            .response
+            .then((m) => id = RegisterResponse.decode(m.payload).instance);
+        async.elapse(ms10);
+        // 1.5 s were left at receipt; the wire carries the service node's
+        // buffer on top.
+        expect(declared, [
+          (
+            const Duration(milliseconds: 1500) + serverOptions.extendBuffer,
+            null,
+          ),
+        ]);
+        // Well past the request and reply timeouts: nothing more is sent.
+        async.elapse(const Duration(milliseconds: 1480));
+        expect(id, isNull);
+        expect(declared, hasLength(1));
+        async.elapse(ms10 * 2);
+        expect(id, 1);
+        expect(declared, hasLength(1));
         unawaited(h.close());
         async.flushMicrotasks();
         expect(async.pendingTimers, isEmpty);

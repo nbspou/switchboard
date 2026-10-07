@@ -3,6 +3,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:clock/clock.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/bytes.dart';
@@ -11,6 +12,7 @@ import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/talk/talk_channel.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:switchboard/src/talk/talk_message.dart';
+import 'package:switchboard/src/talk/talk_stream.dart';
 import 'package:test/test.dart';
 
 const Duration ms30 = Duration(milliseconds: 30);
@@ -1541,8 +1543,8 @@ void main() {
         'request', () async {
       final p = Pair();
       final counts = <String, int>{};
-      void Function() counter(String key) =>
-          () => counts[key] = (counts[key] ?? 0) + 1;
+      void Function(Duration?, Duration?) counter(String key) =>
+          (_, _) => counts[key] = (counts[key] ?? 0) + 1;
       serve(p.b, (m) async {
         m.extend();
         m.extend();
@@ -1614,7 +1616,7 @@ void main() {
       final r = peer.talk.startRequest(
         'X',
         Uint8List(0),
-        onExtend: () => throw StateError('callback bug'),
+        onExtend: (_, _) => throw StateError('callback bug'),
       );
       await pumpEventQueue();
       peer.send(TalkFrame(kind: TalkKind.extend, responseId: r.requestId));
@@ -1631,7 +1633,7 @@ void main() {
         final s = peer.talk.streamRequest(
           'S',
           Uint8List(0),
-          onExtend: () => extends_++,
+          onExtend: (_, _) => extends_++,
         );
         final done = Outcome(s.done);
         async.flushMicrotasks();
@@ -1659,7 +1661,7 @@ void main() {
         final s = peer.talk.streamRequest(
           'S',
           Uint8List(0),
-          onExtend: () => extends_++,
+          onExtend: (_, _) => extends_++,
         );
         s.done.ignore();
         async.flushMicrotasks();
@@ -1770,6 +1772,457 @@ void main() {
       broken.sendHex('41');
       await expectLater(lost, local(StatusCode.connectionLost));
       await expectLater(protocol, local(StatusCode.protocolError));
+    });
+  });
+
+  group('declared deadlines', () {
+    const sec = Duration(seconds: 1);
+    const ms1 = Duration(milliseconds: 1);
+
+    TalkFrame declare(int id, {Duration? deadline, Duration? renew}) =>
+        TalkFrame(
+          kind: TalkKind.extend,
+          responseId: id,
+          payload: TalkFrame.extendPayload(deadline: deadline, renew: renew),
+        );
+
+    TalkFrame item(int id) =>
+        TalkFrame(kind: TalkKind.streamItem, responseId: id);
+
+    /// A stream request from a raw peer's channel (default options unless
+    /// given), its outcome, and the time it was sent.
+    (RawPeer, TalkStream, Outcome<TalkMessage>, DateTime) start(
+      FakeAsync async, {
+      TalkOptions options = const TalkOptions(),
+    }) {
+      final peer = RawPeer(options: options);
+      final s = peer.talk.streamRequest('S', Uint8List(0));
+      final done = Outcome(s.done);
+      async.flushMicrotasks();
+      return (peer, s, done, clock.now());
+    }
+
+    void finish(FakeAsync async, RawPeer peer) {
+      peer.talk.close();
+      async.flushMicrotasks();
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    /// Expects [done] to fail with the requester's own DEADLINE_EXCEEDED
+    /// exactly [left] from now.
+    void expectTimeoutIn(
+      FakeAsync async,
+      Outcome<TalkMessage> done,
+      Duration left,
+    ) {
+      async.elapse(left - ms1);
+      expect(done.isDone, isFalse);
+      async.elapse(ms1);
+      expect(
+        done.error,
+        isA<SwitchboardException>()
+            .having((e) => e.code, 'code', StatusCode.deadlineExceeded)
+            .having((e) => e is TalkAbortException, 'remote', isFalse),
+      );
+    }
+
+    test('without EXTEND the default gap applies, restarted by items', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        expect(s.deadline, t0.add(sec * 15));
+        async.elapse(sec * 10);
+        peer.send(item(s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 25));
+        expectTimeoutIn(async, done, sec * 15);
+        expect(s.deadline, isNull);
+        finish(async, peer);
+      });
+    });
+
+    test('a deadline replaces the default gap; items do not move it', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(declare(s.requestId, deadline: sec * 60));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 60));
+        async.elapse(sec * 50);
+        peer.send(item(s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 60), reason: 'no renewal declared');
+        expectTimeoutIn(async, done, sec * 10);
+        // The requester cancels what it gave up on.
+        expect(peer.received.last.kind, TalkKind.abort);
+        expect(peer.received.last.requestId, s.requestId);
+        finish(async, peer);
+      });
+    });
+
+    test('a renewal alone counts from the last reply', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(declare(s.requestId, renew: sec * 30));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 30));
+        async.elapse(sec * 20);
+        peer.send(item(s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 50));
+        expectTimeoutIn(async, done, sec * 30);
+        finish(async, peer);
+      });
+    });
+
+    test('with both, the later one applies: a reply never brings the '
+        'deadline closer', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(declare(s.requestId, deadline: sec * 60, renew: sec * 20));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 60));
+        async.elapse(sec * 10);
+        peer.send(item(s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 60), reason: 'not t0 + 30 s');
+        async.elapse(sec * 45);
+        peer.send(item(s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 75));
+        expectTimeoutIn(async, done, sec * 20);
+        finish(async, peer);
+      });
+    });
+
+    test('a later EXTEND replaces what it carries, and may shorten it; a '
+        '0 field is unchanged', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(
+          declare(
+            s.requestId,
+            deadline: const Duration(minutes: 10),
+            renew: const Duration(minutes: 1),
+          ),
+        );
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(const Duration(minutes: 10)));
+        async.elapse(sec * 10);
+        // Deadline shortened to t0 + 30 s; the renewal of 1 min stands,
+        // counted from this EXTEND.
+        peer.send(declare(s.requestId, deadline: sec * 20));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 70));
+        async.elapse(sec * 10);
+        // Renewal shortened; the deadline (t0 + 30 s) stands.
+        peer.send(declare(s.requestId, renew: sec * 5));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 30));
+        expectTimeoutIn(async, done, sec * 10);
+        finish(async, peer);
+      });
+    });
+
+    test('values below minExtension are raised to it', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(
+          declare(
+            s.requestId,
+            deadline: const Duration(milliseconds: 100),
+            renew: ms1,
+          ),
+        );
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec));
+        expectTimeoutIn(async, done, sec);
+        finish(async, peer);
+      });
+      fakeAsync((async) {
+        final (peer, s, done, _) = start(
+          async,
+          options: const TalkOptions(minExtension: Duration.zero),
+        );
+        peer.send(
+          declare(s.requestId, deadline: const Duration(milliseconds: 100)),
+        );
+        async.flushMicrotasks();
+        expectTimeoutIn(async, done, const Duration(milliseconds: 100));
+        finish(async, peer);
+      });
+    });
+
+    test('values above maxExtension are lowered to it', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        peer.send(declare(s.requestId, deadline: const Duration(hours: 2)));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(const Duration(hours: 1)));
+        expectTimeoutIn(async, done, const Duration(hours: 1));
+        finish(async, peer);
+      });
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(
+          async,
+          options: const TalkOptions(maxExtension: Duration(minutes: 10)),
+        );
+        peer.send(declare(s.requestId, renew: const Duration(hours: 1)));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(const Duration(minutes: 10)));
+        finish(async, peer);
+      });
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(
+          async,
+          options: const TalkOptions(maxExtension: Duration.zero),
+        );
+        peer.send(declare(s.requestId, deadline: const Duration(days: 3)));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(const Duration(days: 3)));
+        finish(async, peer);
+      });
+    });
+
+    test('an empty EXTEND restarts the default gap, keeping what was '
+        'declared; zero fields count as a reply', () {
+      fakeAsync((async) {
+        final (peer, s, done, t0) = start(async);
+        // Default regime: an empty EXTEND and two zero fields restart the
+        // gap alike.
+        async.elapse(sec * 10);
+        peer.send(TalkFrame(kind: TalkKind.extend, responseId: s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 25));
+        async.elapse(sec * 10);
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.extend,
+            responseId: s.requestId,
+            payload: Uint8List(8),
+          ),
+        );
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 35));
+        // Declared: deadline t0 + 80 s.
+        peer.send(declare(s.requestId, deadline: sec * 60));
+        async.flushMicrotasks();
+        async.elapse(sec * 55);
+        // t0 + 75 s: the gap ends after the deadline.
+        peer.send(TalkFrame(kind: TalkKind.extend, responseId: s.requestId));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 90));
+        async.elapse(sec * 10);
+        // t0 + 85 s: a declaration replaces the gap; the deadline stands.
+        peer.send(declare(s.requestId, renew: sec * 2));
+        async.flushMicrotasks();
+        expect(s.deadline, t0.add(sec * 87));
+        expectTimeoutIn(async, done, sec * 2);
+        finish(async, peer);
+      });
+    });
+
+    test('an EXTEND payload that is neither empty nor 8 bytes is a channel '
+        'protocol error', () async {
+      final peer = RawPeer(mux: true);
+      final pending = peer.talk.request('X', Uint8List(0));
+      await pumpEventQueue();
+      peer.sendHex('34 01 00 00 A0 BB 0D 00');
+      await expectLater(pending, throwsStatus(StatusCode.protocolError));
+      expect((await peer.talk.done).known, StatusCode.protocolError);
+      expect(peer.mux!.closedWith.single.known, StatusCode.protocolError);
+    });
+
+    test('onExtend receives the values as received', () {
+      fakeAsync((async) {
+        final peer = RawPeer();
+        final seen = <(Duration?, Duration?)>[];
+        final r = peer.talk.startRequest(
+          'X',
+          Uint8List(0),
+          onExtend: (deadline, renew) => seen.add((deadline, renew)),
+        );
+        async.flushMicrotasks();
+        final id = r.requestId;
+        peer.send(declare(id, deadline: const Duration(milliseconds: 100)));
+        peer.send(declare(id, renew: const Duration(hours: 2)));
+        peer.send(declare(id, deadline: sec * 90, renew: sec * 30));
+        peer.send(TalkFrame(kind: TalkKind.extend, responseId: id));
+        async.flushMicrotasks();
+        expect(seen, [
+          (const Duration(milliseconds: 100), null),
+          (null, const Duration(hours: 2)),
+          (sec * 90, sec * 30),
+          (null, null),
+        ]);
+        finish(async, peer);
+      });
+    });
+
+    test('the deadline of a request without a timeout is null', () {
+      fakeAsync((async) {
+        final peer = RawPeer();
+        final r = peer.talk.startRequest(
+          'X',
+          Uint8List(0),
+          timeout: Duration.zero,
+        );
+        final result = Outcome(r.response);
+        async.flushMicrotasks();
+        expect(r.deadline, isNull);
+        peer.send(declare(r.requestId, deadline: sec * 10));
+        async.elapse(const Duration(hours: 2));
+        expect(r.deadline, isNull);
+        expect(result.isDone, isFalse);
+        peer.send(TalkFrame(kind: TalkKind.message, responseId: r.requestId));
+        async.flushMicrotasks();
+        expect(result.value, isNotNull);
+        finish(async, peer);
+      });
+    });
+
+    test('extend puts the buffer on the wire, not on the responder '
+        'timeout, so the responder gives up first', () {
+      fakeAsync((async) {
+        final p = Pair();
+        final held = <TalkMessage>[];
+        serve(p.b, held.add);
+        final r = p.a.startRequest('SLOW', Uint8List(0));
+        final result = Outcome(r.response);
+        async.flushMicrotasks();
+        final t0 = clock.now();
+        held.single.extend(deadline: sec * 60);
+        async.flushMicrotasks();
+        final wire = p.bToA.single;
+        expect(wire.extension, (deadline: sec * 65, renew: null));
+        expect(
+          hexString(p.bToARaw.single),
+          '34 01 00 00 E8 FD 00 00 00 00 00 00',
+        );
+        expect(r.deadline, t0.add(sec * 65));
+        async.elapse(sec * 60 - ms1);
+        expect(result.isDone, isFalse);
+        async.elapse(ms1);
+        expect(
+          result.error,
+          isA<TalkAbortException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.deadlineExceeded,
+          ),
+        );
+        expect(held.single.isCancelled, isTrue);
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('the buffer comes from extendBuffer or the call, on each value', () {
+      fakeAsync((async) {
+        final p = Pair(
+          b: const TalkOptions(extendBuffer: Duration(seconds: 10)),
+        );
+        final held = <TalkMessage>[];
+        serve(p.b, held.add);
+        p.a.request('A', Uint8List(0)).ignore();
+        async.flushMicrotasks();
+        final m = held.single;
+        m.extend(deadline: sec * 60, renew: sec * 20);
+        m.extend(renew: sec * 20, buffer: Duration.zero);
+        m.extend(deadline: Duration.zero, buffer: Duration.zero);
+        m.extend();
+        async.flushMicrotasks();
+        expect(p.bToA.map((f) => f.extension), [
+          (deadline: sec * 70, renew: sec * 30),
+          (deadline: null, renew: sec * 20),
+          (deadline: ms1, renew: null),
+          (deadline: null, renew: null),
+        ]);
+        expect(p.bToA.last.payload, isEmpty);
+        p.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('the responder timeout follows its own declaration: items renew, '
+        'the default gap is gone', () {
+      fakeAsync((async) {
+        final p = Pair();
+        final held = <TalkMessage>[];
+        serve(p.b, held.add);
+        final s = p.a.streamRequest('S', Uint8List(0));
+        final done = Outcome(s.done);
+        s.items.listen(null);
+        async.flushMicrotasks();
+        final m = held.single;
+        m.extend(deadline: sec * 30, renew: sec * 20);
+        async.elapse(sec * 25);
+        m.replyItem(bytes([1]));
+        // Responder: max(30, 25 + 20) = 45 s; the requester waits until
+        // max(35, 25 + 25) = 50 s.
+        async.elapse(sec * 20 - ms1);
+        expect(done.isDone, isFalse);
+        expect(m.canReply, isTrue);
+        async.elapse(ms1);
+        expect(m.canReply, isFalse);
+        async.flushMicrotasks();
+        expect(done.error, isA<TalkAbortException>());
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('on the responder, an empty extend restarts the gap and '
+        'setReplyTimeout goes back to the default regime', () {
+      fakeAsync((async) {
+        final p = Pair(a: const TalkOptions(requestTimeout: Duration.zero));
+        final held = <String, TalkMessage>{};
+        serve(p.b, (m) => held[m.procedureName] = m);
+        p.a.request('GAP', Uint8List(0)).ignore();
+        p.a.request('RESET', Uint8List(0)).ignore();
+        p.a.request('NONE', Uint8List(0)).ignore();
+        async.flushMicrotasks();
+        final gap = held['GAP']!;
+        final reset = held['RESET']!;
+        final none = held['NONE']!;
+        none.setReplyTimeout(Duration.zero);
+        for (final m in [gap, reset, none]) {
+          m.extend(deadline: sec * 30);
+        }
+        async.elapse(sec * 25);
+        gap.extend();
+        reset.setReplyTimeout(sec * 2);
+        // GAP: max(30, 25 + 10) = 35 s; RESET: 27 s; NONE: never.
+        async.elapse(sec * 2 - ms1);
+        expect(reset.canReply, isTrue);
+        async.elapse(ms1);
+        expect(reset.canReply, isFalse);
+        async.elapse(sec * 8 - ms1);
+        expect(gap.canReply, isTrue);
+        async.elapse(ms1);
+        expect(gap.canReply, isFalse);
+        async.elapse(const Duration(hours: 1));
+        expect(none.canReply, isTrue);
+        none.reply(Uint8List(0));
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('extend refuses negative values and sends nothing', () async {
+      final p = Pair();
+      final held = <TalkMessage>[];
+      serve(p.b, held.add);
+      p.a.request('A', Uint8List(0)).ignore();
+      await pumpEventQueue();
+      final m = held.single;
+      expect(() => m.extend(deadline: -sec), throwsArgumentError);
+      expect(() => m.extend(renew: -sec), throwsArgumentError);
+      expect(() => m.extend(buffer: -sec), throwsArgumentError);
+      await pumpEventQueue();
+      expect(p.bToA, isEmpty);
+      await p.close();
     });
   });
 

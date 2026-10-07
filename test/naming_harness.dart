@@ -64,7 +64,6 @@ Future<void> until(bool Function() condition) async {
 /// hand-over bound of the service by default.
 class Harness {
   Harness({
-    Duration heldExtendInterval = ms50,
     Duration assignmentHold = Duration.zero,
     Duration holderGrace = const Duration(minutes: 5),
     Duration handoverTimeout = const Duration(milliseconds: 300),
@@ -73,7 +72,6 @@ class Harness {
     Duration holdingSettle = Duration.zero,
     Duration handoverMaxDuration = const Duration(minutes: 10),
   }) : service = NamingService(
-         heldExtendInterval: heldExtendInterval,
          assignmentHold: assignmentHold,
          holderGrace: holderGrace,
          handoverTimeout: handoverTimeout,

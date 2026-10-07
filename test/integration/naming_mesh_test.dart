@@ -12,13 +12,11 @@ const mux = MuxOptions(
   keepAliveInterval: null,
 );
 
-/// Service and naming channels. The reply timeout must exceed the naming
-/// service's heldExtendInterval.
+/// Service and naming channels.
 const talkOptions = TalkOptions(
   requestTimeout: Duration(seconds: 2),
   replyTimeout: Duration(seconds: 1),
 );
-const heldExtendInterval = Duration(milliseconds: 50);
 const reconnectDelay = Duration(milliseconds: 20);
 
 /// Upper bound for anything a test waits on; only reached on failure.
@@ -110,10 +108,7 @@ class NamingNode {
     Duration assignmentHold = Duration.zero,
   }) async {
     final node = newNode();
-    final service = NamingService(
-      heldExtendInterval: heldExtendInterval,
-      assignmentHold: assignmentHold,
-    );
+    final service = NamingService(assignmentHold: assignmentHold);
     addTearDown(service.close);
     node.registerService(Services.naming, service.handler, instance: 1);
     for (final id in taken) {

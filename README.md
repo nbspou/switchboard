@@ -314,7 +314,7 @@ Future<void> main() async {
 * **Frame size.** Frames are limited to 1 MiB by default (`MuxOptions.maxFrameSize`, which a `Switchboard` also applies to its transports). The WebSocket listener uses `WebSocketServerTransport`, which checks the size of a message, all fragments counted, before buffering it, and never negotiates compression.
 * **Buffers.** Unread data is buffered up to 4 MiB per channel; beyond that the channel is closed with `RESOURCE_EXHAUSTED`. Above 16 MiB over all channels, the connection stops reading the transport until half has drained. The number of channels, the OPEN payloads they hold and the unconfirmed CLOSEs are bounded too.
 * **Backpressure.** A transport whose peer does not read queues at most 16 MiB of output, then stops reading its input. A close that cannot drain in time destroys the connection.
-* **Liveness and timeouts.** The mux sends PING after 10 s of silence and drops the connection if nothing arrives within 10 s more. A Talk request fails after 15 s without a response, `EXTEND` or stream item, and a responder has 10 s to reply before the request is aborted for it.
+* **Liveness and timeouts.** The mux sends PING after 10 s of silence and drops the connection if nothing arrives within 10 s more. A Talk request fails after 15 s without a response, `EXTEND` or stream item, and a responder has 10 s to reply before the request is aborted for it, unless the responder declares a longer deadline with `TalkMessage.extend`.
 
 Every limit is an option. The wiki page "Switchboard Dart Reference Implementation" has the full table.
 

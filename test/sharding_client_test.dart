@@ -12,6 +12,9 @@ import 'package:switchboard/src/naming/naming_client.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/naming/naming_resolver.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/switchboard/incoming_channel.dart';
+import 'package:switchboard/src/switchboard/slot_gate.dart';
+import 'package:switchboard/src/switchboard/switchboard.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:test/test.dart';
 
@@ -27,11 +30,7 @@ void main() {
   final clients = <NamingClient>[];
 
   NamingClient newClient(TalkConnector connect) {
-    final client = NamingClient(
-      connect,
-      reconnectDelay: reconnectDelay,
-      slotExtendInterval: ms50,
-    );
+    final client = NamingClient(connect, reconnectDelay: reconnectDelay);
     clients.add(client);
     return client;
   }
@@ -201,19 +200,27 @@ void main() {
     ]);
   });
 
-  test('a slow ASSIGN is kept alive with EXTEND', () async {
-    final (a, handler) = await sharded('A', zone, 1);
-    await a.defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0);
-    // Longer than the service's handover timeout, the client's reply and
-    // request timeouts.
-    const slow = Duration(milliseconds: 700);
-    expect(slow, greaterThan(serverOptions.replyTimeout * 3));
-    handler.assign = (_) => Future.delayed(slow, () => AssignResult.holding);
-    final started = DateTime.now();
-    expect(await a.claim(zone, 2), 1);
-    expect(DateTime.now().difference(started), greaterThanOrEqualTo(slow));
-    expect(h.service.slotTable(zone)![2].owner, 1);
-  });
+  test(
+    'a slow ASSIGN that declares its estimate outlasts the timeouts',
+    () async {
+      final (a, handler) = await sharded('A', zone, 1);
+      await a.defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0);
+      // Longer than the service's handover timeout, the client's reply and
+      // request timeouts.
+      const slow = Duration(milliseconds: 700);
+      expect(slow, greaterThan(serverOptions.replyTimeout * 3));
+      handler.assign = (r) {
+        handler.contexts['ASSIGN ${r.slot}']!.extend(
+          deadline: const Duration(seconds: 2),
+        );
+        return Future.delayed(slow, () => AssignResult.holding);
+      };
+      final started = DateTime.now();
+      expect(await a.claim(zone, 2), 1);
+      expect(DateTime.now().difference(started), greaterThanOrEqualTo(slow));
+      expect(h.service.slotTable(zone)![2].owner, 1);
+    },
+  );
 
   test('managed: capacity 1 by default, served slots tracked', () async {
     final (a, _) = await sharded('A', kv, 1);
@@ -527,7 +534,6 @@ void main() {
         final c = NamingClient(
           Connector(h).call,
           reconnectDelay: reconnectDelay,
-          slotExtendInterval: ms50,
           slotHandlerMaxDuration: const Duration(seconds: 1),
         )..slotHandler = handler;
         unawaited(c.start());
@@ -610,7 +616,6 @@ void main() {
       final client = NamingClient(
         Connector(h).call,
         reconnectDelay: reconnectDelay,
-        slotExtendInterval: ms50,
       );
       final handler = RecordingHandler('A', log)
         ..assign = (_) => Completer<AssignResult>().future;
@@ -632,4 +637,295 @@ void main() {
       expect(async.pendingTimers, isEmpty);
     });
   });
+
+  group('declared deadlines, no heartbeat', () {
+    const handover = Duration(seconds: 60);
+
+    /// A client registered as `zone/[id]` over a connector that records
+    /// the EXTENDs it sends to the naming service in [extends_]; its slot
+    /// handler is [handler], or what [handlerFor] makes for it.
+    NamingClient start(
+      FakeAsync async,
+      Harness h,
+      int id,
+      SlotHandler? handler,
+      List<TalkFrame> extends_, {
+      SlotHandler Function(NamingClient client)? handlerFor,
+      Duration slotHandlerMaxDuration = const Duration(minutes: 10),
+    }) {
+      final connector = LossyConnector(h)
+        ..dropToService = (frame) {
+          if (frame.kind == TalkKind.extend) {
+            extends_.add(frame);
+          }
+          return false;
+        };
+      final c = NamingClient(
+        connector.call,
+        reconnectDelay: reconnectDelay,
+        slotHandlerMaxDuration: slotHandlerMaxDuration,
+      );
+      c.slotHandler = handler ?? handlerFor!(c);
+      unawaited(c.start());
+      unawaited(c.register(zone, [], instance: id));
+      async.elapse(ms10);
+      unawaited(
+        c.defineSlots(zone, count: 4, mode: SlotMode.static, capacity: 0),
+      );
+      async.elapse(ms10);
+      return c;
+    }
+
+    void finish(FakeAsync async, Harness h, List<NamingClient> clients) {
+      for (final c in clients) {
+        unawaited(c.close());
+      }
+      unawaited(h.close());
+      async.flushMicrotasks();
+      async.elapse(ms50 * 2);
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    test('a load that declares 5 min outlasts a 60 s handover timeout with '
+        'one EXTEND', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final loading = Completer<AssignResult>();
+        SlotRequestContext? seen;
+        final lifecycle = _Loader((slot, context) {
+          seen = context;
+          context!.extend(deadline: const Duration(minutes: 5));
+          return loading.future;
+        });
+        final node = Switchboard();
+        final extends_ = <TalkFrame>[];
+        late final SlotGate gate;
+        final c = start(
+          async,
+          h,
+          1,
+          null,
+          extends_,
+          handlerFor: (client) => gate = SlotGate(
+            node,
+            client,
+            zone,
+            lifecycle: lifecycle,
+            instance: 1,
+          ),
+        );
+        int? epoch;
+        Object? error;
+        c
+            .claim(zone, 2)
+            .then(
+              (e) => epoch = e,
+              onError: (Object e) {
+                error = e;
+              },
+            );
+        async.elapse(ms10);
+        expect(seen, isNotNull);
+        expect((seen!.type, seen!.slot, seen!.epoch), (zone, 2, 1));
+        async.elapse(const Duration(minutes: 4));
+        expect(error, isNull);
+        expect(epoch, isNull);
+        expect(seen!.isCancelled, isFalse);
+        expect(gate.stateOf(2), SlotGateState.loading);
+        loading.complete(AssignResult.holding);
+        async.elapse(ms10);
+        expect(epoch, 1);
+        expect(gate.serves(2), isTrue);
+        // Exactly one EXTEND, the estimate plus the client's buffer.
+        expect(extends_.map((f) => f.extension), [
+          (
+            deadline: const Duration(minutes: 5) + clientOptions.extendBuffer,
+            renew: null,
+          ),
+        ]);
+        unawaited(gate.close());
+        unawaited(node.close());
+        finish(async, h, [c]);
+      });
+    });
+
+    test('a load that declares nothing and runs past the handover timeout '
+        'is cancelled, and sends nothing', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final handler = RecordingHandler('A', log);
+        final loading = Completer<AssignResult>();
+        handler.assign = (_) => loading.future;
+        final extends_ = <TalkFrame>[];
+        final c = start(async, h, 1, handler, extends_);
+        Object? error;
+        c
+            .claim(zone, 2)
+            .then(
+              (_) {},
+              onError: (Object e) {
+                error = e;
+              },
+            );
+        async.elapse(ms10);
+        final context = handler.contexts['ASSIGN 2']!;
+        var cancelled = false;
+        context.onCancel.then((_) => cancelled = true);
+        async.elapse(handover - ms50);
+        expect(error, isNull);
+        expect(cancelled, isFalse);
+        async.elapse(ms50 * 2);
+        expect(cancelled, isTrue);
+        expect(context.isCancelled, isTrue);
+        expect(error, isStatus(StatusCode.unavailable));
+        // Extending what can no longer be answered does nothing.
+        context.extend(deadline: const Duration(minutes: 1));
+        async.elapse(ms10);
+        expect(extends_, isEmpty);
+        loading.complete(AssignResult.holding);
+        async.elapse(ms10);
+        expect(handler.revoked, ['zone/2']);
+        finish(async, h, [c]);
+      });
+    });
+
+    test('the handler deadline is the instance\'s own: it gives up first, '
+        'and the estimate is lowered to slotHandlerMaxDuration', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final handler = RecordingHandler('A', log);
+        handler.assign = (r) {
+          handler.contexts['ASSIGN ${r.slot}']!.extend(
+            deadline: const Duration(hours: 1),
+          );
+          return Completer<AssignResult>().future;
+        };
+        final extends_ = <TalkFrame>[];
+        final c = start(
+          async,
+          h,
+          1,
+          handler,
+          extends_,
+          slotHandlerMaxDuration: const Duration(minutes: 2),
+        );
+        Object? error;
+        c
+            .claim(zone, 1)
+            .then(
+              (_) {},
+              onError: (Object e) {
+                error = e;
+              },
+            );
+        async.elapse(ms10);
+        expect(
+          extends_.single.extension.deadline,
+          const Duration(minutes: 2) + clientOptions.extendBuffer,
+        );
+        async.elapse(const Duration(minutes: 2) - ms50);
+        expect(error, isNull);
+        async.elapse(ms50 * 2);
+        expect(error, isStatus(StatusCode.unavailable));
+        expect(
+          (error! as SwitchboardException).status.reason,
+          contains('deadlineExceeded'),
+        );
+        finish(async, h, [c]);
+      });
+    });
+
+    test('MIGRATE passes the deadline the old owner declares on DRAIN on to '
+        'the requester', () {
+      fakeAsync((async) {
+        final h = Harness(handoverTimeout: handover);
+        final log = <String>[];
+        final handlerA = RecordingHandler('A', log);
+        final handlerB = RecordingHandler('B', log);
+        final draining = Completer<void>();
+        handlerA.drain = (r) {
+          handlerA.contexts['DRAIN ${r.slot}']!.extend(
+            deadline: const Duration(minutes: 3),
+          );
+          return draining.future;
+        };
+        final extendsA = <TalkFrame>[];
+        final a = start(async, h, 1, handlerA, extendsA);
+        final b = start(async, h, 2, handlerB, []);
+        unawaited(a.claim(zone, 2));
+        async.elapse(ms10);
+        // The operator, on a raw channel.
+        final (operator, _) = h.link();
+        final declared = <(Duration?, Duration?)>[];
+        final phases = <String>[];
+        final migrate = operator.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 2, to: 2).encode(),
+          onExtend: (deadline, renew) => declared.add((deadline, renew)),
+        );
+        migrate.items.listen(
+          (m) => phases.add(PhaseItem.decode(m.payload).phase.name),
+        );
+        Object? outcome;
+        migrate.done.then(
+          (_) => outcome = 'done',
+          onError: (Object e) {
+            outcome = e;
+          },
+        );
+        async.elapse(ms10);
+        final buffer = serverOptions.extendBuffer;
+        expect(phases, ['draining']);
+        expect(declared, [
+          // The DRAIN was sent: the service's handover timeout.
+          (handover + buffer, null),
+          // The old owner's estimate, with its buffer and the service's.
+          (
+            const Duration(minutes: 3) + clientOptions.extendBuffer + buffer,
+            null,
+          ),
+        ]);
+        // Far past the operator's own request timeout, and the handover
+        // timeout.
+        async.elapse(const Duration(minutes: 2));
+        expect(outcome, isNull);
+        draining.complete();
+        async.elapse(ms10);
+        expect(outcome, 'done');
+        expect(phases, ['draining', 'assigning', 'forwarding', 'done']);
+        // Each later step declared the handover timeout.
+        expect(declared.skip(2), [
+          (handover + buffer, null),
+          (handover + buffer, null),
+        ]);
+        expect(extendsA, hasLength(1));
+        expect(h.service.slotTable(zone)![2].owner, 2);
+        unawaited(operator.close());
+        finish(async, h, [a, b]);
+      });
+    });
+  });
+}
+
+/// A lifecycle whose load is [onLoad]; channels are refused.
+class _Loader extends SlotLifecycle {
+  _Loader(this.onLoad);
+
+  final Future<AssignResult> Function(int slot, SlotRequestContext? context)
+  onLoad;
+
+  @override
+  Future<AssignResult> load(
+    int slot, {
+    required int epoch,
+    required int holder,
+    required bool shared,
+    SlotRequestContext? context,
+  }) => onLoad(slot, context);
+
+  @override
+  void serve(IncomingChannel channel, int slot) =>
+      unawaited(channel.reject(Status.of(StatusCode.unavailable)));
 }

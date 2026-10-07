@@ -25,7 +25,6 @@ const talkOptions = TalkOptions(
   requestTimeout: Duration(seconds: 2),
   replyTimeout: Duration(seconds: 1),
 );
-const heldExtendInterval = Duration(milliseconds: 50);
 const limit = Duration(seconds: 10);
 
 final gpu = Name('gpu');
@@ -145,10 +144,7 @@ void main() {
       'refused push, credential isolation', () async {
     // Naming service: only for holders of the mesh credential.
     final namingNode = newNode();
-    final naming = NamingService(
-      heldExtendInterval: heldExtendInterval,
-      assignmentHold: Duration.zero,
-    );
+    final naming = NamingService(assignmentHold: Duration.zero);
     addTearDown(naming.close);
     final namingPayloads = <String>[];
     namingNode.registerService(Services.naming, (incoming) {

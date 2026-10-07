@@ -15,12 +15,10 @@ const mux = MuxOptions(
   keepAliveInterval: null,
 );
 
-/// The reply timeout must exceed the naming service's heldExtendInterval.
 const talkOptions = TalkOptions(
   requestTimeout: Duration(seconds: 2),
   replyTimeout: Duration(seconds: 1),
 );
-const heldExtendInterval = Duration(milliseconds: 50);
 const reconnectDelay = Duration(milliseconds: 20);
 
 /// Upper bound for anything a test waits on; only reached on failure.
@@ -77,7 +75,6 @@ class Cluster {
   }) async {
     addTearDown(close);
     naming = NamingService(
-      heldExtendInterval: heldExtendInterval,
       assignmentHold: Duration.zero,
       holderGrace: holderGrace,
       handoverTimeout: const Duration(seconds: 5),

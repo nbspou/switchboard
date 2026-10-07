@@ -24,7 +24,9 @@ enum TalkKind {
   /// Kind 2: abort response, cancel, or channel abort, by the ids present.
   abort,
 
-  /// Kind 3: response timeout extension (heartbeat).
+  /// Kind 3: response timeout extension: a deadline and a renewal declared
+  /// by the responder, or, empty, a restart of the requester's default
+  /// timeout.
   extend,
 }
 
@@ -66,6 +68,13 @@ class TalkFrame {
 
   /// Largest valid request or response id (`u24`).
   static const int maxId = 0xFFFFFF;
+
+  /// Length of a non-empty `EXTEND` payload: `u32 deadline ms`,
+  /// `u32 renew ms`.
+  static const int extendPayloadLength = 8;
+
+  /// Largest value of an `EXTEND` field, in milliseconds (`u32`).
+  static const int maxExtendMillis = 0xFFFFFFFF;
 
   static final Uint8List _emptyPayload = Uint8List(0);
 
@@ -115,6 +124,55 @@ class TalkFrame {
     return Status.decode(payload);
   }
 
+  /// The values carried by an [TalkKind.extend] frame: the deadline and the
+  /// renewal the responder declares, each null when the field is 0
+  /// ("unchanged"). Both are null for an empty payload, which restarts the
+  /// requester's default timeout; [payload] tells the two apart. Throws
+  /// [StateError] for other kinds.
+  ({Duration? deadline, Duration? renew}) get extension {
+    if (kind != TalkKind.extend) {
+      throw StateError('only EXTEND frames carry an extension');
+    }
+    if (payload.isEmpty) {
+      return (deadline: null, renew: null);
+    }
+    final data = ByteData.sublistView(payload);
+    Duration? field(int offset) {
+      final ms = data.getUint32(offset, Endian.little);
+      return ms == 0 ? null : Duration(milliseconds: ms);
+    }
+
+    return (deadline: field(0), renew: field(4));
+  }
+
+  /// The payload of an `EXTEND` declaring [deadline] and [renew]: each in
+  /// whole milliseconds, rounded up (a value under 1 ms is sent as 1 ms,
+  /// since 0 means "unchanged") and capped at [maxExtendMillis]; null is
+  /// sent as 0. Empty when both are null.
+  ///
+  /// Throws [ArgumentError] for a negative value.
+  static Uint8List extendPayload({Duration? deadline, Duration? renew}) {
+    if (deadline == null && renew == null) {
+      return _emptyPayload;
+    }
+    final out = Uint8List(extendPayloadLength);
+    final data = ByteData.sublistView(out);
+    data.setUint32(0, _extendMillis(deadline, 'deadline'), Endian.little);
+    data.setUint32(4, _extendMillis(renew, 'renew'), Endian.little);
+    return out;
+  }
+
+  static int _extendMillis(Duration? value, String name) {
+    if (value == null) {
+      return 0;
+    }
+    if (value.isNegative) {
+      throw ArgumentError.value(value, name, 'must not be negative');
+    }
+    final ms = (value.inMicroseconds + 999) ~/ 1000;
+    return ms < 1 ? 1 : (ms > maxExtendMillis ? maxExtendMillis : ms);
+  }
+
   /// Encodes to the short canonical form: optional fields are present only
   /// when set.
   ///
@@ -138,9 +196,6 @@ class TalkFrame {
     );
     if (error != null) {
       throw ArgumentError(error);
-    }
-    if (kind == TalkKind.extend && payload.isNotEmpty) {
-      throw ArgumentError('EXTEND payload must be empty');
     }
     final length =
         1 +
@@ -174,8 +229,8 @@ class TalkFrame {
   ///
   /// Throws [ProtocolException] for a truncated header, reserved bits, an
   /// invalid flag combination, an invalid procedure name, or a violation of
-  /// the kind rules. The payload of an `EXTEND` is discarded, since
-  /// receivers ignore it.
+  /// the kind rules (an `EXTEND` payload that is neither empty nor
+  /// [extendPayloadLength] bytes long among them).
   static TalkFrame decode(Uint8List bytes) {
     final reader = ByteReader(bytes);
     try {
@@ -217,7 +272,7 @@ class TalkFrame {
         requestId: requestId,
         responseId: responseId,
         stream: stream,
-        payload: kind == TalkKind.extend ? _emptyPayload : payload,
+        payload: payload,
       );
     } on FormatException catch (e) {
       throw ProtocolException(e.message);
@@ -262,6 +317,9 @@ class TalkFrame {
         }
         if (hasRequest) {
           return 'EXTEND with HAS_REQUEST';
+        }
+        if (payloadLength != 0 && payloadLength != extendPayloadLength) {
+          return 'EXTEND payload of $payloadLength bytes';
         }
     }
     return null;
