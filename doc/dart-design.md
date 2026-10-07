@@ -443,9 +443,11 @@ Behaviour notes:
 ## Naming protocol codecs
 
 ```dart
-class ServiceRecord { final ServiceAddress address; final List<Uri> endpoints; encode(); decode();
+const int maxMetadataLength = 4096;
+class ServiceRecord { ServiceRecord(ServiceAddress address, {List<Uri> endpoints = const [], Uint8List? metadata});
+  final ServiceAddress address; final List<Uri> endpoints; final Uint8List metadata; encode(); decode();   // == compares metadata bytes too
   static void checkEndpoint(Uri endpoint); }                          // ArgumentError unless it has a scheme, fits 255 bytes, and reparses to an equal Uri
-class RegisterRequest { Name type; int requestedInstance; List<Uri> endpoints; encode/decode }
+class RegisterRequest { Name type; int requestedInstance; List<Uri> endpoints; Uint8List metadata; encode/decode }   // record layout
 class RegisterResponse { int instance; encode/decode }
 class UnregisterRequest { Name type; int instance; encode/decode }   // same layout as DownEvent
 class WatchRequest { Name? type; encode/decode }                      // empty payload or all-zero name = all
@@ -475,6 +477,8 @@ class MovedStatus { MovedStatus({int owner = 0, int epoch = 0, String reason = '
   static bool carriesFields(Status);                                    // MOVED or RELOCATED
   static MovedStatus parse(Uint8List statusPayload); static MovedStatus fromStatus(Status); }   // never throw; other codes (ABORTED too) or short = unknown
 ```
+
+Record metadata (wiki "Records"): `u16` length and the bytes after the endpoints, in records, `UP` items and `REGISTER`. A payload that ends right after its endpoints (the layout before the field) decodes with empty metadata; a partial length, a length over `maxMetadataLength` or missing bytes is a `ProtocolException`; encoders throw `ArgumentError` over the limit. Decoded metadata is a copy, not a view of the message.
 
 Sharding decoders throw `ProtocolException` on truncation, an unknown mode, state or phase, and a slot list longer than the payload; trailing bytes are ignored. Encoders throw `RangeError` for values outside `u32`/`u48`. Vectors: `doc/sharding-vectors.md`, `test/vectors/sharding_vectors_test.dart`.
 
@@ -514,6 +518,7 @@ abstract interface class SlotResolver implements Resolver {
 class StaticResolver implements SlotResolver { StaticResolver([Iterable<ServiceRecord> records]); add/remove;
   defineSlots(SlotSpace); removeSlots(Name); setSlot(Name type, int slot, SlotEntry); }   // locateSlot answers from the configured map
 class EndpointResolver implements Resolver { EndpointResolver(Uri endpoint); }   // every type resolves to [ServiceRecord(type/0, [endpoint])]
+enum SelectionPolicy { roundRobin, random }        // resolver.dart (core): selectAndConnect's pick when no shard is given
 class NamingResolver implements SlotResolver { NamingResolver(NamingClient client, {Duration resolveTimeout = 5 s}); }   // naming_resolver.dart; locateSlot = client.locate
 
 int fnv1a32(List<int> bytes); int slotForKey(List<int> key, int count); int slotForText(String key, int count);   // slot_key.dart (core)
@@ -521,8 +526,8 @@ int fnv1a32(List<int> bytes); int slotForKey(List<int> key, int count); int slot
 class Switchboard {
   Switchboard({Resolver? resolver, Uint8List? defaultPayload, MuxOptions? muxOptions, TalkOptions? talkOptions,
       Duration connectTimeout = 10 s, bool allowHostHint = false, int maxConnectionsPerEndpoint = 4,
-      Duration slotRefreshTimeout = 5 s});
-  Resolver? resolver; Uint8List defaultPayload;
+      Duration slotRefreshTimeout = 5 s, SelectionPolicy selection = roundRobin, Random? random});   // random: source of SelectionPolicy.random
+  Resolver? resolver; Uint8List defaultPayload; SelectionPolicy selection;
 
   // WebSocket listeners use WebSocketServerTransport, and dials IOWebSocketTransport.connect (no
   // compression offered), both with maxFrameSize = muxOptions.maxFrameSize (0: the 1 MiB transport default).
@@ -557,18 +562,21 @@ class Switchboard {
   List<Uri> get listeningEndpoints;
   bool isOwnEndpoint(Uri endpoint);   // scheme, port, ws path; host = bound address, localhost, and for wildcard binds the loopback addresses, host name and interface addresses; mem: the id
 
-  void registerService(Name type, ChannelHandler handler, {int instance = 0});
+  // acceptAnyInstance: also serves channels to any instance of type that no registration matches exactly
+  // (wiki dispatch step 2b, before the instance-0 rule; first registered such registration wins)
+  void registerService(Name type, ChannelHandler handler, {int instance = 0, bool acceptAnyInstance = false});
   void unregisterService(Name type, {int instance = 0});
   set defaultService(ChannelHandler? handler);
   set catchAll(ChannelHandler? handler);
 
-  Future<MuxChannel> openChannel(ServiceAddress address, {int? shard, Uint8List? payload});    // resolve + pool + OPEN
-  Future<TalkChannel> openTalk(ServiceAddress address, {int? shard, Uint8List? payload, TalkOptions? options});
+  // where (on every open method below that resolves): records it refuses are not candidates; none left: NOT_FOUND
+  Future<MuxChannel> openChannel(ServiceAddress address, {int? shard, Uint8List? payload, bool Function(ServiceRecord)? where});    // resolve + pool + OPEN
+  Future<TalkChannel> openTalk(ServiceAddress address, {int? shard, Uint8List? payload, TalkOptions? options, bool Function(ServiceRecord)? where});
   Future<MuxChannel> openChannelAt(Uri endpoint, ChannelAddress address);                       // explicit endpoint
   Future<TalkChannel> openTalkAt(Uri endpoint, ChannelAddress address, {TalkOptions? options});
-  Future<(ServiceRecord, MuxConnection)> selectAndConnect(ServiceAddress address, {int? shard, Resolver? resolver, bool excludeOwnEndpoints = false});   // slot routing: see "Sharding"
-  Future<SlotChannel> openChannelToSlot(Name type, int slot, {Uint8List? payload});            // openChannel(type/0, shard: slot) + one MOVED retry
-  Future<TalkChannel> openTalkToSlot(Name type, int slot, {Uint8List? payload, TalkOptions? options});
+  Future<(ServiceRecord, MuxConnection)> selectAndConnect(ServiceAddress address, {int? shard, Resolver? resolver, bool excludeOwnEndpoints = false, bool Function(ServiceRecord)? where});   // slot routing: see "Sharding"
+  Future<SlotChannel> openChannelToSlot(Name type, int slot, {Uint8List? payload, bool Function(ServiceRecord)? where});   // openChannel(type/0, shard: slot) + one MOVED retry (where applies to both)
+  Future<TalkChannel> openTalkToSlot(Name type, int slot, {Uint8List? payload, TalkOptions? options, bool Function(ServiceRecord)? where});
   Future<ServiceAddress> resolveSlotOwner(Name type, int slot, {bool refresh = false});          // for callers handling MOVED themselves
   Future<MuxConnection> connect(Uri endpoint);        // pooled; ws, wss, tcp, mem; a further connection to the endpoint only when every pooled one is at its peer's announced maxChannels, up to maxConnectionsPerEndpoint
   Stream<MuxConnection> get connections;              // every accepted or initiated connection
@@ -613,7 +621,7 @@ class SlotChannel { Name type; int slot; MuxChannel get channel; bool get retrie
 
 Rejections sent to peers by the node and the proxy (policy refusals, no handler, resolution and connection failures, per-client limit) carry the status code and a generic reason only (`'permission denied'`, `'not found'`, `'unavailable'`, ...); the details (instance ids, endpoints, resolver state) are logged locally at FINE or INFO. Statuses a backend sends pass through the proxy unchanged, except `MOVED` and `RELOCATED`, whose owner and epoch are zeroed (and reason dropped) unless `revealOwners`; a lost connection on one side reaches the other as `UNAVAILABLE` `'connection lost'`.
 
-Dispatch order is as in the wiki "Addressing" page, after the listener policy. Resolution: `resolver.resolve(type)`, filter by instance if non-zero, pick by shard (the slot's owner for a type with a slot table, see "Sharding"; otherwise `sorted[s % n]`) or round robin, connect to `endpoints.first` (try next on failure), OPEN with header `{type, selectedInstance, shard, payload}`.
+Dispatch order is as in the wiki "Addressing" page, after the listener policy. Resolution: `resolver.resolve(type)`, filter by instance if non-zero, then by `where` (an exception it throws reaches the caller), pick by shard (the slot's owner for a type with a slot table, see "Sharding", NOT_FOUND if `where` refuses the owner; otherwise `sorted[s % n]` of the remaining) or by the node's `selection` (round robin: a per-type counter shared by all filters; random: `random.nextInt(n)`), connect to `endpoints.first` (try next on failure, then the following instances in sorted order), OPEN with header `{type, selectedInstance, shard, payload}`. `proxyHandler` gets the node's selection policy through `selectAndConnect` and passes no filter.
 
 ## Naming service
 
@@ -625,6 +633,8 @@ class NamingService {
   void serve(TalkChannel channel);                  // StateError (and nothing kept) if its messages are already listened to
   Map<ServiceAddress, ServiceRecord> get table;
   Stream<ServiceEvent> get events;
+  int registerLocal(Name type, List<Uri> endpoints, {int instance = 0, Uint8List? metadata});   // owned by the service; again: replaces endpoints and metadata
+  void unregisterLocal(ServiceAddress address);
   Duration heartbeat;                               // EXTEND interval on idle watches, default 4 s (see below)
   Duration assignmentHold;                          // REGISTER for any id held this long after construction, default 2 s; slot assignment waits too
   Duration holderGrace;                             // holder-only slot waits this long for its holder, default 5 min
@@ -647,7 +657,7 @@ class SlotEvent { Name type; int slot; SlotEntry entry; SlotEntry previous; }
 class NamingClient {
   NamingClient(TalkConnector connect, {Duration reconnectDelay, Duration? watchTimeout});   // transport independent
   Future<void> start();
-  Future<int> register(Name type, List<Uri> endpoints, {int instance = 0, void Function(int)? onAssigned});   // remembered for re-registration on reconnect; onAssigned on every new id
+  Future<int> register(Name type, List<Uri> endpoints, {int instance = 0, void Function(int)? onAssigned, Uint8List? metadata});   // remembered (metadata copied) for re-registration on reconnect; onAssigned on every new id
   Future<void> unregister(Name type, int instance);
   Future<void> get synced;                          // SYNCED of the current session; replaced after a loss
   bool get isSynced;                                // SYNCED on the current session
@@ -737,6 +747,8 @@ class SlotGates extends SlotHandler { Map<Name, SlotGate> gates; SlotGate? opera
 Behaviour notes:
 
 * What the service accepts, every watcher can decode. Endpoints are checked with `ServiceRecord.checkEndpoint` by the decoders (`ProtocolException`), by the service for `REGISTER` and `registerLocal` (`INVALID_ARGUMENT`) and by `NamingClient.register` (`ArgumentError`): a scheme, at most 255 bytes once normalised, and the normalised text parses back to an equal `Uri` (checked both ways: `Uri ==` compares text or components depending on the representation, so it is not symmetric).
+* Metadata: `REGISTER` and `registerLocal` refuse more than `maxMetadataLength` (4096) bytes with `INVALID_ARGUMENT`, `NamingClient.register` with `ArgumentError`. Re-registering an id held by the same channel replaces endpoints and metadata and publishes `UP` if either changed (record equality), so watchers' `UP` events also mean "metadata changed"; the client and resolver mirror it unchanged.
+* Registrars (wiki "Registering on behalf of others"): nothing ties a record to the registering process's endpoints. One `NamingClient` may register many records (explicit ids, each with its endpoints and metadata); they all live and die with its channel, are re-registered after its reconnects, and are retired with `unregister`. The worker behind such a record registers its handler with `acceptAnyInstance: true`, since it does not know its id.
 * Heartbeat: the wiki asks for `EXTEND` at least every 5 s. Timers fire late, never early, so the default is 4 s, not 5 s.
 * Resolution (`NamingResolver`) depends on `client.hasSynced` only: before the first `SYNCED` ever, `resolve` waits for `firstSynced`, bounded by `resolveTimeout`, then fails `UNAVAILABLE`; after it, the table is served even while stale, whether or not anything was resolved before the loss and whenever the resolver was created. `ready` is `client.firstSynced`: it completes once the table has been synced at least once, does not reset on a loss, and fails with `CANCELLED` if the client is closed first. `Switchboard.selectAndConnect` calls `resolve` only, never `ready`, because `ready` has no bound.
 * Indeterminate outcomes: a `REGISTER` or `UNREGSTR` that times out (`DEADLINE_EXCEEDED`) or gets an unreadable answer may or may not have taken effect. The client fails the caller's future and drops the channel, so the naming service discards everything owned by it, and the reconnect registers the remembered set again. A refused `UNREGSTR` (other than `NOT_FOUND`) drops the channel too. A channel lost while a request is in flight is not indeterminate: the record died with the channel, and the registration is made again after the reconnect (its future completes then).
@@ -789,6 +801,7 @@ The first four were adopted by the wiki since.
 
 * `test/vectors/*_vectors_test.dart`: every vector in the wiki, positive and negative, through the codecs. These files must not import `dart:io`: `dart test -P node` (equivalently `dart test -p node test/vectors/`) runs them compiled to JavaScript on Node.js, together with `test/bytes_test.dart`, the name and status tests, and `test/reconnecting_client_test.dart` (fake_async over `MemoryTransport`).
 * `test/<layer>_test.dart`: unit tests over `MemoryTransport`.
+* `test/selection_test.dart` (over `mem://`): `where` filters over record metadata, `SelectionPolicy.random` with a seeded `Random`, and `acceptAnyInstance` dispatch; the registrar pattern and metadata re-registration are in `test/naming_test.dart`.
 * `test/memory_endpoint_test.dart`: `listenMemory` and `mem://` connections (dispatch, policy, pooling, GOAWAY, `UNAVAILABLE`, own endpoints, timers not starved); the tests that use `mem` endpoints check that the registry is empty at the end.
 * `test/integration/*_test.dart`: real TCP and WebSocket on `127.0.0.1` port 0, and `naming_mesh_test.dart` over `mem://` endpoints too; end-to-end mesh scenarios (naming service with several services, frontend endpoint proxying a client channel to a backend instance, reconnection after the naming service restarts, graceful GOAWAY).
 * `test/integration/sharding/*_test.dart`: the six use cases of the wiki page "Switchboard Sharding", one file each, built on the public API (`cluster.dart` is their shared setup, over `tcp`, `ws` or `mem`; the kv store runs over `tcp` and `mem`). Slot counts are smaller than the wiki's where noted (kv 64, chat rooms 16) to keep them fast. `test/slot_gate_test.dart` and `test/slot_routing_test.dart` cover the gate state machine and slot routing, `test/slot_gate_credential_test.dart` (over `mem://`) the credential of forwarded requests.

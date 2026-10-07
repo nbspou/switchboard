@@ -12,6 +12,21 @@ import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
 
+/// How `Switchboard.selectAndConnect` picks among the candidate instances
+/// of a type when the caller gives no shard slot (with a shard slot the
+/// choice is fixed by the slot, see the wiki page "Switchboard Addressing
+/// and Dispatch", section "Opening channels").
+///
+/// Either way, if the chosen instance cannot be reached, the others are
+/// tried in turn from there.
+enum SelectionPolicy {
+  /// A per-type counter rotates over the candidates sorted by instance id.
+  roundRobin,
+
+  /// A uniformly random candidate, from the node's `Random`.
+  random,
+}
+
 /// Maps a service type to the live instances of that type and where they
 /// listen, and reports changes.
 ///

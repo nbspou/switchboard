@@ -7,6 +7,7 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' show Random;
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -72,6 +73,10 @@ class Switchboard {
   /// lookup of a slot the table has no owner for (see [selectAndConnect])
   /// and the refresh of a slot's owner after a `MOVED` rejection that
   /// names none (see [openChannelToSlot]).
+  ///
+  /// [selection] is how [selectAndConnect] picks an instance when no shard
+  /// slot is given; [random] is the source of [SelectionPolicy.random]
+  /// (default: a new [Random]), to be seeded in tests.
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -81,9 +86,12 @@ class Switchboard {
     this.allowHostHint = false,
     this.maxConnectionsPerEndpoint = 4,
     this.slotRefreshTimeout = const Duration(seconds: 5),
+    this.selection = SelectionPolicy.roundRobin,
+    Random? random,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        muxOptions = muxOptions ?? const MuxOptions(),
-       talkOptions = talkOptions ?? const TalkOptions() {
+       talkOptions = talkOptions ?? const TalkOptions(),
+       _random = random ?? Random() {
     RangeError.checkValueInInterval(
       maxConnectionsPerEndpoint,
       1,
@@ -124,7 +132,18 @@ class Switchboard {
   /// `UNAVAILABLE`. Default 5 s.
   final Duration slotRefreshTimeout;
 
+  /// How [selectAndConnect] picks among the candidates when no shard slot
+  /// is given. Default [SelectionPolicy.roundRobin].
+  final SelectionPolicy selection;
+
+  final Random _random;
+
   final Map<Name, Map<int, ChannelHandler>> _services = {};
+
+  /// Per type, the instances whose registration also serves channels
+  /// addressed to any other instance ([registerService]'s
+  /// `acceptAnyInstance`).
+  final Map<Name, Set<int>> _anyInstance = {};
 
   final List<HttpServer> _httpServers = [];
   final List<ServerSocket> _tcpServers = [];
@@ -879,16 +898,39 @@ class Switchboard {
   /// *not* receive channels addressed to a specific non-zero instance:
   /// register the instance id the service was assigned for that.
   ///
-  /// Registering an existing pair replaces its handler and keeps its
-  /// position. Throws [RangeError] if [instance] is outside `u48`.
-  void registerService(Name type, ChannelHandler handler, {int instance = 0}) {
+  /// With [acceptAnyInstance], the registration also serves channels
+  /// addressed to any instance of [type] that no registration matches
+  /// exactly (step 2b of the wiki's dispatch list, before the rule for
+  /// instance 0 above; among several such registrations, the first
+  /// registered). This is for a service that does not know the instance
+  /// id it is known by: a worker that a registrar (a scaler) registered in
+  /// the naming service under an id the worker was never told, so that the
+  /// channels routed to that id arrive with it in the header. It accepts
+  /// whatever instance a peer names, so a node hosting several instances
+  /// of [type] has no use for it.
+  ///
+  /// Registering an existing pair replaces its handler and its
+  /// [acceptAnyInstance] flag and keeps its position. Throws [RangeError]
+  /// if [instance] is outside `u48`.
+  void registerService(
+    Name type,
+    ChannelHandler handler, {
+    int instance = 0,
+    bool acceptAnyInstance = false,
+  }) {
     RangeError.checkValueInInterval(instance, 0, maxInstance, 'instance');
     (_services[type] ??= {})[instance] = handler;
+    if (acceptAnyInstance) {
+      (_anyInstance[type] ??= {}).add(instance);
+    } else {
+      _removeAnyInstance(type, instance);
+    }
   }
 
   /// Removes the handler registered for `(type, instance)`, if any.
   /// Channels already dispatched to it are unaffected.
   void unregisterService(Name type, {int instance = 0}) {
+    _removeAnyInstance(type, instance);
     final handlers = _services[type];
     if (handlers == null) {
       return;
@@ -896,6 +938,13 @@ class Switchboard {
     handlers.remove(instance);
     if (handlers.isEmpty) {
       _services.remove(type);
+    }
+  }
+
+  void _removeAnyInstance(Name type, int instance) {
+    final any = _anyInstance[type];
+    if (any != null && any.remove(instance) && any.isEmpty) {
+      _anyInstance.remove(type);
     }
   }
 
@@ -979,6 +1028,15 @@ class Switchboard {
       if (exact != null) {
         return exact;
       }
+      final any = _anyInstance[type];
+      if (any != null) {
+        for (final MapEntry(key: instance, value: handler)
+            in handlers.entries) {
+          if (any.contains(instance)) {
+            return handler;
+          }
+        }
+      }
       if (address.instance == 0 && handlers.isNotEmpty) {
         return handlers.values.first;
       }
@@ -1000,9 +1058,12 @@ class Switchboard {
   ///
   /// Records whose instance differs from a non-zero requested instance are
   /// skipped; records with instance 0 (as an [EndpointResolver] returns)
-  /// match any requested instance. The candidates are sorted by instance;
-  /// with a [shard] slot `s` the first choice is `candidates[s mod n]`,
-  /// otherwise a per-type round-robin counter picks it. Endpoints of the
+  /// match any requested instance. So are records for which [where] (an
+  /// application filter, for example on [ServiceRecord.metadata]) returns
+  /// false; an exception it throws reaches the caller. The candidates are
+  /// sorted by instance; with a [shard] slot `s` the first choice is
+  /// `candidates[s mod n]`, otherwise the node's [selection] policy picks
+  /// it (a per-type round-robin counter, or at random). Endpoints of the
   /// chosen instance are tried in order; if none can be connected, the
   /// following instances are tried in turn.
   ///
@@ -1018,7 +1079,8 @@ class Switchboard {
   /// [StatusCode.outOfRange]; an owner that cannot be connected, or is
   /// missing from the service table, with [StatusCode.unavailable]. An
   /// explicit instance bypasses slot routing (the shard is still carried
-  /// in the header).
+  /// in the header). An owner that [where] refuses is not found
+  /// ([StatusCode.notFound]); no other instance is tried.
   ///
   /// The returned record's instance is the one to put in the address
   /// header: the selected record's instance, or the requested instance
@@ -1029,7 +1091,8 @@ class Switchboard {
   /// to itself.
   ///
   /// Throws [SwitchboardException] with [StatusCode.notFound] if no
-  /// instance is known, [StatusCode.unavailable] if none is reachable, and
+  /// instance is known, or none that [where] accepts,
+  /// [StatusCode.unavailable] if none is reachable, and
   /// [StatusCode.failedPrecondition] if there is no resolver or the node
   /// is closed; also whatever [Resolver.resolve] throws (a naming resolver
   /// that was never synced: [StatusCode.unavailable] after its resolve
@@ -1039,6 +1102,7 @@ class Switchboard {
     int? shard,
     Resolver? resolver,
     bool excludeOwnEndpoints = false,
+    bool Function(ServiceRecord record)? where,
   }) async {
     _checkOpen();
     final r = resolver ?? this.resolver;
@@ -1073,9 +1137,17 @@ class Switchboard {
             'not in the service table',
           );
         }
+        final accepted = _filtered(records, where);
+        if (accepted.isEmpty) {
+          throw SwitchboardException.of(
+            StatusCode.notFound,
+            'owner ${ServiceAddress(address.type, owner)} of slot $shard '
+            'does not match the filter',
+          );
+        }
         return _connectFirst(
           ServiceAddress(address.type, owner),
-          records,
+          accepted,
           0,
           excludeOwnEndpoints,
         );
@@ -1095,10 +1167,32 @@ class Switchboard {
         'no known instance of $address',
       );
     }
-    candidates.sort((a, b) => a.address.instance.compareTo(b.address.instance));
-    final start = (shard ?? _nextRoundRobin(address.type)) % candidates.length;
-    return _connectFirst(address, candidates, start, excludeOwnEndpoints);
+    final accepted = _filtered(candidates, where);
+    if (accepted.isEmpty) {
+      throw SwitchboardException.of(
+        StatusCode.notFound,
+        'none of the ${candidates.length} known instances of $address '
+        'matches the filter',
+      );
+    }
+    accepted.sort((a, b) => a.address.instance.compareTo(b.address.instance));
+    final start = shard != null
+        ? shard % accepted.length
+        : _selectStart(address.type, accepted.length);
+    return _connectFirst(address, accepted, start, excludeOwnEndpoints);
   }
+
+  static List<ServiceRecord> _filtered(
+    List<ServiceRecord> records,
+    bool Function(ServiceRecord record)? where,
+  ) => where == null ? records : records.where(where).toList();
+
+  /// The index among [count] candidates of [type] that the [selection]
+  /// policy picks first.
+  int _selectStart(Name type, int count) => switch (selection) {
+    SelectionPolicy.roundRobin => _nextRoundRobin(type) % count,
+    SelectionPolicy.random => _random.nextInt(count),
+  };
 
   /// Connects to the first reachable of [candidates], starting at [start]
   /// and going round.
@@ -1234,19 +1328,22 @@ class Switchboard {
   /// [defaultPayload]) as the application payload.
   ///
   /// The channel is returned at once; a rejection by the peer arrives as
-  /// its close status ([MuxChannel.done]). Throws like [selectAndConnect],
-  /// and like [MuxConnection.open] (for example
+  /// its close status ([MuxChannel.done]). Only records [where] accepts
+  /// are candidates (see [selectAndConnect]). Throws like
+  /// [selectAndConnect], and like [MuxConnection.open] (for example
   /// [StatusCode.resourceExhausted]).
   Future<MuxChannel> openChannel(
     ServiceAddress address, {
     int? shard,
     Uint8List? payload,
+    bool Function(ServiceRecord record)? where,
   }) async {
     final application = payload ?? defaultPayload;
     for (var attempt = 0; ; attempt++) {
       final (record, connection) = await selectAndConnect(
         address,
         shard: shard,
+        where: where,
       );
       final header = ChannelAddress(
         type: address.type,
@@ -1283,17 +1380,21 @@ class Switchboard {
   /// retried (the caller may open again and resend: nothing was
   /// processed) and why a `RELOCATED` never is.
   ///
-  /// Throws like [openChannel].
+  /// [where] applies to the first channel and to the retry: an owner it
+  /// refuses is not found (see [selectAndConnect]). Throws like
+  /// [openChannel].
   Future<SlotChannel> openChannelToSlot(
     Name type,
     int slot, {
     Uint8List? payload,
+    bool Function(ServiceRecord record)? where,
   }) async {
     final application = payload ?? defaultPayload;
     final first = await openChannel(
       ServiceAddress(type),
       shard: slot,
       payload: application,
+      where: where,
     );
     final rejectedBy = ChannelAddress.decode(first.openPayload).instance;
     return SlotChannel(
@@ -1305,6 +1406,7 @@ class Switchboard {
         ChannelAddress(type: type, shard: slot, payload: application),
         rejectedBy,
         moved,
+        where: where,
       ),
     );
   }
@@ -1317,8 +1419,9 @@ class Switchboard {
     int slot, {
     Uint8List? payload,
     TalkOptions? options,
+    bool Function(ServiceRecord record)? where,
   }) async => TalkChannel(
-    await openChannelToSlot(type, slot, payload: payload),
+    await openChannelToSlot(type, slot, payload: payload, where: where),
     options: options ?? talkOptions,
   );
 
@@ -1329,8 +1432,9 @@ class Switchboard {
     int? shard,
     Uint8List? payload,
     TalkOptions? options,
+    bool Function(ServiceRecord record)? where,
   }) async => TalkChannel(
-    await openChannel(address, shard: shard, payload: payload),
+    await openChannel(address, shard: shard, payload: payload, where: where),
     options: options ?? talkOptions,
   );
 

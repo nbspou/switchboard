@@ -69,6 +69,19 @@ The protocol specification lives in the project wiki (section
   `SlotGate` forwards during a hand-over carry the credential of the
   channel they arrived on (or `serveRequest`'s `payload`), one forwarding
   channel per credential, never the node's default payload.
+- Worker fleet support (wiki use case 5): an opaque metadata blob in
+  service records (`ServiceRecord.metadata`, a `u16` length and up to 4096
+  bytes after the endpoints, in `UP` items and `REGISTER`; a record without
+  it decodes as empty), registered with `NamingClient.register(metadata:)`
+  or `NamingService.registerLocal(metadata:)` and published again as `UP`
+  when it changes; a `where` filter over the records on `openChannel`,
+  `openTalk`, `openChannelToSlot`, `openTalkToSlot` and `selectAndConnect`
+  (`NOT_FOUND` when nothing matches); a selection policy per node
+  (`Switchboard(selection: SelectionPolicy.random, random:)`, round robin
+  by default); `registerService(acceptAnyInstance: true)` for a service
+  registered under an id it was never told; the registrar pattern (one
+  client registering records for endpoints that never talk to the naming
+  service, alive as long as its channel).
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for

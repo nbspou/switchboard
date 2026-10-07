@@ -115,6 +115,53 @@ List<Uri> _readEndpoints(ByteReader r) {
   return [for (var i = 0; i < count; i++) _readEndpoint(r)];
 }
 
+/// Largest application metadata blob a [ServiceRecord] (and a `REGISTER`)
+/// carries, in bytes.
+const int maxMetadataLength = 4096;
+
+final Uint8List _noMetadata = Uint8List(0);
+
+void _writeMetadata(ByteWriter w, Uint8List metadata) {
+  if (metadata.length > maxMetadataLength) {
+    throw ArgumentError.value(
+      metadata.length,
+      'metadata',
+      'more than $maxMetadataLength bytes',
+    );
+  }
+  w.u16(metadata.length);
+  w.bytes(metadata);
+}
+
+/// Reads the metadata field after the endpoints. A payload that ends right
+/// after its endpoints (the layout before the field was added) has empty
+/// metadata; a field cut short, or longer than [maxMetadataLength], is a
+/// protocol error. The result is a copy.
+Uint8List _readMetadata(ByteReader r) {
+  if (r.isDone) {
+    return _noMetadata;
+  }
+  final length = r.u16('metadata length');
+  if (length > maxMetadataLength) {
+    throw FormatException(
+      'metadata of $length bytes, more than $maxMetadataLength',
+    );
+  }
+  return Uint8List.fromList(r.take(length, 'metadata'));
+}
+
+bool _sameBytes(Uint8List a, Uint8List b) {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Reads one endpoint and rejects any that [ServiceRecord.checkEndpoint]
 /// refuses, so that a decoded record can always be encoded again and the
 /// result decodes to an equal record.
@@ -156,18 +203,29 @@ String? _endpointProblem(Uri uri) {
   return null;
 }
 
-/// A service record: address with a non-zero instance and its endpoints.
+/// A service record: address with a non-zero instance, its endpoints and
+/// an opaque application metadata blob.
 ///
-/// Wire: name, u48 instance, u8 count, count times len8 URI.
+/// Wire: name, u48 instance, u8 count, count times len8 URI, u16 metadata
+/// length, metadata bytes. A record that ends right after its endpoints
+/// (the layout before metadata was added) decodes with empty metadata.
 class ServiceRecord {
-  /// Creates a record.
-  const ServiceRecord(this.address, {this.endpoints = const []});
+  /// Creates a record. A null [metadata] is empty.
+  ServiceRecord(this.address, {this.endpoints = const [], Uint8List? metadata})
+    : metadata = metadata ?? _noMetadata;
 
   /// Type and instance id.
   final ServiceAddress address;
 
   /// URIs the instance can be reached at; may be empty.
   final List<Uri> endpoints;
+
+  /// Opaque application data published with the record, for example the
+  /// models and tools a worker offers, at most [maxMetadataLength] bytes;
+  /// may be empty. The naming service stores and publishes it without
+  /// reading it; consumers select on it (`Switchboard.openChannel`'s
+  /// `where`). Not to be modified.
+  final Uint8List metadata;
 
   /// Throws [ArgumentError] unless [endpoint] can be carried in a record:
   /// it must have a scheme, its text form must fit in 255 bytes of UTF-8,
@@ -185,8 +243,9 @@ class ServiceRecord {
     }
   }
 
-  /// Encodes the record. Throws [ArgumentError] if the instance is 0 or
-  /// there are more than 255 endpoints.
+  /// Encodes the record. Throws [ArgumentError] if the instance is 0,
+  /// there are more than 255 endpoints, or [metadata] is longer than
+  /// [maxMetadataLength].
   Uint8List encode() {
     if (address.isAny) {
       throw ArgumentError.value(
@@ -199,13 +258,16 @@ class ServiceRecord {
     w.name(address.type);
     w.u48(address.instance);
     _writeEndpoints(w, endpoints);
+    _writeMetadata(w, metadata);
     return w.toBytes();
   }
 
-  /// Decodes a record; trailing bytes are ignored.
+  /// Decodes a record; trailing bytes are ignored. A record without the
+  /// metadata field (nothing after the endpoints) has empty metadata.
   ///
-  /// Throws [ProtocolException] on truncation, instance 0, or an endpoint
-  /// that [checkEndpoint] refuses.
+  /// Throws [ProtocolException] on truncation, instance 0, an endpoint
+  /// that [checkEndpoint] refuses, or metadata longer than
+  /// [maxMetadataLength].
   static ServiceRecord decode(Uint8List bytes) => _guard('service record', () {
     final r = ByteReader(bytes);
     final type = r.name('type');
@@ -216,32 +278,42 @@ class ServiceRecord {
     return ServiceRecord(
       ServiceAddress(type, instance),
       endpoints: _readEndpoints(r),
+      metadata: _readMetadata(r),
     );
   });
 
+  /// Equal address, endpoints in the same order, and equal metadata bytes.
   @override
   bool operator ==(Object other) =>
       other is ServiceRecord &&
       other.address == address &&
       other.endpoints.length == endpoints.length &&
       Iterable<int>.generate(endpoints.length)
-          .every((i) => endpoints[i] == other.endpoints[i]);
+          .every((i) => endpoints[i] == other.endpoints[i]) &&
+      _sameBytes(other.metadata, metadata);
 
   @override
-  int get hashCode => Object.hash(address, Object.hashAll(endpoints));
+  int get hashCode =>
+      Object.hash(address, Object.hashAll(endpoints), Object.hashAll(metadata));
 
   @override
-  String toString() => 'ServiceRecord($address, $endpoints)';
+  String toString() => metadata.isEmpty
+      ? 'ServiceRecord($address, $endpoints)'
+      : 'ServiceRecord($address, $endpoints, '
+            '${metadata.length} metadata bytes)';
 }
 
-/// REGISTER request payload.
+/// REGISTER request payload: the layout of a [ServiceRecord], with the
+/// requested instance id in place of the instance.
 class RegisterRequest {
   /// Creates a request; [requestedInstance] 0 asks the service to assign one.
-  const RegisterRequest(
+  /// A null [metadata] is empty.
+  RegisterRequest(
     this.type, {
     this.requestedInstance = 0,
     this.endpoints = const [],
-  });
+    Uint8List? metadata,
+  }) : metadata = metadata ?? _noMetadata;
 
   /// Service type to register.
   final Name type;
@@ -252,19 +324,26 @@ class RegisterRequest {
   /// Endpoints the instance listens on.
   final List<Uri> endpoints;
 
-  /// Encodes the payload. Throws [ArgumentError] for over 255 endpoints.
+  /// Application metadata for the record ([ServiceRecord.metadata]).
+  final Uint8List metadata;
+
+  /// Encodes the payload. Throws [ArgumentError] for over 255 endpoints or
+  /// metadata longer than [maxMetadataLength].
   Uint8List encode() {
     final w = ByteWriter();
     w.name(type);
     w.u48(requestedInstance);
     _writeEndpoints(w, endpoints);
+    _writeMetadata(w, metadata);
     return w.toBytes();
   }
 
-  /// Decodes the payload; trailing bytes are ignored.
+  /// Decodes the payload; trailing bytes are ignored. A request without
+  /// the metadata field has empty metadata.
   ///
-  /// Throws [ProtocolException] on truncation or an endpoint that
-  /// [ServiceRecord.checkEndpoint] refuses.
+  /// Throws [ProtocolException] on truncation, an endpoint that
+  /// [ServiceRecord.checkEndpoint] refuses, or metadata longer than
+  /// [maxMetadataLength].
   static RegisterRequest decode(Uint8List bytes) =>
       _guard('REGISTER request', () {
         final r = ByteReader(bytes);
@@ -274,6 +353,7 @@ class RegisterRequest {
           type,
           requestedInstance: instance,
           endpoints: _readEndpoints(r),
+          metadata: _readMetadata(r),
         );
       });
 }
@@ -362,7 +442,7 @@ class WatchRequest {
 /// An UP or DOWN stream item.
 ///
 /// UP carries a full [ServiceRecord]; DOWN carries only the address, so
-/// a decoded DOWN event has an empty endpoint list.
+/// a decoded DOWN event has no endpoints and no metadata.
 class ServiceEvent {
   /// Creates an event.
   const ServiceEvent({required this.up, required this.record});

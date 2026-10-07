@@ -37,7 +37,8 @@ final Logger _log = Logger('Switchboard.Router');
 /// one and no host hint; the application payload is unchanged. [resolver]
 /// defaults to the node's; [excludeOwnEndpoints] as in
 /// [Switchboard.selectAndConnect]. [mayLocate], when given, is asked
-/// before a `LOCATE`; false gives up (null). Throws like
+/// before a `LOCATE`; false gives up (null). [where] filters the records
+/// as in [Switchboard.selectAndConnect]. Throws like
 /// [Switchboard.selectAndConnect] and [SlotResolver.locateSlot].
 Future<MuxChannel?> reopenAtSlotOwner(
   Switchboard switchboard,
@@ -47,6 +48,7 @@ Future<MuxChannel?> reopenAtSlotOwner(
   Resolver? resolver,
   bool excludeOwnEndpoints = false,
   bool Function()? mayLocate,
+  bool Function(ServiceRecord record)? where,
 }) async {
   final type = header.type!;
   final slot = header.shard!;
@@ -86,6 +88,7 @@ Future<MuxChannel?> reopenAtSlotOwner(
       shard: slot,
       resolver: r,
       excludeOwnEndpoints: excludeOwnEndpoints,
+      where: where,
     );
     final replacement = header.copyWith(
       instance: record.address.instance,

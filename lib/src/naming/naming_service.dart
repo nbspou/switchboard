@@ -34,7 +34,13 @@ final Logger _log = Logger('Switchboard.Naming');
 /// The service speaks Talk over channels handed to [serve], one per client.
 /// A registration is owned by the channel it was made on; when that channel
 /// closes for any reason, every record it owns is removed and `DOWN` is
-/// published for each. This is the only liveness mechanism.
+/// published for each. This is the only liveness mechanism. A record
+/// carries the liveness of the channel that made it, not of the endpoint
+/// it names: one channel may register many records for endpoints that
+/// never talk to the naming service (a registrar, such as a scaler
+/// registering its workers), and then retires them itself (`UNREGSTR`, or
+/// closing the channel); see the wiki section "Registering on behalf of
+/// others".
 ///
 /// Procedures: `REGISTER`, `UNREGSTR` (requests), `WATCH`, `LOOKUP` (stream
 /// requests), and for sharding `SLOTS`, `HOLDING`, `CLAIM`, `RELEASE`,
@@ -343,18 +349,25 @@ class NamingService {
   /// Registers a record owned by the service itself rather than by a
   /// channel, for example `_ns/1` with the service's own endpoints. It stays
   /// until [unregisterLocal]; registering the same address locally again
-  /// replaces its endpoints.
+  /// replaces its endpoints and [metadata] (`UP` if either changed).
   ///
   /// [instance] 0 assigns an id, at once ([assignmentHold] does not apply).
-  /// Returns the instance id. Throws [SwitchboardException] with
-  /// [StatusCode.invalidArgument] for an empty type,
-  /// [StatusCode.alreadyExists] if [instance] is in use by another
+  /// [metadata] (copied; null is empty) is published with the record, see
+  /// [ServiceRecord.metadata]. Returns the instance id. Throws
+  /// [SwitchboardException] with [StatusCode.invalidArgument] for an empty
+  /// type, [StatusCode.alreadyExists] if [instance] is in use by another
   /// registration, [StatusCode.resourceExhausted] if no id is left, and
   /// [StatusCode.failedPrecondition] after [close]; also
-  /// [StatusCode.invalidArgument] for more than 255 endpoints or an endpoint
-  /// that [ServiceRecord.checkEndpoint] refuses. Throws [RangeError] for an
-  /// instance outside the `u48` range.
-  int registerLocal(Name type, List<Uri> endpoints, {int instance = 0}) {
+  /// [StatusCode.invalidArgument] for more than 255 endpoints, an endpoint
+  /// that [ServiceRecord.checkEndpoint] refuses, or metadata longer than
+  /// [maxMetadataLength]. Throws [RangeError] for an instance outside the
+  /// `u48` range.
+  int registerLocal(
+    Name type,
+    List<Uri> endpoints, {
+    int instance = 0,
+    Uint8List? metadata,
+  }) {
     if (_closed) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
@@ -364,7 +377,13 @@ class NamingService {
     if (instance < 0 || instance > maxInstance) {
       throw RangeError.range(instance, 0, maxInstance, 'instance');
     }
-    return _add(type, instance, endpoints, null);
+    return _add(
+      type,
+      instance,
+      endpoints,
+      metadata == null ? Uint8List(0) : Uint8List.fromList(metadata),
+      null,
+    );
   }
 
   /// Removes a record made with [registerLocal] and publishes `DOWN`.
@@ -468,7 +487,7 @@ class NamingService {
     final RegisterRequest request;
     try {
       request = RegisterRequest.decode(message.payload);
-      _check(request.type, request.endpoints);
+      _check(request.type, request.endpoints, request.metadata);
     } on ProtocolException catch (e) {
       _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
       return;
@@ -494,6 +513,7 @@ class NamingService {
         request.type,
         request.requestedInstance,
         request.endpoints,
+        request.metadata,
         session,
       );
     } on SwitchboardException catch (e) {
@@ -673,10 +693,10 @@ class NamingService {
   // Table
 
   /// Throws [SwitchboardException] with [StatusCode.invalidArgument] unless
-  /// a record of [type] with [endpoints] can be stored and published: every
-  /// watcher must be able to decode what the service accepts, or every
-  /// later snapshot would fail.
-  static void _check(Name type, List<Uri> endpoints) {
+  /// a record of [type] with [endpoints] and [metadata] can be stored and
+  /// published: every watcher must be able to decode what the service
+  /// accepts, or every later snapshot would fail.
+  static void _check(Name type, List<Uri> endpoints, Uint8List metadata) {
     if (type.isEmpty) {
       throw SwitchboardException.of(
         StatusCode.invalidArgument,
@@ -687,6 +707,12 @@ class NamingService {
       throw SwitchboardException.of(
         StatusCode.invalidArgument,
         'more than 255 endpoints',
+      );
+    }
+    if (metadata.length > maxMetadataLength) {
+      throw SwitchboardException.of(
+        StatusCode.invalidArgument,
+        'metadata longer than $maxMetadataLength bytes',
       );
     }
     for (final endpoint in endpoints) {
@@ -701,10 +727,17 @@ class NamingService {
     }
   }
 
-  /// Adds or replaces a registration and publishes `UP`. [owner] null is a
+  /// Adds or replaces a registration and publishes `UP` (for a replacement
+  /// only if the endpoints or the metadata changed). [owner] null is a
   /// local registration.
-  int _add(Name type, int requested, List<Uri> endpoints, _Session? owner) {
-    _check(type, endpoints);
+  int _add(
+    Name type,
+    int requested,
+    List<Uri> endpoints,
+    Uint8List metadata,
+    _Session? owner,
+  ) {
+    _check(type, endpoints, metadata);
     final ServiceAddress address;
     if (requested != 0) {
       final existing = _instances[requested];
@@ -720,6 +753,7 @@ class NamingService {
         final record = ServiceRecord(
           existing.address,
           endpoints: List.unmodifiable(endpoints),
+          metadata: metadata,
         );
         if (_table[existing.address] != record) {
           _log.info('re-registered $record');
@@ -735,6 +769,7 @@ class NamingService {
     final record = ServiceRecord(
       address,
       endpoints: List.unmodifiable(endpoints),
+      metadata: metadata,
     );
     final registration = _Registration(address, owner);
     _instances[address.instance] = registration;

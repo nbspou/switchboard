@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -85,6 +86,144 @@ void main() {
       expect(h.service.table.values.single.endpoints, [uriB]);
       expect(events, ['UP npc/1 $uriA', 'UP npc/1 $uriB']);
       await sub.cancel();
+    });
+
+    test('re-registering with different metadata publishes UP', () async {
+      final (a, _) = h.link();
+      final watcher = Watcher(a);
+      expect(await watcher.next, 'SYNCED');
+      expect(
+        await register(a, 'gpu', endpoints: [uriA], metadata: text('m1')),
+        1,
+      );
+      expect(await watcher.next, 'UP gpu/1 $uriA meta m1');
+      // Same endpoints, other metadata: UP.
+      await register(
+        a,
+        'gpu',
+        instance: 1,
+        endpoints: [uriA],
+        metadata: text('m2'),
+      );
+      expect(await watcher.next, 'UP gpu/1 $uriA meta m2');
+      // Nothing changed: silent. Then metadata removed: UP.
+      await register(
+        a,
+        'gpu',
+        instance: 1,
+        endpoints: [uriA],
+        metadata: text('m2'),
+      );
+      await register(a, 'gpu', instance: 1, endpoints: [uriA]);
+      expect(await watcher.next, 'UP gpu/1 $uriA');
+      expect(h.service.table.values.single.metadata, isEmpty);
+      // Local registrations too.
+      expect(
+        h.service.registerLocal(
+          Name('x'),
+          [uriB],
+          instance: 9,
+          metadata: text('l'),
+        ),
+        9,
+      );
+      expect(await watcher.next, 'UP x/9 $uriB meta l');
+      h.service.registerLocal(
+        Name('x'),
+        [uriB],
+        instance: 9,
+        metadata: text('l'),
+      );
+      h.service.registerLocal(Name('x'), [uriB], instance: 9);
+      expect(await watcher.next, 'UP x/9 $uriB');
+    });
+
+    test('metadata larger than 4096 bytes is INVALID_ARGUMENT', () async {
+      final (c, _) = h.link();
+      final w = ByteWriter()
+        ..name(Name('gpu'))
+        ..u48(0)
+        ..u8(0)
+        ..u16(maxMetadataLength + 1)
+        ..bytes(Uint8List(maxMetadataLength + 1));
+      await expectLater(
+        c.request('REGISTER', w.toBytes()),
+        throwsStatus(StatusCode.invalidArgument),
+      );
+      expect(
+        () => h.service.registerLocal(
+          Name('gpu'),
+          const [],
+          metadata: Uint8List(maxMetadataLength + 1),
+        ),
+        throwsStatus(StatusCode.invalidArgument),
+      );
+      expect(h.service.table, isEmpty);
+      expect(
+        await register(c, 'gpu', metadata: Uint8List(maxMetadataLength)),
+        1,
+      );
+      expect(h.service.table.values.single.metadata, hasLength(4096));
+    });
+
+    test('a REGISTER without the metadata field has empty metadata', () async {
+      final (c, _) = h.link();
+      final watcher = Watcher(c);
+      expect(await watcher.next, 'SYNCED');
+      final old = ByteWriter()
+        ..name(Name('npc'))
+        ..u48(0)
+        ..u8(1)
+        ..string8(uriA.toString());
+      await c.request('REGISTER', old.toBytes());
+      expect(await watcher.next, 'UP npc/1 $uriA');
+      expect(h.service.table.values.single.metadata, isEmpty);
+    });
+
+    test('a registrar registers records on behalf of others; they live as '
+        'long as its channel', () async {
+      final (registrar, _) = h.link();
+      final (consumer, _) = h.link();
+      final watcher = Watcher(consumer, type: 'gpu');
+      expect(await watcher.next, 'SYNCED');
+      // Three workers that never talk to the naming service, each at its
+      // own endpoint with its own capabilities, under ids the registrar
+      // chose.
+      final workers = {
+        0x101: (Uri.parse('tcp://10.1.0.1:7000'), '{"models":["a"]}'),
+        0x102: (Uri.parse('tcp://10.1.0.2:7000'), '{"models":["a","b"]}'),
+        0x103: (Uri.parse('ws://10.1.0.3:7000/ws'), '{"models":["c"]}'),
+      };
+      for (final MapEntry(key: id, value: (uri, meta)) in workers.entries) {
+        expect(
+          await register(
+            registrar,
+            'gpu',
+            instance: id,
+            endpoints: [uri],
+            metadata: text(meta),
+          ),
+          id,
+        );
+      }
+      expect(await watcher.take(3), [
+        for (final MapEntry(key: id, value: (uri, meta)) in workers.entries)
+          'UP gpu/${id.toRadixString(16)} $uri meta $meta',
+      ]);
+      // A late watcher gets the same records in its snapshot.
+      final late = Watcher(h.link().$1, type: 'gpu');
+      expect(await late.take(4), [
+        for (final MapEntry(key: id, value: (uri, meta)) in workers.entries)
+          'UP gpu/${id.toRadixString(16)} $uri meta $meta',
+        'SYNCED',
+      ]);
+      // Retiring one worker.
+      await unregister(registrar, 'gpu', 0x102);
+      expect(await watcher.next, 'DOWN gpu/102');
+      // The registrar's channel goes: every record it made goes with it.
+      await registrar.close();
+      expect(await watcher.take(2), ['DOWN gpu/101', 'DOWN gpu/103']);
+      expect(h.service.table, isEmpty);
     });
 
     test('rejects invalid requests', () async {
@@ -1029,6 +1168,45 @@ void main() {
       },
     );
 
+    test('metadata is published, mirrored and re-registered', () async {
+      final client = newClient(connector);
+      final watcher = newClient(Connector(h));
+      await watcher.start();
+      await client.start();
+      final meta = text('{"models":["a"]}');
+      final id = await client.register(Name('gpu'), [uriA], metadata: meta);
+      // The caller's buffer is copied.
+      meta.fillRange(0, meta.length, 0);
+      final address = ServiceAddress(Name('gpu'), id);
+      await until(() => watcher.table[address] != null);
+      expect(utf8.decode(watcher.table[address]!.metadata), '{"models":["a"]}');
+      // A new registration of the same id replaces the metadata.
+      final events = <String>[];
+      watcher.events.listen((e) => events.add(describeEvent(e)));
+      await client.register(
+        Name('gpu'),
+        [uriA],
+        instance: id,
+        metadata: text('{"models":["b"]}'),
+      );
+      await until(() => events.isNotEmpty);
+      expect(events, ['UP gpu/$id $uriA meta {"models":["b"]}']);
+      // After a reconnect the remembered registration carries it again.
+      await connector.servers.last.close();
+      await until(() => connector.calls == 2 && client.isSynced);
+      await until(() => h.service.table.isNotEmpty);
+      expect(
+        utf8.decode(h.service.table[address]!.metadata),
+        '{"models":["b"]}',
+      );
+      await expectLater(
+        client.register(Name('gpu'), [
+          uriA,
+        ], metadata: Uint8List(maxMetadataLength + 1)),
+        throwsArgumentError,
+      );
+    });
+
     test('register refuses endpoints a watcher could not decode', () async {
       final client = newClient(connector);
       for (final text in ['./>:x', '//10.0.0.5:9101/ws', r'tcp:/.\\{:']) {
@@ -1386,3 +1564,6 @@ class ScriptedConnector {
     await Future.wait([for (final server in servers) server.close()]);
   }
 }
+
+/// [value] as UTF-8 bytes.
+Uint8List text(String value) => Uint8List.fromList(utf8.encode(value));

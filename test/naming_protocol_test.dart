@@ -71,17 +71,131 @@ void main() {
     });
 
     test('truncation at every boundary', () {
-      final bytes = ServiceRecord(
+      final record = ServiceRecord(
         ServiceAddress(npc, 1),
         endpoints: uris,
-      ).encode();
-      for (var n = 0; n < bytes.length; n++) {
+        metadata: bytes([1, 2, 3]),
+      );
+      final encoded = record.encode();
+      // Name, instance, endpoints: the layout before metadata was added.
+      final withoutMetadata = encoded.length - 2 - 3;
+      for (var n = 0; n < encoded.length; n++) {
+        final prefix = Uint8List.sublistView(encoded, 0, n);
+        if (n == withoutMetadata) {
+          final old = ServiceRecord.decode(prefix);
+          expect(old.endpoints, uris);
+          expect(old.metadata, isEmpty);
+          continue;
+        }
         expect(
-          () => ServiceRecord.decode(Uint8List.sublistView(bytes, 0, n)),
+          () => ServiceRecord.decode(prefix),
           throwsA(isA<ProtocolException>()),
           reason: 'prefix $n',
         );
       }
+      expect(ServiceRecord.decode(encoded), record);
+    });
+
+    group('metadata', () {
+      test('round trip, equality and hash', () {
+        final address = ServiceAddress(npc, 7);
+        final record = ServiceRecord(
+          address,
+          endpoints: uris,
+          metadata: bytes([0, 0xFF, 7]),
+        );
+        final back = ServiceRecord.decode(record.encode());
+        expect(back, record);
+        expect(back.hashCode, record.hashCode);
+        expect(back.metadata, [0, 0xFF, 7]);
+        expect(
+          record,
+          isNot(
+            ServiceRecord(address, endpoints: uris, metadata: bytes([0, 0xFF])),
+          ),
+        );
+        expect(record, isNot(ServiceRecord(address, endpoints: uris)));
+        expect(
+          ServiceRecord(address, metadata: Uint8List(0)),
+          ServiceRecord(address),
+        );
+      });
+
+      test('the empty field is two zero bytes', () {
+        final encoded = ServiceRecord(ServiceAddress(npc, 1)).encode();
+        expect(encoded.length, 8 + 6 + 1 + 2);
+        expect(encoded.sublist(15), [0, 0]);
+      });
+
+      test('at most maxMetadataLength bytes', () {
+        expect(maxMetadataLength, 4096);
+        final address = ServiceAddress(npc, 1);
+        final largest = ServiceRecord(
+          address,
+          metadata: Uint8List(maxMetadataLength)..fillRange(0, 4096, 0x5A),
+        );
+        expect(ServiceRecord.decode(largest.encode()), largest);
+        final tooLarge = Uint8List(maxMetadataLength + 1);
+        expect(
+          ServiceRecord(address, metadata: tooLarge).encode,
+          throwsArgumentError,
+        );
+        expect(
+          RegisterRequest(npc, metadata: tooLarge).encode,
+          throwsArgumentError,
+        );
+        // A decoder refuses what an encoder would.
+        final w = ByteWriter()
+          ..name(npc)
+          ..u48(1)
+          ..u8(0)
+          ..u16(maxMetadataLength + 1)
+          ..bytes(tooLarge);
+        expect(
+          () => ServiceRecord.decode(w.toBytes()),
+          throwsA(isA<ProtocolException>()),
+        );
+        expect(
+          () => RegisterRequest.decode(w.toBytes()),
+          throwsA(isA<ProtocolException>()),
+        );
+      });
+
+      test('a field cut short is a protocol error', () {
+        final full = ServiceRecord(
+          ServiceAddress(npc, 1),
+          metadata: bytes([1, 2, 3]),
+        ).encode();
+        // One byte of the length, the length without all its bytes.
+        for (final n in [16, 17, 18, 19]) {
+          expect(
+            () => ServiceRecord.decode(Uint8List.sublistView(full, 0, n)),
+            throwsA(isA<ProtocolException>()),
+            reason: 'prefix $n',
+          );
+        }
+      });
+
+      test('trailing bytes after the metadata are ignored', () {
+        final record = ServiceRecord(
+          ServiceAddress(npc, 1),
+          metadata: bytes([9]),
+        );
+        expect(
+          ServiceRecord.decode(Uint8List.fromList([...record.encode(), 1, 2])),
+          record,
+        );
+      });
+
+      test('a decoded record does not share the input buffer', () {
+        final encoded = ServiceRecord(
+          ServiceAddress(npc, 1),
+          metadata: bytes([1, 2, 3]),
+        ).encode();
+        final record = ServiceRecord.decode(encoded);
+        encoded.fillRange(0, encoded.length, 0);
+        expect(record.metadata, [1, 2, 3]);
+      });
     });
   });
 
@@ -102,22 +216,40 @@ void main() {
       final r = RegisterRequest.decode(RegisterRequest(npc).encode());
       expect(r.requestedInstance, 0);
       expect(r.endpoints, isEmpty);
+      expect(r.metadata, isEmpty);
     });
 
-    test('truncation at every byte boundary throws ProtocolException', () {
-      final bytes = RegisterRequest(
+    test('metadata round trip', () {
+      final r = RegisterRequest.decode(
+        RegisterRequest(npc, endpoints: uris, metadata: bytes([4, 5])).encode(),
+      );
+      expect(r.endpoints, uris);
+      expect(r.metadata, [4, 5]);
+    });
+
+    test('truncation at every byte boundary throws ProtocolException, '
+        'except before the metadata', () {
+      final encoded = RegisterRequest(
         npc,
         requestedInstance: 7,
         endpoints: uris,
+        metadata: bytes([1]),
       ).encode();
-      for (var n = 0; n < bytes.length; n++) {
+      final withoutMetadata = encoded.length - 2 - 1;
+      for (var n = 0; n < encoded.length; n++) {
+        final prefix = Uint8List.sublistView(encoded, 0, n);
+        if (n == withoutMetadata) {
+          expect(RegisterRequest.decode(prefix).metadata, isEmpty);
+          continue;
+        }
         expect(
-          () => RegisterRequest.decode(Uint8List.sublistView(bytes, 0, n)),
+          () => RegisterRequest.decode(prefix),
           throwsA(isA<ProtocolException>()),
           reason: 'prefix $n',
         );
       }
-      expect(RegisterRequest.decode(bytes).endpoints, uris);
+      expect(RegisterRequest.decode(encoded).endpoints, uris);
+      expect(RegisterRequest.decode(encoded).metadata, [1]);
     });
 
     test('non-ASCII endpoint', () {

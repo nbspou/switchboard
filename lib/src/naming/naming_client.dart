@@ -153,8 +153,8 @@ class NamingClient {
     _table,
   );
 
-  /// Changes of [table]: `UP` when a record appears or its endpoints
-  /// change, `DOWN` (address only) when it disappears, including records
+  /// Changes of [table]: `UP` when a record appears or its endpoints or
+  /// metadata change, `DOWN` (address only) when it disappears, including records
   /// found missing when a new snapshot arrives after a reconnect. Broadcast
   /// stream; it ends on [close].
   Stream<ServiceEvent> get events => _events.stream;
@@ -397,7 +397,15 @@ class NamingClient {
 
   /// Registers an instance of [type] reachable at [endpoints] and returns
   /// the instance id the naming service assigned ([instance] 0) or
-  /// accepted.
+  /// accepted. [metadata] (copied; null is empty, at most
+  /// [maxMetadataLength] bytes) is published with the record for consumers
+  /// to select on ([ServiceRecord.metadata]).
+  ///
+  /// The endpoints need not be this process's: a registrar (a scaler, an
+  /// operator tool) may register any number of records for endpoints that
+  /// never talk to the naming service. Each record lives as long as this
+  /// client's channel, so the registrar retires dead endpoints itself with
+  /// [unregister].
   ///
   /// The registration is remembered and made again after every reconnect,
   /// asking for the same id; if that id has been taken meanwhile, a new one
@@ -410,8 +418,9 @@ class NamingClient {
   /// Registering a non-zero [instance] of [type] again supersedes the
   /// earlier registration of `type/instance` made through this client,
   /// whether or not it has completed: the naming service replaces the
-  /// endpoints, only the newest registration is remembered, and the earlier
-  /// call's future completes (or fails) like this one.
+  /// endpoints and metadata (publishing `UP` if either changed), only the
+  /// newest registration is remembered, and the earlier call's future
+  /// completes (or fails) like this one.
   ///
   /// [onAssigned], if given, is called synchronously with the instance id
   /// whenever the registration gets an id different from the one it had:
@@ -432,12 +441,14 @@ class NamingClient {
   /// remembered. Fails with [ArgumentError] or [RangeError] for more than
   /// 255 endpoints, an endpoint [ServiceRecord.checkEndpoint] refuses (no
   /// scheme, longer than 255 bytes, or not stable through its text form),
-  /// or an instance outside the `u48` range.
+  /// metadata longer than [maxMetadataLength], or an instance outside the
+  /// `u48` range.
   Future<int> register(
     Name type,
     List<Uri> endpoints, {
     int instance = 0,
     void Function(int instance)? onAssigned,
+    Uint8List? metadata,
   }) {
     if (_closed) {
       return Future.error(
@@ -463,17 +474,25 @@ class NamingClient {
         throw ArgumentError.value(endpoints.length, 'endpoints', 'over 255');
       }
       endpoints.forEach(ServiceRecord.checkEndpoint);
+      if (metadata != null && metadata.length > maxMetadataLength) {
+        throw ArgumentError.value(
+          metadata.length,
+          'metadata',
+          'more than $maxMetadataLength bytes',
+        );
+      }
     } catch (e, st) {
       return Future.error(e, st);
     }
     final entry = _Entry(
       type,
       List.unmodifiable(endpoints),
+      metadata == null ? Uint8List(0) : Uint8List.fromList(metadata),
       instance,
       onAssigned,
     );
     if (instance != 0) {
-      // Registering an id again replaces its endpoints: the older entry is
+      // Registering an id again replaces its record: the older entry is
       // superseded, even while its own request is still in flight.
       for (final older in [
         for (final e in _entries)
@@ -743,6 +762,7 @@ class NamingClient {
           entry.type,
           requestedInstance: requested,
           endpoints: entry.endpoints,
+          metadata: entry.metadata,
         ).encode(),
       );
       assigned = RegisterResponse.decode(response.payload).instance;
@@ -772,7 +792,7 @@ class NamingClient {
   ) async {
     if (entry.superseded) {
       // A newer registration of the same id took over; it registers the
-      // endpoints it wants on its own.
+      // endpoints and metadata it wants on its own.
       return;
     }
     if (!_entries.contains(entry)) {
@@ -1087,10 +1107,19 @@ class NamingClient {
 
 /// A registration remembered for re-registration.
 class _Entry {
-  _Entry(this.type, this.endpoints, this.instance, this.onAssigned);
+  _Entry(
+    this.type,
+    this.endpoints,
+    this.metadata,
+    this.instance,
+    this.onAssigned,
+  );
 
   final Name type;
   final List<Uri> endpoints;
+
+  /// A private copy of the caller's metadata.
+  final Uint8List metadata;
 
   /// Told about every new id.
   final void Function(int instance)? onAssigned;

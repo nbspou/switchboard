@@ -190,6 +190,7 @@ Future<int> register(
   String type, {
   int instance = 0,
   List<Uri> endpoints = const [],
+  Uint8List? metadata,
 }) async {
   final response = await channel.request(
     'REGISTER',
@@ -197,6 +198,7 @@ Future<int> register(
       Name(type),
       requestedInstance: instance,
       endpoints: endpoints,
+      metadata: metadata,
     ).encode(),
   );
   return RegisterResponse.decode(response.payload).instance;
@@ -214,13 +216,17 @@ String describeEvent(ServiceEvent e) {
     return 'DOWN ${e.record.address}';
   }
   final endpoints = e.record.endpoints.join(',');
-  return endpoints.isEmpty
-      ? 'UP ${e.record.address}'
-      : 'UP ${e.record.address} $endpoints';
+  final metadata = e.record.metadata;
+  return [
+    'UP ${e.record.address}',
+    if (endpoints.isNotEmpty) endpoints,
+    if (metadata.isNotEmpty) 'meta ${utf8.decode(metadata)}',
+  ].join(' ');
 }
 
 /// Random bytes on even [i]; on odd [i] something shaped like a naming
-/// payload (name, u48, endpoint list) with noisy, URI-ish endpoints.
+/// payload (name, u48, endpoint list, then mostly a metadata field, of
+/// any size, possibly cut short) with noisy, URI-ish endpoints.
 Uint8List fuzzInput(Random random, int i) {
   Uint8List noise(int n) =>
       Uint8List.fromList([for (var k = 0; k < n; k++) random.nextInt(256)]);
@@ -262,6 +268,22 @@ Uint8List fuzzInput(Random random, int i) {
     b
       ..addByte(length)
       ..add(encoded.sublist(0, length));
+  }
+  switch (random.nextInt(4)) {
+    case 0:
+      // No metadata field: the layout before it was added.
+      break;
+    case 1:
+      // A length, possibly over the limit, and up to 8 bytes.
+      b
+        ..addByte(random.nextInt(256))
+        ..addByte(random.nextInt(3) == 0 ? random.nextInt(256) : 0)
+        ..add(noise(random.nextInt(9)));
+    default:
+      final length = random.nextInt(8);
+      b
+        ..add([length, 0])
+        ..add(noise(length));
   }
   return b.toBytes();
 }
