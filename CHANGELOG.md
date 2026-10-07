@@ -70,6 +70,15 @@ The protocol specification lives in the project wiki (section
   `SlotGate` forwards during a hand-over carry the credential of the
   channel they arrived on (or `serveRequest`'s `payload`), one forwarding
   channel per credential, never the node's default payload.
+- Sharding: `SlotLifecycle.serve` and `discard` return `FutureOr<void>`
+  (existing `void` overrides stay valid), and a `SlotGate` watches the
+  returned future: an asynchronous `serve` that fails closes its channel
+  with `INTERNAL`, a failed `discard` is logged, and neither escapes as an
+  unhandled error. A `SlotGate` never forwards to its own node: forwarded
+  channels and requests skip this node's own listeners
+  (`excludeOwnEndpoints`, `UNAVAILABLE`), and a `DRAIN` or `FORWARD` naming
+  no instance or this one is refused with `FAILED_PRECONDITION` (the
+  `FORWARD` then stops the slot as a revocation does).
 - Worker fleet support (wiki use case 5): an opaque metadata blob in
   service records (`ServiceRecord.metadata`, a `u16` length and up to 4096
   bytes after the endpoints, in `UP` items and `REGISTER`; a record without
