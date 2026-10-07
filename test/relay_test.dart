@@ -645,6 +645,18 @@ void main() {
         'r by ${worker.id} for relay-2 with "p"',
       );
       await channel.close();
+      // An identified consumer is held to its scopes all the same.
+      final scoped = await newNode(
+        credential: await issue('consumer-4', [Scope.of(Right.open, 'x')]),
+      );
+      final identified = await scoped.dial(lenient.uri, receiver: 'relay-2');
+      expect(
+        await refusal(
+          identified,
+          ChannelAddress(type: workerType, instance: worker.id).encode(),
+        ),
+        hasCode(StatusCode.permissionDenied),
+      );
     });
 
     test('a consumer that identifies without naming the relay is refused by '

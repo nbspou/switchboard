@@ -9,10 +9,8 @@
 // (a new listener) is brokered anew, and the worker going away takes the
 // peer down and then out of the set.
 //
-// Not covered: the relay variant of the wiki page (a relay node
-// registering the instance's records with its own endpoint and forwarding
-// channels over the instance's outbound connection, found by peer
-// identity), which the reference implementation does not provide.
+// The relay variant, for a consumer that listens nowhere either, is in
+// relayed_workers_test.dart.
 
 import 'dart:async';
 import 'dart:convert';
