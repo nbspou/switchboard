@@ -227,6 +227,21 @@ The protocol specification lives in the project wiki (section
   `brokerEndpoint`, brokered records in `openChannel` and `PeerSet`,
   `MeshNode` dialling back). `NamingClient(watch: false)` and
   `MeshNode.join(watch: false)` for nodes that may only register.
+- Relay (use case 5c): the reserved type `_relay` (`Services.relay`) for
+  instances that listen nowhere reached by consumers that listen nowhere
+  either. `RelayService` checks the consumer's identity and its `open`
+  scope for the inner type, refuses malformed or reserved inner addresses
+  and host hints, bounds the channels per consumer connection, brokers one
+  pooled connection per instance through `CONNECT` for every consumer, and
+  pipes with statuses relayed unchanged; `MeshNode.publishRelay` registers
+  it with the node's identity as the record metadata. A node that cannot
+  broker (`Switchboard.canBroker`) reaches such instances through
+  `Switchboard(relay: RelayConfig(...))`: `openChannel`, `openTalk`, the
+  slot opens and `PeerSet` (`Peer.viaRelay`) open `_relay` channels
+  carrying the destination's open payload, through a relay resolved round
+  robin with failover (`resolveRelays`) or explicit endpoints, named from
+  its record when identifying. `ChannelPolicies.scoped` admits `_relay`
+  like `_ns`. The proxy and the relay share their forwarding code.
 - Tests: over 1200 tests, including the wiki test vectors (the codec tests also
   run on Node.js with `dart test -P node`) and integration tests over TCP
   and WebSocket.

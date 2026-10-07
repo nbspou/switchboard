@@ -262,6 +262,156 @@ client: chat without a session -> permissionDenied: permission denied
 
 To serve other routes on the same port (OAuth returns, `.well-known` files), give `listenWebSocket` an `onOtherRequest` callback, or hand the node an upgrade from your own `HttpServer` with `acceptWebSocket`.
 
+### Outbound-only ends: a relay
+
+A worker that listens nowhere registers without endpoints; a node that listens is reached by having the worker dial it (`CONNECT`). When the client listens nowhere either, a relay node does that for it: the client opens a `_relay` channel carrying the open payload meant for the worker, and the relay checks the client's credential, brokers one connection to the worker for every client and forwards. Every node here holds a credential with the rights it needs and nothing else.
+
+```dart
+// Outbound-only on both ends: a worker and a client that listen nowhere,
+// joined through a relay node. Credentials are required everywhere.
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:switchboard/switchboard.dart';
+
+Future<void> main() async {
+  final work = Name('work');
+  final loopback = InternetAddress.loopbackIPv4;
+
+  // The mesh authority issues every node a credential with the rights it
+  // needs, bound to the node's own key.
+  final authority = await CredentialIssuer.ed25519FromSeed(
+    Name('auth1'),
+    List.generate(32, (i) => i),
+  );
+  final verifier = CredentialVerifier();
+  await verifier.addIssuer(authority);
+  Future<(Credential, HolderKey)> identity(
+    String name,
+    List<Scope> scopes,
+  ) async {
+    final key = await HolderKey.generate();
+    final credential = await authority.issue(
+      kind: CredentialKind.node,
+      identity: name,
+      scopes: scopes,
+      holderKey: key.publicKey,
+    );
+    return (credential, key);
+  }
+
+  // Nodes name the naming service when they identify to it; relays are
+  // named from their records.
+  late final Uri namingUri;
+  String? namesTheNamingService(Uri endpoint, ServiceRecord? record) =>
+      endpoint == namingUri ? 'ns' : null;
+
+  // The naming node requires credentials, and IDENTs that name it.
+  final (nsCredential, nsKey) = await identity('ns', const []);
+  final namingNode = Switchboard(
+    muxOptions: const MuxOptions(requireNamedIdent: true),
+    credential: nsCredential,
+    holderKey: nsKey,
+    verifier: verifier,
+  );
+  final naming = NamingService(
+    assignmentHold: Duration.zero,
+    verifier: verifier,
+    requireCredential: true,
+  );
+  namingNode.registerService(Services.naming, naming.handler, instance: 1);
+  namingUri = await namingNode.listenTcp(
+    loopback,
+    0,
+    policy: ChannelPolicies.scoped(),
+  );
+  print('naming: listening on $namingUri');
+
+  // The relay listens where both ends can reach it, and publishes `_relay`
+  // with its identity. It may broker and open `work`.
+  final (relayCredential, relayKey) = await identity('relay-1', [
+    Scope.of(Right.register, '_relay'),
+    Scope.of(Right.watch, '*'),
+    Scope.of(Right.open, 'work'),
+    Scope.of(Right.broker, 'work'),
+  ]);
+  final relayNode = Switchboard(
+    muxOptions: const MuxOptions(requireNamedIdent: true),
+    credential: relayCredential,
+    holderKey: relayKey,
+    verifier: verifier,
+    expectedIdentityFor: namesTheNamingService,
+  );
+  final relayUri = await relayNode.listenTcp(
+    loopback,
+    0,
+    policy: ChannelPolicies.scoped(),
+  );
+  final relayMesh = MeshNode.join(relayNode, namingUri);
+  await relayMesh.synced;
+  await relayMesh.publishRelay(RelayService(relayNode));
+  print('relay: listening on $relayUri');
+
+  // The worker listens nowhere and may only register its type.
+  final (workerCredential, workerKey) = await identity('worker-1', [
+    Scope.of(Right.register, 'work'),
+  ]);
+  final worker = Switchboard(
+    credential: workerCredential,
+    holderKey: workerKey,
+    verifier: verifier,
+    expectedIdentityFor: namesTheNamingService,
+  );
+  final workerMesh = MeshNode.join(worker, namingUri, watch: false);
+  final id = await workerMesh.publish(work, (incoming) {
+    final via = incoming.peerIdentity?.identity;
+    incoming.talk().messages.listen((message) {
+      if (message.expectsReply) {
+        final job = utf8.decode(message.payload);
+        message.reply(utf8.encode('$job done, reached through $via'));
+      }
+    });
+  }, endpoints: const []);
+  print('worker: published ${ServiceAddress(work, id)} without endpoints');
+
+  // The client listens nowhere either, so it cannot have the worker dial
+  // it: with a relay configured, its channel goes through the relay.
+  final (clientCredential, clientKey) = await identity('client-1', [
+    Scope.of(Right.watch, '*'),
+    Scope.of(Right.open, 'work'),
+  ]);
+  final client = Switchboard(
+    credential: clientCredential,
+    holderKey: clientKey,
+    verifier: verifier,
+    expectedIdentityFor: namesTheNamingService,
+    relay: RelayConfig(),
+  );
+  final clientMesh = MeshNode.join(client, namingUri);
+  await clientMesh.synced;
+  final talk = await client.openTalk(ServiceAddress(work, id));
+  final reply = await talk.request(
+    'RUN',
+    Uint8List.fromList(utf8.encode('job 1')),
+  );
+  print('client: ${utf8.decode(reply.payload)}');
+  await talk.close();
+
+  // Leave the mesh before closing a node; the naming node goes last.
+  for (final (mesh, node) in [
+    (clientMesh, client),
+    (workerMesh, worker),
+    (relayMesh, relayNode),
+  ]) {
+    await mesh.leave();
+    await node.close();
+  }
+  await naming.close();
+  await namingNode.close();
+}
+```
+
 ### The lower layers alone
 
 `MuxConnection` and `TalkChannel` work over any `StreamChannel<Uint8List>` that carries one frame per event. Use them directly in a browser client (over `WebSocketTransport.connect`) or in a peer that does its own addressing. Only `core.dart` is needed.
@@ -311,6 +461,7 @@ Future<void> main() async {
 * **Outgoing connections.** A connection a node initiates is trusted by default: the peer may open channels to its local services. A node that dials peers it does not trust (workers on rented machines) sets `Switchboard(outgoingPolicy: ChannelPolicies.denyAll)`, or chooses per endpoint with `endpointPolicy`, and chooses the credential per destination with `credentialFor`, so that its own `defaultPayload` never reaches them. A per-instance key can come from the record's metadata, which every watcher of the naming table sees: such a key authenticates the mesh to the worker, not the worker to the mesh. `PeerSet.watch` keeps a connection to every instance of such a type.
 * **Proxy.** `proxyHandler` refuses reserved types unless its `allow` filter admits them, forwards at most 256 channels at a time per client connection by default, refuses channels without a shard slot to sharded types (the state transfer path) unless `allowNoSlot` admits the type, and never forwards to the node's own listeners. It acts on host hints only with `Switchboard(allowHostHint: true)`, which makes the node an open relay.
 * **Identity.** A node can prove who it is on its connections: `Switchboard(credential: ..., holderKey: ...)` identifies with a signed credential (`CredentialIssuer`, HMAC-SHA256 or Ed25519) on every connection it initiates, and a node with a `verifier` checks the credentials its peers present, so that its policies can read `connection.peerIdentity`. `ChannelPolicies.scoped()` admits only the service types the peer's credential has an `open` scope for, so a worker whose credential opens nothing can open nothing, whichever side dialled. Present a credential only to peers in the mesh's trust domain (`identifyFor`): a bearer credential is reusable by whoever receives it, and a peer can relay a handshake. Without credentials nothing changes; the naming service does not check scopes yet.
+* **Relay.** `RelayService` relays only for identified consumers (by default), and only to the types their credential has `open` for; it refuses reserved types and host hints inside the relayed payload, so it cannot reach the naming service or chain relays, and forwards at most 1024 channels at a time per consumer connection. Its host should set `MuxOptions(requireNamedIdent: true)`, as the naming service's does. A node that listens never uses a relay.
 * **Rejections.** Statuses sent to peers carry a generic reason such as `permission denied`. Instance ids, endpoints and resolver state go to the local log only.
 * **Frame size.** Frames are limited to 1 MiB by default (`MuxOptions.maxFrameSize`, which a `Switchboard` also applies to its transports). The WebSocket listener uses `WebSocketServerTransport`, which checks the size of a message, all fragments counted, before buffering it, and never negotiates compression.
 * **Buffers.** Unread data is buffered up to 4 MiB per channel; beyond that the channel is closed with `RESOURCE_EXHAUSTED`. Above 16 MiB over all channels, the connection stops reading the transport until half has drained. The number of channels, the OPEN payloads they hold and the unconfirmed CLOSEs are bounded too.
@@ -322,7 +473,7 @@ Every limit is an option. The wiki page "Switchboard Dart Reference Implementati
 ## Platforms
 
 * `package:switchboard/core.dart` does not import `dart:io` and compiles for the web. It has the status codes, names, the in-memory and WebSocket client transports, the stream binding wire format, the mux and Talk layers, credentials and connection identity, addressing, the naming service and client, and the resolvers.
-* `package:switchboard/switchboard.dart` adds the `dart:io` parts: the TCP transport, the WebSocket server transports, `Switchboard`, `MeshNode`, `PeerSet`, `proxyHandler`, `namingClientFor`, and the instance side of sharding (`SlotGate`, `SlotLifecycle`).
+* `package:switchboard/switchboard.dart` adds the `dart:io` parts: the TCP transport, the WebSocket server transports, `Switchboard`, `MeshNode`, `PeerSet`, `proxyHandler`, `RelayService`, `namingClientFor`, and the instance side of sharding (`SlotGate`, `SlotLifecycle`).
 * `dart test` runs the whole suite on the VM. `dart test -P node` runs the codec, test vector and identity tests compiled to JavaScript on Node.js, which checks the 32 and 48-bit arithmetic of the wire codecs and the pure Dart Ed25519.
 * `Switchboard.listenMemory` gives a node an in-process `mem://` endpoint, so a whole mesh (naming service included) can run in one isolate, for tests or a single-process mode; `mem://` URIs mean nothing outside that isolate, so publish them to a naming service only when every node is in it.
 
