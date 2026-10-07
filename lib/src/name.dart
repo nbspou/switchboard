@@ -87,6 +87,13 @@ class Name {
     out.setRange(offset, offset + byteLength, _bytes);
   }
 
+  // Not inlined: the Dart 3.13.5 AOT compiler hoists the receiver's
+  // `_bytes` load out of an enclosing loop, above the null check, when
+  // the receiver is a nullable variable compared as `n == null || n == x`
+  // inside the loop (the JIT does not), and a native binary then dies
+  // with SIGSEGV on the first such loop with a null receiver. See
+  // tool/aot_smoke.dart.
+  @pragma('vm:never-inline')
   @override
   bool operator ==(Object other) {
     if (other is! Name) {

@@ -248,6 +248,8 @@ The protocol specification lives in the project wiki (section
 - Documentation: README with quick start programs (`example/`), and the
   wiki page "Switchboard Dart Reference Implementation".
 
+- Fixed: native (`dart compile exe`) binaries of the naming service crashed with SIGSEGV on the first `WATCH` without a type filter, which every joining node sends: the Dart 3.13.5 AOT compiler hoisted a field load of the inlined `Name.==` above its null check. `Name.==` is no longer inlined and the handler compares a non-null filter. `tool/aot_smoke.sh` checks a native build.
+
 ## 2.1.7
 
 - Use `WebSocketChannel` and `StreamChannel` interfaces.

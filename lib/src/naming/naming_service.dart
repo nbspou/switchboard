@@ -751,7 +751,10 @@ class NamingService {
       );
       return;
     }
-    bool matches(Name recordType) => type == null || type == recordType;
+    // The filter is never null: a nullable name compared inside the loop
+    // crashed native binaries (see Name.operator ==).
+    final filter = type ?? Name.empty;
+    bool matches(Name recordType) => filter.isEmpty || filter == recordType;
     // Snapshot, reply and subscription happen in one synchronous step: a
     // change is either in the snapshot or sent after the reply.
     for (final record in _table.values) {
