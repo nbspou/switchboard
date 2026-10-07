@@ -178,6 +178,10 @@ class FramedByteTransport {
   /// listener paused its subscription).
   bool get isInputPaused => _inputSub?.isPaused ?? false;
 
+  /// Whether reading the input has started: the stream was listened to, or
+  /// the transport started draining the input.
+  bool get isInputStarted => _inputListened;
+
   /// Whether the stream has ended.
   bool get isEnded => _ended;
 
