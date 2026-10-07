@@ -1086,7 +1086,7 @@ class Switchboard {
     if (policy != null && !_permitted(policy, address, connection)) {
       _log.info(
         'channel ${channel.id} from $remote: $address refused by the '
-        'listener policy',
+        'policy',
       );
       unawaited(channel.close(genericStatus(StatusCode.permissionDenied)));
       return;
@@ -1127,7 +1127,7 @@ class Switchboard {
     try {
       return policy(address, connection);
     } on Object catch (e, st) {
-      _log.warning('listener policy failed for $address', e, st);
+      _log.warning('policy failed for $address', e, st);
       return false;
     }
   }
