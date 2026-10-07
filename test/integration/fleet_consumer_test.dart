@@ -25,7 +25,7 @@ const talkOptions = TalkOptions(
   requestTimeout: Duration(seconds: 2),
   replyTimeout: Duration(seconds: 1),
 );
-const heartbeat = Duration(milliseconds: 50);
+const heldExtendInterval = Duration(milliseconds: 50);
 const limit = Duration(seconds: 10);
 
 final gpu = Name('gpu');
@@ -146,7 +146,7 @@ void main() {
     // Naming service: only for holders of the mesh credential.
     final namingNode = newNode();
     final naming = NamingService(
-      heartbeat: heartbeat,
+      heldExtendInterval: heldExtendInterval,
       assignmentHold: Duration.zero,
     );
     addTearDown(naming.close);
@@ -218,7 +218,6 @@ void main() {
       consumer,
       namingUri,
       reconnectDelay: const Duration(milliseconds: 20),
-      watchTimeout: const Duration(milliseconds: 500),
       resolveTimeout: limit,
       talkOptions: talkOptions,
     );

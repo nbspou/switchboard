@@ -41,7 +41,7 @@ class NamingResolver implements SlotResolver {
 
   /// All instances of [type] in the client's table.
   ///
-  /// Before the client's first `SYNCED` ([NamingClient.hasSynced]) this
+  /// Before the client's first sync ([NamingClient.hasSynced]) this
   /// waits for [NamingClient.firstSynced], at most [resolveTimeout], and
   /// then fails with [SwitchboardException] [StatusCode.unavailable]. Once
   /// the client has been synced once, a later loss of the naming service
@@ -131,8 +131,7 @@ class NamingResolver implements SlotResolver {
   /// The client's [NamingClient.firstSynced]: completes once the table has
   /// been synced at least once, and stays complete through later losses of
   /// the naming service (the stale table is served meanwhile). Fails with
-  /// [StatusCode.cancelled] if the client is closed before its first
-  /// `SYNCED`.
+  /// [StatusCode.cancelled] if the client is closed before its first sync.
   @override
   Future<void> get ready => client.firstSynced;
 

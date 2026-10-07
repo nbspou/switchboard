@@ -29,7 +29,8 @@ final Logger _log = Logger('Switchboard.Naming');
 
 /// The naming service (`_ns`): hands out instance ids, keeps the
 /// authoritative table of live service instances, and pushes changes to
-/// watchers. See the wiki page "Switchboard Naming Service".
+/// the channels subscribed to them. See the wiki page "Switchboard Naming
+/// Service".
 ///
 /// The service speaks Talk over channels handed to [serve], one per client.
 /// A registration is owned by the channel it was made on; when that channel
@@ -42,16 +43,27 @@ final Logger _log = Logger('Switchboard.Naming');
 /// closing the channel); see the wiki section "Registering on behalf of
 /// others".
 ///
-/// Procedures: `REGISTER`, `UNREGSTR` (requests), `WATCH`, `LOOKUP` (stream
-/// requests), and for sharding `SLOTS`, `HOLDING`, `CLAIM`, `RELEASE`,
-/// `LOCATE` (requests) and `MIGRATE` (stream request). Requests for any
-/// other procedure are answered with `ABORT UNIMPLEMENTED`; plain messages
-/// are ignored. Malformed payloads are answered with
+/// Procedures: `REGISTER`, `UNREGSTR`, `WATCH`, `UNWATCH` (requests),
+/// `LOOKUP` (stream request), and for sharding `SLOTS`, `HOLDING`, `CLAIM`,
+/// `RELEASE`, `LOCATE` (requests) and `MIGRATE` (stream request). Requests
+/// for any other procedure are answered with `ABORT UNIMPLEMENTED`; plain
+/// messages are ignored. Malformed payloads are answered with
 /// `ABORT INVALID_ARGUMENT`.
+///
+/// Subscriptions: `WATCH` sends the snapshot of the matching records and
+/// slot spaces as one-way events (`UP`, then `SLOTSPC` and `SLOT`), then
+/// its reply, and subscribes the channel; from then on every change is
+/// sent to it as an event (`UP`, `DOWN`, `SLOTSPC`, `SLOT`), at most once
+/// per channel however many of its subscriptions match. A subscription is
+/// per channel and type filter and counts the `WATCH`es that hold it:
+/// `UNWATCH` with the same filter gives one back, the last one ends it,
+/// and every subscription of a channel ends when the channel closes. There
+/// is no heartbeat: a watcher detects a lost naming service through its
+/// connection (mux keep-alive).
 ///
 /// Sharding (wiki page "Switchboard Sharding"): the service keeps a slot
 /// table per sharded type ([slotTables]), publishes it to watchers as
-/// `SLOTSPC` and `SLOT` items, assigns the slots of managed spaces, and
+/// `SLOTSPC` and `SLOT` events, assigns the slots of managed spaces, and
 /// orchestrates hand-overs by sending `ASSIGN`, `DRAIN`, `FORWARD` and
 /// `RESUME` to instances over their registration channels. The instance
 /// serving the slots of a type on a channel is the channel's registration
@@ -81,15 +93,16 @@ final Logger _log = Logger('Switchboard.Naming');
 class NamingService {
   /// Creates an empty service.
   ///
-  /// [heartbeat] is the interval at which an idle watch is sent `EXTEND`.
-  /// It must be shorter than the [TalkOptions.replyTimeout] of every channel
-  /// passed to [serve] (10 s by default), otherwise the responder timeout of
-  /// the channel aborts the watch with `DEADLINE_EXCEEDED`; it must also be
-  /// shorter than the watcher's request timeout. The wiki requires `EXTEND`
-  /// at least every 5 s on an idle watch. A timer never fires early but
-  /// often fires late (event loop latency, load), so a 5 s heartbeat would
-  /// regularly overshoot that bound; the default of 4 s leaves a second of
-  /// margin.
+  /// [heldExtendInterval] is the interval at which the requests the service
+  /// holds are sent `EXTEND`: a `REGISTER` waiting for the end of
+  /// [assignmentHold], a `MIGRATE`, and the slot requests waiting on an
+  /// `ASSIGN`, a migration or the hold. These are bounded operations;
+  /// subscriptions need nothing of the kind. It must be shorter than the
+  /// [TalkOptions.replyTimeout] of every channel passed to [serve] (10 s by
+  /// default), otherwise the responder timeout of the channel aborts a held
+  /// request with `DEADLINE_EXCEEDED`, and shorter than the requesters'
+  /// timeout (15 s by default). A timer never fires early but often fires
+  /// late (event loop latency, load); the default of 4 s leaves margin.
   ///
   /// [assignmentHold] is how long, counted from construction, a `REGISTER`
   /// that asks for any id (instance 0) waits before it is answered. After a
@@ -99,7 +112,8 @@ class NamingService {
   /// can take one (which would move the surviving service to a new id, see
   /// `NamingClient.register`). Requests for a specific id, [registerLocal]
   /// and everything else are served at once. Held requests are kept alive
-  /// with `EXTEND` every [heartbeat]. [Duration.zero] disables the hold.
+  /// with `EXTEND` every [heldExtendInterval]. [Duration.zero] disables the
+  /// hold.
   ///
   /// [holderGrace] is how long a free slot of a holder-only managed space
   /// waits for its holder to come back after the holder went down; then the
@@ -144,13 +158,13 @@ class NamingService {
   /// Slots with a known holder still go back to it, and `LOCATE` still
   /// assigns. [Duration.zero] disables it.
   ///
-  /// Throws [ArgumentError] if [heartbeat] or [assignBackoff] is not
-  /// positive, if [assignBackoffMax] is shorter than [assignBackoff], if
+  /// Throws [ArgumentError] if [heldExtendInterval] or [assignBackoff] is
+  /// not positive, if [assignBackoffMax] is shorter than [assignBackoff], if
   /// [assignmentHold], [holderGrace], [handoverTimeout],
   /// [handoverMaxDuration] or [holdingSettle] is negative, or if
   /// [maxSlotCount] is not positive.
   NamingService({
-    this.heartbeat = const Duration(seconds: 4),
+    this.heldExtendInterval = const Duration(seconds: 4),
     this.assignmentHold = const Duration(seconds: 2),
     this.holderGrace = const Duration(minutes: 5),
     this.handoverTimeout = const Duration(seconds: 60),
@@ -160,8 +174,12 @@ class NamingService {
     this.holdingSettle = const Duration(seconds: 1),
     this.handoverMaxDuration = const Duration(minutes: 10),
   }) {
-    if (heartbeat <= Duration.zero) {
-      throw ArgumentError.value(heartbeat, 'heartbeat', 'must be positive');
+    if (heldExtendInterval <= Duration.zero) {
+      throw ArgumentError.value(
+        heldExtendInterval,
+        'heldExtendInterval',
+        'must be positive',
+      );
     }
     if (assignBackoff <= Duration.zero) {
       throw ArgumentError.value(
@@ -196,8 +214,13 @@ class NamingService {
     }
   }
 
-  /// Interval at which an idle watch is sent `EXTEND`.
-  final Duration heartbeat;
+  /// Largest number of subscriptions (distinct type filters) one channel
+  /// may hold; a `WATCH` that would open one more is answered
+  /// `ABORT RESOURCE_EXHAUSTED`.
+  static const int maxWatchesPerChannel = 1024;
+
+  /// Interval at which held requests are sent `EXTEND`.
+  final Duration heldExtendInterval;
 
   /// How long after construction `REGISTER` requests for any id are held,
   /// and slot assignment waits for claims.
@@ -232,7 +255,9 @@ class NamingService {
   final Map<ServiceAddress, ServiceRecord> _table = {};
   final Map<int, _Registration> _instances = {};
   final Set<_Session> _sessions = {};
-  final Set<_Watch> _watches = {};
+
+  /// Sessions with at least one subscription.
+  final Set<_Session> _watching = {};
   final StreamController<ServiceEvent> _events =
       StreamController<ServiceEvent>.broadcast();
   int _nextInstance = 1;
@@ -243,7 +268,7 @@ class NamingService {
   Timer? _holdTimer;
 
   /// Extends the held requests while there are any.
-  Timer? _heldHeartbeat;
+  Timer? _heldExtend;
   final List<_Held> _held = [];
 
   /// Read-only live view of the table: every registered record by address.
@@ -255,8 +280,15 @@ class NamingService {
   /// stream; it ends when the service is closed.
   Stream<ServiceEvent> get events => _events.stream;
 
-  /// Number of outstanding `WATCH` requests over all channels.
-  int get watchCount => _watches.length;
+  /// Number of subscriptions over all channels: one per channel and type
+  /// filter, however many `WATCH`es hold it.
+  int get watchCount {
+    var count = 0;
+    for (final session in _watching) {
+      count += session.watches.length;
+    }
+    return count;
+  }
 
   /// Read-only live view of the slot tables, by type. A redefinition of a
   /// space replaces its [SlotTable].
@@ -267,7 +299,7 @@ class NamingService {
   /// The slot table of [type], or null if it has no slot space.
   SlotTable? slotTable(Name type) => _slots.views[type];
 
-  /// Every `SLOT` item the service publishes, in order. Broadcast stream;
+  /// Every `SLOT` event the service publishes, in order. Broadcast stream;
   /// it ends when the service is closed.
   Stream<SlotItem> get slotEvents => _slots.events.stream;
 
@@ -304,8 +336,8 @@ class NamingService {
   ///
   /// Channels addressed to `_ns` with any instance (0), as
   /// `namingClientFor` opens them, reach it too: it is the first registered
-  /// instance of the type. Mind the [heartbeat] constraint on the node's
-  /// [TalkOptions.replyTimeout].
+  /// instance of the type. Mind the [heldExtendInterval] constraint on the
+  /// node's [TalkOptions.replyTimeout].
   ChannelHandler get handler => _handle;
 
   void _handle(IncomingChannel incoming) => serve(incoming.talk());
@@ -316,7 +348,7 @@ class NamingService {
   /// Takes over [TalkChannel.messages], so each channel can be served only
   /// once: throws [StateError] if its messages are already listened to, in
   /// which case the service keeps nothing of it. The channel keeps its own
-  /// options; see [heartbeat] for the constraint on
+  /// options; see [heldExtendInterval] for the constraint on
   /// [TalkOptions.replyTimeout]. After [close] the channel is closed
   /// immediately with [StatusCode.goingAway].
   void serve(TalkChannel channel) {
@@ -327,10 +359,11 @@ class NamingService {
       return;
     }
     final replyTimeout = channel.options.replyTimeout;
-    if (replyTimeout > Duration.zero && heartbeat >= replyTimeout) {
+    if (replyTimeout > Duration.zero && heldExtendInterval >= replyTimeout) {
       _log.warning(
-        'heartbeat $heartbeat is not shorter than the channel reply timeout '
-        '$replyTimeout; watches on this channel will be aborted',
+        'heldExtendInterval $heldExtendInterval is not shorter than the '
+        'channel reply timeout $replyTimeout; held requests on this channel '
+        'will be aborted',
       );
     }
     final session = _Session(channel);
@@ -402,11 +435,12 @@ class NamingService {
     _remove(registration);
   }
 
-  /// Aborts every watch and every held `REGISTER` with
+  /// Ends every subscription, aborts every held `REGISTER` with
   /// [StatusCode.goingAway], removes the records of every channel
-  /// (publishing `DOWN`), closes the channels with [StatusCode.goingAway],
-  /// and ends [events]. Records made with [registerLocal] stay in [table].
-  /// No timer is left running. Calling it again returns the same future.
+  /// (publishing `DOWN` on [events], not to the channels), closes the
+  /// channels with [StatusCode.goingAway], and ends [events]. Records made
+  /// with [registerLocal] stay in [table]. No timer is left running.
+  /// Calling it again returns the same future.
   Future<void> close() => _closeFuture ??= _close();
 
   Future<void> _close() async {
@@ -415,8 +449,8 @@ class NamingService {
     _slots.close();
     _holdTimer?.cancel();
     _holdTimer = null;
-    _heldHeartbeat?.cancel();
-    _heldHeartbeat = null;
+    _heldExtend?.cancel();
+    _heldExtend = null;
     final held = List.of(_held);
     _held.clear();
     for (final h in held) {
@@ -424,10 +458,9 @@ class NamingService {
         _abort(h.message, goingAway);
       }
     }
-    for (final watch in _watches.toList()) {
-      watch.end(goingAway);
+    for (final session in _watching.toList()) {
+      _endWatches(session);
     }
-    _watches.clear();
     final sessions = _sessions.toList();
     for (final session in sessions) {
       _drop(session);
@@ -457,6 +490,8 @@ class NamingService {
       _onUnregister(session, message);
     } else if (procedure == Procedures.watch) {
       _onWatch(session, message);
+    } else if (procedure == Procedures.unwatch) {
+      _onUnwatch(session, message);
     } else if (procedure == Procedures.lookup) {
       _onLookup(message);
     } else if (procedure == Procedures.slots) {
@@ -547,57 +582,103 @@ class NamingService {
     _reply(message, Uint8List(0));
   }
 
-  void _onWatch(_Session session, TalkMessage message) {
-    if (!message.expectsStream) {
+  /// The payload of a `WATCH` or `UNWATCH`, or null once [message] is
+  /// answered `INVALID_ARGUMENT` (malformed, or sent as a stream request).
+  static WatchRequest? _subscriptionRequest(TalkMessage message) {
+    if (message.expectsStream) {
       _abort(
         message,
-        Status.of(StatusCode.invalidArgument, 'WATCH is a stream request'),
+        Status.of(
+          StatusCode.invalidArgument,
+          '${message.procedureName} is not a stream request',
+        ),
+      );
+      return null;
+    }
+    try {
+      return WatchRequest.decode(message.payload);
+    } on ProtocolException catch (e) {
+      _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
+      return null;
+    }
+  }
+
+  void _onWatch(_Session session, TalkMessage message) {
+    final request = _subscriptionRequest(message);
+    if (request == null) {
+      return;
+    }
+    final type = request.type;
+    final count = session.watches[type];
+    if (count == null && session.watches.length >= maxWatchesPerChannel) {
+      _abort(
+        message,
+        Status.of(
+          StatusCode.resourceExhausted,
+          'more than $maxWatchesPerChannel subscriptions on one channel',
+        ),
       );
       return;
     }
-    final WatchRequest request;
-    try {
-      request = WatchRequest.decode(message.payload);
-    } on ProtocolException catch (e) {
-      _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
-      return;
-    }
-    final watch = _Watch(this, session, message, request.type);
-    // Snapshot, SYNCED and registration happen in one synchronous step, so
-    // no change can fall between the snapshot and the live items.
+    bool matches(Name recordType) => type == null || type == recordType;
+    // Snapshot, reply and subscription happen in one synchronous step: a
+    // change is either in the snapshot or sent after the reply.
     for (final record in _table.values) {
-      if (watch.matches(record.address.type) &&
-          !watch.send(Procedures.up, record.encode())) {
+      if (matches(record.address.type) &&
+          !session.send(Procedures.up, record.encode())) {
         return;
       }
     }
-    for (final (procedure, payload) in _slots.snapshot(watch.matches)) {
-      if (!watch.send(procedure, payload)) {
+    for (final (procedure, payload) in _slots.snapshot(matches)) {
+      if (!session.send(procedure, payload)) {
         return;
       }
     }
-    if (!watch.send(Procedures.synced, Uint8List(0))) {
+    try {
+      message.reply(Uint8List(0));
+    } on SwitchboardException catch (e) {
+      _log.fine('WATCH reply failed: $e');
       return;
     }
-    _watches.add(watch);
-    session.watches.add(watch);
-    _log.fine('watch ${request.type ?? '*'} started');
-    unawaited(message.onCancel.then((_) => _onWatchCancelled(watch)));
+    session.watches[type] = (count ?? 0) + 1;
+    _watching.add(session);
+    _log.fine('watch ${type ?? '*'}: ${count ?? 0} -> ${(count ?? 0) + 1}');
   }
 
-  void _onWatchCancelled(_Watch watch) {
-    if (!_watches.remove(watch)) {
+  void _onUnwatch(_Session session, TalkMessage message) {
+    final request = _subscriptionRequest(message);
+    if (request == null) {
       return;
     }
-    watch.session.watches.remove(watch);
-    _log.fine('watch ${watch.type ?? '*'} cancelled');
-    watch.end(Status.of(StatusCode.cancelled, 'watch cancelled'));
+    final type = request.type;
+    final count = session.watches[type];
+    if (count == null) {
+      _abort(
+        message,
+        Status.of(
+          StatusCode.notFound,
+          'no subscription to ${type ?? 'every type'} on this channel',
+        ),
+      );
+      return;
+    }
+    // Ended before the reply: no event for it follows the reply.
+    if (count > 1) {
+      session.watches[type] = count - 1;
+    } else {
+      session.watches.remove(type);
+      if (session.watches.isEmpty) {
+        _watching.remove(session);
+      }
+    }
+    _log.fine('watch ${type ?? '*'}: $count -> ${count - 1}');
+    _reply(message, Uint8List(0));
   }
 
-  /// Called by a watch whose channel refused an item.
-  void _onWatchFailed(_Watch watch) {
-    _watches.remove(watch);
-    watch.session.watches.remove(watch);
+  /// Ends every subscription of [session].
+  void _endWatches(_Session session) {
+    session.watches.clear();
+    _watching.remove(session);
   }
 
   void _onLookup(TalkMessage message) {
@@ -658,7 +739,7 @@ class NamingService {
         }
       }),
     );
-    _heldHeartbeat ??= Timer.periodic(heartbeat, (_) {
+    _heldExtend ??= Timer.periodic(heldExtendInterval, (_) {
       for (final h in _held) {
         if (h.message.canReply) {
           try {
@@ -674,8 +755,8 @@ class NamingService {
   /// Answers the held requests, in arrival order.
   void _endHold() {
     _holdTimer = null;
-    _heldHeartbeat?.cancel();
-    _heldHeartbeat = null;
+    _heldExtend?.cancel();
+    _heldExtend = null;
     final held = List.of(_held);
     _held.clear();
     if (held.isNotEmpty) {
@@ -820,29 +901,27 @@ class NamingService {
     _slots.onDown(registration);
   }
 
-  /// Sends a watch item about [type] to every watch of it.
+  /// Sends an event about [type] to every channel subscribed to it, once
+  /// per channel. A channel that no longer takes events loses its
+  /// subscriptions (it is closing, and dropped when it has closed).
   void _publishItem(Name type, Name procedure, Uint8List payload) {
-    for (final watch in _watches.toList()) {
-      if (watch.matches(type)) {
-        watch.send(procedure, payload);
+    for (final session in _watching.toList()) {
+      if (session.watchesType(type) && !session.send(procedure, payload)) {
+        _endWatches(session);
       }
     }
   }
 
   void _publish(ServiceEvent event) {
-    final procedure = event.procedure;
-    final payload = event.encode();
-    for (final watch in _watches.toList()) {
-      if (watch.matches(event.record.address.type)) {
-        watch.send(procedure, payload);
-      }
+    if (_watching.isNotEmpty) {
+      _publishItem(event.record.address.type, event.procedure, event.encode());
     }
     if (!_events.isClosed) {
       _events.add(event);
     }
   }
 
-  /// Forgets a channel: stops its watches and removes its records.
+  /// Forgets a channel: ends its subscriptions and removes its records.
   /// Idempotent.
   void _drop(_Session session) {
     if (!_sessions.remove(session)) {
@@ -851,14 +930,10 @@ class NamingService {
     session.active = false;
     _held.removeWhere((h) => identical(h.session, session));
     if (_held.isEmpty) {
-      _heldHeartbeat?.cancel();
-      _heldHeartbeat = null;
+      _heldExtend?.cancel();
+      _heldExtend = null;
     }
-    for (final watch in session.watches) {
-      _watches.remove(watch);
-      watch.stop();
-    }
-    session.watches.clear();
+    _endWatches(session);
     final owned = session.owned.toList();
     if (owned.isNotEmpty) {
       _log.info('naming client channel closed, removing ${owned.length}');
@@ -895,9 +970,27 @@ class _Session {
 
   final TalkChannel channel;
   final Set<_Registration> owned = {};
-  final Set<_Watch> watches = {};
+
+  /// Subscriptions: the number of `WATCH`es holding each type filter (null:
+  /// every type).
+  final Map<Name?, int> watches = {};
   StreamSubscription<TalkMessage>? subscription;
   bool active = true;
+
+  /// Whether a subscription of this channel covers [type].
+  bool watchesType(Name type) =>
+      watches.containsKey(null) || watches.containsKey(type);
+
+  /// Sends one event. Returns false if the channel no longer takes any.
+  bool send(Name procedure, Uint8List payload) {
+    try {
+      channel.send(procedure.toString(), payload, name: procedure);
+      return true;
+    } on SwitchboardException catch (e) {
+      _log.fine('$procedure event not sent: $e');
+      return false;
+    }
+  }
 
   /// Stops listening to the channel.
   void cancel() {
@@ -939,69 +1032,4 @@ class _Registration {
 
   /// Registered on a channel that is still served.
   bool get up => !removed && (owner?.active ?? false);
-}
-
-/// One outstanding `WATCH` request.
-class _Watch {
-  _Watch(this.service, this.session, this.message, this.type);
-
-  final NamingService service;
-  final _Session session;
-  final TalkMessage message;
-
-  /// The watched type, or null for all.
-  final Name? type;
-  Timer? _timer;
-
-  bool matches(Name recordType) => type == null || type == recordType;
-
-  /// Sends one item and restarts the heartbeat. On failure the watch is
-  /// dropped and false is returned.
-  bool send(Name procedure, Uint8List payload) {
-    try {
-      message.replyItem(payload, procedure: procedure.toString());
-    } on SwitchboardException catch (e) {
-      _log.fine('watch item not sent: $e');
-      _fail();
-      return false;
-    }
-    _arm();
-    return true;
-  }
-
-  void _arm() {
-    _timer?.cancel();
-    _timer = Timer(service.heartbeat, _beat);
-  }
-
-  void _beat() {
-    _timer = null;
-    try {
-      message.extend();
-    } on SwitchboardException catch (e) {
-      _log.fine('watch heartbeat not sent: $e');
-      _fail();
-      return;
-    }
-    _arm();
-  }
-
-  void _fail() {
-    stop();
-    service._onWatchFailed(this);
-  }
-
-  /// Stops the heartbeat.
-  void stop() {
-    _timer?.cancel();
-    _timer = null;
-  }
-
-  /// Stops the heartbeat and sends the final abort, if still possible.
-  void end(Status status) {
-    stop();
-    if (message.canReply) {
-      NamingService._abort(message, status);
-    }
-  }
 }

@@ -20,9 +20,12 @@ import 'naming_protocol.dart';
 /// the node gives that endpoint: `credentialFor(namingEndpoint, null)`
 /// when the node has a [Switchboard.credentialFor] hook (a hook that
 /// returns null there sends an empty credential to the naming service),
-/// else the node's [Switchboard.defaultPayload]. [talkOptions] (default: the node's
-/// [Switchboard.talkOptions]) apply to that channel; [reconnectDelay] and
-/// [watchTimeout] are passed to [NamingClient.new].
+/// else the node's [Switchboard.defaultPayload]. [talkOptions] (default:
+/// the node's [Switchboard.talkOptions]) apply to that channel, their
+/// `requestTimeout` bounding the `WATCH` with its snapshot;
+/// [reconnectDelay] is passed to [NamingClient.new]. A naming service that
+/// stops answering is detected by the node's connection to it (the mux
+/// keep-alive of [Switchboard.muxOptions]), which ends the channel.
 ///
 /// Nothing happens until [NamingClient.start]. Close the client before
 /// closing [switchboard]: once the node is closed every reconnect attempt
@@ -31,7 +34,6 @@ NamingClient namingClientFor(
   Switchboard switchboard,
   Uri namingEndpoint, {
   Duration reconnectDelay = const Duration(seconds: 1),
-  Duration? watchTimeout,
   TalkOptions? talkOptions,
 }) => NamingClient(
   () => switchboard.openTalkAt(
@@ -40,5 +42,4 @@ NamingClient namingClientFor(
     options: talkOptions,
   ),
   reconnectDelay: reconnectDelay,
-  watchTimeout: watchTimeout,
 );

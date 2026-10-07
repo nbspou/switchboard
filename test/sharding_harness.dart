@@ -1,5 +1,5 @@
 // Shared helpers for the sharding tests: scripted instances speaking the
-// slot procedures over raw Talk channels, and a watch of slot items.
+// slot procedures over raw Talk channels, and watches of slot events.
 
 import 'dart:async';
 import 'dart:typed_data';
@@ -39,34 +39,23 @@ String describeSlot(SlotItem item) =>
     'SLOT ${item.type}/${item.slot} '
     '${item.entry}';
 
-/// A raw `WATCH` (or `LOOKUP`) whose items are read one by one as strings.
-class ItemWatch {
-  ItemWatch(
-    TalkChannel channel, {
-    String procedure = 'WATCH',
-    Uint8List? payload,
-  }) : stream = channel.streamRequest(procedure, payload ?? Uint8List(0)) {
+/// A [Watcher] that also reads the slot events (`SLOTSPC`, `SLOT`).
+class ItemWatch extends Watcher {
+  ItemWatch(super.channel, {super.payload, super.start})
+    : super(describer: describeItem);
+}
+
+/// A raw `LOOKUP` whose items are read one by one as strings.
+class Lookup {
+  Lookup(TalkChannel channel, Uint8List payload)
+    : stream = channel.streamRequest('LOOKUP', payload) {
     _queue = StreamQueue(stream.items.map(describeItem));
   }
 
   final TalkStream stream;
   late final StreamQueue<String> _queue;
 
-  Future<String> get next => _queue.next.timeout(timeout);
-
   Future<List<String>> take(int count) => _queue.take(count).timeout(timeout);
-
-  /// Items up to and including the first that satisfies [test].
-  Future<List<String>> until(bool Function(String) test) async {
-    final out = <String>[];
-    while (true) {
-      final item = await next;
-      out.add(item);
-      if (test(item)) {
-        return out;
-      }
-    }
-  }
 }
 
 /// A sharded instance scripted over a raw Talk channel: registers with a
@@ -93,6 +82,9 @@ class Instance {
   /// Slots this instance believes it serves, with their epochs.
   final Map<int, int> serving = {};
 
+  /// Receives the one-way messages (subscription events) of [channel].
+  void Function(TalkMessage event)? onEvent;
+
   Future<void> start({SlotSpace? space, int capacity = 1}) async {
     final (client, server) = harness.link();
     channel = client;
@@ -105,6 +97,10 @@ class Instance {
   }
 
   void _serve(TalkMessage m) {
+    if (!m.expectsReply) {
+      onEvent?.call(m);
+      return;
+    }
     if (!m.canReply) {
       return;
     }

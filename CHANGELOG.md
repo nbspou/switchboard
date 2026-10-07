@@ -35,8 +35,9 @@ The protocol specification lives in the project wiki (section
   `(type, instance)` with a default service and a catch-all, dispatch on
   initiated connections too, static, endpoint and naming resolvers, round
   robin and shard slot selection, a default application payload per node.
-- Naming service: `NamingService` (`REGISTER`, `UNREGSTR`, `WATCH`,
-  `LOOKUP`, heartbeat, assignment hold after a restart), `NamingClient`
+- Naming service: `NamingService` (`REGISTER`, `UNREGSTR`, `WATCH` and
+  `UNWATCH` subscriptions, `LOOKUP`, assignment hold after a restart),
+  `NamingClient`
   (re-registration on reconnect, mirrored table served while stale),
   `NamingResolver`, and `MeshNode` to join a node to a mesh.
 - `ReconnectingClient` (core, web-capable) for frontend apps: backoff
@@ -109,6 +110,23 @@ The protocol specification lives in the project wiki (section
   initial records are read are folded into them; resolver errors are
   logged; `watch` warns when no policy applies to its connections or the
   node's default payload would reach every peer.
+- Protocol change, naming service: `WATCH` is a subscription instead of a
+  stream request that never completes and was kept alive by `EXTEND`
+  heartbeats. It is a plain request: the snapshot follows as one-way
+  `UP`, `SLOTSPC` and `SLOT` messages, then the reply, which marks the
+  end of the snapshot (`SYNCED` is gone), then the live `UP`, `DOWN`,
+  `SLOTSPC` and `SLOT` messages, sent once per channel per change.
+  Subscriptions are per channel and type filter, counted per `WATCH`,
+  given back with the new `UNWATCH` request (`NOT_FOUND` without one),
+  and end with the channel; at most
+  `NamingService.maxWatchesPerChannel` (1024) filters per channel.
+  Liveness is the connection's (mux keep-alive). `NamingService`'s
+  `heartbeat` option is replaced by `heldExtendInterval` (the `EXTEND`
+  interval of held requests, 4 s), and `NamingClient`, `namingClientFor`
+  and `MeshNode.join` lose `watchTimeout` (the channel's request timeout
+  bounds `WATCH`). Talk requests take `ordered: true` to have their answer
+  delivered in wire order with `TalkChannel.messages`; the naming client
+  uses it for `WATCH`, `REGISTER` and `UNREGSTR`.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for

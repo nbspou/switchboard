@@ -69,13 +69,17 @@ class _SlotManager {
   void abortCode(TalkMessage message, StatusCode code, String reason) =>
       abort(message, Status.of(code, reason));
 
-  /// Keeps [message] alive with `EXTEND` every heartbeat until answered.
+  /// Keeps [message] alive with `EXTEND` every
+  /// [NamingService.heldExtendInterval] until answered.
   void wait(TalkMessage message) {
     if (!message.canReply || closed) {
       return;
     }
     waiting.add(message);
-    keepAliveTimer ??= Timer.periodic(service.heartbeat, (_) => _tick());
+    keepAliveTimer ??= Timer.periodic(
+      service.heldExtendInterval,
+      (_) => _tick(),
+    );
   }
 
   void unwait(TalkMessage message) {
@@ -173,7 +177,7 @@ class _SlotManager {
   // Table
 
   /// Sets the state of [slot], keeps the allocator's counters, and
-  /// publishes a `SLOT` item if it changed.
+  /// publishes a `SLOT` event if it changed.
   void setEntry(_Space space, int slot, SlotEntry entry) {
     final old = space.entry(slot);
     if (old == entry) {
@@ -214,7 +218,7 @@ class _SlotManager {
     );
   }
 
-  /// `SLOTSPC` and `SLOT` items of the spaces [matches] accepts, for a
+  /// `SLOTSPC` and `SLOT` events of the spaces [matches] accepts, for a
   /// snapshot: each space before its slots, slots in ascending order,
   /// leaving out free slots with holder 0.
   Iterable<(Name, Uint8List)> snapshot(bool Function(Name type) matches) sync* {
@@ -840,7 +844,7 @@ class _SlotManager {
     final migration = _Migration(request.slot, request.to, message);
     space.queue.add(migration);
     // Migrations can take long: the responder timeout is replaced by the
-    // heartbeat, which keeps the requester's timeout from firing.
+    // EXTENDs of wait(), which keep the requester's timeout from firing.
     message.setReplyTimeout(Duration.zero);
     wait(message);
     unawaited(

@@ -45,7 +45,7 @@ abstract interface class Resolver {
 
   /// Completes once the table has been usable at least once; a later loss
   /// of the source does not reset it. Completes immediately for static
-  /// resolvers; for a naming resolver, after the first `SYNCED` (it fails if
+  /// resolvers; for a naming resolver, after the first sync (it fails if
   /// the resolver is closed before that).
   Future<void> get ready;
 

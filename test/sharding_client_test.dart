@@ -30,7 +30,6 @@ void main() {
     final client = NamingClient(
       connect,
       reconnectDelay: reconnectDelay,
-      watchTimeout: clientOptions.requestTimeout,
       slotExtendInterval: ms50,
     );
     clients.add(client);
@@ -528,7 +527,6 @@ void main() {
         final c = NamingClient(
           Connector(h).call,
           reconnectDelay: reconnectDelay,
-          watchTimeout: clientOptions.requestTimeout,
           slotExtendInterval: ms50,
           slotHandlerMaxDuration: const Duration(seconds: 1),
         )..slotHandler = handler;
@@ -612,7 +610,6 @@ void main() {
       final client = NamingClient(
         Connector(h).call,
         reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
         slotExtendInterval: ms50,
       );
       final handler = RecordingHandler('A', log)

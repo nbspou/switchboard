@@ -55,7 +55,7 @@ void main() {
       await a.start();
       await b.start();
       final watch = ItemWatch(h.link().$1);
-      expect(await watch.take(3), ['UP kv/1', 'UP kv/2', 'SYNCED']);
+      expect(await watch.take(3), ['UP kv/1', 'UP kv/2', 'WATCHED']);
       await a.slots(SlotSpace(kv, count: 8), capacity: 0);
       expect(await watch.next, 'SLOTSPC kv 8 managed');
       await b.slots(SlotSpace(kv, count: 8), capacity: 0);
@@ -93,7 +93,7 @@ void main() {
       expect(await watch.take(3), [
         'UP discord/1',
         'SLOTSPC discord 4 static',
-        'SYNCED',
+        'WATCHED',
       ]);
       expect(await a.claim(1), 1);
       expect(await watch.next, 'SLOT discord/1 owned 1 holder 1 epoch 1');
@@ -571,16 +571,23 @@ void main() {
         'SLOTSPC kv 4 static',
         'SLOT kv/1 owned 1 holder 1 epoch 1',
         'SLOT kv/2 free holder 1 epoch 1',
-        'SYNCED',
+        'WATCHED',
       ]);
       await a.claim(0);
       expect(await watch.next, 'SLOT kv/0 owned 1 holder 1 epoch 1');
       await a.release(0);
       expect(await watch.next, 'SLOT kv/0 free holder 0 epoch 1');
       // Other types see none of it.
-      final other = ItemWatch(router, payload: WatchRequest(zone).encode());
-      expect(await other.next, 'SYNCED');
-      final lookup = ItemWatch(router, procedure: 'LOOKUP', payload: kv.bytes);
+      final (other, _) = h.link();
+      final zoneWatch = ItemWatch(other, payload: WatchRequest(zone).encode());
+      expect(await zoneWatch.next, 'WATCHED');
+      await a.claim(3);
+      expect(await watch.next, 'SLOT kv/3 owned 1 holder 1 epoch 2');
+      await zoneWatch.unwatch(payload: WatchRequest(zone).encode());
+      expect(await zoneWatch.next, 'UNWATCHED');
+      await a.release(3);
+      expect(await watch.next, 'SLOT kv/3 free holder 0 epoch 2');
+      final lookup = Lookup(router, kv.bytes);
       expect(await lookup.take(4), [
         'UP kv/1',
         'SLOTSPC kv 4 static',
@@ -609,15 +616,14 @@ void main() {
 
     test('hand-over: DRAIN, ASSIGN, table, FORWARD', () async {
       // The old owner's own watch shows when it learns of the table.
-      final ready = Completer<void>();
-      a.channel.streamRequest('WATCH', Uint8List(0)).items.listen((m) {
-        if (m.procedureName == 'SYNCED') {
-          ready.complete();
-        } else if (ready.isCompleted && m.procedureName == 'SLOT') {
+      var live = false;
+      a.onEvent = (m) {
+        if (live && m.procedureName == 'SLOT') {
           log.add('1 sees ${describeItem(m)}');
         }
-      });
-      await ready.future;
+      };
+      await a.channel.request('WATCH', Uint8List(0), ordered: true);
+      live = true;
       final m = Migration(router.channel, zone, 1, to: 2);
       expect(await m.done, Status.ok);
       expect(m.phases, ['draining', 'assigning', 'forwarding', 'done']);

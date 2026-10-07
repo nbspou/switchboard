@@ -1900,6 +1900,154 @@ void main() {
     });
   });
 
+  group('ordered answers', () {
+    /// A channel whose peer is driven by hand over a synchronous link: a
+    /// burst of frames is decoded in one go, as the mux delivers them.
+    (TalkChannel, StreamSink<Uint8List>) syncLink() {
+      final c = StreamChannelController<Uint8List>(sync: true);
+      c.foreign.stream.listen((_) {});
+      return (TalkChannel(c.local), c.foreign.sink);
+    }
+
+    Uint8List plain(String procedure) =>
+        TalkFrame(kind: TalkKind.message, procedure: Name(procedure)).encode();
+
+    Uint8List answer(int id) =>
+        TalkFrame(kind: TalkKind.message, responseId: id).encode();
+
+    test('the answer comes after the messages sent before it, and code '
+        'waiting on it runs before the messages sent after it', () async {
+      final (talk, peer) = syncLink();
+      final seen = <String>[];
+      talk.messages.listen((m) => seen.add(m.procedureName));
+      Future<void> awaiting() async {
+        await talk.request('Q', Uint8List(0), ordered: true);
+        seen.add('awaited');
+      }
+
+      final ordered = awaiting();
+      final unordered = talk
+          .request('P', Uint8List(0))
+          .then((_) => seen.add('unordered'));
+      for (final frame in [
+        plain('M1'),
+        plain('M2'),
+        plain('M3'),
+        answer(1),
+        plain('M4'),
+        plain('M5'),
+        answer(2),
+      ]) {
+        peer.add(frame);
+      }
+      await Future.wait([ordered, unordered]);
+      await pumpEventQueue();
+      expect(seen.where((s) => s != 'unordered'), [
+        'M1',
+        'M2',
+        'M3',
+        'awaited',
+        'M4',
+        'M5',
+      ]);
+      // Without the option the answer overtakes messages sent before it.
+      expect(seen.indexOf('unordered'), lessThan(seen.indexOf('M5')));
+      expect(talk.outgoingRequestCount, 0);
+      await talk.close();
+    });
+
+    test('an abort answer is ordered too', () async {
+      final (talk, peer) = syncLink();
+      final seen = <String>[];
+      talk.messages.listen((m) => seen.add(m.procedureName));
+      final failed = talk
+          .request('Q', Uint8List(0), ordered: true)
+          .then<void>(
+            (_) => fail('no abort'),
+            onError: (Object e) =>
+                seen.add('aborted ${(e as SwitchboardException).code}'),
+          );
+      peer
+        ..add(plain('M1'))
+        ..add(plain('M2'))
+        ..add(
+          TalkFrame(
+            kind: TalkKind.abort,
+            responseId: 1,
+            payload: Status.of(StatusCode.notFound).encode(),
+          ).encode(),
+        )
+        ..add(plain('M3'));
+      await failed;
+      await pumpEventQueue();
+      expect(seen, ['M1', 'M2', 'aborted ${StatusCode.notFound}', 'M3']);
+      await talk.close();
+    });
+
+    test('without a listener the answer is delivered at once', () async {
+      final (talk, peer) = syncLink();
+      final response = talk.request('Q', Uint8List(0), ordered: true);
+      peer
+        ..add(plain('M1'))
+        ..add(answer(1));
+      await response;
+      // The message stays buffered for a later listener.
+      expect(
+        (await talk.messages.first.timeout(ms30 * 10)).procedureName,
+        'M1',
+      );
+      await talk.close();
+    });
+
+    test('a paused listener holds the answer; resuming or cancelling '
+        'delivers it', () async {
+      final (talk, peer) = syncLink();
+      final seen = <String>[];
+      final sub = talk.messages.listen((m) => seen.add(m.procedureName));
+      sub.pause();
+      var done = false;
+      final response = talk
+          .request('Q', Uint8List(0), ordered: true)
+          .then((_) => done = true);
+      peer
+        ..add(plain('M1'))
+        ..add(answer(1));
+      await pumpEventQueue();
+      expect(done, isFalse);
+      // Local failures do not wait.
+      final late = talk.request(
+        'T',
+        Uint8List(0),
+        timeout: ms30,
+        ordered: true,
+      );
+      await expectLater(late, throwsStatus(StatusCode.deadlineExceeded));
+      sub.resume();
+      await response;
+      expect(seen, ['M1']);
+
+      // A cancelled subscription releases the answers it held.
+      sub.pause();
+      done = false;
+      final second = talk
+          .request('Q', Uint8List(0), ordered: true)
+          .then((_) => done = true);
+      peer
+        ..add(plain('M2'))
+        ..add(answer(3));
+      await pumpEventQueue();
+      expect(done, isFalse);
+      await sub.cancel();
+      await second;
+      expect(seen, ['M1']);
+      // Answers arriving afterwards are delivered at once.
+      final third = talk.request('Q', Uint8List(0), ordered: true);
+      peer.add(answer(4));
+      await third;
+      await talk.close();
+    });
+  });
+
   group('subscriptions', () {
     test('leaving await for early cancels the stream request', () async {
       final p = Pair();

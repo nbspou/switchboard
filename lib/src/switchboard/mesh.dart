@@ -51,8 +51,8 @@ class MeshNode {
 
   /// Joins the mesh whose naming service listens at [namingEndpoint].
   ///
-  /// Creates the client with [namingClientFor] (passing [reconnectDelay],
-  /// [watchTimeout] and [talkOptions]), sets `switchboard.resolver` to a
+  /// Creates the client with [namingClientFor] (passing [reconnectDelay]
+  /// and [talkOptions]), sets `switchboard.resolver` to a
   /// [NamingResolver] with [resolveTimeout], replacing any resolver the
   /// node had, and starts the client. Returns at once; the client keeps
   /// connecting in the background until [leave], and [synced] completes
@@ -63,7 +63,6 @@ class MeshNode {
     Switchboard switchboard,
     Uri namingEndpoint, {
     Duration reconnectDelay = const Duration(seconds: 1),
-    Duration? watchTimeout,
     Duration resolveTimeout = const Duration(seconds: 5),
     TalkOptions? talkOptions,
     Duration leaveTimeout = const Duration(seconds: 5),
@@ -72,7 +71,6 @@ class MeshNode {
       switchboard,
       namingEndpoint,
       reconnectDelay: reconnectDelay,
-      watchTimeout: watchTimeout,
       talkOptions: talkOptions,
     );
     final resolver = NamingResolver(client, resolveTimeout: resolveTimeout);

@@ -723,7 +723,7 @@ class _ClientSlots {
   void onSlotItem(_Session session, SlotItem item) {
     final mirror = mirrors[item.type];
     if (mirror == null || item.slot >= mirror.space.count) {
-      _log.warning('SLOT item outside any known space: $item');
+      _log.warning('SLOT event outside any known space: $item');
       return;
     }
     if (session.syncing) {
@@ -732,7 +732,8 @@ class _ClientSlots {
     _set(mirror, item.slot, item.entry);
   }
 
-  /// After `SYNCED`: spaces and slots missing from the snapshot are gone.
+  /// On the `WATCH` reply: spaces and slots missing from the snapshot are
+  /// gone.
   void onSynced(_Session session) {
     for (final type in mirrors.keys.toList()) {
       final mirror = mirrors[type]!;

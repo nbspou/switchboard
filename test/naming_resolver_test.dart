@@ -21,11 +21,7 @@ void main() {
   setUp(() {
     h = Harness();
     connector = Connector(h);
-    client = NamingClient(
-      connector.call,
-      reconnectDelay: reconnectDelay,
-      watchTimeout: clientOptions.requestTimeout,
-    );
+    client = NamingClient(connector.call, reconnectDelay: reconnectDelay);
     resolver = NamingResolver(client, resolveTimeout: ms50);
   });
 
@@ -135,7 +131,7 @@ void main() {
     connector.down = true;
     await connector.servers.last.close();
     await until(() => !client.isSynced);
-    // The stale table is served; ready does not wait for the next SYNCED.
+    // The stale table is served; ready does not wait for the next sync.
     await resolver.ready.timeout(ms10 * 4);
   });
 

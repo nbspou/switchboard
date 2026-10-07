@@ -51,6 +51,20 @@ void main() {
     expect(WatchRequest.decode(Uint8List(8)).type, isNull);
   });
 
+  // UNWATCH carries the payload of the WATCH it gives back.
+  test('UNWATCH all (empty payload)', () {
+    final r = WatchRequest.decode(Uint8List(0));
+    expect(r.type, isNull);
+    expect(r.encode(), isEmpty);
+  });
+
+  test('UNWATCH type npc', () {
+    final bytes = hexBytes('6E 70 63 00 00 00 00 00');
+    final r = WatchRequest.decode(bytes);
+    expect(r.type, Name('npc'));
+    expect(r.encode(), bytes);
+  });
+
   test('UP npc instance 5, no endpoints', () {
     final bytes = hexBytes(
       '6E 70 63 00 00 00 00 00 05 00 00 00 00 00 00 00 00',
@@ -91,10 +105,11 @@ void main() {
     expect(e.encode(), bytes);
   });
 
-  test('SYNCED is empty and procedure names are as specified', () {
-    expect(Procedures.synced.toString(), 'SYNCED');
+  test('procedure names are as specified', () {
     expect(Procedures.register.bytes, hexBytes('52 45 47 49 53 54 45 52'));
     expect(Procedures.unregister.toString(), 'UNREGSTR');
+    expect(Procedures.watch.toString(), 'WATCH');
+    expect(Procedures.unwatch.bytes, hexBytes('55 4E 57 41 54 43 48 00'));
     expect(Services.naming.bytes, hexBytes('5F 6E 73 00 00 00 00 00'));
   });
 }

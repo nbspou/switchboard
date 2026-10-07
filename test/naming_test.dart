@@ -3,7 +3,6 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:async/async.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/address/service_address.dart';
@@ -16,7 +15,6 @@ import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/talk/talk_channel.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:switchboard/src/talk/talk_message.dart';
-import 'package:switchboard/src/talk/talk_stream.dart';
 import 'package:test/test.dart';
 
 import 'naming_harness.dart';
@@ -91,7 +89,7 @@ void main() {
     test('re-registering with different metadata publishes UP', () async {
       final (a, _) = h.link();
       final watcher = Watcher(a);
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       expect(
         await register(a, 'gpu', endpoints: [uriA], metadata: text('m1')),
         1,
@@ -169,7 +167,7 @@ void main() {
     test('a REGISTER without the metadata field has empty metadata', () async {
       final (c, _) = h.link();
       final watcher = Watcher(c);
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       final old = ByteWriter()
         ..name(Name('npc'))
         ..u48(0)
@@ -185,7 +183,7 @@ void main() {
       final (registrar, _) = h.link();
       final (consumer, _) = h.link();
       final watcher = Watcher(consumer, type: 'gpu');
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       // Three workers that never talk to the naming service, each at its
       // own endpoint with its own capabilities, under ids the registrar
       // chose.
@@ -215,7 +213,7 @@ void main() {
       expect(await late.take(4), [
         for (final MapEntry(key: id, value: (uri, meta)) in workers.entries)
           'UP gpu/${id.toRadixString(16)} $uri meta $meta',
-        'SYNCED',
+        'WATCHED',
       ]);
       // Retiring one worker.
       await unregister(registrar, 'gpu', 0x102);
@@ -240,15 +238,31 @@ void main() {
         c.request('UNREGSTR', Uint8List(3)),
         throwsStatus(StatusCode.invalidArgument),
       );
-      // A name with a byte after its terminating zero.
+      // A name with a byte after its terminating zero, a short name.
+      for (final procedure in ['WATCH', 'UNWATCH']) {
+        for (final payload in [
+          bytes([0x61, 0, 0x62, 0, 0, 0, 0, 0]),
+          bytes([0x61]),
+        ]) {
+          await expectLater(
+            c.request(procedure, payload),
+            throwsStatus(StatusCode.invalidArgument),
+            reason: '$procedure $payload',
+          );
+        }
+        // Not stream requests.
+        await expectLater(
+          c.streamRequest(procedure, Uint8List(0)).done,
+          throwsStatus(StatusCode.invalidArgument),
+          reason: procedure,
+        );
+      }
+      // Nothing to give back.
       await expectLater(
-        c.streamRequest('WATCH', bytes([0x61, 0, 0x62, 0, 0, 0, 0, 0])).done,
-        throwsStatus(StatusCode.invalidArgument),
+        c.request('UNWATCH', Uint8List(0)),
+        throwsStatus(StatusCode.notFound),
       );
-      await expectLater(
-        c.request('WATCH', Uint8List(0)),
-        throwsStatus(StatusCode.invalidArgument),
-      );
+      expect(h.service.watchCount, 0);
       await expectLater(
         c.request('LOOKUP', Name('npc').bytes),
         throwsStatus(StatusCode.invalidArgument),
@@ -287,7 +301,7 @@ void main() {
       final (a, _) = h.link();
       final (b, _) = h.link();
       final watcher = Watcher(b);
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       final id = await register(a, 'npc');
       expect(await watcher.next, 'UP npc/1');
       await expectLater(
@@ -312,13 +326,13 @@ void main() {
       );
     });
 
-    test('watch: snapshot, SYNCED, then live UP and DOWN', () async {
+    test('watch: snapshot events, the reply, then live UP and DOWN', () async {
       final (a, _) = h.link();
       final (b, _) = h.link();
       await register(a, 'npc', endpoints: [uriA]);
       await register(a, 'api');
       final watcher = Watcher(b);
-      expect(await watcher.take(3), ['UP npc/1 $uriA', 'UP api/2', 'SYNCED']);
+      expect(await watcher.take(3), ['UP npc/1 $uriA', 'UP api/2', 'WATCHED']);
       final id = await register(a, 'npc', endpoints: [uriB]);
       expect(await watcher.next, 'UP npc/3 $uriB');
       await register(a, 'npc', instance: id, endpoints: [uriA]);
@@ -329,18 +343,31 @@ void main() {
     });
 
     test(
-      'a watch on the registering channel sees UP before the reply',
+      'a watch on the registering channel has the UP before the reply',
       () async {
-        final (a, _) = h.link();
+        final (a, _) = h.link(sync: true);
         final watcher = Watcher(a);
-        expect(await watcher.next, 'SYNCED');
-        final seen = <String>[];
-        final registered = register(a, 'npc').then((_) => seen.add('reply'));
-        seen.add(await watcher.next);
-        await registered;
-        expect(seen, ['UP npc/1', 'reply']);
+        expect(await watcher.next, 'WATCHED');
+        final id = await register(a, 'npc');
+        // Sent before the reply, and the reply is read in order.
+        expect(watcher.log, ['WATCHED', 'UP npc/$id']);
       },
     );
+
+    test('the reply follows the whole snapshot, even when it arrives in '
+        'one burst', () async {
+      final (a, _) = h.link();
+      for (var i = 0; i < 20; i++) {
+        await register(a, 'npc');
+      }
+      final watcher = Watcher(h.link(sync: true).$1);
+      expect(await watcher.take(21), [
+        for (var id = 1; id <= 20; id++) 'UP npc/${id.toRadixString(16)}',
+        'WATCHED',
+      ]);
+      await register(a, 'api');
+      expect(await watcher.next, 'UP api/15');
+    });
 
     test('watch filtered by type', () async {
       final (a, _) = h.link();
@@ -348,16 +375,85 @@ void main() {
       await register(a, 'npc');
       await register(a, 'api');
       final watcher = Watcher(b, type: 'api');
-      expect(await watcher.take(2), ['UP api/2', 'SYNCED']);
+      expect(await watcher.take(2), ['UP api/2', 'WATCHED']);
       await register(a, 'npc');
       await register(a, 'api');
       await unregister(a, 'npc', 1);
       await unregister(a, 'api', 2);
       expect(await watcher.take(2), ['UP api/4', 'DOWN api/2']);
-      // An all-zero name watches everything.
-      final all = Watcher(b, payload: Uint8List(8));
-      expect(await all.take(3), ['UP npc/3', 'UP api/4', 'SYNCED']);
+      // An all-zero name watches everything: a second subscription on the
+      // same channel, with its own snapshot.
+      await watcher.watch(payload: Uint8List(8));
+      expect(await watcher.take(3), ['UP npc/3', 'UP api/4', 'WATCHED']);
+      expect(h.service.watchCount, 2);
     });
+
+    test('subscriptions of one channel: each change is sent once', () async {
+      final (a, _) = h.link();
+      final (b, _) = h.link();
+      final watcher = Watcher(b, type: 'npc');
+      await watcher.watch(type: 'api');
+      await watcher.watch();
+      expect(await watcher.take(3), ['WATCHED', 'WATCHED', 'WATCHED']);
+      expect(h.service.watchCount, 3);
+      await register(a, 'npc');
+      await register(a, 'api');
+      await register(a, 'gpu');
+      await unregister(a, 'npc', 1);
+      await watcher.unwatch();
+      // Once each, though npc and api match two subscriptions.
+      expect(await watcher.take(5), [
+        'UP npc/1',
+        'UP api/2',
+        'UP gpu/3',
+        'DOWN npc/1',
+        'UNWATCHED',
+      ]);
+      expect(h.service.watchCount, 2);
+      // Without the subscription to every type, gpu is not covered.
+      await register(a, 'gpu');
+      await register(a, 'api');
+      await watcher.unwatch(type: 'api');
+      await register(a, 'api');
+      await register(a, 'npc');
+      await watcher.unwatch(type: 'npc');
+      expect(await watcher.take(4), [
+        'UP api/5',
+        'UNWATCHED',
+        'UP npc/7',
+        'UNWATCHED',
+      ]);
+      expect(h.service.watchCount, 0);
+      // Closing the channel ends every subscription it holds.
+      await watcher.watch(type: 'npc');
+      await watcher.watch(type: 'api');
+      expect(h.service.watchCount, 2);
+      await b.close();
+      await until(() => h.service.watchCount == 0);
+      expect(h.service.channelCount, 1);
+    });
+
+    test(
+      'a channel holds at most maxWatchesPerChannel subscriptions',
+      () async {
+        final (a, _) = h.link();
+        const max = NamingService.maxWatchesPerChannel;
+        await Future.wait([
+          for (var i = 0; i < max; i++)
+            a.request('WATCH', WatchRequest(Name('t$i')).encode()),
+        ]);
+        expect(h.service.watchCount, max);
+        await expectLater(
+          a.request('WATCH', Uint8List(0)),
+          throwsStatus(StatusCode.resourceExhausted),
+        );
+        // One it holds can be taken again; once given back, another fits.
+        await a.request('WATCH', WatchRequest(Name('t0')).encode());
+        await a.request('UNWATCH', WatchRequest(Name('t1')).encode());
+        await a.request('WATCH', Uint8List(0));
+        expect(h.service.watchCount, max);
+      },
+    );
 
     test('LOOKUP streams the records of a type, then ends', () async {
       final (a, _) = h.link();
@@ -382,17 +478,40 @@ void main() {
       expect(h.service.watchCount, 0);
     });
 
-    test('cancelling a watch ends it with CANCELLED', () async {
-      final (a, server) = h.link();
-      final watcher = Watcher(a);
-      expect(await watcher.next, 'SYNCED');
+    test('WATCH and UNWATCH of one filter are counted', () async {
+      final (a, _) = h.link();
+      final (b, server) = h.link();
+      final watcher = Watcher(b);
+      expect(await watcher.next, 'WATCHED');
       expect(h.service.watchCount, 1);
-      watcher.stream.cancel();
-      await until(() => h.service.watchCount == 0);
-      // The cancelled request id is released by the final CANCELLED.
-      await until(() => a.outgoingRequestCount == 0);
+      await register(a, 'npc');
+      expect(await watcher.next, 'UP npc/1');
+      // The same filter again: a fresh snapshot, one subscription held
+      // twice.
+      await watcher.watch();
+      expect(await watcher.take(2), ['UP npc/1', 'WATCHED']);
+      expect(h.service.watchCount, 1);
+      // Given back once: still subscribed.
+      await watcher.unwatch();
+      expect(await watcher.next, 'UNWATCHED');
+      await register(a, 'npc');
+      expect(await watcher.next, 'UP npc/2');
+      expect(h.service.watchCount, 1);
+      // Given back again: nothing after the reply.
+      await watcher.unwatch();
+      expect(await watcher.next, 'UNWATCHED');
+      expect(h.service.watchCount, 0);
+      await register(a, 'npc');
+      await unregister(a, 'npc', 1);
+      // A third time: nothing to give back.
+      await expectLater(watcher.unwatch(), throwsStatus(StatusCode.notFound));
+      expect(await watcher.next, 'UNWATCH notFound');
+      // Nothing arrived meanwhile: next is the snapshot of a new WATCH.
+      await watcher.watch();
+      expect(await watcher.take(3), ['UP npc/2', 'UP npc/3', 'WATCHED']);
+      // Nothing is left outstanding on either side.
+      expect(b.outgoingRequestCount, 0);
       expect(server.incomingRequestCount, 0);
-      expect(await register(a, 'npc'), 1);
     });
 
     test('channel close removes its records; watchers see DOWN', () async {
@@ -408,7 +527,7 @@ void main() {
         'UP npc/1',
         'UP api/2',
         'UP npc/3',
-        'SYNCED',
+        'WATCHED',
       ]);
       expect(await watcherA.take(4), hasLength(4));
       expect(h.service.watchCount, 2);
@@ -426,7 +545,7 @@ void main() {
     test('local registrations', () async {
       final (a, _) = h.link();
       final watcher = Watcher(a);
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       expect(h.service.registerLocal(Services.naming, [uriA], instance: 1), 1);
       expect(await watcher.next, 'UP _ns/1 $uriA');
       expect(await register(a, 'npc'), 2);
@@ -454,7 +573,7 @@ void main() {
     test('refuses endpoints a watcher could not decode', () async {
       final (c, _) = h.link();
       final watcher = Watcher(c);
-      expect(await watcher.next, 'SYNCED');
+      expect(await watcher.next, 'WATCHED');
       for (final text in [
         './>:x', // `%3E:x` once normalized: no scheme, does not parse
         '//10.0.0.5:9101/ws', // no scheme
@@ -487,7 +606,6 @@ void main() {
       final client = NamingClient(
         Connector(h).call,
         reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
       );
       await client.start();
       await client.synced.timeout(timeout);
@@ -543,143 +661,139 @@ void main() {
     });
 
     test('REGISTER racing a WATCH snapshot: exactly one UP', () async {
-      // The snapshot, SYNCED and the watch's registration happen in one
-      // step, so a registration lands either in the snapshot or after it.
+      // The snapshot, the reply and the subscription happen in one step,
+      // so a registration lands either in the snapshot or after the reply.
       for (var round = 0; round < 50; round++) {
         final h = Harness();
         final (a, _) = h.link();
-        final (b, _) = h.link();
+        final (b, _) = h.link(sync: round.isEven);
         final ups = <String>[];
-        var synced = false;
-        final registered = register(a, 'npc');
-        final watch = b.streamRequest('WATCH', Uint8List(0));
-        final items = watch.items.listen((m) {
-          if (m.procedureName == 'SYNCED') {
-            synced = true;
-          } else if (m.procedureName == 'UP') {
-            ups.add(synced ? 'live' : 'snapshot');
+        var replied = false;
+        b.messages.listen((m) {
+          if (m.procedureName == 'UP') {
+            ups.add(replied ? 'live' : 'snapshot');
           }
         });
-        if (round.isOdd) {
+        final registered = register(a, 'npc');
+        final watched = b
+            .request('WATCH', Uint8List(0), ordered: true)
+            .then((_) => replied = true);
+        if (round % 4 >= 2) {
           await pump();
         }
         await registered;
-        await until(() => synced && ups.isNotEmpty);
+        await watched;
+        await until(() => ups.isNotEmpty);
         await pump();
         expect(ups, hasLength(1), reason: 'round $round');
-        await items.cancel();
         await h.close();
       }
     });
 
-    test('close aborts watches with GOING_AWAY and closes channels', () async {
-      final (a, _) = h.link();
-      await register(a, 'npc');
-      final watcher = Watcher(a);
-      expect(await watcher.take(2), ['UP npc/1', 'SYNCED']);
-      final eventsDone = h.service.events.toList();
-      await h.service.close();
-      await expectLater(
-        watcher.stream.done,
-        throwsStatus(StatusCode.goingAway),
-      );
-      await a.done;
-      expect(a.isOpen, isFalse);
-      expect((await h.servers[0].done).known, StatusCode.goingAway);
-      expect(h.service.watchCount, 0);
-      expect(h.service.table, isEmpty);
-      expect((await eventsDone).map(describeEvent), ['DOWN npc/1']);
-      // Channels served after close are closed at once.
-      final (b, bServer) = h.link();
-      await b.done;
-      expect(b.isOpen, isFalse);
-      expect((await bServer.done).known, StatusCode.goingAway);
-    });
-  });
-
-  group('heartbeat', () {
-    test('keeps an idle watch alive well past every timeout', () {
-      fakeAsync((async) {
-        final h = Harness();
+    test(
+      'close ends subscriptions and closes channels with GOING_AWAY',
+      () async {
         final (a, _) = h.link();
-        final items = <String>[];
-        Object? error;
-        final watch = a.streamRequest('WATCH', Uint8List(0));
-        watch.items.listen(
-          (m) => items.add(describe(m)),
-          onError: (Object e) => error = e,
-        );
-        // 10 times the watcher's request timeout, 15 times the service's
-        // reply timeout.
-        async.elapse(clientOptions.requestTimeout * 10);
-        expect(error, isNull);
-        expect(items, ['SYNCED']);
-        expect(h.service.watchCount, 1);
-        // Still live.
         final (b, _) = h.link();
-        unawaited(register(b, 'npc'));
-        async.elapse(ms10);
-        expect(items, ['SYNCED', 'UP npc/1']);
-        async.elapse(clientOptions.requestTimeout * 10);
-        expect(error, isNull);
-        watch.cancel();
-        async.elapse(ms10);
+        await register(a, 'npc');
+        final watcher = Watcher(b);
+        expect(await watcher.take(2), ['UP npc/1', 'WATCHED']);
+        final eventsDone = h.service.events.toList();
+        await h.service.close();
+        await a.done;
+        await b.done;
+        expect(a.isOpen, isFalse);
+        expect((await h.servers[0].done).known, StatusCode.goingAway);
         expect(h.service.watchCount, 0);
-        unawaited(h.close());
-        async.flushMicrotasks();
-        expect(async.pendingTimers, isEmpty);
-      });
-    });
-
-    test('a heartbeat slower than the reply timeout loses the watch', () {
-      fakeAsync((async) {
-        final h = Harness(heartbeat: const Duration(seconds: 1));
-        final (a, _) = h.link();
-        final watch = a.streamRequest('WATCH', Uint8List(0));
-        Object? error;
-        watch.items.listen((_) {}, onError: (Object e) => error = e);
-        async.elapse(clientOptions.requestTimeout * 2);
-        expect(error, isStatus(StatusCode.deadlineExceeded));
-        expect(h.service.watchCount, 0);
-        unawaited(h.close());
-        async.flushMicrotasks();
-        expect(async.pendingTimers, isEmpty);
-      });
-    });
+        expect(h.service.table, isEmpty);
+        expect((await eventsDone).map(describeEvent), ['DOWN npc/1']);
+        // The subscriptions ended first: no DOWN went to the channels.
+        expect(watcher.log, ['UP npc/1', 'WATCHED']);
+        // Channels served after close are closed at once.
+        final (c, cServer) = h.link();
+        await c.done;
+        expect(c.isOpen, isFalse);
+        expect((await cServer.done).known, StatusCode.goingAway);
+      },
+    );
   });
 
-  group('heartbeat default', () {
-    test('stays below the 5 s the wiki allows', () {
-      expect(
-        NamingService(assignmentHold: Duration.zero).heartbeat,
-        lessThan(const Duration(seconds: 5)),
-      );
+  group('idle subscriptions', () {
+    test('an idle subscription costs no traffic and lives on', () {
       fakeAsync((async) {
         // Default options everywhere.
         final ns = NamingService();
         final link = StreamChannelController<Uint8List>();
         ns.serve(TalkChannel(link.local));
-        final times = <Duration>[];
-        link.foreign.stream.listen((_) => times.add(async.elapsed));
+        final frames = <TalkFrame>[];
+        link.foreign.stream.listen((f) => frames.add(TalkFrame.decode(f)));
         link.foreign.sink.add(
           TalkFrame(
             kind: TalkKind.message,
             procedure: Name('WATCH'),
             requestId: 1,
-            stream: true,
             payload: Uint8List(0),
           ).encode(),
         );
-        async.elapse(const Duration(seconds: 60));
+        async.elapse(const Duration(seconds: 1));
+        // The reply to an empty snapshot, and nothing else: no EXTEND.
+        expect(frames.single.kind, TalkKind.message);
+        expect(frames.single.responseId, 1);
+        expect(frames.single.payload, isEmpty);
+        async.elapse(const Duration(minutes: 5));
+        expect(frames, hasLength(1));
         expect(ns.watchCount, 1);
-        expect(times.length, greaterThan(10));
-        for (var i = 1; i < times.length; i++) {
-          expect(times[i] - times[i - 1], lessThan(const Duration(seconds: 5)));
-        }
+        // Still live: a change arrives as a one-way message.
+        ns.registerLocal(Name('npc'), const []);
+        async.flushMicrotasks();
+        expect(frames, hasLength(2));
+        expect(frames.last.procedure, Procedures.up);
+        expect(frames.last.requestId, 0);
+        expect(frames.last.responseId, 0);
         unawaited(ns.close());
         async.flushMicrotasks();
         expect(async.pendingTimers, isEmpty);
       });
+    });
+
+    test('outlives every request and reply timeout', () {
+      fakeAsync((async) {
+        final h = Harness();
+        final (a, _) = h.link();
+        final lines = <String>[];
+        a.messages.listen((m) => lines.add(describe(m)));
+        a
+            .request('WATCH', Uint8List(0), ordered: true)
+            .then((_) => lines.add('WATCHED'))
+            .ignore();
+        // 10 times the watcher's request timeout, 15 times the service's
+        // reply timeout.
+        async.elapse(clientOptions.requestTimeout * 10);
+        expect(lines, ['WATCHED']);
+        expect(h.service.watchCount, 1);
+        final (b, _) = h.link();
+        unawaited(register(b, 'npc'));
+        async.elapse(ms10);
+        expect(lines, ['WATCHED', 'UP npc/1']);
+        async.elapse(clientOptions.requestTimeout * 10);
+        expect(h.service.watchCount, 1);
+        expect(a.isOpen, isTrue);
+        unawaited(h.close());
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('heldExtendInterval: positive, and by default shorter than the '
+        'default reply timeout', () {
+      expect(
+        NamingService(assignmentHold: Duration.zero).heldExtendInterval,
+        lessThan(const TalkOptions().replyTimeout),
+      );
+      expect(
+        () => NamingService(heldExtendInterval: Duration.zero),
+        throwsArgumentError,
+      );
     });
   });
 
@@ -740,7 +854,6 @@ void main() {
         final survivor = NamingClient(
           connector.call,
           reconnectDelay: const Duration(milliseconds: 300),
-          watchTimeout: clientOptions.requestTimeout,
         );
         final assigned = <int>[];
         unawaited(survivor.start());
@@ -759,7 +872,6 @@ void main() {
         final newcomer = NamingClient(
           Connector(h).call,
           reconnectDelay: reconnectDelay,
-          watchTimeout: clientOptions.requestTimeout,
         );
         unawaited(newcomer.start());
         int? fresh;
@@ -879,7 +991,6 @@ void main() {
       final client = NamingClient(
         connector.call,
         reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
       );
       clients.add(client);
       return client;
@@ -924,6 +1035,27 @@ void main() {
         'UP api/3',
         'DOWN api/1',
       ]);
+    });
+
+    test('synced means complete, even over a link that delivers in '
+        'bursts', () async {
+      final raw = h.link().$1;
+      for (var i = 0; i < 20; i++) {
+        await register(raw, 'npc');
+      }
+      final client = newClient(Connector(h, sync: true));
+      int? atSync;
+      client.synced.then((_) => atSync = client.table.length).ignore();
+      await client.start();
+      await client.synced.timeout(timeout);
+      expect(atSync, 20);
+      // The events after the reply are live.
+      final id = await register(raw, 'api');
+      await until(() => client.table.length == 21);
+      expect(client.table.keys.last, ServiceAddress(Name('api'), id));
+      // A registration through the client is in its table once done.
+      final own = await client.register(Name('own'), []);
+      expect(client.table.keys, contains(ServiceAddress(Name('own'), own)));
     });
 
     test('register after sync is mirrored when it completes', () async {
@@ -1071,21 +1203,20 @@ void main() {
       expect(client.table.keys.map((a) => '$a'), ['npc/$id']);
     });
 
-    test('a watch timeout is a loss of the service', () async {
-      // The service never answers: no SYNCED, no heartbeat.
+    test('a WATCH without a reply is a loss of the service', () async {
+      // The service never answers.
       final silent = <StreamChannelController<Uint8List>>[];
       var calls = 0;
-      final client = NamingClient(
-        () async {
-          calls++;
-          final link = StreamChannelController<Uint8List>();
-          silent.add(link);
-          link.local.stream.listen((_) {});
-          return TalkChannel(link.foreign, options: clientOptions);
-        },
-        reconnectDelay: reconnectDelay,
-        watchTimeout: ms50,
-      );
+      final client = NamingClient(() async {
+        calls++;
+        final link = StreamChannelController<Uint8List>();
+        silent.add(link);
+        link.local.stream.listen((_) {});
+        return TalkChannel(
+          link.foreign,
+          options: const TalkOptions(requestTimeout: ms50),
+        );
+      }, reconnectDelay: reconnectDelay);
       clients.add(client);
       await client.start();
       await until(() => calls >= 3);
@@ -1240,7 +1371,6 @@ void main() {
       final client = NamingClient(
         scripted.call,
         reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
       );
       clients.add(client);
       final assigned = <int>[];
@@ -1281,7 +1411,6 @@ void main() {
       final client = NamingClient(
         scripted.call,
         reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
       );
       clients.add(client);
       await client.start();
@@ -1304,11 +1433,7 @@ void main() {
       'a REGISTER without an answer drops the channel: no phantom',
       () async {
         final lossy = LossyConnector(h);
-        final client = NamingClient(
-          lossy.call,
-          reconnectDelay: reconnectDelay,
-          watchTimeout: clientOptions.requestTimeout,
-        );
+        final client = NamingClient(lossy.call, reconnectDelay: reconnectDelay);
         clients.add(client);
         final published = <String>[];
         h.service.events.listen((e) => published.add(describeEvent(e)));
@@ -1343,11 +1468,7 @@ void main() {
 
     test('an UNREGSTR without an answer drops the channel', () async {
       final lossy = LossyConnector(h);
-      final client = NamingClient(
-        lossy.call,
-        reconnectDelay: reconnectDelay,
-        watchTimeout: clientOptions.requestTimeout,
-      );
+      final client = NamingClient(lossy.call, reconnectDelay: reconnectDelay);
       clients.add(client);
       await client.start();
       final kept = await client.register(Name('api'), [uriB]);
@@ -1459,7 +1580,6 @@ void main() {
         final client = NamingClient(
           connector.call,
           reconnectDelay: reconnectDelay,
-          watchTimeout: clientOptions.requestTimeout,
         );
         unawaited(client.start());
         unawaited(client.register(Name('npc'), [uriA]));
@@ -1480,7 +1600,6 @@ void main() {
         final second = NamingClient(
           Connector(h).call,
           reconnectDelay: reconnectDelay,
-          watchTimeout: clientOptions.requestTimeout,
         );
         unawaited(second.start());
         async.elapse(ms10);
@@ -1498,33 +1617,8 @@ void main() {
   });
 }
 
-/// Unregisters over a raw Talk channel.
-Future<void> unregister(TalkChannel channel, String type, int instance) =>
-    channel.request(
-      'UNREGSTR',
-      UnregisterRequest(Name(type), instance).encode(),
-    );
-
-/// A raw `WATCH` whose items are read one by one, as strings.
-class Watcher {
-  Watcher(TalkChannel channel, {String? type, Uint8List? payload})
-    : stream = channel.streamRequest(
-        'WATCH',
-        payload ?? WatchRequest(type == null ? null : Name(type)).encode(),
-      ) {
-    _queue = StreamQueue(stream.items.map(describe));
-  }
-
-  final TalkStream stream;
-  late final StreamQueue<String> _queue;
-
-  Future<String> get next => _queue.next.timeout(timeout);
-
-  Future<List<String>> take(int count) => _queue.take(count).timeout(timeout);
-}
-
-/// A [TalkConnector] to a scripted naming service: `WATCH` gets `SYNCED`
-/// and a heartbeat; every other request goes to [handle].
+/// A [TalkConnector] to a scripted naming service: `WATCH` is answered at
+/// once (an empty snapshot); every other request goes to [handle].
 class ScriptedConnector {
   ScriptedConnector(this.handle);
 
@@ -1532,37 +1626,23 @@ class ScriptedConnector {
 
   /// Server sides of the links handed out.
   final List<TalkChannel> servers = [];
-  final List<Timer> _heartbeats = [];
 
   Future<TalkChannel> call() async {
     final link = StreamChannelController<Uint8List>();
     final server = TalkChannel(link.local, options: serverOptions);
     servers.add(server);
     server.messages.listen((m) {
-      if (m.procedureName != 'WATCH') {
+      if (m.procedureName == 'WATCH') {
+        m.reply(Uint8List(0));
+      } else {
         handle(m);
-        return;
       }
-      m.replyItem(Uint8List(0), procedure: 'SYNCED');
-      _heartbeats.add(
-        Timer.periodic(ms10, (timer) {
-          if (m.canReply) {
-            m.extend();
-          } else {
-            timer.cancel();
-          }
-        }),
-      );
     }, onError: (Object _) {});
     return TalkChannel(link.foreign, options: clientOptions);
   }
 
-  Future<void> close() async {
-    for (final timer in _heartbeats) {
-      timer.cancel();
-    }
-    await Future.wait([for (final server in servers) server.close()]);
-  }
+  Future<void> close() =>
+      Future.wait([for (final server in servers) server.close()]);
 }
 
 /// [value] as UTF-8 bytes.

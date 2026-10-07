@@ -13,13 +13,12 @@ const mux = MuxOptions(
 );
 
 /// Service and naming channels. The reply timeout must exceed the naming
-/// heartbeat, the watch timeout too.
+/// service's heldExtendInterval.
 const talkOptions = TalkOptions(
   requestTimeout: Duration(seconds: 2),
   replyTimeout: Duration(seconds: 1),
 );
-const heartbeat = Duration(milliseconds: 50);
-const watchTimeout = Duration(milliseconds: 500);
+const heldExtendInterval = Duration(milliseconds: 50);
 const reconnectDelay = Duration(milliseconds: 20);
 
 /// Upper bound for anything a test waits on; only reached on failure.
@@ -71,7 +70,6 @@ MeshNode join(Switchboard node, Uri naming) => MeshNode.join(
   node,
   naming,
   reconnectDelay: reconnectDelay,
-  watchTimeout: watchTimeout,
   resolveTimeout: limit,
   talkOptions: talkOptions,
 );
@@ -113,7 +111,7 @@ class NamingNode {
   }) async {
     final node = newNode();
     final service = NamingService(
-      heartbeat: heartbeat,
+      heldExtendInterval: heldExtendInterval,
       assignmentHold: assignmentHold,
     );
     addTearDown(service.close);
@@ -227,6 +225,84 @@ class Backend {
   Future<void> stop() async {
     await mesh.leave();
     await node.close();
+  }
+}
+
+/// A TCP relay to a `tcp://` endpoint. [freeze] makes the connections
+/// open at that moment go dead, as a hung host or a network partition
+/// does: nothing is forwarded either way and nothing is closed, until one
+/// side closes its own socket, which the relay passes on. Connections made
+/// afterwards are relayed normally.
+class Relay {
+  Relay._(this._server, this._target);
+
+  static Future<Relay> start(Uri target) async {
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final relay = Relay._(server, target);
+    server.listen(relay._accept);
+    return relay;
+  }
+
+  final ServerSocket _server;
+  final Uri _target;
+  final List<_Pipe> _pipes = [];
+
+  Uri get uri => Uri.parse('tcp://127.0.0.1:${_server.port}');
+
+  /// Connections relayed so far.
+  int get connections => _pipes.length;
+
+  Future<void> _accept(Socket client) async {
+    // Handed to the pipe, which destroys it.
+    // ignore: close_sinks
+    final Socket upstream;
+    try {
+      upstream = await Socket.connect(_target.host, _target.port);
+    } on SocketException {
+      client.destroy();
+      return;
+    }
+    _pipes.add(_Pipe(client, upstream));
+  }
+
+  void freeze() {
+    for (final pipe in _pipes) {
+      pipe.frozen = true;
+    }
+  }
+
+  Future<void> close() async {
+    await _server.close();
+    for (final pipe in _pipes) {
+      pipe.close();
+    }
+  }
+}
+
+class _Pipe {
+  _Pipe(this.a, this.b) {
+    a.listen((data) => _pass(b, data), onDone: close, onError: (_) => close());
+    b.listen((data) => _pass(a, data), onDone: close, onError: (_) => close());
+  }
+
+  final Socket a;
+  final Socket b;
+  bool frozen = false;
+  bool _closed = false;
+
+  void _pass(Socket to, Uint8List data) {
+    if (!frozen && !_closed) {
+      to.add(data);
+    }
+  }
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    a.destroy();
+    b.destroy();
   }
 }
 
@@ -757,4 +833,62 @@ void main() {
       });
     });
   }
+
+  group('liveness', () {
+    test('a naming service that stops answering is detected by the mux '
+        'keep-alive; the client reconnects and resyncs', () async {
+      final naming = await NamingNode.start('tcp');
+      final relay = await Relay.start(naming.uri);
+      addTearDown(relay.close);
+      // A node that probes a silent connection after 100 ms and gives it
+      // up 100 ms later.
+      final node = Switchboard(
+        muxOptions: const MuxOptions(
+          goAwayGrace: Duration(milliseconds: 100),
+          keepAliveInterval: Duration(milliseconds: 100),
+          keepAliveTimeout: Duration(milliseconds: 100),
+        ),
+        talkOptions: talkOptions,
+      );
+      addTearDown(node.close);
+      final mesh = join(node, relay.uri);
+      addTearDown(mesh.leave);
+      final endpoint = Uri.parse('tcp://10.0.0.1:7000');
+      await mesh.client.register(npc, [endpoint]).timeout(limit);
+      await mesh.synced.timeout(limit);
+      final firstSynced = mesh.synced;
+
+      // Idle for many keep-alive rounds: the PINGs are answered, the
+      // subscription needs nothing else.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      expect(mesh.client.isSynced, isTrue);
+      expect(relay.connections, 1);
+
+      // The naming service's host hangs.
+      relay.freeze();
+      await until(() => !mesh.client.isSynced, 'loss noticed');
+      expect(identical(mesh.synced, firstSynced), isFalse);
+      // The stale table is kept meanwhile.
+      expect(
+        mesh.client.table.values.where((r) => r.endpoints.contains(endpoint)),
+        hasLength(1),
+      );
+
+      // New connections get through: reconnected, registered again,
+      // resynced, with nothing left of the dead channel.
+      await mesh.synced.timeout(limit);
+      expect(relay.connections, greaterThanOrEqualTo(2));
+      await until(
+        () =>
+            naming.service.table.values
+                    .where((r) => r.endpoints.contains(endpoint))
+                    .length ==
+                1 &&
+            sameTable(mesh.client.table, naming.service.table),
+        'registered again and mirrored',
+      );
+      expect(naming.service.channelCount, 1);
+      expect(naming.service.watchCount, 1);
+    });
+  });
 }

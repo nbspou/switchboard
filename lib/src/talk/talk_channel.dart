@@ -91,6 +91,13 @@ class TalkAbortException extends SwitchboardException {
 /// Works over a mux channel or any `StreamChannel<Uint8List>` whose events
 /// are whole Talk messages.
 ///
+/// Delivery order: [messages] delivers incoming plain messages and
+/// requests in wire order, and [TalkStream.items] the items of a stream
+/// request, but the answers to our requests complete futures of their own,
+/// so an answer can be seen before messages that arrived ahead of it. A
+/// request started with `ordered: true` has its answer delivered in wire
+/// order with [messages] instead (see [startRequest]).
+///
 /// Failure handling:
 ///
 /// * A malformed frame or a violation of the kind rules from the peer
@@ -141,6 +148,10 @@ class TalkChannel {
 
   /// Requests added to [_messages] and not yet handed to its listener.
   final Queue<_Message> _undeliveredRequests = Queue<_Message>();
+
+  /// Markers carrying the outcome of an `ordered` request, added to
+  /// [_messages] and not yet handed to its listener.
+  final Queue<_Message> _orderedOutcomes = Queue<_Message>();
 
   /// Incoming plain messages and requests, in arrival order. Responses
   /// never appear here. Single subscription; buffered until listened.
@@ -231,13 +242,21 @@ class TalkChannel {
   /// or the channel's failure status. It never reports an unhandled error,
   /// so it may be dropped.
   ///
-  /// Throws synchronously like [startRequest]. [name] as for [send].
+  /// Throws synchronously like [startRequest]. [name] and [ordered] as for
+  /// [startRequest].
   Future<TalkMessage> request(
     String procedure,
     Uint8List payload, {
     Duration? timeout,
     Name? name,
-  }) => startRequest(procedure, payload, timeout: timeout, name: name).response;
+    bool ordered = false,
+  }) => startRequest(
+    procedure,
+    payload,
+    timeout: timeout,
+    name: name,
+    ordered: ordered,
+  ).response;
 
   /// Sends a request and returns its handle, through which the response
   /// arrives and the request can be cancelled.
@@ -250,6 +269,20 @@ class TalkChannel {
   /// [name], when given, is the procedure instead of [procedure], as for
   /// [send].
   ///
+  /// With [ordered], the peer's answer (its final response or its abort)
+  /// is delivered in wire order with [messages]: [TalkRequest.response]
+  /// completes only once every plain message and request that arrived
+  /// before the answer has been handed to the listener of [messages], and
+  /// code waiting on [TalkRequest.response] runs before the messages that
+  /// arrived after it. Use it when the peer sends one-way messages that
+  /// the answer marks a point in, such as the snapshot that precedes the
+  /// reply to a subscription. If nobody listens to [messages] yet, or its
+  /// subscription was cancelled, the answer is delivered at once. While
+  /// the subscription is paused the answer waits, so the body of an
+  /// `await for` loop over [messages] must not wait for an ordered
+  /// request. Local failures (timeout, [TalkRequest.cancel], the end of
+  /// the channel) are reported at once.
+  ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
   /// reached, with [StatusCode.failedPrecondition] if the channel is
@@ -260,6 +293,7 @@ class TalkChannel {
     Duration? timeout,
     void Function()? onExtend,
     Name? name,
+    bool ordered = false,
   }) {
     final wire = name ?? Name(procedure);
     return _TalkRequest(
@@ -267,6 +301,7 @@ class TalkChannel {
         stream: false,
         timeout: timeout,
         onExtend: onExtend,
+        ordered: ordered,
         build: (id) => TalkFrame(
           kind: TalkKind.message,
           procedure: wire,
@@ -426,6 +461,7 @@ class TalkChannel {
     required TalkFrame Function(int id) build,
     void Function()? onExtend,
     _ResponseSink? sink,
+    bool ordered = false,
   }) {
     if (_closing) {
       throw SwitchboardException.of(
@@ -453,6 +489,7 @@ class TalkChannel {
       stream: stream,
       onExtend: onExtend,
       sink: sink,
+      ordered: ordered,
     );
     // Registered before sending: over a synchronous transport the response
     // can arrive while the request is still being sent.
@@ -602,6 +639,26 @@ class TalkChannel {
         Status.of(StatusCode.unimplemented, 'no message listener'),
       );
     }
+    // Nothing is delivered any more: the waiting answers go at once.
+    final outcomes = _orderedOutcomes.toList();
+    _orderedOutcomes.clear();
+    for (final marker in outcomes) {
+      marker._runOutcome();
+    }
+  }
+
+  /// Delivers the answer to an `ordered` request: [outcome] runs once
+  /// [marker] reaches the listener of [messages], after the messages that
+  /// arrived before it; the listener never sees [marker]. At once when
+  /// nobody listens, or nobody will.
+  void _deliverOrdered(_Message marker, void Function() outcome) {
+    if (_messagesCancelled || !_messages.hasListener || _messages.isClosed) {
+      outcome();
+      return;
+    }
+    marker._outcome = outcome;
+    _orderedOutcomes.add(marker);
+    _messages.add(marker);
   }
 
   // ---------------------------------------------------------------------
@@ -659,7 +716,11 @@ class TalkChannel {
     if (frame.hasRequest) {
       _register(message);
     }
-    pending.complete(message);
+    if (pending.ordered) {
+      _deliverOrdered(message, () => pending.complete(message));
+    } else {
+      pending.complete(message);
+    }
   }
 
   void _onStreamItem(TalkFrame frame) {
@@ -697,8 +758,14 @@ class TalkChannel {
         return;
       }
       pending.stopTimer();
-      if (!pending.abandoned) {
-        pending.fail(TalkAbortException(_abortStatus(frame)));
+      if (pending.abandoned) {
+        return;
+      }
+      final error = TalkAbortException(_abortStatus(frame));
+      if (pending.ordered) {
+        _deliverOrdered(_Message(this, frame), () => pending.fail(error));
+      } else {
+        pending.fail(error);
       }
     } else if (frame.hasRequest) {
       final message = _incoming[frame.requestId];
@@ -907,6 +974,7 @@ class _Outgoing {
     required bool stream,
     this.onExtend,
     this.sink,
+    this.ordered = false,
   }) : isStream = stream,
        items = stream && sink == null ? StreamController<TalkMessage>() : null {
     items?.onCancel = _onItemsCancelled;
@@ -921,6 +989,9 @@ class _Outgoing {
   final void Function()? onExtend;
   final _ResponseSink? sink;
   final StreamController<TalkMessage>? items;
+
+  /// The answer is delivered in order with [TalkChannel.messages].
+  final bool ordered;
 
   /// Item requests added to [items] and not yet handed to its listener.
   final Queue<_Message> undeliveredItems = Queue<_Message>();
@@ -1080,6 +1151,17 @@ class _Message extends TalkMessage {
 
   /// Called synchronously once when the request is cancelled.
   void Function()? _cancelHook;
+
+  /// Set while this message is the marker of an `ordered` request's answer
+  /// in [TalkChannel.messages]: delivers that answer.
+  void Function()? _outcome;
+
+  /// Delivers the answer this message is the marker of, once.
+  void _runOutcome() {
+    final outcome = _outcome;
+    _outcome = null;
+    outcome?.call();
+  }
 
   /// [forwardMessage] took this request over.
   bool _forwarded = false;
@@ -1444,6 +1526,18 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
   @override
   void onData(void Function(TalkMessage data)? handleData) {
     super.onData((message) {
+      if (message is _Message && message._outcome != null) {
+        // The answer to an ordered request, in its place among the
+        // messages; never shown to the listener.
+        final outcomes = message.channel._orderedOutcomes;
+        if (outcomes.isNotEmpty && identical(outcomes.first, message)) {
+          outcomes.removeFirst();
+        } else {
+          outcomes.remove(message);
+        }
+        message._runOutcome();
+        return;
+      }
       // Requests are queued, and delivered, in arrival order.
       if (_undelivered.isNotEmpty && identical(_undelivered.first, message)) {
         _undelivered.removeFirst();

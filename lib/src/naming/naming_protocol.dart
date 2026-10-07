@@ -23,20 +23,22 @@ class Procedures {
   /// Remove a registration (request).
   static final Name unregister = Name('UNREGSTR');
 
-  /// Watch the service table (stream request).
+  /// Subscribe to the service table (request): the snapshot follows as
+  /// events, then the reply, then the live events.
   static final Name watch = Name('WATCH');
+
+  /// End a subscription made with [watch] (request).
+  static final Name unwatch = Name('UNWATCH');
 
   /// One-shot table query (stream request).
   static final Name lookup = Name('LOOKUP');
 
-  /// Stream item: a service record came up.
+  /// Event (one-way message to a watcher) and `LOOKUP` item: a service
+  /// record came up.
   static final Name up = Name('UP');
 
-  /// Stream item: a service instance went away.
+  /// Event: a service instance went away.
   static final Name down = Name('DOWN');
-
-  /// Stream item: the initial snapshot is complete.
-  static final Name synced = Name('SYNCED');
 
   /// Define or confirm a slot space (request).
   static final Name slots = Name('SLOTS');
@@ -74,10 +76,10 @@ class Procedures {
   /// unlock and serve (request).
   static final Name resume = Name('RESUME');
 
-  /// Watch item: a slot space definition.
+  /// Event and `LOOKUP` item: a slot space definition.
   static final Name slotSpace = Name('SLOTSPC');
 
-  /// Watch item: the state of one slot.
+  /// Event and `LOOKUP` item: the state of one slot.
   static final Name slot = Name('SLOT');
 }
 
@@ -411,7 +413,7 @@ class UnregisterRequest {
       });
 }
 
-/// WATCH request payload.
+/// `WATCH` and `UNWATCH` request payload (also the `LOOKUP` payload).
 class WatchRequest {
   /// Creates a request; a null [type] watches every type.
   const WatchRequest([this.type]);
@@ -443,7 +445,7 @@ class WatchRequest {
   }
 }
 
-/// An UP or DOWN stream item.
+/// An `UP` or `DOWN` event.
 ///
 /// UP carries a full [ServiceRecord]; DOWN carries only the address, so
 /// a decoded DOWN event has no endpoints and no metadata.
@@ -580,7 +582,7 @@ enum MigrationPhase {
       code >= 1 && code <= values.length ? values[code - 1] : null;
 }
 
-/// A slot space definition, also the payload of a `SLOTSPC` watch item.
+/// A slot space definition, also the payload of a `SLOTSPC` event.
 ///
 /// Wire: name type, u32 count, u8 mode, u8 flags (0x01 lazy, 0x02 shared
 /// recovery). Unknown flag bits are ignored when decoding.
@@ -1391,7 +1393,7 @@ class SlotEntry {
   }
 }
 
-/// `SLOT` watch item payload: one slot of a type and its state.
+/// `SLOT` event payload: one slot of a type and its state.
 ///
 /// Wire: name type, u32 slot, u8 state, u48 owner (or from), u48 to,
 /// u48 holder, u32 epoch.

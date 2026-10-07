@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:async/async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
@@ -22,7 +23,7 @@ const Duration reconnectDelay = Duration(milliseconds: 20);
 /// Upper bound for anything a test waits on; only reached on failure.
 const Duration timeout = Duration(seconds: 2);
 
-/// Short timeouts so that a lost heartbeat shows quickly.
+/// Short timeouts, so that a request left unanswered shows quickly.
 const TalkOptions serverOptions = TalkOptions(
   replyTimeout: Duration(milliseconds: 200),
   requestTimeout: Duration(milliseconds: 300),
@@ -63,7 +64,7 @@ Future<void> until(bool Function() condition) async {
 /// hand-over bound of the service by default.
 class Harness {
   Harness({
-    Duration heartbeat = ms50,
+    Duration heldExtendInterval = ms50,
     Duration assignmentHold = Duration.zero,
     Duration holderGrace = const Duration(minutes: 5),
     Duration handoverTimeout = const Duration(milliseconds: 300),
@@ -72,7 +73,7 @@ class Harness {
     Duration holdingSettle = Duration.zero,
     Duration handoverMaxDuration = const Duration(minutes: 10),
   }) : service = NamingService(
-         heartbeat: heartbeat,
+         heldExtendInterval: heldExtendInterval,
          assignmentHold: assignmentHold,
          holderGrace: holderGrace,
          handoverTimeout: handoverTimeout,
@@ -94,8 +95,11 @@ class Harness {
   final List<TalkChannel> clients = [];
 
   /// Opens a link: the server side is served, both sides are returned.
-  (TalkChannel client, TalkChannel server) link() {
-    final controller = StreamChannelController<Uint8List>();
+  /// With [sync] the link delivers synchronously, so that everything the
+  /// service sends in one step reaches the client's channel in one burst,
+  /// as the mux delivers a batch of frames.
+  (TalkChannel client, TalkChannel server) link({bool sync = false}) {
+    final controller = StreamChannelController<Uint8List>(sync: sync);
     final server = TalkChannel(controller.local, options: serverOptions);
     final client = TalkChannel(controller.foreign, options: clientOptions);
     servers.add(server);
@@ -110,11 +114,14 @@ class Harness {
   }
 }
 
-/// A [TalkConnector] over a [Harness] that can be switched off.
+/// A [TalkConnector] over a [Harness] that can be switched off. With
+/// [sync], its links deliver synchronously (see [Harness.link]).
 class Connector {
-  Connector(this.harness);
+  Connector(this.harness, {this.sync = false});
 
   Harness harness;
+
+  final bool sync;
 
   /// While true, connecting fails.
   bool down = false;
@@ -129,7 +136,7 @@ class Connector {
     if (down) {
       throw SwitchboardException.of(StatusCode.unavailable, 'service down');
     }
-    final (client, server) = harness.link();
+    final (client, server) = harness.link(sync: sync);
     servers.add(server);
     return client;
   }
@@ -184,7 +191,9 @@ bool Function(TalkFrame) isRequestFor(String procedure) =>
         frame.requestId != 0 &&
         frame.procedure?.toString() == procedure;
 
-/// Registers over a raw Talk channel and returns the instance id.
+/// Registers over a raw Talk channel and returns the instance id. The
+/// answer is ordered with the channel's messages: a [Watcher] on the same
+/// channel has seen the `UP` when this completes.
 Future<int> register(
   TalkChannel channel,
   String type, {
@@ -200,11 +209,110 @@ Future<int> register(
       endpoints: endpoints,
       metadata: metadata,
     ).encode(),
+    ordered: true,
   );
   return RegisterResponse.decode(response.payload).instance;
 }
 
-/// `UP npc/1 tcp://...`, `DOWN npc/1`, `SYNCED`.
+/// Unregisters over a raw Talk channel; ordered like [register].
+Future<void> unregister(TalkChannel channel, String type, int instance) =>
+    channel.request(
+      'UNREGSTR',
+      UnregisterRequest(Name(type), instance).encode(),
+      ordered: true,
+    );
+
+/// The subscriptions of one raw Talk channel to the naming table, read one
+/// by one as strings in channel order: the events (`UP npc/1`,
+/// `DOWN npc/1`, ... through [describer]) and the answers to [watch] and
+/// [unwatch] (`WATCHED`, `UNWATCHED`, or for instance `UNWATCH notFound`).
+/// Everything read is also in [log] at once.
+class Watcher {
+  /// Takes [channel]'s messages, then sends `WATCH` with [type] or
+  /// [payload] unless [start] is false.
+  Watcher(
+    this.channel, {
+    String? type,
+    Uint8List? payload,
+    bool start = true,
+    this.describer = describe,
+  }) {
+    channel.messages.listen(add, onError: (Object _) {});
+    if (start) {
+      watch(type: type, payload: payload).ignore();
+    }
+  }
+
+  /// For a channel whose messages are taken elsewhere: that listener
+  /// passes the one-way messages to [add].
+  Watcher.fed(this.channel, {this.describer = describe});
+
+  final TalkChannel channel;
+  final String Function(TalkMessage) describer;
+
+  /// Everything read so far, in order.
+  final List<String> log = [];
+
+  // Synchronous, so that the lines are queued in the order they happen.
+  final StreamController<String> _lines = StreamController<String>(sync: true);
+  late final StreamQueue<String> _queue = StreamQueue(_lines.stream);
+
+  /// Takes one message of the channel.
+  void add(TalkMessage message) => _line(describer(message));
+
+  void _line(String line) {
+    log.add(line);
+    _lines.add(line);
+  }
+
+  /// Sends `WATCH` (all types unless [type] or [payload]); its answer is
+  /// read in its place among the events.
+  Future<void> watch({String? type, Uint8List? payload}) =>
+      _subscription('WATCH', type, payload);
+
+  /// Sends `UNWATCH`, like [watch].
+  Future<void> unwatch({String? type, Uint8List? payload}) =>
+      _subscription('UNWATCH', type, payload);
+
+  Future<void> _subscription(
+    String procedure,
+    String? type,
+    Uint8List? payload,
+  ) => channel
+      .request(
+        procedure,
+        payload ?? WatchRequest(type == null ? null : Name(type)).encode(),
+        ordered: true,
+      )
+      .then(
+        (_) => _line('${procedure}ED'),
+        onError: (Object e) {
+          _line(
+            '$procedure '
+            '${e is SwitchboardException ? e.code?.name ?? e.status : e}',
+          );
+          throw e;
+        },
+      );
+
+  Future<String> get next => _queue.next.timeout(timeout);
+
+  Future<List<String>> take(int count) => _queue.take(count).timeout(timeout);
+
+  /// Lines up to and including the first that satisfies [test].
+  Future<List<String>> until(bool Function(String) test) async {
+    final out = <String>[];
+    while (true) {
+      final line = await next;
+      out.add(line);
+      if (test(line)) {
+        return out;
+      }
+    }
+  }
+}
+
+/// `UP npc/1 tcp://...`, `DOWN npc/1`, or the procedure name.
 String describe(TalkMessage m) => switch (m.procedureName) {
   'UP' => describeEvent(ServiceEvent.decodeUp(m.payload)),
   'DOWN' => describeEvent(ServiceEvent.decodeDown(m.payload)),

@@ -28,14 +28,23 @@ final Logger _log = Logger('Switchboard.Naming');
 typedef TalkConnector = Future<TalkChannel> Function();
 
 /// A client of the naming service: registers this process's services and
-/// mirrors the service table through a `WATCH` stream.
+/// mirrors the service table through a `WATCH` subscription.
 ///
 /// The client keeps one channel to the naming service. On every connect it
 /// first re-registers the services registered through it (asking for the
-/// ids they had), then watches every type and rebuilds [table] from the
-/// snapshot. When the channel is lost (it closes, the watch fails or times
-/// out) the client marks the table stale, keeps it, and reconnects after
-/// [reconnectDelay], until [close].
+/// ids they had), then subscribes to every type with `WATCH` and rebuilds
+/// [table] from the snapshot: the events that arrive before the `WATCH`
+/// reply are the snapshot, the reply marks the table synced, and the
+/// events after it are live. The client keeps that single subscription to
+/// every type for the life of the channel; it never sends `UNWATCH`.
+///
+/// The client sends no heartbeat and expects none: the subscription lives
+/// as long as the channel, and a naming service that stops answering is
+/// detected by the connection under the channel (the mux keep-alive of a
+/// `Switchboard` node, see `MuxOptions.keepAliveInterval`), which then
+/// ends the channel. When the channel is lost (it ends, or the `WATCH`
+/// request fails or times out) the client marks the table stale, keeps
+/// it, and reconnects after [reconnectDelay], until [close].
 ///
 /// When a `REGISTER` or `UNREGSTR` has no clear outcome (no answer in time,
 /// or an unreadable answer) the client drops the channel itself: the naming
@@ -64,10 +73,8 @@ class NamingClient {
   ///
   /// [connect] opens a fresh Talk channel to the naming service; it is
   /// called on start and again after a loss, with [reconnectDelay] between
-  /// attempts. [watchTimeout] is the requester timeout of the `WATCH`
-  /// request (default 15 s): if nothing, not even a heartbeat `EXTEND`,
-  /// arrives for that long the naming service is considered lost. It must be
-  /// longer than the service's heartbeat.
+  /// attempts. The channel's [TalkOptions.requestTimeout] bounds every
+  /// request, `WATCH` included: its reply comes after the whole snapshot.
   ///
   /// [slotExtendInterval] is how often a request from the naming service
   /// (`ASSIGN`, `DRAIN`, `FORWARD`, `RESUME`) is answered with `EXTEND`
@@ -84,11 +91,9 @@ class NamingClient {
   NamingClient(
     TalkConnector connect, {
     this.reconnectDelay = const Duration(seconds: 1),
-    Duration? watchTimeout,
     this.slotExtendInterval = const Duration(seconds: 4),
     this.slotHandlerMaxDuration = const Duration(minutes: 10),
-  }) : _connect = connect,
-       watchTimeout = watchTimeout ?? const Duration(seconds: 15) {
+  }) : _connect = connect {
     if (slotExtendInterval <= Duration.zero) {
       throw ArgumentError.value(
         slotExtendInterval,
@@ -109,9 +114,6 @@ class NamingClient {
 
   /// Delay before each reconnect attempt.
   final Duration reconnectDelay;
-
-  /// Requester timeout of the `WATCH` request.
-  final Duration watchTimeout;
 
   /// Interval of `EXTEND` while a [slotHandler] call runs.
   final Duration slotExtendInterval;
@@ -148,7 +150,7 @@ class NamingClient {
   }
 
   /// Read-only live view of the mirrored table. It is incomplete before the
-  /// first `SYNCED` and stale while not [isSynced].
+  /// first `WATCH` reply ([hasSynced]) and stale while not [isSynced].
   late final Map<ServiceAddress, ServiceRecord> table = UnmodifiableMapView(
     _table,
   );
@@ -162,15 +164,16 @@ class NamingClient {
   /// True while a channel to the naming service is open.
   bool get isConnected => _session?.alive ?? false;
 
-  /// True after `SYNCED` on the current channel; false while disconnected.
+  /// True once the `WATCH` of the current channel has been answered (the
+  /// snapshot is in [table]); false while disconnected.
   bool get isSynced => _isSynced;
 
-  /// True once any channel has reached `SYNCED`: [table] has been complete
-  /// at least once. A later loss of the naming service does not reset it;
-  /// the table is then stale ([isSynced] is false) but still served.
+  /// True once any channel has been synced: [table] has been complete at
+  /// least once. A later loss of the naming service does not reset it; the
+  /// table is then stale ([isSynced] is false) but still served.
   bool get hasSynced => _hasSynced;
 
-  /// Completes on the first `SYNCED` ever, when [hasSynced] becomes true.
+  /// Completes on the first sync ever, when [hasSynced] becomes true.
   /// One-shot: unlike [synced] it is never replaced after a loss. Fails
   /// with [StatusCode.cancelled] if [close] is called before that.
   Future<void> get firstSynced => _firstSynced.future;
@@ -178,10 +181,11 @@ class NamingClient {
   /// True after [close].
   bool get isClosed => _closed;
 
-  /// Completes after `SYNCED` of the current session. After a loss of the
-  /// channel this returns a new future for the next session (unless the
-  /// previous one never completed, in which case it is the same one).
-  /// Fails with [StatusCode.cancelled] if [close] is called first.
+  /// Completes once the current session is synced (its `WATCH` answered).
+  /// After a loss of the channel this returns a new future for the next
+  /// session (unless the previous one never completed, in which case it is
+  /// the same one). Fails with [StatusCode.cancelled] if [close] is called
+  /// first.
   Future<void> get synced => _synced.future;
 
   // ---------------------------------------------------------------------
@@ -194,7 +198,7 @@ class NamingClient {
   set slotHandler(SlotHandler? handler) => _slots.handler = handler;
 
   /// Read-only live view of the mirrored slot tables, by type. Like
-  /// [table], incomplete before the first `SYNCED` and stale while not
+  /// [table], incomplete before the first sync and stale while not
   /// [isSynced]. A redefinition of a space replaces its [SlotTable].
   late final Map<Name, SlotTable> slotTables = UnmodifiableMapView(
     _slots.views,
@@ -716,6 +720,10 @@ class NamingClient {
   }
 
   void _onServerMessage(_Session session, TalkMessage message) {
+    if (!message.expectsReply) {
+      _onEvent(session, message);
+      return;
+    }
     if (message.canReply &&
         _ClientSlots.procedures.contains(message.procedure)) {
       if (session.alive) {
@@ -736,7 +744,7 @@ class NamingClient {
         _log.fine('abort failed: $e');
       }
     } else {
-      _log.fine('ignoring message ${message.procedureName}');
+      _log.fine('ignoring request ${message.procedureName}');
     }
   }
 
@@ -758,6 +766,8 @@ class NamingClient {
     final requested = instance ?? entry.instance;
     final int assigned;
     try {
+      // Ordered: the UP of the record, which the naming service sends
+      // before the reply, is in the table when this completes.
       final response = await session.channel.request(
         Procedures.register.toString(),
         RegisterRequest(
@@ -766,6 +776,7 @@ class NamingClient {
           endpoints: entry.endpoints,
           metadata: entry.metadata,
         ).encode(),
+        ordered: true,
       );
       assigned = RegisterResponse.decode(response.payload).instance;
       if (assigned == 0 || (requested != 0 && assigned != requested)) {
@@ -972,6 +983,7 @@ class NamingClient {
       await session.channel.request(
         Procedures.unregister.toString(),
         UnregisterRequest(type, instance).encode(),
+        ordered: true,
       );
     } catch (e) {
       if (!session.usable) {
@@ -991,78 +1003,71 @@ class NamingClient {
   // ---------------------------------------------------------------------
   // Watch
 
+  /// Subscribes to every type. The reply is ordered with the events: every
+  /// event before it is part of the snapshot, every event after it is live.
   void _startWatch(_Session session) {
-    final TalkStream watch;
+    final Future<TalkMessage> reply;
     try {
-      watch = session.channel.streamRequest(
+      reply = session.channel.request(
         Procedures.watch.toString(),
         const WatchRequest().encode(),
-        timeout: watchTimeout,
+        ordered: true,
       );
     } on SwitchboardException catch (e) {
       session.lose(Status.ok, 'cannot watch: $e');
       return;
     }
-    session.watchItems = watch.items.listen(
-      (item) => _onWatchItem(session, item),
-      onError: (Object e) {
-        final status = e is SwitchboardException
-            ? e.status
-            : Status.of(StatusCode.unknown, '$e');
-        session.lose(
-          Status.of(StatusCode.unavailable, 'watch failed: $status'),
-          'watch failed: $status',
-        );
-      },
-      onDone: () => session.lose(
-        Status.of(StatusCode.unavailable, 'watch ended'),
-        'watch ended',
-      ),
-    );
+    reply
+        .then(
+          (_) => _onSynced(session),
+          onError: (Object e) {
+            final status = e is SwitchboardException
+                ? e.status
+                : Status.of(StatusCode.unknown, '$e');
+            session.lose(
+              Status.of(StatusCode.unavailable, 'WATCH failed: $status'),
+              'WATCH failed: $status',
+            );
+          },
+        )
+        .ignore();
   }
 
-  void _onWatchItem(_Session session, TalkMessage item) {
+  /// A one-way message from the naming service: an event of the
+  /// subscription. Events before the `WATCH` reply ([_Session.syncing])
+  /// belong to the snapshot.
+  void _onEvent(_Session session, TalkMessage event) {
     if (!session.alive) {
       return;
     }
-    if (item.canReply) {
-      try {
-        item.replyAbort(
-          Status.of(StatusCode.unimplemented, 'no reply to watch items'),
-        );
-      } on SwitchboardException catch (e) {
-        _log.fine('abort failed: $e');
-      }
-    }
-    final procedure = item.procedure;
+    final procedure = event.procedure;
     try {
       if (procedure == Procedures.up) {
-        final record = ServiceRecord.decode(item.payload);
+        final record = ServiceRecord.decode(event.payload);
         if (session.syncing) {
           session.seen.add(record.address);
         }
         _applyUp(record);
       } else if (procedure == Procedures.down) {
-        final address = ServiceEvent.decodeDown(item.payload).record.address;
+        final address = ServiceEvent.decodeDown(event.payload).record.address;
         session.seen.remove(address);
         _applyDown(address);
-      } else if (procedure == Procedures.synced) {
-        _onSynced(session);
       } else if (procedure == Procedures.slotSpace) {
-        _slots.onSpaceItem(session, SlotSpace.decode(item.payload));
+        _slots.onSpaceItem(session, SlotSpace.decode(event.payload));
       } else if (procedure == Procedures.slot) {
-        _slots.onSlotItem(session, SlotItem.decode(item.payload));
+        _slots.onSlotItem(session, SlotItem.decode(event.payload));
       } else {
-        _log.fine('ignoring watch item ${item.procedureName}');
+        _log.fine('ignoring message ${event.procedureName}');
       }
     } on ProtocolException catch (e) {
-      _log.warning('malformed ${item.procedureName} item: $e');
+      _log.warning('malformed ${event.procedureName} event: $e');
     }
   }
 
+  /// The `WATCH` reply: the snapshot is complete. Records, spaces and
+  /// slots it did not mention are gone.
   void _onSynced(_Session session) {
-    if (!session.syncing) {
-      _log.warning('second SYNCED on one watch ignored');
+    if (!session.alive || !session.syncing) {
       return;
     }
     session.syncing = false;
@@ -1154,15 +1159,15 @@ class _Session {
   final Completer<void> _lost = Completer<void>();
   final Completer<void> _closed = Completer<void>();
   StreamSubscription<TalkMessage>? messages;
-  StreamSubscription<TalkMessage>? watchItems;
   Future<void>? closeChannel;
   final Set<Timer> _timers = {};
 
-  /// Before `SYNCED`: addresses seen in the snapshot.
+  /// Until the `WATCH` reply: events are the snapshot, and the addresses
+  /// they mention are collected.
   bool syncing = true;
   final Set<ServiceAddress> seen = {};
 
-  /// Before `SYNCED`: slot spaces and slots seen in the snapshot.
+  /// Until the `WATCH` reply: slot spaces and slots seen in the snapshot.
   final Set<Name> seenSpaces = {};
   final Set<(Name, int)> seenSlots = {};
 
@@ -1224,7 +1229,6 @@ class _Session {
     // Nothing worth waiting for in the cancels. Cancelling a subscription
     // to a stream that already ended returns a future of the root zone,
     // which a fake clock (package:fake_async) never completes.
-    watchItems?.cancel().ignore();
     messages?.cancel().ignore();
     await closeChannel;
     if (!_closed.isCompleted) {
