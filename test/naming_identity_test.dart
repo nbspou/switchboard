@@ -2,7 +2,8 @@
 // Credentials", stage B): scope enforcement per `_ns` channel (connection
 // identity, or a credential in the open payload), RENEW and the renewal of
 // a MeshNode's credential (with fake time), the end of a channel whose
-// credential expires, and CONNECT brokering, over mem:// nodes.
+// credential expires, slot spaces defined again after a restart, and
+// CONNECT brokering (a late dial-back included), over mem:// nodes.
 
 import 'dart:async';
 import 'dart:convert';
@@ -113,6 +114,7 @@ class Mesh {
     bool Function(Credential credential)? renewable,
     Duration brokerTimeout = const Duration(seconds: 5),
     bool close = true,
+    String? name,
   }) async {
     final host = await node(close: close);
     final service = NamingService(
@@ -131,6 +133,7 @@ class Mesh {
     // The naming service checks identities itself, the payload's too.
     final uri = await host.listenMemory(
       policy: ChannelPolicies.allowTypes({naming}),
+      name: name,
     );
     return Mesh._(host, service, uri);
   }
@@ -243,6 +246,21 @@ Future<Map<String, StatusCode?>> survey(
 const ok = null;
 const denied = StatusCode.permissionDenied;
 
+/// A slot lifecycle with nothing to load or serve.
+class Idle extends SlotLifecycle {
+  @override
+  Future<AssignResult> load(
+    int slot, {
+    required int epoch,
+    required int holder,
+    required bool shared,
+    SlotRequestContext? context,
+  }) async => AssignResult.notHolding;
+
+  @override
+  void serve(IncomingChannel channel, int slot) {}
+}
+
 void main() {
   setUpAll(() async {
     authority = await CredentialIssuer.ed25519FromSeed(
@@ -254,42 +272,45 @@ void main() {
   });
 
   group('scopes', () {
-    test(
-      'a worker credential can register its type and nothing else',
-      () async {
-        final mesh = await Mesh.start();
-        final worker = await node(
-          credential: await issue('worker-a1', workerScopes),
-        );
-        final c = await channelTo(worker, mesh);
-        expect(await survey(c, workerType), {
-          'REGISTER': ok,
-          'WATCH *': denied,
-          'WATCH type': denied,
-          'LOOKUP': denied,
-          'SLOTS': denied,
-          'CLAIM': denied,
-          'LOCATE': denied,
-          'MIGRATE': denied,
-          'CONNECT': denied,
-        });
-        expect(
-          await call(c, Procedures.register, registerPayload(npc)),
-          denied,
-        );
-        // Its own record it may take back; not another channel's.
-        final id = mesh.service.table.keys.single.instance;
-        expect(
-          await call(
-            c,
-            Procedures.unregister,
-            UnregisterRequest(workerType, id).encode(),
-          ),
-          ok,
-        );
-        expect(mesh.service.table, isEmpty);
-      },
-    );
+    test('a worker credential can register its type (and define its slot '
+        'space) and nothing else', () async {
+      final mesh = await Mesh.start();
+      final worker = await node(
+        credential: await issue('worker-a1', workerScopes),
+      );
+      final c = await channelTo(worker, mesh);
+      expect(await survey(c, workerType), {
+        'REGISTER': ok,
+        'WATCH *': denied,
+        'WATCH type': denied,
+        'LOOKUP': denied,
+        'SLOTS': ok,
+        'CLAIM': denied,
+        'LOCATE': denied,
+        'MIGRATE': denied,
+        'CONNECT': denied,
+      });
+      expect(await call(c, Procedures.register, registerPayload(npc)), denied);
+      expect(
+        await call(
+          c,
+          Procedures.slots,
+          SlotsRequest(SlotSpace(npc, count: 4), capacity: 0).encode(),
+        ),
+        denied,
+      );
+      // Its own record it may take back; not another channel's.
+      final id = mesh.service.table.keys.single.instance;
+      expect(
+        await call(
+          c,
+          Procedures.unregister,
+          UnregisterRequest(workerType, id).encode(),
+        ),
+        ok,
+      );
+      expect(mesh.service.table, isEmpty);
+    });
 
     test('a consumer credential can watch and broker', () async {
       final mesh = await Mesh.start();
@@ -339,32 +360,60 @@ void main() {
       });
     });
 
-    test('a slot space is defined with admin and confirmed with claim or '
-        'register', () async {
+    test('a slot space is defined, redefined while blank and confirmed '
+        'with claim or register, never with watch alone', () async {
       final mesh = await Mesh.start();
-      final admin = await node(credential: await issue('root', adminScopes));
+      final watcher = await node(
+        credential: await issue('consumer-3', [Scope.of(Right.watch, '*')]),
+      );
       final worker = await node(
         credential: await issue('worker-a1', [
           ...workerScopes,
           Scope.of(Right.claim, 'worker-*'),
         ]),
       );
-      final a = await channelTo(admin, mesh);
+      final registrar = await node(
+        credential: await issue('worker-b2', workerScopes),
+      );
+      final claimer = await node(
+        credential: await issue('worker-c3', [
+          Scope.of(Right.claim, 'worker-*'),
+        ]),
+      );
+      final admin = await node(credential: await issue('root', adminScopes));
+      final v = await channelTo(watcher, mesh);
       final w = await channelTo(worker, mesh);
+      final r = await channelTo(registrar, mesh);
+      final c = await channelTo(claimer, mesh);
+      final a = await channelTo(admin, mesh);
       final space = SlotSpace(workerType, count: 4);
+      final wider = SlotSpace(workerType, count: 8);
       Uint8List slots(SlotSpace space) =>
           SlotsRequest(space, capacity: 0).encode();
-      expect(await call(w, Procedures.slots, slots(space)), denied);
-      expect(await call(a, Procedures.slots, slots(space)), ok);
+      SlotSpace? defined() => mesh.service.slotTable(workerType)?.space;
+      // watch defines nothing; register alone defines (what an instance
+      // does after a restart of the naming service).
+      expect(await call(v, Procedures.slots, slots(space)), denied);
+      expect(defined(), isNull);
+      expect(await call(r, Procedures.slots, slots(space)), ok);
+      expect(defined(), space);
+      // Confirmed with claim or register, not with watch.
+      expect(await call(c, Procedures.slots, slots(space)), ok);
+      expect(await call(v, Procedures.slots, slots(space)), denied);
+      // While blank, redefined under the same rule.
+      expect(await call(v, Procedures.slots, slots(wider)), denied);
+      expect(defined(), space);
+      expect(await call(c, Procedures.slots, slots(wider)), ok);
+      expect(defined(), wider);
+      expect(await call(r, Procedures.slots, slots(space)), ok);
+      expect(defined(), space);
+      // A held slot ends the blank state: a redefinition is refused for
+      // everyone, admin included; HOLDING still needs claim.
       expect(
         await call(w, Procedures.register, registerPayload(workerType)),
         ok,
       );
       expect(await call(w, Procedures.slots, slots(space)), ok);
-      expect(
-        await call(w, Procedures.slots, slots(SlotSpace(workerType, count: 8))),
-        denied,
-      );
       expect(
         await call(
           w,
@@ -373,12 +422,6 @@ void main() {
         ),
         ok,
       );
-      // register alone confirms too, but holds no claim right.
-      final registrar = await node(
-        credential: await issue('worker-b2', workerScopes),
-      );
-      final r = await channelTo(registrar, mesh);
-      expect(await call(r, Procedures.slots, slots(space)), ok);
       expect(
         await call(
           r,
@@ -386,6 +429,85 @@ void main() {
           HoldingRequest(workerType, [1]).encode(),
         ),
         denied,
+      );
+      for (final channel in [w, a]) {
+        expect(
+          await call(channel, Procedures.slots, slots(wider)),
+          StatusCode.failedPrecondition,
+        );
+      }
+      expect(await call(a, Procedures.slots, slots(space)), ok);
+      expect(defined(), space);
+    });
+
+    test('after a naming service restart, an instance defines its slot '
+        'space again with its own credential', () async {
+      const name = 'ns-restarting';
+      final mesh = await Mesh.start(name: name);
+      final worker = await node(
+        credential: await issue('worker-a1', [
+          ...workerScopes,
+          Scope.of(Right.claim, 'worker-*'),
+        ]),
+      );
+      final joined = MeshNode.join(
+        worker,
+        mesh.uri,
+        watch: false,
+        renewCredential: false,
+        reconnectDelay: const Duration(milliseconds: 20),
+      );
+      addTearDown(joined.leave);
+      final space = SlotSpace(workerType, count: 4, mode: SlotMode.static);
+      await joined
+          .publishSharded(
+            workerType,
+            Idle(),
+            count: space.count,
+            mode: space.mode,
+            capacity: 0,
+            endpoints: const [],
+          )
+          .timeout(limit);
+      await joined.claimSlot(workerType, 2).timeout(limit);
+      final id = mesh.service.table.keys.single.instance;
+      expect(mesh.service.slotTable(workerType)![2].owner, id);
+      await mesh.close();
+      // Nobody with admin around: the instance's own SLOTS defines the
+      // space on the new naming service, and its slot is claimed back.
+      final restarted = await Mesh.start(name: name);
+      expect(restarted.uri, mesh.uri);
+      await until(
+        () => restarted.service.slotTable(workerType)?[2].owner == id,
+      );
+      expect(restarted.service.slotTable(workerType)!.space, space);
+      expect(
+        restarted.service.table.keys.single,
+        ServiceAddress(workerType, id),
+      );
+      await joined.leave().timeout(limit);
+    });
+
+    test('the connection identity takes precedence over a credential in '
+        'the open payload', () async {
+      final mesh = await Mesh.start();
+      // Identified by IDENT as "weak", which has no scope; its channel's
+      // payload carries a valid bearer credential that grants everything.
+      final weak = await node(credential: await issue('weak', const []));
+      final wide = await issue('wide', adminScopes, bearer: true);
+      final c = await channelTo(weak, mesh, payload: wide.encode());
+      final results = await survey(c, workerType);
+      expect(results.values.toSet(), {denied});
+      expect(mesh.service.table, isEmpty);
+      expect(mesh.service.slotTable(workerType), isNull);
+      // The same payload identifies a channel whose connection has no
+      // identity.
+      final anonymous = await node(verify: false);
+      final a = await channelTo(anonymous, mesh, payload: wide.encode());
+      expect(await call(a, Procedures.watch, Uint8List(0)), ok);
+      expect(
+        await call(a, Procedures.register, registerPayload(workerType)),
+        ok,
       );
     });
 
@@ -846,6 +968,81 @@ void main() {
         consumer.openChannel(ServiceAddress(workerType, id)),
         throwsCode(StatusCode.unavailable),
       );
+    });
+
+    test('a dial-back that arrives after the consumer gave up is sent '
+        'GOAWAY, and the instance\'s dial fails', () async {
+      // Either side gives up first: the consumer (its connectTimeout), or
+      // the naming service (its brokerTimeout, then UNAVAILABLE).
+      for (final consumerFirst in [true, false]) {
+        const short = Duration(milliseconds: 300);
+        final mesh = await Mesh.start(
+          brokerTimeout: consumerFirst ? limit : short,
+        );
+        final worker = await node(
+          credential: await issue('worker-a1', workerScopes),
+        );
+        final workerMesh = MeshNode.join(worker, mesh.uri, watch: false);
+        addTearDown(workerMesh.leave);
+        final id = await workerMesh
+            .publish(workerType, (incoming) {}, endpoints: const [])
+            .timeout(limit);
+        // The instance answers only once the consumer has given up.
+        final dialBack = workerMesh.client.connectHandler!;
+        final asked = Completer<void>();
+        final release = Completer<void>();
+        final dialled = Completer<Object?>();
+        workerMesh.client.connectHandler = (request) async {
+          asked.complete();
+          await release.future;
+          try {
+            await dialBack(request);
+            dialled.complete(null);
+          } on Object catch (e) {
+            dialled.complete(e);
+            rethrow;
+          }
+        };
+        final peerGoAways = <Status>[];
+        final ended = <Future<Status>>[];
+        worker.connections.listen((connection) {
+          connection.peerGoAwayStatus.then(peerGoAways.add).ignore();
+          ended.add(connection.done);
+        });
+        final consumer = await node(
+          credential: await issue('consumer-1', consumerScopes),
+          connectTimeout: consumerFirst ? short : limit,
+        );
+        await consumer.listenMemory(policy: ChannelPolicies.scoped());
+        final consumerMesh = MeshNode.join(consumer, mesh.uri);
+        addTearDown(consumerMesh.leave);
+        await consumerMesh.synced.timeout(limit);
+        await expectLater(
+          consumer.broker(ServiceAddress(workerType, id)),
+          throwsCode(
+            consumerFirst
+                ? StatusCode.deadlineExceeded
+                : StatusCode.unavailable,
+          ),
+        );
+        await asked.future.timeout(limit);
+        release.complete();
+        final outcome = await dialled.future.timeout(limit);
+        expect(
+          outcome,
+          isA<SwitchboardException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.unauthenticated,
+          ),
+        );
+        // The consumer recognised the intent it gave up on and sent GOAWAY
+        // once the IDENT verified.
+        expect(ended, hasLength(1));
+        await ended.single.timeout(limit);
+        expect(peerGoAways, [hasCode(StatusCode.goingAway)]);
+        expect(workerMesh.brokeredConnections, isEmpty);
+      }
     });
 
     test('broker refuses without a brokering resolver, a listener, an '

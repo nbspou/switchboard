@@ -18,8 +18,10 @@ The protocol specification lives in the project wiki (section
   `AbortableTransport` and `OutputBufferedTransport`.
 - Mux: channels opened by either side, short and long ids reused after
   mutual close, reserved ids, a control channel with PING, PONG, GOAWAY and
-  LIMITS, status payloads in CLOSE, keep-alive, graceful shutdown, the
-  peer's GOAWAY status and byte counters for clients.
+  LIMITS (at most `MuxConnection.maxPendingPings` pings awaiting a PONG,
+  the oldest failing beyond it), status payloads in CLOSE, keep-alive,
+  graceful shutdown, the peer's GOAWAY status and byte counters for
+  clients.
 - Talk: plain messages, requests, stream requests, chained responses and
   item requests to any depth, aborts with status codes, channel aborts,
   `EXTEND`, cancellation, requester and responder timeouts, request limits,
@@ -196,7 +198,9 @@ The protocol specification lives in the project wiki (section
   id for rotation, a cache by credential bytes), `HolderKey`; connection
   identity with the `NONCE` and `IDENT` control messages
   (`MuxConnection.identify`, `peerIdentity`, `MuxOptions.identityVerifier`;
-  a refused `IDENT` ends the connection with GOAWAY `UNAUTHENTICATED`);
+  a refused `IDENT` ends the connection with GOAWAY `UNAUTHENTICATED`, so
+  an unidentified peer gets one credential check per connection; a
+  malformed `IDENT` is a protocol error with or without a verifier);
   `Switchboard(credential:, holderKey:, verifier:, identifyOutgoing:,
   identifyFor:, identityTimeout:)`, which identifies on the connections it
   initiates before using them, `identifyOn`, `ChannelPolicies.scoped`,
@@ -210,8 +214,10 @@ The protocol specification lives in the project wiki (section
   `Switchboard(expectedIdentityFor:)`, `dial(intent:, receiver:, record:)`,
   `identifyOn(receiver:)`); credentials are at most 637 bytes. The naming
   service enforces scopes per `_ns` channel, from the connection's identity
-  or a bearer credential in the open payload
-  (`NamingService(verifier:, requireCredential:)`), ends a channel whose
+  or else a bearer credential in the open payload
+  (`NamingService(verifier:, requireCredential:)`; `SLOTS` needs `claim` or
+  `register` for the type, so that instances define their spaces again
+  after a naming service restart), ends a channel whose
   credential expires, renews credentials (`RENEW`,
   `NamingService(issuer:, renewable:)`, `NamingClient.renew`, renewal at
   two thirds of the lifetime by `MeshNode` with

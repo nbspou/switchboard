@@ -62,6 +62,17 @@ Future<CredentialVerifier> verifierFor(
   return verifier;
 }
 
+/// A verifier that counts the credentials it is asked to verify.
+class CountingVerifier extends CredentialVerifier {
+  int calls = 0;
+
+  @override
+  Future<Credential> verify(Uint8List bytes, {DateTime? now}) {
+    calls++;
+    return super.verify(bytes, now: now);
+  }
+}
+
 /// Two connected muxes; [acceptorVerifier] checks the initiator's IDENT,
 /// [initiatorVerifier] the acceptor's.
 (MuxConnection, MuxConnection) identityPair({
@@ -444,6 +455,75 @@ void main() {
       expect(b.peerIdentity, isNull);
     });
 
+    test('a replayed bearer IDENT is accepted, by design', () async {
+      // A bearer credential is a password (wiki "Security considerations"):
+      // its IDENT carries no proof, so nothing binds it to the nonces of
+      // the connection it was sent on, and whoever saw it presents it
+      // again until it expires. Only a holder-key credential resists the
+      // replay (the test above); bearer credentials stay within one trust
+      // domain. Changing this means changing the wire format, not a check.
+      final (a, first) = rawPair();
+      final identifying = a.identify(await bearer());
+      await first.nextControl(MuxControlType.nonce);
+      first.send(
+        control(MuxControlType.nonce, Uint8List(32)..fillRange(0, 32, 0x22)),
+      );
+      final ident = await first.nextControl(MuxControlType.ident);
+      final ping = await first.nextControl(MuxControlType.ping);
+      first.send(control(MuxControlType.pong, ping.payload));
+      await identifying;
+      await a.close();
+
+      final verifier = await verifierFor([hmacIssuer]);
+      final (b, raw) = rawPair(
+        muxIsInitiator: false,
+        options: rawOptions.copyWith(identityVerifier: verifier),
+      );
+      raw.send(
+        control(MuxControlType.nonce, Uint8List(32)..fillRange(0, 32, 0x33)),
+      );
+      await raw.nextControl(MuxControlType.nonce);
+      raw
+        ..send(control(MuxControlType.ident, ident.payload))
+        ..send(control(MuxControlType.ping, hexBytes('07')));
+      final pong = await raw.nextControl(MuxControlType.pong);
+      expect(hexString(pong.payload), '07');
+      expect(b.peerIdentity?.identity, 'npc-7');
+      expect(b.peerIdentity?.provedPossession, isFalse);
+      expect(b.isOpen, isTrue);
+      await b.close();
+    });
+
+    test('a failing IDENT ends the connection: one verification per '
+        'connection', () async {
+      // An unidentified peer costs the receiver at most one credential
+      // check per connection: the IDENTs it queues behind a failing one
+      // are dropped unverified with the connection.
+      final verifier = CountingVerifier();
+      await verifier.addIssuer(hmacIssuer);
+      final (b, raw) = rawPair(
+        muxIsInitiator: false,
+        options: rawOptions.copyWith(identityVerifier: verifier),
+      );
+      raw.send(control(MuxControlType.nonce, Uint8List(32)));
+      await raw.nextControl(MuxControlType.nonce);
+      for (var i = 0; i < 20; i++) {
+        // Distinct, well-formed, with a signature that does not verify.
+        final forged = Uint8List.fromList(
+          (await bearer(identity: 'npc-$i')).encode(),
+        );
+        forged[forged.length - 1] ^= 1;
+        raw.send(
+          control(MuxControlType.ident, MuxIdent(credential: forged).encode()),
+        );
+      }
+      final goAway = await raw.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus, hasCode(StatusCode.unauthenticated));
+      expect(await b.done, hasCode(StatusCode.unauthenticated));
+      expect(verifier.calls, 1);
+      expect(b.peerIdentity, isNull);
+    });
+
     group('receiver binding', () {
       /// A mux accepting IDENTs as [identity] (null: no credential).
       (MuxConnection, RawPeer) receiverPair(
@@ -742,47 +822,73 @@ void main() {
       await b.done;
     });
 
-    group('protocol errors', () {
-      Future<void> expectProtocolError(List<String> frames) async {
-        final verifier = await verifierFor([hmacIssuer]);
-        final (b, raw) = rawPair(
-          muxIsInitiator: false,
-          options: rawOptions.copyWith(identityVerifier: verifier),
-        );
-        frames.forEach(raw.send);
-        final goAway = await raw.nextControl(MuxControlType.goAway);
-        expect(goAway.goAwayStatus, hasCode(StatusCode.protocolError));
-        expect(await b.done, hasCode(StatusCode.protocolError));
-      }
+    // The envelope rules hold whether or not the receiver can verify
+    // credentials: a side without a verifier ignores only well-formed
+    // IDENTs, so a malformed one does not tell whether it checks identity.
+    for (final verifying in [true, false]) {
+      group('protocol errors ${verifying ? 'with' : 'without'} a verifier', () {
+        Future<void> expectProtocolError(List<String> frames) async {
+          final (b, raw) = rawPair(
+            muxIsInitiator: false,
+            options: verifying
+                ? rawOptions.copyWith(
+                    identityVerifier: await verifierFor([hmacIssuer]),
+                  )
+                : rawOptions,
+          );
+          frames.forEach(raw.send);
+          final goAway = await raw.nextControl(MuxControlType.goAway);
+          expect(goAway.goAwayStatus, hasCode(StatusCode.protocolError));
+          expect(await b.done, hasCode(StatusCode.protocolError));
+        }
 
-      test('NONCE of 31 bytes', () async {
-        await expectProtocolError([
-          control(MuxControlType.nonce, Uint8List(31)),
-        ]);
-      });
+        test('NONCE of 31 bytes', () async {
+          await expectProtocolError([
+            control(MuxControlType.nonce, Uint8List(31)),
+          ]);
+        });
 
-      test('a second NONCE', () async {
-        await expectProtocolError([
-          control(MuxControlType.nonce, Uint8List(32)),
-          control(MuxControlType.nonce, Uint8List(32)),
-        ]);
-      });
+        test('a second NONCE', () async {
+          await expectProtocolError([
+            control(MuxControlType.nonce, Uint8List(32)),
+            control(MuxControlType.nonce, Uint8List(32)),
+          ]);
+        });
 
-      test('IDENT before the nonces', () async {
-        await expectProtocolError([
-          control(
-            MuxControlType.ident,
-            MuxIdent(credential: (await bearer()).encode()).encode(),
-          ),
-        ]);
-      });
+        test('IDENT before the nonces', () async {
+          await expectProtocolError([
+            control(
+              MuxControlType.ident,
+              MuxIdent(credential: (await bearer()).encode()).encode(),
+            ),
+          ]);
+        });
 
-      test('a truncated IDENT', () async {
-        await expectProtocolError([
-          control(MuxControlType.nonce, Uint8List(32)),
-          control(MuxControlType.ident, hexBytes('05 00 01 02')),
-        ]);
+        test('a truncated IDENT', () async {
+          await expectProtocolError([
+            control(MuxControlType.nonce, Uint8List(32)),
+            control(MuxControlType.ident, hexBytes('05 00 01 02')),
+          ]);
+        });
+
+        test('an IDENT with an intent over 64 bytes', () async {
+          final credential = (await bearer()).encode();
+          await expectProtocolError([
+            control(MuxControlType.nonce, Uint8List(32)),
+            control(
+              MuxControlType.ident,
+              Uint8List.fromList([
+                credential.length & 0xFF,
+                credential.length >> 8,
+                ...credential,
+                65,
+                ...Uint8List(65),
+                0,
+              ]),
+            ),
+          ]);
+        });
       });
-    });
+    }
   });
 }

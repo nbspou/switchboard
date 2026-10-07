@@ -162,8 +162,10 @@ class MuxOptions {
 
   /// Verifies the credential of an `IDENT` from the peer, which then sets
   /// [MuxConnection.peerIdentity]. Null: nothing can verify a credential,
-  /// so an `IDENT` is ignored (and logged). A `NONCE` is answered either
-  /// way.
+  /// so a well-formed `IDENT` is ignored (and logged). A `NONCE` is
+  /// answered either way, and an `IDENT` that breaks the envelope rules
+  /// (before both nonces, truncated, or with an intent over 64 bytes) is a
+  /// protocol error either way.
   final CredentialVerifier? identityVerifier;
 
   /// How long [MuxConnection.identify] waits for the peer's `NONCE` and the
@@ -696,13 +698,19 @@ class MuxConnection {
     return link.channel;
   }
 
+  /// Most PINGs of [ping] awaiting their PONG. Beyond it, the oldest
+  /// fails with [StatusCode.deadlineExceeded], so that a peer that
+  /// withholds PONGs cannot make them accumulate.
+  static const int maxPendingPings = 1024;
+
   /// Sends PING and completes with the round trip time when the matching
   /// PONG arrives.
   ///
   /// Without [payload] a unique one is generated. Fails with
   /// [SwitchboardException] if the connection is closed or ends before
-  /// the PONG arrives. Throws [ArgumentError] if [payload] is longer than
-  /// 125 bytes.
+  /// the PONG arrives, and with [StatusCode.deadlineExceeded] if
+  /// [maxPendingPings] later PINGs are sent before it arrives. Throws
+  /// [ArgumentError] if [payload] is longer than 125 bytes.
   Future<Duration> ping([Uint8List? payload]) {
     final message = MuxControlMessage.ping(payload ?? _nextPingPayload());
     if (_closing) {
@@ -712,6 +720,17 @@ class MuxConnection {
           'connection is closed',
         ),
       );
+    }
+    if (_pings.length >= maxPendingPings) {
+      _pings
+          .removeAt(0)
+          .completer
+          .completeError(
+            SwitchboardException.of(
+              StatusCode.deadlineExceeded,
+              'no PONG before $maxPendingPings later PINGs',
+            ),
+          );
     }
     final pending = _PendingPing(Uint8List.fromList(message.payload));
     _pings.add(pending);
@@ -1105,17 +1124,19 @@ class MuxConnection {
   }
 
   void _onIdent(Uint8List payload) {
-    final verifier = options.identityVerifier;
-    if (verifier == null) {
-      _log.fine('$this: ignoring IDENT, no identity verifier');
-      return;
-    }
     final localNonce = _localNonce;
     final peerNonce = _peerNonce;
     if (localNonce == null || peerNonce == null) {
       throw ProtocolException('IDENT before both nonces were exchanged');
     }
+    // The envelope rules hold with or without a verifier, so that a
+    // malformed IDENT does not tell whether this side checks identity.
     final ident = MuxIdent.decode(payload);
+    final verifier = options.identityVerifier;
+    if (verifier == null) {
+      _log.fine('$this: ignoring IDENT, no identity verifier');
+      return;
+    }
     // Frames after the IDENT wait for its verification, so that they see
     // the identity it establishes (or never run if it fails).
     _verifyingIdent = true;

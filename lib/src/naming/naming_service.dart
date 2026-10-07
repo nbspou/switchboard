@@ -96,9 +96,10 @@ final Logger _log = Logger('Switchboard.Naming');
 /// credential's scopes grant: `REGISTER` needs `register` for the type;
 /// `WATCH`, `UNWATCH`, `LOOKUP` and `LOCATE` need `watch` (`watch *` for a
 /// `WATCH` of every type); `CLAIM`, `RELEASE` and `HOLDING` need `claim`;
-/// `MIGRATE` needs `migrate`; `CONNECT` needs `broker`; defining a slot
-/// space with `SLOTS` needs `admin`, confirming the existing definition
-/// `claim` or `register`; `UNREGSTR` needs the record to be the channel's.
+/// `MIGRATE` needs `migrate`; `CONNECT` needs `broker`; `SLOTS` (defining
+/// a slot space, redefining a blank one, or confirming the definition)
+/// needs `claim` or `register`, so that the instances define their spaces
+/// again after a restart; `UNREGSTR` needs the record to be the channel's.
 /// A request the scopes do not grant is answered `PERMISSION_DENIED`. A
 /// channel without an identity may do everything, unless
 /// [requireCredential] (every request answered `UNAUTHENTICATED`); a
@@ -993,28 +994,22 @@ class NamingService {
     return false;
   }
 
-  /// Whether [session] may define a slot space (`admin`) or, with
-  /// [confirm], confirm the existing definition of [type] (`claim` or
-  /// `register` for it); answers [message] when it may not.
-  bool _permitsSpace(
-    _Session session,
-    TalkMessage message,
-    Name type, {
-    required bool confirm,
-  }) {
+  /// Whether [session] may define, redefine (while blank) or confirm the
+  /// slot space of [type]: `claim` or `register` for it, so that after a
+  /// restart of this service the instances define their spaces again
+  /// with their own credentials. Answers [message] when it may not.
+  bool _permitsSpace(_Session session, TalkMessage message, Name type) {
     final credential = _identityOf(session);
     if (credential == null) {
-      return _permits(session, message, Right.admin, type);
+      return _permits(session, message, Right.claim, type);
     }
-    if (credential.allows(Right.admin, type) ||
-        (confirm &&
-            (credential.allows(Right.claim, type) ||
-                credential.allows(Right.register, type)))) {
+    if (credential.allows(Right.claim, type) ||
+        credential.allows(Right.register, type)) {
       return true;
     }
     _log.info(
-      'SLOTS refused: "${credential.identity}" may not '
-      '${confirm ? 'confirm' : 'define'} the slot space of $type',
+      'SLOTS refused: "${credential.identity}" has no claim or register '
+      'scope for $type',
     );
     _abort(message, _permissionDenied);
     return false;

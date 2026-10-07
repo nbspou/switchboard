@@ -796,6 +796,33 @@ void main() {
       await mux.close();
     });
 
+    test('pending pings are bounded: the oldest fails with '
+        'DEADLINE_EXCEEDED', () async {
+      // A peer that withholds PONGs cannot make ping() accumulate.
+      final (mux, raw) = rawPair();
+      const max = MuxConnection.maxPendingPings;
+      Matcher fails(StatusCode code) =>
+          isA<SwitchboardException>().having((e) => e.code, 'code', code);
+      final outcomes = [
+        for (var i = 0; i <= max; i++)
+          mux.ping().then<Object>((rtt) => rtt, onError: (Object e) => e),
+      ];
+      expect(await outcomes[0], fails(StatusCode.deadlineExceeded));
+      final sent = [
+        for (var i = 0; i <= max; i++)
+          (await raw.nextControl(MuxControlType.ping)).payload,
+      ];
+      // The others still wait for their own PONGs.
+      raw.transport.sink.add(
+        MuxControlMessage.pong(sent[1]).toFrame().encode(),
+      );
+      expect(await outcomes[1], isA<Duration>());
+      await mux.close();
+      for (final outcome in outcomes.skip(2)) {
+        expect(await outcome, isA<SwitchboardException>());
+      }
+    });
+
     test('ping payload over 125 bytes is refused', () async {
       final (a, _) = muxPair();
       expect(() => a.ping(Uint8List(126)), throwsArgumentError);

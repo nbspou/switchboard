@@ -42,7 +42,8 @@ enum CredentialKind {
 ///
 /// See the wiki page "Switchboard Identity and Credentials".
 enum Right {
-  /// May register records of matching types, its own endpoints or others'.
+  /// May register records of matching types, its own endpoints or others',
+  /// and define or confirm their slot spaces (`SLOTS`).
   register(1),
 
   /// May open channels to matching types on any peer that checks scopes.
@@ -51,7 +52,8 @@ enum Right {
   /// May `WATCH`, `UNWATCH` and `LOOKUP` matching types.
   watch(3),
 
-  /// May `CLAIM`, `RELEASE` and declare `HOLDING` for matching types.
+  /// May `CLAIM`, `RELEASE` and declare `HOLDING` for matching types, and
+  /// define or confirm their slot spaces (`SLOTS`).
   claim(4),
 
   /// May request `MIGRATE` for matching types.

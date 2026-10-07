@@ -373,13 +373,7 @@ class _SlotManager {
       );
       return;
     }
-    final existing = spaces[type];
-    if (!service._permitsSpace(
-      session,
-      message,
-      type,
-      confirm: existing != null && existing.space == definition,
-    )) {
+    if (!service._permitsSpace(session, message, type)) {
       return;
     }
     final _Registration? registration;
