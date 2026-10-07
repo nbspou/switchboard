@@ -2131,7 +2131,7 @@ class Switchboard {
           continue;
         }
         try {
-          final connection = await connect(endpoint);
+          final connection = await _connect(endpoint, null, record);
           // A record for any instance (an endpoint resolver's) stands for
           // the instance asked for, metadata included (credentialFor reads
           // it).

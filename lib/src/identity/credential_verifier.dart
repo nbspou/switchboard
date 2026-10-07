@@ -138,6 +138,23 @@ class CredentialVerifier {
   /// credentials are bearer only), or the credential has expired. The
   /// cause is logged at FINE (logger `Switchboard.Identity`), never told to
   /// the peer.
+  /// The credential [bytes] verified earlier, if it is still cached and
+  /// not expired at [now] (`clock.now()` by default); null otherwise, in
+  /// which case [verify] is the way to check it. Synchronous and never
+  /// throws, for paths that cannot wait, such as a request handler that
+  /// receives a credential relayed by another instance (`forwardMessage`,
+  /// `SlotGate.serveRequest` with a payload): a credential this node has
+  /// verified once, over any channel, is answered at once, and an unknown
+  /// one can be verified asynchronously or refused. Does not refresh the
+  /// entry's place in the cache.
+  Credential? cached(Uint8List bytes, {DateTime? now}) {
+    final credential = _cache[_Bytes(bytes)];
+    if (credential == null || credential.isExpired(now ?? clock.now())) {
+      return null;
+    }
+    return credential;
+  }
+
   Future<Credential> verify(Uint8List bytes, {DateTime? now}) async {
     final key = _Bytes(bytes);
     var credential = _cache.remove(key);

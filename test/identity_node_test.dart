@@ -666,5 +666,37 @@ void main() {
       // The PeerSet tells the hook which record it dials.
       expect(records.single?.address, ServiceAddress(npc, 5));
     });
+
+    test('an open through the resolver tells the hook its record', () async {
+      final gate = await node(
+        credential: await issue('gate', gateKey, const []),
+        holderKey: gateKey,
+        requireNamedIdent: true,
+      );
+      gate.registerService(npc, answer, acceptAnyInstance: true);
+      final uri = await gate.listenMemory();
+      final records = <ServiceRecord?>[];
+      final client = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        resolver: StaticResolver([
+          ServiceRecord(ServiceAddress(npc, 5), endpoints: [uri]),
+        ]),
+        expectedIdentityFor: (endpoint, record) {
+          records.add(record);
+          return 'gate';
+        },
+      );
+      expect(
+        await answerOf(await client.openChannel(ServiceAddress(npc))),
+        'npc for npc-7',
+      );
+      // A second open reuses the pooled connection: no new identification.
+      expect(
+        await answerOf(await client.openChannel(ServiceAddress(npc, 5))),
+        'npc for npc-7',
+      );
+      expect(records.single?.address, ServiceAddress(npc, 5));
+    });
   });
 }

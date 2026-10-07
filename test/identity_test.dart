@@ -227,6 +227,26 @@ void main() {
       expect(verifier.cachedCount, 3);
     });
 
+    test('cached answers synchronously what verify checked', () async {
+      final verifier = await verifierFor([hmacIssuer, edIssuer]);
+      final a = await bearer();
+      final bytes = a.encode();
+      expect(verifier.cached(bytes), isNull);
+      expect(await verifier.verify(bytes), a);
+      expect(verifier.cached(bytes), a);
+      expect(verifier.cached(Uint8List.fromList([...bytes, 1])), isNull);
+      // Expired at the time asked about, and after key rotation.
+      expect(
+        verifier.cached(
+          bytes,
+          now: a.expiresAtTime!.add(const Duration(seconds: 1)),
+        ),
+        isNull,
+      );
+      verifier.removeKey(Name('mesh1'));
+      expect(verifier.cached(bytes), isNull);
+    });
+
     test('the cache is bounded, least recently used first', () async {
       final verifier = await verifierFor([hmacIssuer], cacheSize: 2);
       final one = await bearer(identity: 'one');

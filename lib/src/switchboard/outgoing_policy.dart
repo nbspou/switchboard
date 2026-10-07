@@ -94,11 +94,13 @@ typedef EndpointCredential = FutureOr<Uint8List?> Function(
 /// Identity and Credentials", section "Connection identity").
 ///
 /// [endpoint] is normalised as for [EndpointPolicy]. [record] is the
-/// resolver's record the connection is established for when the caller
-/// knows it (`PeerSet`, `Switchboard.dial` given one, and the connection
-/// to a relay the open methods establish), else null (the pooled
-/// connections of `Switchboard.connect` and the open methods, which
-/// several records may share).
+/// resolver's record the connection is established for: the record whose
+/// endpoint an open method dials (the pooled connection then serves every
+/// record at that endpoint, which is one node, so naming it from the first
+/// record is sound), the record `PeerSet` or `Switchboard.dial` was given,
+/// or the relay's record for a connection to a relay; null for
+/// `Switchboard.connect` and `openChannelAt`, which dial an endpoint with
+/// no record.
 ///
 /// For a relay's record (`_relay`, or the type of `Switchboard.relay`), a
 /// null answer names the identity the record's metadata carries.
