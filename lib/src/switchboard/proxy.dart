@@ -231,9 +231,11 @@ Status _closeStatusFor(Status status) {
 ///    refuses every such channel. An admitted one is routed like a channel
 ///    to a type without a slot table: to the instance its address names,
 ///    else round robin over the type's instances, the selected instance
-///    filled in. The slot table is looked at once the resolver is ready
-///    (its `resolve` answered), so a resolver still syncing cannot let a
-///    channel through. Channels relayed to a host hint are not checked:
+///    filled in. The slot tables are looked at once the resolver is ready
+///    (its `resolve` answered; a failure rejects the channel with the code
+///    the forwarding would fail with), so that a resolver still syncing
+///    lets neither a channel without a slot nor an instance the client
+///    named past a table. Channels relayed to a host hint are not checked:
 ///    they bypass the resolver and its tables.
 /// 5. A channel is opened to the destination with the same open payload
 ///    (as rewritten by [authorize]), except that the host hint is removed
@@ -247,6 +249,11 @@ Status _closeStatusFor(Status status) {
 ///    entry, or found with [SlotResolver.locateSlot] within
 ///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
 ///    instance set to the new owner's, and the client does not notice.
+///    What the client sends meanwhile is held, at most
+///    [MuxOptions.maxChannelBufferBytes] of the node's
+///    [Switchboard.muxOptions] ([SlotChannel.maxHeldBytes]); beyond, the
+///    channel is closed with `RESOURCE_EXHAUSTED` (nothing was processed:
+///    the client may open it again).
 ///    After the first subframe, or when no other owner is found, the
 ///    `MOVED` is forwarded to the client, which may open the channel again
 ///    and resend, since `MOVED` means nothing was processed (see
@@ -370,29 +377,36 @@ ChannelHandler proxyHandler(
       final r = resolver ?? switchboard.resolver;
       final shard = address.shard;
       final relaying = address.host != null && switchboard.allowHostHint;
-      if (shard == null && !relaying && r is SlotResolver) {
-        final refusal = await _refuseNoSlot(r, type, allowNoSlot, incoming);
-        if (refusal != null) {
-          await incoming.reject(genericStatus(refusal));
+      if (!relaying && r is SlotResolver) {
+        // The slot tables are complete once the resolver answers: one
+        // still syncing has none yet, and would let a channel without a
+        // slot, or a client-named instance, past its table.
+        final failure = await _resolved(r, type, incoming);
+        if (failure != null) {
+          await incoming.reject(genericStatus(failure));
           return;
         }
-      }
-      final table = shard != null && r is SlotResolver
-          ? r.slotTable(type)
-          : null;
-      if (table != null && !relaying) {
-        if (address.instance != 0 && !allowExplicitInstance) {
-          _log.fine('proxy: $incoming routed by the slot table instead');
-          address = address.copyWith(instance: 0);
-        }
-        if (address.instance == 0 &&
-            shard! < table.count &&
-            table.space.mode == SlotMode.managed &&
-            (r as SlotResolver).slotOwner(type, shard) == null &&
-            !locates.take(client)) {
-          _log.info('proxy: $incoming refused, too many LOCATEs');
-          await incoming.reject(genericStatus(StatusCode.resourceExhausted));
+        final table = r.slotTable(type);
+        if (table != null &&
+            shard == null &&
+            !_admitNoSlot(type, allowNoSlot, incoming)) {
+          await incoming.reject(genericStatus(StatusCode.permissionDenied));
           return;
+        }
+        if (table != null && shard != null) {
+          if (address.instance != 0 && !allowExplicitInstance) {
+            _log.fine('proxy: $incoming routed by the slot table instead');
+            address = address.copyWith(instance: 0);
+          }
+          if (address.instance == 0 &&
+              shard < table.count &&
+              table.space.mode == SlotMode.managed &&
+              r.slotOwner(type, shard) == null &&
+              !locates.take(client)) {
+            _log.info('proxy: $incoming refused, too many LOCATEs');
+            await incoming.reject(genericStatus(StatusCode.resourceExhausted));
+            return;
+          }
         }
       }
       final _Backend backend;
@@ -428,6 +442,7 @@ ChannelHandler proxyHandler(
             excludeOwnEndpoints: true,
             mayLocate: () => locates.take(client),
           ),
+          maxHeldBytes: switchboard.muxOptions.maxChannelBufferBytes,
         );
         await _pipe(
           _MuxEnd(incoming.channel),
@@ -444,20 +459,17 @@ ChannelHandler proxyHandler(
   };
 }
 
-/// Whether [proxyHandler] refuses a channel to [type] without a shard slot:
-/// the code to reject it with, or null to forward it. Refused with
-/// `PERMISSION_DENIED` when [type] has a slot table in [r] and [allow]
-/// (null: nothing) does not admit it; when [r] cannot resolve, with the
-/// code the forwarding would fail with.
-Future<StatusCode?> _refuseNoSlot(
+/// Waits for [r] to answer for [type], after which its slot tables are
+/// complete: null once it has, else the code [proxyHandler] rejects the
+/// channel with, the one the forwarding would fail with.
+Future<StatusCode?> _resolved(
   SlotResolver r,
   Name type,
-  bool Function(Name type)? allow,
   IncomingChannel incoming,
 ) async {
   try {
-    // The slot tables are complete once the resolver answers.
     await r.resolve(type);
+    return null;
   } on SwitchboardException catch (e) {
     _log.fine('proxy: $incoming: ${e.status}');
     final code = e.code ?? StatusCode.unavailable;
@@ -465,9 +477,16 @@ Future<StatusCode?> _refuseNoSlot(
         ? StatusCode.unavailable
         : code;
   }
-  if (r.slotTable(type) == null) {
-    return null;
-  }
+}
+
+/// Whether [proxyHandler] forwards a channel without a shard slot to
+/// [type], which has a slot table: only when [allow] (null: nothing)
+/// admits the type. A throwing [allow] refuses.
+bool _admitNoSlot(
+  Name type,
+  bool Function(Name type)? allow,
+  IncomingChannel incoming,
+) {
   var allowed = false;
   if (allow != null) {
     try {
@@ -476,11 +495,10 @@ Future<StatusCode?> _refuseNoSlot(
       _log.warning('proxy: allowNoSlot threw for $incoming', error, stackTrace);
     }
   }
-  if (allowed) {
-    return null;
+  if (!allowed) {
+    _log.fine('proxy: $incoming has no shard slot for a table-routed type');
   }
-  _log.fine('proxy: $incoming has no shard slot for a table-routed type');
-  return StatusCode.permissionDenied;
+  return allowed;
 }
 
 bool _notReserved(ChannelAddress address) =>

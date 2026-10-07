@@ -31,12 +31,23 @@ Matcher throwsCode(StatusCode code) =>
 Matcher hasCode(StatusCode code) =>
     isA<Status>().having((s) => s.known, 'code', code);
 
+/// Waits until [condition] holds; fails after [limit].
+Future<void> until(bool Function() condition) async {
+  final watch = Stopwatch()..start();
+  while (!condition()) {
+    if (watch.elapsed > limit) {
+      fail('condition not met within $limit');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 1));
+  }
+}
+
 /// A static resolver whose LOCATE answers are scripted.
 class LocatingResolver extends StaticResolver {
   LocatingResolver(super.records);
 
   final List<int> located = [];
-  SlotEntry? Function(int slot) answer = (_) => null;
+  FutureOr<SlotEntry?> Function(int slot) answer = (_) => null;
 
   @override
   Future<SlotEntry?> locateSlot(Name type, int slot) async {
@@ -64,6 +75,9 @@ enum Mode {
 
   /// Talk: sends a `HELLO` message, answers requests with `<name>:<data>`.
   talk,
+
+  /// Sends nothing; records what arrives in [Backend.received].
+  collect,
 }
 
 class Backend {
@@ -76,6 +90,12 @@ class Backend {
   Mode mode = Mode.greet;
   MovedStatus moved = MovedStatus.unknown;
   final List<ChannelAddress> opened = [];
+
+  /// What arrived in [Mode.collect].
+  final List<String> received = [];
+
+  /// The end status of every channel opened to it.
+  final List<Status> ended = [];
 
   ServiceRecord get record =>
       ServiceRecord(ServiceAddress(svc, id), endpoints: [uri]);
@@ -90,6 +110,7 @@ class Backend {
   void _serve(IncomingChannel incoming) {
     opened.add(incoming.address);
     final channel = incoming.channel;
+    unawaited(channel.done.then(ended.add));
     final moved = this.moved.toStatus();
     switch (mode) {
       case Mode.greet:
@@ -108,6 +129,8 @@ class Backend {
         final talk = incoming.talk();
         talk.send('HELLO', bytes(name));
         talk.messages.listen((m) => m.reply(bytes('$name:${text(m.payload)}')));
+      case Mode.collect:
+        channel.stream.listen((d) => received.add(text(d)));
     }
   }
 }
@@ -178,6 +201,20 @@ void main() {
       define(mode: SlotMode.static);
       await expectLater(greetingOf(5), throwsCode(StatusCode.unavailable));
       expect(resolver.located, isEmpty);
+    });
+
+    test('an owner that registered while the slot was located', () async {
+      define();
+      final c = Backend('C', 3);
+      await c.start();
+      resolver.answer = (_) {
+        // Not in the records the router read before asking.
+        resolver.add(c.record);
+        return const SlotEntry.owned(3, epoch: 1);
+      };
+      expect(await greetingOf(4), 'C 4');
+      expect(resolver.located, [4]);
+      expect(c.opened.single.instance, 3);
     });
 
     test('a slot outside the space: OUT_OF_RANGE', () async {
@@ -345,6 +382,87 @@ void main() {
       expect(await channel.done, hasCode(StatusCode.moved));
       expect(channel.retried, isFalse);
       expect(b.opened, isEmpty);
+    });
+
+    group('subframes sent while the replacement is opened', () {
+      late Switchboard small;
+      late Completer<void> asked;
+      late Completer<SlotEntry?> answer;
+
+      setUp(() {
+        // Channels of this node buffer at most 1000 bytes, each subframe
+        // counted as its length plus 32.
+        small = Switchboard(
+          resolver: resolver,
+          muxOptions: fast.copyWith(maxChannelBufferBytes: 1000),
+          slotRefreshTimeout: limit,
+        );
+        addTearDown(small.close);
+        // The owner names nobody; the LOCATE answers when the test says.
+        a.mode = Mode.moved;
+        b.mode = Mode.collect;
+        asked = Completer<void>();
+        answer = Completer<SlotEntry?>();
+        addTearDown(() {
+          if (!answer.isCompleted) {
+            answer.complete(null);
+          }
+        });
+        resolver.answer = (_) {
+          asked.complete();
+          return answer.future;
+        };
+      });
+
+      test(
+        'are sent on it, in order, within the node\'s buffer limit',
+        () async {
+          final channel = await small.openChannelToSlot(svc, 1);
+          await asked.future.timeout(limit);
+          final held = [for (var i = 0; i < 3; i++) '$i' * 300];
+          for (final subframe in held) {
+            channel.send(bytes(subframe));
+          }
+          expect(channel.canSend, isTrue);
+          answer.complete(const SlotEntry.owned(2, epoch: 2));
+          await until(() => b.received.length == held.length);
+          expect(b.received, held);
+          expect(channel.retried, isTrue);
+          channel.send(bytes('after'));
+          await until(() => b.received.length > held.length);
+          expect(b.received.last, 'after');
+          await channel.close();
+          expect(await channel.done, Status.ok);
+        },
+      );
+
+      test('beyond it: RESOURCE_EXHAUSTED at once, the replacement closed '
+          'unused', () async {
+        final channel = await small.openChannelToSlot(svc, 1);
+        await asked.future.timeout(limit);
+        for (var i = 0; i < 3; i++) {
+          channel.send(bytes('x' * 300));
+        }
+        expect(channel.canSend, isTrue);
+        // A fourth would hold 1328 bytes.
+        channel.send(bytes('x' * 300));
+        expect(channel.canSend, isFalse);
+        // Before the LOCATE has answered.
+        final status = await channel.done.timeout(limit);
+        expect(status, hasCode(StatusCode.resourceExhausted));
+        expect(await channel.stream.toList(), isEmpty);
+        expect(
+          () => channel.send(bytes('y')),
+          throwsCode(StatusCode.failedPrecondition),
+        );
+        await channel.close();
+        // The LOCATE answers after all: nothing is sent on the replacement.
+        answer.complete(const SlotEntry.owned(2, epoch: 2));
+        await until(() => b.ended.isNotEmpty);
+        expect(b.ended.single, hasCode(StatusCode.resourceExhausted));
+        expect(b.received, isEmpty);
+        expect(await channel.done, status);
+      });
     });
 
     test('Talk: a server that speaks first gets the retry', () async {
