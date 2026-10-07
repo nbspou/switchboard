@@ -28,12 +28,22 @@ class RelayConfig {
   /// the resolver, or at [endpoints] (tried in round robin, with failover)
   /// presenting [identity].
   ///
-  /// Throws [ArgumentError] for an empty [endpoints] list, an endpoint
+  /// Throws [ArgumentError] for a [type] that is not reserved (its name
+  /// does not start with `_`), an empty [endpoints] list, an endpoint
   /// without a scheme, and an [identity] that is empty or longer than an
   /// `IDENT` receiver may be (255 bytes of UTF-8).
   RelayConfig({Name? type, List<Uri>? endpoints, this.identity})
     : type = type ?? Services.relay,
       endpoints = endpoints == null ? null : List.unmodifiable(endpoints) {
+    if (!this.type.isReserved) {
+      // A relay refuses inner channels of reserved types, which keeps
+      // relays from chaining only if the relays run under a reserved type.
+      throw ArgumentError.value(
+        type,
+        'type',
+        'must be a reserved name (starting with "_")',
+      );
+    }
     final list = this.endpoints;
     if (list != null) {
       if (list.isEmpty) {
@@ -62,7 +72,9 @@ class RelayConfig {
   }
 
   /// The service type of the relays, `_relay` unless the mesh runs its
-  /// relays under another (reserved) type.
+  /// relays under another type, which must be reserved (start with `_`):
+  /// a relay refuses to relay channels of reserved types, which keeps
+  /// relays from forming chains.
   final Name type;
 
   /// Explicit relay endpoints, used instead of resolving [type]; null to

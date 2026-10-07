@@ -35,9 +35,15 @@ final Logger _log = Logger('Switchboard.Relay');
 /// (`Switchboard.relay` does this). For each such channel, [handler]:
 ///
 /// 1. Reads the peer identity of the connection it arrived on. Without
-///    one, and with [requireIdentity] (the default), the channel is held
-///    for the consumer to identify, at most the node's
-///    [Switchboard.identityTimeout], then refused with `UNAUTHENTICATED`.
+///    one, the channel is held for the consumer to identify, at most the
+///    node's [Switchboard.identityTimeout], so that a consumer whose OPEN
+///    overtakes its `IDENT` is checked under the identity the `IDENT`
+///    establishes; a channel that ends while held is dropped. A consumer
+///    still unidentified after the hold is refused with `UNAUTHENTICATED`
+///    when [requireIdentity] (the default), and admitted unchecked
+///    otherwise. A node without a verifier ([Switchboard.verifier])
+///    identifies nobody: there, without [requireIdentity], an
+///    unidentified consumer is admitted at once, without the hold.
 /// 2. Decodes the inner open payload: malformed, without a service type,
 ///    with a host hint, or addressing a reserved type (any name starting
 ///    with `_`: no chains of relays, no naming service through a relay):
@@ -46,7 +52,12 @@ final Logger _log = Logger('Switchboard.Relay');
 ///    inner type: `PERMISSION_DENIED` otherwise. The instance sees only
 ///    the relay's identity, so the consumer's scopes are checked here.
 ///    An unidentified consumer (admitted without [requireIdentity]) is
-///    not checked.
+///    not checked. A consumer that identifies (again) while the channel
+///    to the instance is being opened (steps 4 to 7) is checked again
+///    under its new identity: if that may not open the type, the channel
+///    to the instance is closed (`CANCELLED`) and the consumer's refused
+///    with `PERMISSION_DENIED`. An identity that arrives once the two
+///    channels are piped does not affect them.
 /// 4. Bounds the channels it relays per consumer connection to
 ///    [maxChannelsPerConnection] (0: no bound): `RESOURCE_EXHAUSTED`
 ///    beyond, since every consumer shares the relay's connection to each
@@ -83,7 +94,8 @@ final Logger _log = Logger('Switchboard.Relay');
 /// checks the relay's `open` scope, and the naming service its `broker`
 /// right. Give its node `MuxOptions(requireNamedIdent: true)`, as the
 /// naming service's host has, so that no identification a consumer meant
-/// for another peer can be relayed to it, and give its listener
+/// for another peer can be relayed to it (the constructor logs a warning
+/// otherwise), and give its listener
 /// [ChannelPolicies.scoped] (which admits `_relay` for every identified
 /// peer and refuses everything else a consumer has no `open` scope for).
 ///
@@ -103,7 +115,9 @@ final Logger _log = Logger('Switchboard.Relay');
 class RelayService {
   /// A relay forwarding through [switchboard] (see the class
   /// documentation). Throws [RangeError] for a negative
-  /// [maxChannelsPerConnection].
+  /// [maxChannelsPerConnection]. Logs a warning when [switchboard] does
+  /// not require named identifications (`MuxOptions.requireNamedIdent`),
+  /// which a relay's host should.
   RelayService(
     this.switchboard, {
     this.requireIdentity = true,
@@ -115,6 +129,13 @@ class RelayService {
       maxChannelsPerConnection,
       'maxChannelsPerConnection',
     );
+    if (!switchboard.muxOptions.requireNamedIdent) {
+      _log.warning(
+        'relay: the node accepts identifications that name nobody, so an '
+        'IDENT a consumer meant for another peer can be relayed to it; '
+        'give the relay\'s node MuxOptions(requireNamedIdent: true)',
+      );
+    }
   }
 
   /// The node the relay forwards through: its resolver, listener and
@@ -122,8 +143,21 @@ class RelayService {
   final Switchboard switchboard;
 
   /// Whether consumers must identify (`IDENT`) to have channels relayed.
-  /// Default true. An identified consumer is held to its `open` scopes
-  /// either way.
+  /// Default true.
+  ///
+  /// An identified consumer is held to its `open` scopes either way: a
+  /// channel of a consumer that has not identified is held until it does,
+  /// at most the node's [Switchboard.identityTimeout], whatever this
+  /// says, so that an OPEN that overtakes the consumer's `IDENT` is
+  /// checked under the identity the `IDENT` establishes, and a consumer
+  /// that identifies while its channel is being opened is checked again.
+  /// Only what happens after the hold differs: with [requireIdentity], a
+  /// consumer still unidentified is refused with `UNAUTHENTICATED`;
+  /// without, it is admitted unchecked (a mesh without identities, or
+  /// moving to them), after waiting out the hold (none with a timeout of
+  /// zero). A node without a verifier ([Switchboard.verifier]) identifies
+  /// nobody, so there, without [requireIdentity], an unidentified consumer
+  /// is admitted at once.
   final bool requireIdentity;
 
   /// Whether destinations whose records have endpoints are relayed too
@@ -148,15 +182,25 @@ class RelayService {
   Future<void> _relay(IncomingChannel incoming) async {
     final connection = incoming.connection;
     var identity = incoming.peerIdentity;
-    if (identity == null && requireIdentity) {
+    if (identity == null && (requireIdentity || switchboard.verifier != null)) {
+      // Held even when unidentified consumers may pass, so that an OPEN
+      // that overtakes the IDENT is checked under the identity it
+      // establishes.
       identity = await _identified(incoming);
       if (identity == null) {
         if (incoming.channel.state != MuxChannelState.open) {
+          _log.fine(
+            'relay: $incoming ended while held for the consumer to identify',
+          );
           return;
         }
-        _log.info('relay: $incoming refused, the consumer has not identified');
-        await incoming.reject(genericStatus(StatusCode.unauthenticated));
-        return;
+        if (requireIdentity) {
+          _log.info(
+            'relay: $incoming refused, the consumer has not identified',
+          );
+          await incoming.reject(genericStatus(StatusCode.unauthenticated));
+          return;
+        }
       }
     }
     final ChannelAddress inner;
@@ -226,6 +270,22 @@ class RelayService {
         return;
       }
       final channel = target.channel;
+      // The consumer may have identified (again) while the channel to the
+      // instance was being opened: the identity it has now is the one held
+      // to its scopes.
+      final now = connection.peerIdentity;
+      if (now != null &&
+          !identical(now, identity) &&
+          !now.allows(Right.open, type)) {
+        _log.info(
+          'relay: $incoming refused, the consumer identified as '
+          '"${now.identity}" while the channel to the instance was being '
+          'opened, and may not open $type',
+        );
+        unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+        await incoming.reject(genericStatus(StatusCode.permissionDenied));
+        return;
+      }
       _log.fine(
         'relay: $incoming for $who piped to ${target.header.address} on '
         'channel ${channel.id} of ${channel.connection}',
@@ -243,6 +303,9 @@ class RelayService {
     final connection = incoming.connection;
     final channel = incoming.channel;
     final timeout = switchboard.identityTimeout;
+    if (timeout > Duration.zero) {
+      _log.fine('relay: $incoming held until the consumer identifies');
+    }
     final watch = Stopwatch()..start();
     while (connection.peerIdentity == null) {
       final left = timeout - watch.elapsed;

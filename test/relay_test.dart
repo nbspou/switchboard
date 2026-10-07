@@ -3,15 +3,18 @@
 // requires credentials, outbound-only workers registered without
 // endpoints, a relay node publishing `_relay` with its identity, and
 // consumers that listen nowhere and reach the workers through it. Every
-// refusal of RelayService, the identity rules on both hops, one brokered
-// connection shared by all consumers, statuses relayed both ways, the
-// consumer side (Switchboard.relay, the slot variants, PeerSet), and the
-// rule that a node that can broker never relays.
+// refusal of RelayService, the identity rules on both hops (the hold for
+// identity with and without requireIdentity, an OPEN that overtakes its
+// IDENT, an identification while the channel is being opened), one
+// brokered connection shared by all consumers, statuses relayed both ways,
+// the consumer side (Switchboard.relay, the slot variants, PeerSet), and
+// the rule that a node that can broker never relays.
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -81,10 +84,30 @@ Future<void> until(bool Function() condition, [String? what]) async {
   }
 }
 
+/// The messages logged on `Switchboard.Relay` (or [logger]) at [level] or
+/// above from now on, until the test ends. Below INFO, the root level is
+/// lowered for the test.
+List<String> logged(Level level, {String logger = 'Switchboard.Relay'}) {
+  if (level < Logger.root.level) {
+    final previous = Logger.root.level;
+    Logger.root.level = level;
+    addTearDown(() => Logger.root.level = previous);
+  }
+  final records = <String>[];
+  final logs = Logger.root.onRecord.listen((r) {
+    if (r.loggerName == logger && r.level >= level) {
+      records.add(r.message);
+    }
+  });
+  addTearDown(logs.cancel);
+  return records;
+}
+
 /// A node, closed after the test.
 Future<Switchboard> newNode({
   Credential? credential,
   bool requireNamedIdent = false,
+  bool identifyOutgoing = true,
   Duration identityTimeout = limit,
   RelayConfig? relay,
   ExpectedIdentity? expectedIdentityFor,
@@ -95,6 +118,7 @@ Future<Switchboard> newNode({
     credential: credential,
     holderKey: credential == null ? null : key,
     verifier: await verifier(),
+    identifyOutgoing: identifyOutgoing,
     identityTimeout: identityTimeout,
     relay: relay,
     expectedIdentityFor: expectedIdentityFor,
@@ -199,6 +223,7 @@ class Relay {
     int maxChannelsPerConnection = 1024,
     ChannelPolicy? policy,
     Duration identityTimeout = limit,
+    Resolver? resolver,
   }) async {
     final n = await newNode(
       credential: await issue(identity, scopes ?? relayScopes),
@@ -214,6 +239,7 @@ class Relay {
       requireIdentity: requireIdentity,
       allowEndpoints: allowEndpoints,
       maxChannelsPerConnection: maxChannelsPerConnection,
+      resolver: resolver,
     );
     await m.publishRelay(service).timeout(limit);
     return Relay._(n, m, service, uri);
@@ -223,6 +249,41 @@ class Relay {
   final MeshNode mesh;
   final RelayService service;
   final Uri uri;
+}
+
+/// A resolver of fixed [records] that answers only once [release]d.
+class GatedResolver implements Resolver {
+  GatedResolver(this.records);
+
+  final List<ServiceRecord> records;
+  final Completer<void> _gate = Completer<void>();
+  final Completer<void> _asked = Completer<void>();
+
+  /// Completes at the first [resolve].
+  Future<void> get asked => _asked.future;
+
+  void release() => _gate.complete();
+
+  @override
+  Future<List<ServiceRecord>> resolve(Name type) async {
+    if (!_asked.isCompleted) {
+      _asked.complete();
+    }
+    await _gate.future;
+    return [
+      for (final record in records)
+        if (record.address.type == type) record,
+    ];
+  }
+
+  @override
+  Stream<ServiceEvent> get events => const Stream.empty();
+
+  @override
+  Future<void> get ready => Future.value();
+
+  @override
+  Future<void> close() async {}
 }
 
 /// A consumer that listens nowhere, joined to the mesh, with [relay].
@@ -415,6 +476,41 @@ void main() {
       );
     });
 
+    test('RelayConfig: the relay type must be reserved', () async {
+      expect(RelayConfig().type, relayType);
+      expect(RelayConfig(type: Name('_relay2')).type, Name('_relay2'));
+      // Relays refuse to relay to reserved types only: a relay type
+      // outside them would let relays chain.
+      expect(() => RelayConfig(type: Name('meshrelay')), throwsArgumentError);
+      expect(() => RelayConfig(type: Name.empty), throwsArgumentError);
+      expect(
+        () => RelayConfig(
+          type: Name('meshrelay'),
+          endpoints: [Uri.parse('mem://relay')],
+          identity: 'relay-1',
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    test('a relay on a node that accepts unnamed IDENTs is warned '
+        'about', () async {
+      final warnings = logged(Level.WARNING);
+      final lax = await newNode(
+        credential: await issue('relay-1', relayScopes),
+      );
+      RelayService(lax);
+      expect(warnings, hasLength(1));
+      expect(warnings.single, contains('requireNamedIdent'));
+      warnings.clear();
+      final strict = await newNode(
+        credential: await issue('relay-1', relayScopes),
+        requireNamedIdent: true,
+      );
+      RelayService(strict);
+      expect(warnings, isEmpty);
+    });
+
     test('one brokered connection shared by two consumers', () async {
       final mesh = await startMesh();
       await Relay.start(mesh);
@@ -584,8 +680,8 @@ void main() {
   });
 
   group('refusals', () {
-    test('an unidentified consumer: UNAUTHENTICATED, after the hold; '
-        'admitted without requireIdentity', () async {
+    test('an unidentified consumer: UNAUTHENTICATED, after the hold; one '
+        'whose OPEN overtakes its IDENT is held, then admitted', () async {
       final mesh = await startMesh();
       final worker = await Worker.start(mesh);
       final relay = await Relay.start(
@@ -624,12 +720,60 @@ void main() {
         'h by ${worker.id} for relay-1 with "p"',
       );
       await held.close();
+    });
+
+    test('a channel that ends while held for identity is dropped without a '
+        'refusal and does not count toward the bound', () async {
+      final mesh = await startMesh();
+      final worker = await Worker.start(mesh);
+      final relay = await Relay.start(mesh, maxChannelsPerConnection: 1);
+      final logs = logged(Level.FINE);
+      final c = await newNode(
+        credential: await issue('consumer-1', consumerScopes),
+        identifyOutgoing: false,
+      );
+      final connection = await c.dial(relay.uri);
+      ChannelAddress inner(String payload) => ChannelAddress(
+        type: workerType,
+        instance: worker.id,
+        payload: bytes(payload),
+      );
+      final dropped = openRelayed(connection, inner('dropped').encode());
+      await until(() => logs.any((m) => m.contains('held until')), 'held');
+      await dropped.close(Status.of(StatusCode.cancelled, 'gone'));
+      await until(
+        () => logs.any((m) => m.contains('ended while held')),
+        'dropped',
+      );
+      expect(logs.where((m) => m.contains('refused')), isEmpty);
+      // The bound of one is free: the next channel, held until the
+      // consumer identifies, is relayed, and the one after it refused.
+      final next = openRelayed(connection, inner('hold').encode());
+      await c.identifyOn(connection, receiver: 'relay-1');
+      await until(() => worker.seen.length == 1, 'relayed');
+      expect(worker.seen.single.payload, 'hold');
+      expect(
+        await refusal(connection, inner('hold').encode()),
+        hasCode(StatusCode.resourceExhausted),
+      );
+      expect(next.state, MuxChannelState.open);
+    });
+
+    test('without requireIdentity: an unidentified consumer is admitted '
+        'unchecked after the hold, an identified one held to its '
+        'scopes', () async {
+      final mesh = await startMesh();
+      final worker = await Worker.start(mesh);
+      const hold = Duration(milliseconds: 300);
       final lenient = await Relay.start(
         mesh,
         identity: 'relay-2',
         requireIdentity: false,
+        identityTimeout: hold,
       );
+      final anonymous = await newNode();
       final open = await anonymous.connect(lenient.uri);
+      final watch = Stopwatch()..start();
       final channel = TalkChannel(
         openRelayed(
           open,
@@ -644,6 +788,9 @@ void main() {
         text((await channel.request('R', bytes('r')).timeout(limit)).payload),
         'r by ${worker.id} for relay-2 with "p"',
       );
+      // Held for the node's identity timeout first, in case an IDENT was
+      // on its way.
+      expect(watch.elapsed, greaterThanOrEqualTo(hold));
       await channel.close();
       // An identified consumer is held to its scopes all the same.
       final scoped = await newNode(
@@ -656,6 +803,122 @@ void main() {
           ChannelAddress(type: workerType, instance: worker.id).encode(),
         ),
         hasCode(StatusCode.permissionDenied),
+      );
+      expect(worker.seen, hasLength(1));
+    });
+
+    test('without requireIdentity: an OPEN that overtakes the IDENT is '
+        'checked under the identity the IDENT establishes', () async {
+      final mesh = await startMesh();
+      final worker = await Worker.start(mesh);
+      final lenient = await Relay.start(
+        mesh,
+        identity: 'relay-2',
+        requireIdentity: false,
+      );
+      // A credential without `open` for the type, presented only after
+      // the OPEN.
+      final sneaky = await newNode(
+        credential: await issue('consumer-4', [Scope.of(Right.open, 'x')]),
+        identifyOutgoing: false,
+      );
+      final connection = await sneaky.dial(lenient.uri);
+      final channel = openRelayed(
+        connection,
+        ChannelAddress(
+          type: workerType,
+          instance: worker.id,
+          payload: bytes('sneaky'),
+        ).encode(),
+      );
+      await sneaky.identifyOn(connection, receiver: 'relay-2');
+      expect(
+        await channel.done.timeout(limit),
+        hasCode(StatusCode.permissionDenied),
+      );
+      expect(worker.seen, isEmpty);
+      // The same order with `open` for the type: relayed.
+      final honest = await newNode(
+        credential: await issue('consumer-1', consumerScopes),
+        identifyOutgoing: false,
+      );
+      final second = await honest.dial(lenient.uri);
+      final relayed = TalkChannel(
+        openRelayed(
+          second,
+          ChannelAddress(
+            type: workerType,
+            instance: worker.id,
+            payload: bytes('p'),
+          ).encode(),
+        ),
+      );
+      await honest.identifyOn(second, receiver: 'relay-2');
+      expect(
+        text((await relayed.request('R', bytes('h')).timeout(limit)).payload),
+        'h by ${worker.id} for relay-2 with "p"',
+      );
+      await relayed.close();
+    });
+
+    test('a consumer that identifies again while its channel is being opened '
+        'is checked under the new identity', () async {
+      final mesh = await startMesh();
+      // A worker that listens, which the relay finds through a resolver
+      // that answers only once the consumer has identified again.
+      final lister = await newNode(
+        credential: await issue('worker-b2', workerScopes),
+      );
+      final listerUri = await lister.listenMemory(
+        policy: ChannelPolicies.scoped(),
+      );
+      final listedType = Name('worker-l');
+      final opened = <MuxChannel>[];
+      lister.registerService(
+        listedType,
+        (incoming) => opened.add(incoming.channel),
+        instance: 1,
+      );
+      final gate = GatedResolver([
+        ServiceRecord(ServiceAddress(listedType, 1), endpoints: [listerUri]),
+      ]);
+      final relay = await Relay.start(
+        mesh,
+        allowEndpoints: true,
+        resolver: gate,
+      );
+      final accepted = <MuxConnection>[];
+      relay.node.connections.listen(accepted.add);
+      final c = await newNode(
+        credential: await issue('consumer-1', consumerScopes),
+      );
+      final connection = await relayConnection(c, relay.uri);
+      final channel = openRelayed(
+        connection,
+        ChannelAddress(type: listedType, instance: 1).encode(),
+      );
+      // Past the scope check, resolving: the consumer identifies again,
+      // with a credential that may not open the type.
+      await gate.asked.timeout(limit);
+      await connection.identify(
+        await issue('consumer-5', [Scope.of(Right.open, 'other-*')]),
+        holderKey: key,
+        receiver: 'relay-1',
+      );
+      await until(
+        () => accepted.any((x) => x.peerIdentity?.identity == 'consumer-5'),
+        'identified again',
+      );
+      gate.release();
+      expect(
+        await channel.done.timeout(limit),
+        hasCode(StatusCode.permissionDenied),
+      );
+      // The channel to the instance, opened meanwhile, is closed.
+      await until(() => opened.isNotEmpty, 'opened at the worker');
+      expect(
+        await opened.single.done.timeout(limit),
+        hasCode(StatusCode.cancelled),
       );
     });
 
@@ -784,6 +1047,28 @@ void main() {
       );
     });
 
+    test('maxChannelsPerConnection 0: no bound', () async {
+      final mesh = await startMesh();
+      final relay = await Relay.start(mesh, maxChannelsPerConnection: 0);
+      final worker = await Worker.start(mesh);
+      final c = await newNode(
+        credential: await issue('consumer-1', consumerScopes),
+      );
+      final connection = await relayConnection(c, relay.uri);
+      final hold = ChannelAddress(
+        type: workerType,
+        instance: worker.id,
+        payload: bytes('hold'),
+      ).encode();
+      final channels = [
+        for (var i = 0; i < 5; i++) openRelayed(connection, hold),
+      ];
+      await until(() => worker.seen.length == 5);
+      for (final channel in channels) {
+        expect(channel.state, MuxChannelState.open);
+      }
+    });
+
     test('no record: NOT_FOUND; a record with endpoints: '
         'FAILED_PRECONDITION, relayed with allowEndpoints', () async {
       final mesh = await startMesh();
@@ -855,6 +1140,46 @@ void main() {
         'listed for relay-2',
       );
       await channel.close();
+    });
+
+    test('with allowEndpoints, a record pointing back at the relay\'s own '
+        'listener: UNAVAILABLE, never connected to', () async {
+      final mesh = await startMesh();
+      final relay = await Relay.start(mesh, allowEndpoints: true);
+      final warnings = logged(Level.WARNING, logger: 'Switchboard.Router');
+      // A record of a worker claiming to listen where the relay does.
+      final misdirected = await newNode(
+        credential: await issue('worker-c3', workerScopes),
+      );
+      final misdirectedMesh = MeshNode.join(misdirected, mesh, watch: false);
+      addTearDown(misdirectedMesh.leave);
+      final selfType = Name('worker-s');
+      final id = await misdirectedMesh
+          .publish(selfType, (incoming) {}, endpoints: [relay.uri])
+          .timeout(limit);
+      await until(
+        () => relay.mesh.client.table.values.any(
+          (r) => r.address.type == selfType,
+        ),
+      );
+      final c = await newNode(
+        credential: await issue('consumer-1', consumerScopes),
+      );
+      final connection = await relayConnection(c, relay.uri);
+      final connections = <MuxConnection>[];
+      relay.node.connections.listen(connections.add);
+      expect(
+        await refusal(
+          connection,
+          ChannelAddress(type: selfType, instance: id).encode(),
+        ),
+        hasCode(StatusCode.unavailable),
+      );
+      expect(connections, isEmpty);
+      expect(
+        warnings.where((m) => m.contains('is this node itself')),
+        hasLength(1),
+      );
     });
 
     test('a relay without `broker`: UNAVAILABLE', () async {
