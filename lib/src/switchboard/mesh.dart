@@ -6,6 +6,8 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 */
 
 import 'dart:async';
+import 'dart:collection';
+import 'dart:math';
 
 import 'package:logging/logging.dart';
 
@@ -22,6 +24,12 @@ import 'slot_gate.dart';
 import 'switchboard.dart';
 
 final Logger _log = Logger('Switchboard.Naming');
+
+/// At most this many `RELEASE`s, and as many hand-over migrations,
+/// [MeshNode.leave] keeps in flight: well under the request limit of the
+/// naming channel (`TalkOptions.maxOutgoingRequests`, 1024 by default),
+/// refilled as the answers arrive.
+const int _leaveWindow = 64;
 
 /// Wires a [Switchboard] into a mesh run by a naming service: the usual
 /// setup of a backend service node.
@@ -361,7 +369,8 @@ class MeshNode {
   /// 1. For each managed type, `SLOTS` with capacity 0, so that the
   ///    allocator gives this node no slot back.
   /// 2. In a holder-only managed space, every served slot is handed over,
-  ///    one after the other, with a migration to an instance the
+  ///    one after the other (types in parallel, at most 64 migrations at
+  ///    a time), with a migration to an instance the
   ///    allocator chooses ([migrateSlot] with `to: 0`): the new owner
   ///    takes the drained state over (fetching it from this node) while
   ///    this node is still up, so no data stays behind on a node that is
@@ -370,7 +379,7 @@ class MeshNode {
   ///    other instance to take it, a static space, or a `shared` space,
   ///    whose state is in shared storage and is reassigned at once) is
   ///    released keeping its storage (`RELEASE`, [SlotGate.release]), at
-  ///    most [leaveTimeout] more. In a holder-only managed space the
+  ///    most [leaveTimeout] more, 64 at a time. In a holder-only managed space the
   ///    allocator then assigns such a slot elsewhere, the new owner
   ///    fetching the state from this node only while it is reachable.
   ///
@@ -397,9 +406,10 @@ class MeshNode {
       final handOvers = Stopwatch()..start();
       var over = false;
       Duration left() => leaveTimeout - handOvers.elapsed;
+      final window = _Window(_leaveWindow);
       await Future.wait([
         for (final gate in gates.gates.values)
-          _handOver(gate, left, () => over, handedOver[gate.type] = {}),
+          _handOver(gate, window, left, () => over, handedOver[gate.type] = {}),
       ]).timeout(
         leaveTimeout,
         onTimeout: () {
@@ -409,16 +419,13 @@ class MeshNode {
       );
       over = true;
       if (client.isConnected) {
-        await Future.wait([
-          for (final gate in gates.gates.values)
-            _release(gate, released[gate.type] = {}),
-        ]).timeout(
+        var stop = false;
+        await _releaseAll(released, () => stop).timeout(
           leaveTimeout,
-          onTimeout: () {
-            _log.warning('leaving: slots not released within $leaveTimeout');
-            return const [];
-          },
+          onTimeout: () =>
+              _log.warning('leaving: slots not released within $leaveTimeout'),
         );
+        stop = true;
       }
     }
     final report = LeaveReport._(
@@ -455,10 +462,11 @@ class MeshNode {
 
   /// Takes this instance out of the allocator for [gate]'s type, then, in
   /// a holder-only managed space, hands every served slot over to another
-  /// instance, one at a time, while [left] has time and [over] is false.
-  /// Adds the slots handed over to [done].
+  /// instance, one at a time and each in its turn of [window], while [left]
+  /// has time and [over] is false. Adds the slots handed over to [done].
   Future<void> _handOver(
     SlotGate gate,
+    _Window window,
     Duration Function() left,
     bool Function() over,
     Set<int> done,
@@ -485,14 +493,15 @@ class MeshNode {
       return;
     }
     for (final slot in gate.servedSlots.keys.toList()..sort()) {
-      final time = left();
-      if (over() || time <= Duration.zero || !client.isConnected) {
-        return;
-      }
-      if (!gate.serves(slot)) {
-        continue;
-      }
+      await window.enter();
       try {
+        final time = left();
+        if (over() || time <= Duration.zero || !client.isConnected) {
+          return;
+        }
+        if (!gate.serves(slot)) {
+          continue;
+        }
         await client.migrate(type, slot).drain<void>().timeout(time);
         done.add(slot);
       } on TimeoutException {
@@ -500,24 +509,71 @@ class MeshNode {
         return;
       } on Object catch (e) {
         _log.info('leaving: $type/$slot not handed over: $e');
+      } finally {
+        window.exit();
       }
     }
   }
 
-  /// Releases the slots [gate] still serves, keeping the storage; adds
-  /// those released to [done].
-  Future<void> _release(SlotGate gate, Set<int> done) async {
-    final type = gate.type;
+  /// Releases the slots the gates still serve, keeping the storage, at
+  /// most [_leaveWindow] at a time and until [stop]; adds those released
+  /// to [released].
+  Future<void> _releaseAll(
+    Map<Name, Set<int>> released,
+    bool Function() stop,
+  ) async {
+    final work = Queue<(SlotGate, int)>();
+    for (final gate in gates.gates.values) {
+      released[gate.type] = {};
+      for (final slot in gate.servedSlots.keys.toList()..sort()) {
+        work.add((gate, slot));
+      }
+    }
+    Future<void> releasing() async {
+      while (work.isNotEmpty && !stop()) {
+        final (gate, slot) = work.removeFirst();
+        try {
+          await gate.release(slot, keepStorage: true);
+          released[gate.type]!.add(slot);
+        } on Object catch (e) {
+          _log.info('leaving: ${gate.type}/$slot not released: $e');
+        }
+      }
+    }
+
     await Future.wait([
-      for (final slot in gate.servedSlots.keys)
-        gate
-            .release(slot, keepStorage: true)
-            .then<void>(
-              (_) => done.add(slot),
-              onError: (Object e) =>
-                  _log.info('leaving: $type/$slot not released: $e'),
-            ),
+      for (var i = min(_leaveWindow, work.length); i > 0; i--) releasing(),
     ]);
+  }
+}
+
+/// Lets at most [size] operations in at a time; the others wait for their
+/// turn, in order.
+class _Window {
+  _Window(this.size);
+
+  final int size;
+  int _inside = 0;
+  final Queue<Completer<void>> _waiting = Queue();
+
+  /// Completes when it is the caller's turn; [exit] ends it.
+  Future<void> enter() {
+    if (_inside < size) {
+      _inside++;
+      return Future.value();
+    }
+    final turn = Completer<void>();
+    _waiting.add(turn);
+    return turn.future;
+  }
+
+  void exit() {
+    if (_waiting.isNotEmpty) {
+      // The turn passes on.
+      _waiting.removeFirst().complete();
+    } else {
+      _inside--;
+    }
   }
 }
 

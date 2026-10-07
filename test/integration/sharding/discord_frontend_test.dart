@@ -183,6 +183,41 @@ void main() {
         expect(await post(service, 81384788765712384, 'still'), 'A shard 2');
       });
 
+      test('a frontend with more shards than its naming channel takes '
+          'requests leaves with every one released', () async {
+        // 16 requests at a time on the naming channel, 40 shards.
+        final mesh = await cluster.member(
+          options: const TalkOptions(
+            requestTimeout: Duration(seconds: 2),
+            replyTimeout: Duration(seconds: 1),
+            maxOutgoingRequests: 16,
+          ),
+        );
+        final frontend = Frontend('A');
+        await mesh
+            .publishSharded(discord, frontend, count: 40, mode: SlotMode.static)
+            .timeout(limit);
+        final shards = List.generate(40, (i) => i);
+        await Future.wait([
+          for (final shard in shards) mesh.claimSlot(discord, shard),
+        ]).timeout(limit);
+        expect(frontend.shards, shards.toSet());
+        final report = await mesh.leave().timeout(limit);
+        expect(report.released, {discord: shards});
+        expect(report.dropped, isEmpty);
+        expect(report.handedOver, isEmpty);
+        expect(frontend.shards, isEmpty);
+        await until(
+          () => cluster.naming.slotTable(discord)!.owners.isEmpty,
+          'every shard free',
+        );
+        // Released, not lost: the epoch is kept (stateless: no holder).
+        expect(
+          cluster.naming.slotTable(discord)!.entries.values,
+          List.filled(40, const SlotEntry.free(epoch: 1)),
+        );
+      });
+
       test('a frontend whose publish failed publishes again', () async {
         await startFrontend(cluster, 'A', count: 4, shards: [0]);
         final mesh = await cluster.member();

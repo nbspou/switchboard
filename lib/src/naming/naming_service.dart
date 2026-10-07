@@ -160,11 +160,20 @@ class NamingService {
   /// Slots with a known holder still go back to it, and `LOCATE` still
   /// assigns. [Duration.zero] disables it.
   ///
+  /// [resumeAttempts] bounds the `RESUME` of a rolled-back migration,
+  /// which the old owner needs to unlock the slot: one that fails (refused,
+  /// or not answered within [handoverTimeout]) is sent again once a backoff
+  /// per slot and owner ends, with the intervals of the `ASSIGN` backoff,
+  /// as long as the slot stays with that owner. After [resumeAttempts]
+  /// failures in a row the slot is set free with its holder kept, and the
+  /// old owner enters its `ASSIGN` backoff for it, so that the allocator
+  /// places it elsewhere first.
+  ///
   /// Throws [ArgumentError] if [assignBackoff] is not positive, if
   /// [assignBackoffMax] is shorter than [assignBackoff], if
   /// [assignmentHold], [holderGrace], [handoverTimeout],
   /// [handoverMaxDuration] or [holdingSettle] is negative, or if
-  /// [maxSlotCount] is not positive.
+  /// [maxSlotCount] or [resumeAttempts] is not positive.
   NamingService({
     this.assignmentHold = const Duration(seconds: 2),
     this.holderGrace = const Duration(minutes: 5),
@@ -174,6 +183,7 @@ class NamingService {
     this.assignBackoffMax = const Duration(seconds: 10),
     this.holdingSettle = const Duration(seconds: 1),
     this.handoverMaxDuration = const Duration(minutes: 10),
+    this.resumeAttempts = 5,
   }) {
     if (assignBackoff <= Duration.zero) {
       throw ArgumentError.value(
@@ -202,6 +212,13 @@ class NamingService {
     }
     if (maxSlotCount < 1 || maxSlotCount > maxU32) {
       throw ArgumentError.value(maxSlotCount, 'maxSlotCount', 'out of range');
+    }
+    if (resumeAttempts < 1) {
+      throw ArgumentError.value(
+        resumeAttempts,
+        'resumeAttempts',
+        'must be positive',
+      );
     }
     if (assignmentHold > Duration.zero) {
       _holdEnd = monotonicNow() + assignmentHold;
@@ -242,6 +259,10 @@ class NamingService {
   /// How long the allocator waits for `HOLDING` after a `SLOTS` with
   /// capacity before it assigns free slots that have no holder.
   final Duration holdingSettle;
+
+  /// How many times the `RESUME` of a rolled-back migration is sent before
+  /// its slot is set free.
+  final int resumeAttempts;
 
   late final _SlotManager _slots = _SlotManager(this);
 

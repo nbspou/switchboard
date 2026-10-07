@@ -321,3 +321,73 @@ class RecordingHandler extends SlotHandler {
   void onDiscard(Name type, List<int> slots) =>
       discarded.add('$type: ${slots.join(',')}');
 }
+
+/// A scripted naming service over one link at a time, for timing what the
+/// client sends: answers at once `REGISTER` (the id asked for), `SLOTS`,
+/// `HOLDING` (nothing to discard) and `CLAIM` (the epoch claimed, unless
+/// [answerClaims] is off), and `WATCH` once [watch] completes. Records the
+/// requests in [log].
+class ScriptedNaming {
+  ScriptedNaming({int maxOutgoingRequests = 1024})
+    : options = TalkOptions(
+        requestTimeout: const Duration(seconds: 2),
+        replyTimeout: const Duration(seconds: 1),
+        maxOutgoingRequests: maxOutgoingRequests,
+      );
+
+  /// The client's options.
+  final TalkOptions options;
+  final List<String> log = [];
+  final Completer<void> watch = Completer<void>();
+  bool answerClaims = true;
+  int connects = 0;
+
+  /// The service side of the latest link.
+  late TalkChannel server;
+
+  Future<TalkChannel> connect() async {
+    connects++;
+    final link = StreamChannelController<Uint8List>();
+    server = TalkChannel(link.local, options: serverOptions);
+    server.messages.listen(_serve, onError: (Object _) {});
+    return TalkChannel(link.foreign, options: options);
+  }
+
+  void _serve(TalkMessage m) {
+    if (!m.canReply) {
+      return;
+    }
+    switch (m.procedureName) {
+      case 'WATCH':
+        log.add('WATCH');
+        m.setReplyTimeout(Duration.zero);
+        watch.future.then((_) {
+          if (m.canReply) {
+            m.reply(Uint8List(0));
+          }
+        });
+      case 'REGISTER':
+        final r = RegisterRequest.decode(m.payload);
+        log.add('REGISTER ${r.type}/${r.requestedInstance}');
+        m.reply(RegisterResponse(r.requestedInstance).encode());
+      case 'SLOTS':
+        log.add('SLOTS ${SlotsRequest.decode(m.payload).space.type}');
+        m.reply(Uint8List(0));
+      case 'HOLDING':
+        final r = HoldingRequest.decode(m.payload);
+        log.add('HOLDING ${r.type} ${r.slots.join(',')}');
+        m.reply(const HoldingResponse([]).encode());
+      case 'CLAIM':
+        final r = ClaimRequest.decode(m.payload);
+        log.add('CLAIM ${r.type}/${r.slot} e${r.epoch}');
+        if (answerClaims) {
+          m.reply(ClaimResponse(r.epoch).encode());
+        } else {
+          m.setReplyTimeout(Duration.zero);
+        }
+      default:
+        log.add(m.procedureName);
+        m.reply(Uint8List(0));
+    }
+  }
+}

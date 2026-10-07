@@ -62,9 +62,13 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// instance of that type it registers. It remembers the slot space
 /// definitions, the declared storage and the slots it serves; after a
 /// reconnect it registers again, then re-sends `SLOTS` and `HOLDING` and
-/// claims every slot it was serving with its last epoch. When the channel
-/// is lost, or the client is closed, every slot locked by `DRAIN` is
-/// unlocked through [SlotHandler.onResume]. Every `HOLDING` response's
+/// claims every slot it was serving with its last epoch; a request the
+/// channel refuses to send (its `TalkOptions.maxOutgoingRequests`) is
+/// sent after [reconnectDelay], with what follows it. Calls of [claim],
+/// [release] and [locate] beyond that limit wait for their turn, in call
+/// order, rather than fail with [StatusCode.resourceExhausted]. When the
+/// channel is lost, or the client is closed, every slot locked by `DRAIN`
+/// is unlocked through [SlotHandler.onResume]. Every `HOLDING` response's
 /// list of slots to discard reaches [SlotHandler.onDiscard].
 ///
 /// See the wiki page "Switchboard Naming Service", section "Mirror
@@ -262,12 +266,16 @@ class NamingClient {
   /// holds are given back to it first (managed mode).
   ///
   /// The declaration is remembered (minus the slots to discard) and sent
-  /// again after every reconnect. While disconnected, or before the
-  /// registration of [type] made through this client is back, the future
-  /// completes when the declaration is sent. Fails with the naming
-  /// service's [SwitchboardException] ([StatusCode.notFound] without a slot
-  /// space, [StatusCode.failedPrecondition] without a registration of
-  /// [type] on the channel); those slots are then forgotten. Fails with
+  /// again after every reconnect, once the registration of [type] made
+  /// through this client is back. While disconnected, or before that
+  /// registration is back, the future completes when the declaration is
+  /// sent and answered. A client that registers no instance of [type]
+  /// sends it right away (after the next connect while disconnected), and
+  /// the naming service refuses it, since only a registered instance holds
+  /// storage. Fails with the naming service's [SwitchboardException]
+  /// ([StatusCode.notFound] without a slot space,
+  /// [StatusCode.failedPrecondition] without a registration of [type] on
+  /// the channel); those slots are then forgotten. Fails with
   /// [StatusCode.cancelled] on [close].
   Future<List<int>> declareHolding(Name type, List<int> slots) {
     try {
@@ -291,7 +299,8 @@ class NamingClient {
   /// [StatusCode.failedPrecondition] while it migrates,
   /// [StatusCode.notFound] without such a space or slot,
   /// [StatusCode.unavailable] if the `ASSIGN` failed. Fails with
-  /// [StatusCode.unavailable] while disconnected.
+  /// [StatusCode.unavailable] while disconnected, or if the channel is lost
+  /// while the call waits for the channel's request limit.
   Future<int> claim(Name type, int slot, {bool holding = false}) =>
       _slotCall(type, slot, () => _slots.claim(type, slot, holding: holding));
 
@@ -300,7 +309,8 @@ class NamingClient {
   ///
   /// Fails with [StatusCode.permissionDenied] if this instance does not own
   /// it, [StatusCode.failedPrecondition] while it migrates, and
-  /// [StatusCode.unavailable] while disconnected.
+  /// [StatusCode.unavailable] while disconnected (or if the channel is lost
+  /// while the call waits for the channel's request limit).
   Future<void> release(Name type, int slot, {bool keepStorage = false}) =>
       _slotCall(
         type,
@@ -313,8 +323,9 @@ class NamingClient {
   /// confirmed. A free slot answers [SlotState.free] with owner 0.
   ///
   /// Fails with [StatusCode.notFound] without such a space or slot,
-  /// [StatusCode.unavailable] if the assignment failed or while
-  /// disconnected.
+  /// [StatusCode.unavailable] if the assignment failed, while disconnected,
+  /// or if the channel is lost while the call waits for the channel's
+  /// request limit.
   Future<LocateResponse> locate(Name type, int slot) =>
       _slotCall(type, slot, () => _slots.locate(type, slot));
 
@@ -991,6 +1002,8 @@ class NamingClient {
 
   /// Subscribes to every type. The reply is ordered with the events: every
   /// event before it is part of the snapshot, every event after it is live.
+  /// A `WATCH` the channel refuses for its request limit (the slot state
+  /// restored ahead of it fills it) is sent after [reconnectDelay].
   void _startWatch(_Session session) {
     final Future<TalkMessage> reply;
     try {
@@ -1000,6 +1013,11 @@ class NamingClient {
         ordered: true,
       );
     } on SwitchboardException catch (e) {
+      if (e.code == StatusCode.resourceExhausted && session.usable) {
+        _log.info('WATCH not sent yet, retrying in $reconnectDelay: $e');
+        session.later(reconnectDelay, () => _startWatch(session));
+        return;
+      }
       session.lose(Status.ok, 'cannot watch: $e');
       return;
     }
@@ -1158,12 +1176,37 @@ class _Session {
   final Set<(Name, int)> seenSlots = {};
 
   /// Types whose slot state was sent on this channel: true once with the
-  /// registration of the type, false when sent without one.
+  /// registration of the type, false when sent without one. Set once every
+  /// request of the restoration went out.
   final Map<Name, bool> restored = {};
+
+  /// What of the slot state went out on this channel: the definition sent
+  /// per type (and whether the type was registered on the channel then:
+  /// only then does it carry the instance's capacity), the types whose
+  /// `HOLDING` was sent with their registration, and those whose served
+  /// slots were queued for claiming. A restoration that resumes after a
+  /// retry does not send these again.
+  final Map<Name, (_SpaceDefinition, bool)> sentSlots = {};
+  final Set<Name> sentHolding = {};
+  final Set<Name> reclaimed = {};
+
+  /// Types whose restoration waits for a retry: one of its requests was
+  /// refused before it was sent (the channel's request limit).
+  final Set<Name> retrying = {};
 
   /// Claims of served slots waiting to be sent, and the number in flight.
   final Queue<(Name, int, _Served)> reclaims = Queue();
   int reclaiming = 0;
+
+  /// The claims wait for a retry: one was refused before it was sent.
+  bool reclaimsPaused = false;
+
+  /// Requests of the client's slot API waiting for the channel to take
+  /// them (see `_ClientSlots.call`), the number of them in flight, and
+  /// whether they wait for a retry timer.
+  final Queue<_Call> calls = Queue();
+  int calling = 0;
+  bool callsPaused = false;
 
   bool get alive => !_lost.isCompleted;
 
@@ -1204,6 +1247,16 @@ class _Session {
       timer.cancel();
     }
     _timers.clear();
+    final waiting = List.of(calls);
+    calls.clear();
+    for (final call in waiting) {
+      call.completer.completeError(
+        SwitchboardException.of(
+          StatusCode.unavailable,
+          'naming service channel lost',
+        ),
+      );
+    }
     closeChannel = channel.close(status);
     _lost.complete();
     _onLost();

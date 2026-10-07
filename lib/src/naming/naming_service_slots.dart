@@ -1098,7 +1098,7 @@ class _SlotManager {
         failure = e;
       }
       if (closed) {
-        _abandon(migration, 'naming service closed');
+        _abandon(space, migration, from, holder, epoch);
         return;
       }
       if (!from.up) {
@@ -1135,7 +1135,7 @@ class _SlotManager {
         failure = e;
       }
       if (closed) {
-        _abandon(migration, 'naming service closed');
+        _abandon(space, migration, from, holder, epoch);
         return;
       }
       if (response == null || !to.up) {
@@ -1203,7 +1203,17 @@ class _SlotManager {
   void _lost(_Space space, int slot, int holder, int epoch) =>
       setEntry(space, slot, SlotEntry.free(holder: holder, epoch: epoch));
 
-  /// Gives the slot back to [from] and tells it to unlock.
+  /// Gives the slot back to [from] and tells it to unlock with `RESUME`.
+  ///
+  /// Nothing else unlocks the slot while the channel of [from] lives, and
+  /// `RESUME` is idempotent at the instance: one that fails (refused, or
+  /// not answered in time) is sent again once a backoff per slot and owner
+  /// ends ([NamingService.assignBackoff], doubling up to
+  /// [NamingService.assignBackoffMax]), as long as the slot stays owned by
+  /// [from] with [epoch] and no other operation starts on it. After
+  /// [NamingService.resumeAttempts] failures in a row the slot is set free
+  /// with its holder kept, and [from] enters its `ASSIGN` backoff for it:
+  /// the allocator places it elsewhere first.
   void _resume(
     _Space space,
     int slot,
@@ -1216,19 +1226,85 @@ class _SlotManager {
       slot,
       SlotEntry.owned(from.instance, holder: holder, epoch: epoch),
     );
+    space.resumes.remove(slot)?.timer?.cancel();
+    final resume = space.resumes[slot] = _Resume(from, epoch);
+    _sendResume(space, slot, resume);
+  }
+
+  void _sendResume(_Space space, int slot, _Resume resume) {
+    final from = resume.owner;
     unawaited(
       ask(
         from,
         Procedures.resume,
-        ResumeRequest(space.type, slot, epoch: epoch).encode(),
+        ResumeRequest(space.type, slot, epoch: resume.epoch).encode(),
       ).then<void>(
-        (_) {},
-        onError: (Object e) => _log.warning(
-          'RESUME ${space.type}/$slot to ${from.address} failed: '
-          '${_statusOf(e)}',
-        ),
+        (_) => _endResume(space, slot, resume),
+        onError: (Object e) => _resumeFailed(space, slot, resume, e),
       ),
     );
+  }
+
+  void _resumeFailed(_Space space, int slot, _Resume resume, Object error) {
+    final what =
+        'RESUME ${space.type}/$slot to ${resume.owner.address} failed: '
+        '${_statusOf(error)}';
+    if (!_resuming(space, slot, resume)) {
+      _log.fine(what);
+      _endResume(space, slot, resume);
+      return;
+    }
+    resume.failures++;
+    if (resume.failures >= service.resumeAttempts) {
+      _endResume(space, slot, resume);
+      _log.warning(
+        '$what (${resume.failures} times); the slot is free, holder kept',
+      );
+      assignFailed(space, slot, resume.owner);
+      final entry = space.entry(slot);
+      setEntry(
+        space,
+        slot,
+        SlotEntry.free(holder: entry.holder, epoch: entry.epoch),
+      );
+      scheduleBalance(space);
+      return;
+    }
+    final previous = resume.delay;
+    final doubled = previous == null ? service.assignBackoff : previous * 2;
+    final delay = resume.delay = doubled > service.assignBackoffMax
+        ? service.assignBackoffMax
+        : doubled;
+    _log.warning('$what; sent again in $delay');
+    resume.timer = Timer(delay, () {
+      resume.timer = null;
+      if (_resuming(space, slot, resume)) {
+        _sendResume(space, slot, resume);
+      } else {
+        _endResume(space, slot, resume);
+      }
+    });
+  }
+
+  /// Whether [resume] is still to be sent: the latest `RESUME` of [slot],
+  /// whose owner still owns it with that epoch, with no operation on it.
+  bool _resuming(_Space space, int slot, _Resume resume) {
+    final entry = space.entry(slot);
+    return !closed &&
+        identical(space.resumes[slot], resume) &&
+        resume.owner.up &&
+        entry.state == SlotState.owned &&
+        entry.owner == resume.owner.instance &&
+        entry.epoch == resume.epoch &&
+        !space.busy.containsKey(slot);
+  }
+
+  void _endResume(_Space space, int slot, _Resume resume) {
+    resume.timer?.cancel();
+    resume.timer = null;
+    if (identical(space.resumes[slot], resume)) {
+      space.resumes.remove(slot);
+    }
   }
 
   void _rollBack(_Migration migration, String reason) {
@@ -1240,10 +1316,28 @@ class _SlotManager {
     }
   }
 
-  void _abandon(_Migration migration, String reason) {
+  /// The service closed during the migration: the slot is set back to
+  /// [from], or free with its holder kept once [from] is gone (as its other
+  /// slots are by then), as on a rollback, so that the table matches what
+  /// the requester is told. Nothing is sent: instances unlock their slots
+  /// when they lose the channel.
+  void _abandon(
+    _Space space,
+    _Migration migration,
+    _Registration from,
+    int holder,
+    int epoch,
+  ) {
+    setEntry(
+      space,
+      migration.slot,
+      from.up
+          ? SlotEntry.owned(from.instance, holder: holder, epoch: epoch)
+          : SlotEntry.free(holder: holder, epoch: epoch),
+    );
     final request = migration.request;
     if (request != null) {
-      abortCode(request, StatusCode.goingAway, reason);
+      abortCode(request, StatusCode.goingAway, 'naming service closed');
     }
   }
 
@@ -1563,8 +1657,9 @@ class _SlotManager {
 
   /// Moves one slot to the most under-share candidate when that one is
   /// short by at least one slot, from the most over-share candidate that
-  /// has a slot it can move (not busy, and not in the `DRAIN` backoff of
-  /// that owner), else from the next most over-share one, and so on among
+  /// has a slot it can move (not busy, not waiting for the answer to a
+  /// `RESUME`, and not in the `DRAIN` backoff of that owner), else from the
+  /// next most over-share one, and so on among
   /// the candidates over their share. Runs only when nothing else is in
   /// flight in the space, so the allocator's migrations are strictly one
   /// at a time. A candidate in its backoff for any slot of the space is
@@ -1615,6 +1710,7 @@ class _SlotManager {
         if (entry.state == SlotState.owned &&
             entry.owner == over.instance &&
             !space.busy.containsKey(s) &&
+            !space.resumes.containsKey(s) &&
             !drainBackingOff(space, s, over.instance) &&
             (slot == null || s < slot)) {
           slot = s;
@@ -1995,6 +2091,10 @@ class _Space {
   /// `DRAIN` backoffs by owner, then slot (see `_SlotManager.drainFailed`).
   final Map<int, Map<int, _Backoff>> drainBackoffs = {};
 
+  /// `RESUME`s of rolled-back migrations not answered yet, by slot (see
+  /// `_SlotManager._resume`).
+  final Map<int, _Resume> resumes = {};
+
   /// `LOCATE` requests waiting for a slot to change, by slot.
   final Map<int, Completer<void>> _wakers = {};
 
@@ -2058,7 +2158,8 @@ class _Space {
     }
   }
 
-  /// Forgets the backoffs of [instance] (it went down).
+  /// Forgets the backoffs of [instance] (it went down), and the `RESUME`s
+  /// to send it.
   void dropBackoffs(int instance) {
     cooling.remove(instance);
     for (final map in [backoffs, drainBackoffs]) {
@@ -2066,10 +2167,21 @@ class _Space {
         backoff.timer?.cancel();
       }
     }
+    resumes.removeWhere((_, resume) {
+      if (resume.owner.instance != instance) {
+        return false;
+      }
+      resume.timer?.cancel();
+      return true;
+    });
   }
 
   void clearBackoffs() {
-    for (final instance in {...backoffs.keys, ...drainBackoffs.keys}) {
+    for (final instance in {
+      ...backoffs.keys,
+      ...drainBackoffs.keys,
+      for (final resume in resumes.values) resume.owner.instance,
+    }) {
       dropBackoffs(instance);
     }
   }
@@ -2144,6 +2256,26 @@ class _Backoff {
   Duration? delay;
 
   /// Runs while the instance is not offered the slot.
+  Timer? timer;
+}
+
+/// The `RESUME` of a rolled-back migration, sent until the old owner
+/// answers it (see `_SlotManager._resume`).
+class _Resume {
+  _Resume(this.owner, this.epoch);
+
+  final _Registration owner;
+
+  /// The slot's epoch, unchanged by the rollback.
+  final int epoch;
+
+  /// Failed attempts in a row.
+  int failures = 0;
+
+  /// The last backoff; null before the first failure.
+  Duration? delay;
+
+  /// Runs until the next attempt.
   Timer? timer;
 }
 

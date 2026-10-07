@@ -152,6 +152,20 @@ The protocol specification lives in the project wiki (section
   `LOCATE` backoff wait), and the deadlines instances declare for `ASSIGN`
   and `DRAIN` are passed on to the requests waiting for them, the
   `MIGRATE` requester included. Adds a dependency on `package:clock`.
+- Naming and sharding fixes: the `RESUME` of a rolled-back migration is
+  sent again until the old owner answers it (the `ASSIGN` backoff
+  intervals); after `NamingService.resumeAttempts` (5) failures in a row
+  the slot is set free with its holder kept and placed elsewhere first. A
+  migration interrupted by the service's `close` sets its slot back. The
+  channel's request limit (`TalkOptions.maxOutgoingRequests`) no longer
+  loses or stalls work in `NamingClient`: the slot state restored after a
+  reconnect, and the `WATCH`, are sent after `reconnectDelay` when the
+  channel refuses them, in order and once, and `claim`, `release` and
+  `locate` calls past the limit wait for their turn instead of failing
+  with `RESOURCE_EXHAUSTED`. `declareHolding` for a type the client
+  registers no instance of is sent and refused by the naming service
+  instead of never completing. `MeshNode.leave()` keeps at most 64
+  `RELEASE`s and 64 hand-over migrations in flight.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-channel and per-connection receive buffers, a budget for
