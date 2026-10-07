@@ -1210,12 +1210,14 @@ class Switchboard {
   /// migrates); if the table has none, in a managed space the owner the
   /// resolver locates ([SlotResolver.locateSlot], which assigns a free
   /// slot; at most [slotRefreshTimeout], then [StatusCode.unavailable]),
-  /// and in a static space the open fails with [StatusCode.unavailable]. A slot outside the space fails with
-  /// [StatusCode.outOfRange]; an owner that cannot be connected, or is
-  /// missing from the service table, with [StatusCode.unavailable]. An
-  /// explicit instance bypasses slot routing (the shard is still carried
-  /// in the header). An owner that [where] refuses is not found
-  /// ([StatusCode.notFound]); no other instance is tried.
+  /// and in a static space the open fails with [StatusCode.unavailable].
+  /// A slot outside the space fails with [StatusCode.outOfRange]; an owner
+  /// that cannot be connected, or is missing from the service table, with
+  /// [StatusCode.unavailable] (the resolver is asked once more before,
+  /// since an owner just located may have registered after the records
+  /// were read). An explicit instance bypasses slot routing (the shard is
+  /// still carried in the header). An owner that [where] refuses is not
+  /// found ([StatusCode.notFound]); no other instance is tried.
   ///
   /// The returned record's instance is the one to put in the address
   /// header: the selected record's instance, or the requested instance
@@ -1259,12 +1261,17 @@ class Switchboard {
       if (table != null) {
         final owner = await _slotOwner(r, table, shard, refresh: false);
         _checkOpen();
-        final records = [
-          for (final record in known)
-            if (record.address.type == address.type &&
-                record.address.instance == owner)
-              record,
-        ];
+        var records = _recordsOf(known, address.type, owner);
+        if (records.isEmpty) {
+          // An owner that registered while the slot was located is not in
+          // the records read before.
+          records = _recordsOf(
+            await r.resolve(address.type),
+            address.type,
+            owner,
+          );
+          _checkOpen();
+        }
         if (records.isEmpty) {
           throw SwitchboardException.of(
             StatusCode.unavailable,
@@ -1316,6 +1323,17 @@ class Switchboard {
         : _selectStart(address.type, accepted.length);
     return _connectFirst(address, accepted, start, excludeOwnEndpoints);
   }
+
+  /// The records of instance [instance] of [type] among [records].
+  static List<ServiceRecord> _recordsOf(
+    List<ServiceRecord> records,
+    Name type,
+    int instance,
+  ) => [
+    for (final record in records)
+      if (record.address.type == type && record.address.instance == instance)
+        record,
+  ];
 
   static List<ServiceRecord> _filtered(
     List<ServiceRecord> records,
@@ -1525,7 +1543,11 @@ class Switchboard {
   /// retry fails, the returned channel ends with the `MOVED` status. See
   /// [SlotChannel] for why a `MOVED` after the first subframe is not
   /// retried (the caller may open again and resend: nothing was
-  /// processed) and why a `RELOCATED` never is.
+  /// processed) and why a `RELOCATED` never is. Subframes sent while the
+  /// replacement is being opened are held, at most
+  /// [MuxOptions.maxChannelBufferBytes] of [muxOptions]
+  /// ([SlotChannel.maxHeldBytes]); beyond, the channel is closed with
+  /// `RESOURCE_EXHAUSTED`.
   ///
   /// [where] applies to the first channel and to the retry: an owner it
   /// refuses is not found (see [selectAndConnect]); on the retry, the
@@ -1563,6 +1585,7 @@ class Switchboard {
         where: where,
         payloadFor: payload == null ? _implicitPayload : null,
       ),
+      maxHeldBytes: muxOptions.maxChannelBufferBytes,
     );
   }
 

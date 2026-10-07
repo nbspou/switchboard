@@ -876,21 +876,25 @@ void main() {
     final zone = Name('zone');
     late Map<int, String> modes;
     late Map<int, List<ChannelAddress>> opened;
+    late Map<int, List<Status>> ended;
     late _Locating table;
     late Switchboard proxy;
     late Switchboard client;
 
-    /// The proxy, with [budget] channels per client connection and the
-    /// other options of [proxyHandler], and a client of it.
+    /// The proxy, with [budget] channels per client connection, the other
+    /// options of [proxyHandler] and [options] for its connections, and a
+    /// client of it, over TCP or, with [memory], in memory.
     Future<void> startProxy({
       int budget = 256,
       bool revealOwners = false,
       bool allowExplicitInstance = false,
       int maxLocates = 32,
       Duration refill = const Duration(seconds: 1),
+      MuxOptions options = fast,
+      bool memory = false,
     }) async {
       proxy = Switchboard(
-        muxOptions: fast,
+        muxOptions: options,
         slotRefreshTimeout: const Duration(milliseconds: 500),
       );
       addTearDown(proxy.close);
@@ -903,7 +907,9 @@ void main() {
         maxLocatesPerConnection: maxLocates,
         locateRefillInterval: refill,
       );
-      final proxyUri = await proxy.listenTcp('127.0.0.1', 0);
+      final proxyUri = memory
+          ? await proxy.listenMemory()
+          : await proxy.listenTcp('127.0.0.1', 0);
       client = Switchboard(
         resolver: EndpointResolver(proxyUri),
         muxOptions: fast,
@@ -922,10 +928,12 @@ void main() {
       final node = Switchboard(muxOptions: fast);
       addTearDown(node.close);
       opened[id] = [];
+      ended[id] = [];
       modes[id] = 'greet';
       node.registerService(zone, (incoming) {
         opened[id]!.add(incoming.address);
         final channel = incoming.channel;
+        unawaited(channel.done.then(ended[id]!.add));
         final [mode, ...rest] = modes[id]!.split(':');
         final fields = rest.length == 2
             ? MovedStatus(owner: int.parse(rest[0]), epoch: int.parse(rest[1]))
@@ -957,6 +965,7 @@ void main() {
     setUp(() async {
       modes = {};
       opened = {};
+      ended = {};
       table = _Locating([await backend(1), await backend(2)]);
       addTearDown(table.close);
       table.defineSlots(SlotSpace(zone, count: 8, mode: SlotMode.managed));
@@ -1108,6 +1117,84 @@ void main() {
         await explicit.close();
       },
     );
+
+    test('a resolver still syncing: the table routes once it answered, '
+        'the instance the client named ignored, LOCATEs counted', () async {
+      await startProxy(maxLocates: 1, refill: Duration.zero);
+      table.answer = (_) => const SlotEntry.owned(2, epoch: 1);
+      // Takes the only LOCATE token.
+      final located = await open(3);
+      expect(await located.stream.first, bytes('2 3'));
+      await located.close();
+      // The resolver has not synced: no table yet.
+      table.removeSlots(zone);
+      final gate = table.gate = Completer<void>();
+      final named = await client.openChannel(ServiceAddress(zone, 1), shard: 1);
+      await table.waiting.future;
+      table.waiting = Completer<void>();
+      final free = await open(2);
+      await table.waiting.future;
+      // It syncs: instance 2 owns slot 1, slot 2 is free.
+      table
+        ..defineSlots(SlotSpace(zone, count: 8, mode: SlotMode.managed))
+        ..setSlot(zone, 1, const SlotEntry.owned(2, epoch: 1));
+      gate.complete();
+      expect(await named.stream.first, bytes('2 1'));
+      expect(opened[1], isEmpty);
+      expect(
+        [for (final address in opened[2]!) (address.instance, address.shard)],
+        [(2, 3), (2, 1)],
+      );
+      expect(await free.done, hasCode(StatusCode.resourceExhausted));
+      expect(table.located, [3]);
+      await named.close();
+    });
+
+    test('what the client sends during a retry is held up to the node\'s '
+        'channel buffer limit, then RESOURCE_EXHAUSTED', () async {
+      // In memory, so that each subframe reaches the proxy's pipe before
+      // the next is sent: the client leg's own receive buffer, with the
+      // same limit, never fills up.
+      await startProxy(
+        options: fast.copyWith(maxChannelBufferBytes: 1000),
+        memory: true,
+      );
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'moved:';
+      final asked = Completer<void>();
+      final answer = Completer<SlotEntry?>();
+      addTearDown(() {
+        if (!answer.isCompleted) {
+          answer.complete(null);
+        }
+      });
+      table.answer = (_) {
+        asked.complete();
+        return answer.future;
+      };
+      final channel = await open(4);
+      await asked.future;
+      // Each subframe counts its length plus 32: the fourth goes beyond.
+      var sent = 0;
+      while (channel.canSend && sent < 10) {
+        channel.send(pattern(300, sent++));
+        await Future<void>.delayed(Duration.zero);
+      }
+      final status = await channel.done;
+      expect(status, hasCode(StatusCode.resourceExhausted));
+      expect(status.reason, 'send buffer of 1000 bytes exceeded');
+      expect(sent, lessThan(10));
+      // The LOCATE answers after all: the new owner's channel is closed at
+      // once.
+      answer.complete(const SlotEntry.owned(2, epoch: 2));
+      final watch = Stopwatch()..start();
+      while (ended[2]!.isEmpty) {
+        expect(watch.elapsed, lessThan(const Duration(seconds: 5)));
+        await Future<void>.delayed(const Duration(milliseconds: 1));
+      }
+      expect(ended[2]!.single, hasCode(StatusCode.resourceExhausted));
+      expect(opened[2]!.single.instance, 2);
+    });
 
     test('LOCATEs per client connection are bounded', () async {
       await startProxy(maxLocates: 2, refill: Duration.zero);
@@ -1332,8 +1419,9 @@ void main() {
   });
 }
 
-/// A static resolver whose LOCATE answers are scripted.
-class _Locating extends StaticResolver {
+/// A static resolver whose LOCATE answers are scripted, and whose
+/// [resolve] waits as [_Gated]'s.
+class _Locating extends _Gated {
   _Locating(super.records);
 
   final List<int> located = [];
@@ -1352,7 +1440,7 @@ class _Gated extends StaticResolver {
   _Gated(super.records);
 
   Completer<void>? gate;
-  final Completer<void> waiting = Completer<void>();
+  Completer<void> waiting = Completer<void>();
 
   @override
   Future<List<ServiceRecord>> resolve(Name type) async {

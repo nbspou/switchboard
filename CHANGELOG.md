@@ -47,10 +47,15 @@ The protocol specification lives in the project wiki (section
   forced) and `ClientState.nextAttemptAt` for app resume and connectivity
   changes.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
-  host hint relays, routing by shard slot with a one-shot retry on `MOVED`,
-  an asynchronous `authorize` hook that may rewrite the address, and
-  refusal of slot-less channels to sharded types unless `allowNoSlot`
-  admits the type.
+  host hint relays, routing by shard slot with a one-shot retry on `MOVED`
+  (what the client sends meanwhile is held up to the node's
+  `maxChannelBufferBytes`, beyond which the channel is closed with
+  `RESOURCE_EXHAUSTED`), an asynchronous `authorize` hook that may rewrite
+  the address, and refusal of slot-less channels to sharded types unless
+  `allowNoSlot` admits the type. The slot tables are read once the
+  resolver has answered, so a proxy whose naming client has not synced
+  yet neither lets a client-named instance past them nor skips the
+  `LOCATE` budget.
 - Sharding: slot spaces per service type in the naming service (`SLOTS`,
   `HOLDING`, `CLAIM`, `RELEASE`, `LOCATE`, `MIGRATE`, `SLOTSPC` and `SLOT`
   table items), managed and static modes, lazy and shared-recovery flags,
