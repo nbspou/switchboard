@@ -42,8 +42,16 @@ class RacingSwitchboard extends Switchboard {
   Future<void> Function(MuxConnection connection)? beforeReturn;
 
   @override
-  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy}) async {
-    final connection = await super.connect(endpoint, policy: policy);
+  Future<MuxConnection> connect(
+    Uri endpoint, {
+    ChannelPolicy? policy,
+    ServiceRecord? record,
+  }) async {
+    final connection = await super.connect(
+      endpoint,
+      policy: policy,
+      record: record,
+    );
     final hook = beforeReturn;
     beforeReturn = null;
     await hook?.call(connection);

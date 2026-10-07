@@ -1006,8 +1006,17 @@ class Switchboard {
   /// [StatusCode.invalidArgument] for a `tcp` URI without host or port or
   /// a `mem` URI without id, and with [StatusCode.failedPrecondition]
   /// after [close].
-  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy}) =>
-      _connect(endpoint, policy, null);
+  ///
+  /// [record] is the resolver's record the connection is established for,
+  /// if the caller has one: it reaches [expectedIdentityFor] (and names a
+  /// relay from its metadata) when a new connection is dialled; a pooled
+  /// connection that already exists is returned as is. The open methods
+  /// pass the record whose endpoint they dial.
+  Future<MuxConnection> connect(
+    Uri endpoint, {
+    ChannelPolicy? policy,
+    ServiceRecord? record,
+  }) => _connect(endpoint, policy, record);
 
   /// [connect]; a new connection is established for [record] (named as
   /// [dial] names it in the `IDENT`).
@@ -2131,7 +2140,7 @@ class Switchboard {
           continue;
         }
         try {
-          final connection = await _connect(endpoint, null, record);
+          final connection = await connect(endpoint, record: record);
           // A record for any instance (an endpoint resolver's) stands for
           // the instance asked for, metadata included (credentialFor reads
           // it).
@@ -2280,7 +2289,7 @@ class Switchboard {
     for (final record in await _relayCandidates(config, resolver)) {
       for (final endpoint in record.endpoints) {
         try {
-          return (record, await _connect(endpoint, null, record));
+          return (record, await connect(endpoint, record: record));
         } on SwitchboardException catch (e) {
           if (_closing) {
             rethrow;
