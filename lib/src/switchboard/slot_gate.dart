@@ -28,6 +28,10 @@ import 'switchboard.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
+/// The epoch after [epoch], as the naming service assigns it (wrapping to
+/// 1).
+int _nextEpoch(int epoch) => epoch >= maxU32 ? 1 : epoch + 1;
+
 /// How long a channel a gate forwards late requests on stays open without
 /// a request in flight before it is closed (it is opened again for the
 /// next one).
@@ -148,7 +152,8 @@ enum SlotGateState {
   /// Served here.
   serving,
 
-  /// Locked by `DRAIN`, until `FORWARD` or `RESUME`; channels are queued.
+  /// Locked by `DRAIN`, until `FORWARD` or `RESUME` (or an `ASSIGN`, see
+  /// [SlotGate.onAssign]); channels are queued.
   locked,
 
   /// Handed over by `FORWARD`; channels and gated requests are forwarded
@@ -207,10 +212,12 @@ enum SlotGateState {
 /// it calls [SlotLifecycle.drain]. On `FORWARD` it pipes the queued
 /// channels to the new owner in arrival order, forwards the queued
 /// requests, answers, and keeps forwarding for [forwardGrace], then calls
-/// [SlotLifecycle.unload]. On `RESUME` it serves the queue itself. On
-/// revocation (and [release], [close]) it rejects the queue with `MOVED`,
-/// closes the slot's tracked channels with `RELOCATED` ([relocatedStatus])
-/// and calls [SlotLifecycle.unload].
+/// [SlotLifecycle.unload]. On `RESUME` it serves the queue itself, and so
+/// on an `ASSIGN` of the locked slot when no other instance owned it since
+/// (the `RESUME` was lost, see [onAssign]). On revocation (and [release],
+/// [close]) it rejects the queue with `MOVED`, closes the slot's tracked
+/// channels with `RELOCATED` ([relocatedStatus]) and calls
+/// [SlotLifecycle.unload].
 class SlotGate implements SlotHandler {
   /// Creates the gate of [type] on [switchboard], serving the slot
   /// requests [client] receives, with the application's [lifecycle] (which
@@ -782,8 +789,19 @@ class SlotGate implements SlotHandler {
   /// `ASSIGN`: loads the slot with [SlotLifecycle.load] (queueing its
   /// channels meanwhile), then serves it and its queue. For a slot already
   /// served (a claim confirmed after a naming service restart) only the
-  /// epoch changes. A slot still being forwarded after a migration comes
-  /// back: forwarding stops, [SlotLifecycle.unload] runs, then
+  /// epoch changes.
+  ///
+  /// A slot still locked whose `RESUME` was lost (the naming service set
+  /// it free after its retries, then assigned it back here) is unlocked
+  /// as on `RESUME`, with the new epoch, when no other instance owned it
+  /// in between: the epoch is the next one after the epoch it was locked
+  /// with, since only an assignment increments it. Its queue is served
+  /// here and the answer is that of its load.
+  ///
+  /// A slot that another instance owned since (a locked slot with a later
+  /// epoch, or a slot still being forwarded after a migration, which
+  /// comes back) has stale state here: its queue is refused with `MOVED`,
+  /// forwarding stops, [SlotLifecycle.unload] runs, then
   /// [SlotLifecycle.load], which receives [context]. Refused with
   /// `UNAVAILABLE` after [close].
   @override
@@ -801,22 +819,30 @@ class SlotGate implements SlotHandler {
     }
     final existing = _slots[slot];
     switch (existing?.state) {
-      case SlotGateState.serving || SlotGateState.locked:
+      case SlotGateState.serving:
         existing!.epoch = request.epoch;
+        return existing.result;
+      case SlotGateState.locked
+          when request.epoch == _nextEpoch(existing!.epoch):
+        _log.info(
+          '$type gate: slot $slot assigned back while locked (RESUME lost), '
+          'serving it again, epoch ${request.epoch}',
+        );
+        _unlock(existing, slot, request.epoch);
         return existing.result;
       case SlotGateState.loading:
         throw SwitchboardException.of(
           StatusCode.unavailable,
           'slot $type/$slot is already being loaded',
         );
-      case SlotGateState.forwarding || null:
+      case SlotGateState.locked || SlotGateState.forwarding || null:
         break;
     }
     final s = _GateSlot(request.epoch);
     _slots[slot] = s;
     if (existing != null) {
-      // Coming back during the grace period: its queue is empty, its
-      // state stale.
+      // Owned by another instance since it was locked or handed over: its
+      // state is stale, its queue (never read) refused with MOVED.
       await _retire(existing, slot);
     }
     final AssignResult result;
@@ -1005,11 +1031,16 @@ class SlotGate implements SlotHandler {
     if (s == null || s.state != SlotGateState.locked) {
       return;
     }
+    _log.fine('$type gate: slot $slot resumed');
+    _unlock(s, slot, request.epoch);
+  }
+
+  /// Unlocks the locked slot [s] at [epoch] and serves its queue here.
+  void _unlock(_GateSlot s, int slot, int epoch) {
     s
       ..state = SlotGateState.serving
       ..to = 0
-      ..epoch = request.epoch;
-    _log.fine('$type gate: slot $slot resumed');
+      ..epoch = epoch;
     _release(s, slot);
   }
 

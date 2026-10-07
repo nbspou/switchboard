@@ -605,16 +605,25 @@ void main() {
       expect(gate.movedStatus(1), isMoved(2, 2));
     });
 
-    test('a slot coming back during the grace period is unloaded, then '
-        'loaded', () async {
-      newGate();
+    test('a slot coming back during the grace period: forwarding stops, it '
+        'is unloaded, then loaded and served here', () async {
+      newGate(forwardGrace: const Duration(milliseconds: 50));
       await gate.onAssign(assign(1));
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      expect(await ask(peer.open(shard: 1, payload: 'late'), 'a'), 'to:a');
       await gate.onAssign(assign(1, epoch: 3, holder: 2));
       expect(gate.serves(1), isTrue);
+      expect(gate.servedSlots, {1: 3});
       expect(lifecycle.log.skip(2), ['unload 1', 'load 1 e3 h2']);
       expect(await ask(peer.open(shard: 1), 'x'), '1:x');
+      // Past the grace period it was handed over with: still served here,
+      // nothing more forwarded or unloaded.
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(await ask(peer.open(shard: 1, payload: 'after'), 'y'), '1:y');
+      expect(gate.servedSlots, {1: 3});
+      expect(arrived, hasLength(1));
+      expect(lifecycle.log.where((l) => l == 'unload 1'), hasLength(1));
     });
 
     test('ASSIGN of a slot served already only updates the epoch', () async {
@@ -624,6 +633,56 @@ void main() {
       expect(await gate.onAssign(assign(1, epoch: 9)), AssignResult.notHolding);
       expect(gate.servedSlots, {1: 9});
       expect(lifecycle.log, ['load 1 e1 h0']);
+    });
+
+    test('ASSIGN of a slot still locked after a lost RESUME unlocks it with '
+        'the new epoch and serves its queue here', () async {
+      final infos = gateLogs(Level.INFO);
+      newGate();
+      await gate.onAssign(assign(1, holder: 1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = peer.open(shard: 1, payload: 'queued');
+      queued.send(bytes('a'));
+      await settle();
+      expect(lifecycle.served, isEmpty);
+      // The migration to 2 failed, its RESUME (epoch 1) never arrived, and
+      // the slot, free at epoch 1, is assigned back here at epoch 2.
+      expect(
+        await gate.onAssign(assign(1, epoch: 2, holder: 1)),
+        AssignResult.holding,
+      );
+      expect(gate.stateOf(1), SlotGateState.serving);
+      expect(gate.servedSlots, {1: 2});
+      expect(text(await queued.stream.first.timeout(limit)), '1:a');
+      expect(await ask(peer.open(shard: 1, payload: 'new'), 'b'), '1:b');
+      // Served on the state it has: not unloaded nor loaded again, nothing
+      // forwarded.
+      expect(lifecycle.log, [
+        'load 1 e1 h1',
+        'drain 1 e2 to2',
+        'serve 1 queued',
+        'serve 1 new',
+      ]);
+      expect(arrived, isEmpty);
+      expect(infos, [contains('RESUME lost')]);
+      // A RESUME arriving late changes nothing.
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(gate.servedSlots, {1: 2});
+    });
+
+    test('ASSIGN of a slot locked while another instance owned it since '
+        'refuses its queue with MOVED, unloads, then loads', () async {
+      newGate();
+      await gate.onAssign(assign(1, holder: 1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = peer.open(shard: 1, payload: 'queued');
+      await settle();
+      // Owned by 2 at epoch 2, handed back at epoch 3: the state is there.
+      await gate.onAssign(assign(1, epoch: 3, holder: 2));
+      expect(await queued.done.timeout(limit), isMoved());
+      expect(gate.servedSlots, {1: 3});
+      expect(lifecycle.log.skip(2), ['unload 1', 'load 1 e3 h2']);
+      expect(await ask(peer.open(shard: 1), 'x'), '1:x');
     });
 
     test('revocation refuses the queue with MOVED and closes served channels '
@@ -860,6 +919,25 @@ void main() {
       expect(text((await first).payload), '1:a');
       expect(text((await second.timeout(limit)).payload), '1:b');
       expect(answered, ['a', 'b']);
+      await talk.close();
+    });
+
+    test('an ASSIGN of the locked slot after a lost RESUME runs the queue '
+        'here and answers as its load did', () async {
+      newGate(trackChannels: false);
+      talkLifecycle();
+      lifecycle.result = AssignResult.notHolding;
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      expect(text((await talk.request('GET', bytes('a'))).payload), '1:a');
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = talk.request('GET', bytes('b'));
+      await settle();
+      expect(answered, ['a']);
+      expect(await gate.onAssign(assign(1, epoch: 2)), AssignResult.notHolding);
+      expect(text((await queued.timeout(limit)).payload), '1:b');
+      expect(answered, ['a', 'b']);
+      expect(arrived, isEmpty);
       await talk.close();
     });
 
