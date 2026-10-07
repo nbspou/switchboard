@@ -80,6 +80,11 @@ abstract class TalkMessage {
   /// request. The request is then finished: [canReply] is false and the
   /// reply methods throw [StatusCode.failedPrecondition], as after the
   /// responder timeout. The application only has to stop working.
+  ///
+  /// A cancel that a synchronous transport delivers while a reply is still
+  /// being sent is handled once that send returns: after the final reply
+  /// it is ignored, as for any request already answered, so the request
+  /// gets exactly one final response.
   Future<void> get onCancel;
 
   /// True while a reply method may still be called: the message expects a
@@ -334,6 +339,12 @@ abstract class TalkMessage {
   /// the requester's own timeout. The requester raises the values to its
   /// [TalkOptions.minExtension] and lowers them to its
   /// [TalkOptions.maxExtension].
+  ///
+  /// A value on the wire, buffer included, is at most
+  /// [TalkFrame.maxExtendMillis] (about 49.7 days). A longer one is lowered
+  /// on both sides, so that the local responder timeout stays [buffer]
+  /// short of what the requester is told (a buffer that long leaves no
+  /// time at all).
   ///
   /// With neither value, sends an empty `EXTEND`, which restarts the
   /// default gap of the requester and of this responder, keeping what was

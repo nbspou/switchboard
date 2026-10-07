@@ -769,6 +769,61 @@ void main() {
       expect(answer.status.known, StatusCode.unavailable);
       await proxy.close();
     });
+
+    test('a chained request the proxy cannot send toward the client '
+        'answers both sides UNAVAILABLE', () async {
+      final toClient = StreamChannelController<Uint8List>();
+      final toBackend = StreamChannelController<Uint8List>();
+      final proxy = Proxy(
+        TalkChannel(
+          toClient.local,
+          options: const TalkOptions(maxOutgoingRequests: 1),
+        ),
+        TalkChannel(toBackend.local),
+      );
+      final atClient = <TalkFrame>[];
+      final atBackend = <TalkFrame>[];
+      toClient.foreign.stream.listen((d) => atClient.add(TalkFrame.decode(d)));
+      toBackend.foreign.stream.listen(
+        (d) => atBackend.add(TalkFrame.decode(d)),
+      );
+      // A request of the backend's, forwarded to the client, holds the one
+      // outgoing request the proxy may have toward the client.
+      toBackend.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('HOLD'),
+          requestId: 1,
+        ).encode(),
+      );
+      toClient.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('ASK'),
+          requestId: 7,
+        ).encode(),
+      );
+      await pumpEventQueue();
+      expect(proxy.front.outgoingRequestCount, 1);
+      final ask = atBackend.single;
+      toBackend.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          requestId: 2,
+          responseId: ask.requestId,
+        ).encode(),
+      );
+      await pumpEventQueue();
+      // The chained request is refused toward the backend, and the request
+      // it was to answer still gets its final.
+      expect(atBackend.last.responseId, 2);
+      expect(atBackend.last.status.known, StatusCode.unavailable);
+      final answer = atClient.singleWhere((f) => f.responseId == 7);
+      expect(answer.kind, TalkKind.abort);
+      expect(answer.status.known, StatusCode.unavailable);
+      expect(proxy.front.incomingRequestCount, 0);
+      await proxy.close();
+    });
   });
 
   group('forwardMessage', () {

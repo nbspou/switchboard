@@ -136,8 +136,10 @@ The protocol specification lives in the project wiki (section
   `TalkOptions.extendBuffer` (5 s) on the wire and not on its own timer,
   so it gives up first; the requester raises the values to
   `TalkOptions.minExtension` (1 s) and lowers them to
-  `TalkOptions.maxExtension` (1 h). `TalkMessage.extend({deadline, renew,
-  buffer})`; `onExtend` callbacks receive `(deadline, renew)`;
+  `TalkOptions.maxExtension` (1 h); a declaration beyond the `u32` field
+  (about 49.7 days, buffer included) is lowered on both sides, the buffer
+  kept. `TalkMessage.extend({deadline, renew, buffer})`; `onExtend`
+  callbacks receive `(deadline, renew)`;
   `TalkRequest.deadline` and `TalkStream.deadline` show the expiry;
   `forwardMessage` passes `EXTEND` payloads through unchanged. Nothing in
   the library sends `EXTEND` from a timer any more: `SlotHandler` methods

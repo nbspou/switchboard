@@ -1364,6 +1364,15 @@ class _Message extends TalkMessage {
   /// [forwardMessage] took this request over.
   bool _forwarded = false;
 
+  /// A reply to this request is being sent (see [_sendReply]).
+  bool _sending = false;
+
+  /// The reply being sent is the final one: the request counts as answered.
+  bool _finalizing = false;
+
+  /// The status of a peer cancel that arrived while a reply was being sent.
+  Status? _heldCancel;
+
   @override
   bool get isCancelled => _cancelled;
 
@@ -1371,7 +1380,7 @@ class _Message extends TalkMessage {
   Future<void> get onCancel => (_cancelCompleter ??= Completer<void>()).future;
 
   @override
-  bool get canReply => !_finished && channel.isOpen;
+  bool get canReply => !_finished && !_finalizing && channel.isOpen;
 
   void _check({bool item = false}) {
     if (!expectsReply) {
@@ -1386,7 +1395,7 @@ class _Message extends TalkMessage {
         'channel closed',
       );
     }
-    if (_finished) {
+    if (_finished || _finalizing) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'request $requestId already answered',
@@ -1403,21 +1412,61 @@ class _Message extends TalkMessage {
   static Name? _name(String? procedure, Name? name) =>
       name ?? (procedure == null ? null : Name(procedure));
 
+  /// Sends a reply to this request with [send]: the final one if
+  /// [isFinal], which finishes the request, else a stream item or an
+  /// `EXTEND`. Returns what [send] returns.
+  ///
+  /// Over a synchronous transport the peer's frames can be handled while
+  /// [send] is still sending, a cancel of this request among them. That
+  /// cancel is held until [send] returns, then handled as if it had
+  /// arrived just after: ignored if the final reply went out (a request has
+  /// exactly one final response, and a cancel of an answered request is
+  /// ignored), otherwise answered with `ABORT CANCELLED` as usual. Without
+  /// such a cancel, a final reply that fails to send leaves the request
+  /// answerable.
+  T _sendReply<T>(T Function() send, {bool isFinal = false}) {
+    // Forwarding can relay a reply while another one is being sent (never
+    // within a final reply: [_check] refuses); the outermost send handles
+    // a held cancel.
+    final outer = _sending;
+    _sending = true;
+    _finalizing = isFinal;
+    try {
+      final result = send();
+      if (isFinal) {
+        _finish();
+      }
+      return result;
+    } finally {
+      _sending = outer;
+      _finalizing = false;
+      final cancel = outer ? null : _heldCancel;
+      if (cancel != null) {
+        _heldCancel = null;
+        if (!_finished) {
+          _cancelledByPeer(cancel);
+        }
+      }
+    }
+  }
+
   @override
   void reply(Uint8List payload, {String? procedure, Name? name}) =>
       _reply(payload, _name(procedure, name));
 
   void _reply(Uint8List payload, Name? procedure) {
     _check();
-    channel._sendChecked(
-      TalkFrame(
-        kind: TalkKind.message,
-        procedure: procedure,
-        responseId: requestId,
-        payload: payload,
+    _sendReply(
+      () => channel._sendChecked(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: procedure,
+          responseId: requestId,
+          payload: payload,
+        ),
       ),
+      isFinal: true,
     );
-    _finish();
   }
 
   @override
@@ -1476,22 +1525,23 @@ class _Message extends TalkMessage {
     _ResponseSink? sink,
   }) {
     _check();
-    final pending = channel._startRequest(
-      stream: stream,
-      timeout: timeout,
-      onExtend: onExtend,
-      sink: sink,
-      build: (id) => TalkFrame(
-        kind: TalkKind.message,
-        procedure: procedure,
-        requestId: id,
-        responseId: requestId,
+    return _sendReply(
+      () => channel._startRequest(
         stream: stream,
-        payload: payload,
+        timeout: timeout,
+        onExtend: onExtend,
+        sink: sink,
+        build: (id) => TalkFrame(
+          kind: TalkKind.message,
+          procedure: procedure,
+          requestId: id,
+          responseId: requestId,
+          stream: stream,
+          payload: payload,
+        ),
       ),
+      isFinal: true,
     );
-    _finish();
-    return pending;
   }
 
   @override
@@ -1500,12 +1550,14 @@ class _Message extends TalkMessage {
 
   void _replyItem(Uint8List payload, Name? procedure) {
     _check(item: true);
-    channel._sendChecked(
-      TalkFrame(
-        kind: TalkKind.streamItem,
-        procedure: procedure,
-        responseId: requestId,
-        payload: payload,
+    _sendReply(
+      () => channel._sendChecked(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          procedure: procedure,
+          responseId: requestId,
+          payload: payload,
+        ),
       ),
     );
     _replied();
@@ -1567,18 +1619,20 @@ class _Message extends TalkMessage {
     _ResponseSink? sink,
   }) {
     _check(item: true);
-    final pending = channel._startRequest(
-      stream: stream,
-      timeout: timeout,
-      onExtend: onExtend,
-      sink: sink,
-      build: (id) => TalkFrame(
-        kind: TalkKind.streamItem,
-        procedure: procedure,
-        requestId: id,
-        responseId: requestId,
+    final pending = _sendReply(
+      () => channel._startRequest(
         stream: stream,
-        payload: payload,
+        timeout: timeout,
+        onExtend: onExtend,
+        sink: sink,
+        build: (id) => TalkFrame(
+          kind: TalkKind.streamItem,
+          procedure: procedure,
+          requestId: id,
+          responseId: requestId,
+          stream: stream,
+          payload: payload,
+        ),
       ),
     );
     _replied();
@@ -1593,14 +1647,16 @@ class _Message extends TalkMessage {
 
   void _replyAbort(Status status) {
     _check();
-    channel._sendChecked(
-      TalkFrame(
-        kind: TalkKind.abort,
-        responseId: requestId,
-        payload: TalkChannel._wireAbortStatus(status).encode(),
+    _sendReply(
+      () => channel._sendChecked(
+        TalkFrame(
+          kind: TalkKind.abort,
+          responseId: requestId,
+          payload: TalkChannel._wireAbortStatus(status).encode(),
+        ),
       ),
+      isFinal: true,
     );
-    _finish();
   }
 
   @override
@@ -1616,28 +1672,40 @@ class _Message extends TalkMessage {
     }
     _check();
     final extra = buffer ?? channel.options.extendBuffer;
-    channel._sendChecked(
-      TalkFrame(
-        kind: TalkKind.extend,
-        responseId: requestId,
-        payload: TalkFrame.extendPayload(
-          deadline: deadline == null ? null : deadline + extra,
-          renew: renew == null ? null : renew + extra,
-        ),
+    // A field holds at most _maxExtend, buffer included. A longer value is
+    // lowered so that the local timeout stays the buffer short of what the
+    // requester is told: this responder still gives up first.
+    final room = extra < _maxExtend ? _maxExtend - extra : Duration.zero;
+    Duration? lowered(Duration? value) =>
+        value == null || value <= room ? value : room;
+    final localDeadline = lowered(deadline);
+    final localRenew = lowered(renew);
+    final frame = TalkFrame(
+      kind: TalkKind.extend,
+      responseId: requestId,
+      payload: TalkFrame.extendPayload(
+        deadline: localDeadline == null ? null : localDeadline + extra,
+        renew: localRenew == null ? null : localRenew + extra,
       ),
     );
+    _sendReply(() => channel._sendChecked(frame));
     final expiry = _expiry;
-    if (expiry == null) {
+    if (expiry == null || _finished) {
       return;
     }
     final now = monotonicNow();
-    if (deadline == null && renew == null) {
+    if (localDeadline == null && localRenew == null) {
       expiry.restartGap(now);
     } else {
-      expiry.declare(now, deadline, renew);
+      expiry.declare(now, localDeadline, localRenew);
     }
     _arm();
   }
+
+  /// The longest deadline or renewal an `EXTEND` field can carry.
+  static const Duration _maxExtend = Duration(
+    milliseconds: TalkFrame.maxExtendMillis,
+  );
 
   /// Sends an `EXTEND` with [payload] as received from the far responder,
   /// for forwarding: buffers already on the wire stay as they are.
@@ -1648,9 +1716,9 @@ class _Message extends TalkMessage {
       responseId: requestId,
       payload: payload,
     );
-    channel._sendChecked(frame);
+    _sendReply(() => channel._sendChecked(frame));
     final expiry = _expiry;
-    if (expiry == null) {
+    if (expiry == null || _finished) {
       return;
     }
     final (:deadline, :renew) = frame.extension;
@@ -1680,10 +1748,11 @@ class _Message extends TalkMessage {
     _arm();
   }
 
-  /// A stream item (possibly a request) was sent.
+  /// A stream item (possibly a request) was sent. Nothing to restart if
+  /// the request ended meanwhile.
   void _replied() {
     final expiry = _expiry;
-    if (expiry == null) {
+    if (expiry == null || _finished) {
       return;
     }
     expiry.reply(monotonicNow());
@@ -1722,8 +1791,9 @@ class _Message extends TalkMessage {
   }
 
   /// Answers with an abort on the channel's behalf, if still unanswered.
+  /// Never while the final reply is being sent: that is the one final.
   void _abortQuietly(Status status) {
-    if (_finished || !expectsReply) {
+    if (_finished || _finalizing || !expectsReply) {
       return;
     }
     channel._rejectRequest(requestId, status);
@@ -1731,8 +1801,13 @@ class _Message extends TalkMessage {
   }
 
   /// The peer cancelled the request: answer it with the final the protocol
-  /// requires, then tell the application.
+  /// requires, then tell the application. Held while a reply is being sent
+  /// (see [_sendReply]).
   void _cancelledByPeer(Status status) {
+    if (_sending) {
+      _heldCancel ??= status;
+      return;
+    }
     _abortQuietly(Status.of(StatusCode.cancelled, 'cancelled by requester'));
     _markCancelled(status);
   }

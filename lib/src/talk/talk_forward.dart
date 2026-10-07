@@ -276,8 +276,10 @@ class _Relay implements _ResponseSink {
           ),
         ),
       );
-      // If the chained request could not be sent, [incoming] still needs
-      // its final.
+      // Sent, the chained request is the final of [incoming], which is then
+      // finished and this does nothing. Not sent (over the outgoing request
+      // limit of [incoming]'s channel, say), [start] answered [message]
+      // only, and [incoming] still needs its final.
       _abortIncoming(_localFailure(Status.of(StatusCode.unavailable)));
     }
     _end();

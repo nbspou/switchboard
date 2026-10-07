@@ -146,6 +146,115 @@ class _LimitedSink implements StreamSink<Uint8List> {
   Future<void> get done => _inner.done;
 }
 
+/// A sink that hands each frame to [intercept], when set, instead of
+/// passing it on: the interceptor passes it on with `pass`, and may do more
+/// before or after, or throw instead.
+class _InterceptingSink implements StreamSink<Uint8List> {
+  _InterceptingSink(this._inner);
+
+  final StreamSink<Uint8List> _inner;
+
+  void Function(TalkFrame frame, void Function() pass)? intercept;
+
+  @override
+  void add(Uint8List event) {
+    final intercept = this.intercept;
+    if (intercept == null) {
+      _inner.add(event);
+    } else {
+      intercept(TalkFrame.decode(event), () => _inner.add(event));
+    }
+  }
+
+  @override
+  void addError(Object error, [StackTrace? stackTrace]) =>
+      _inner.addError(error, stackTrace);
+
+  @override
+  Future<void> addStream(Stream<Uint8List> stream) => _inner.addStream(stream);
+
+  @override
+  Future<void> close() => _inner.close();
+
+  @override
+  Future<void> get done => _inner.done;
+}
+
+/// A responder over a synchronous link, holding request 1 of a peer driven
+/// by hand. [cancelDuring] has the peer cancel the request while the
+/// responder is still sending a reply: over a synchronous transport the
+/// responder handles the cancel at once, inside its own send.
+class SyncResponder {
+  SyncResponder({bool stream = false}) {
+    final c = StreamChannelController<Uint8List>(sync: true);
+    _peer = c.foreign;
+    _sink = _InterceptingSink(c.local.sink);
+    talk = TalkChannel(StreamChannel<Uint8List>(c.local.stream, _sink));
+    _peer.stream.listen((data) => sent.add(TalkFrame.decode(data)));
+    talk.messages.listen(_held.add);
+    send(
+      TalkFrame(
+        kind: TalkKind.message,
+        procedure: Name('Q'),
+        requestId: 1,
+        stream: stream,
+      ),
+    );
+  }
+
+  late final StreamChannel<Uint8List> _peer;
+  // The talk channel closes it.
+  // ignore: close_sinks
+  late final _InterceptingSink _sink;
+  late final TalkChannel talk;
+  final List<TalkMessage> _held = [];
+
+  /// Every frame the responder sent, in wire order.
+  final List<TalkFrame> sent = [];
+
+  /// The peer's request 1, once delivered.
+  TalkMessage get request => _held.single;
+
+  void send(TalkFrame frame) => _peer.sink.add(frame.encode());
+
+  /// The peer cancels request 1 while the responder sends the first frame
+  /// [when] accepts: once the frame is on the wire, or, if [refuse], in
+  /// place of it, the send then failing with [StatusCode.frameTooLarge].
+  void cancelDuring(
+    bool Function(TalkFrame frame) when, {
+    bool refuse = false,
+  }) {
+    _sink.intercept = (frame, pass) {
+      if (!when(frame)) {
+        pass();
+        return;
+      }
+      _sink.intercept = null;
+      if (!refuse) {
+        pass();
+      }
+      send(
+        TalkFrame(
+          kind: TalkKind.abort,
+          requestId: 1,
+          payload: Status.of(StatusCode.cancelled).encode(),
+        ),
+      );
+      if (refuse) {
+        throw SwitchboardException.of(StatusCode.frameTooLarge);
+      }
+    };
+  }
+
+  /// The final responses sent for request 1.
+  List<TalkFrame> get finals => [
+    for (final frame in sent)
+      if (frame.responseId == 1 &&
+          (frame.kind == TalkKind.message || frame.kind == TalkKind.abort))
+        frame,
+  ];
+}
+
 /// Runs [body] and returns the errors it left unhandled.
 Future<List<Object>> uncaughtErrors(Future<void> Function() body) {
   final errors = <Object>[];
@@ -2143,6 +2252,55 @@ void main() {
       });
     });
 
+    test('a value beyond the EXTEND field is lowered on both sides, the '
+        'buffer kept', () {
+      fakeAsync((async) {
+        const day = Duration(days: 1);
+        const max = Duration(milliseconds: TalkFrame.maxExtendMillis);
+        final p = Pair(
+          a: const TalkOptions(
+            requestTimeout: Duration(days: 100),
+            maxExtension: Duration.zero,
+          ),
+          b: const TalkOptions(
+            replyTimeout: Duration(days: 100),
+            extendBuffer: Duration(days: 20),
+          ),
+        );
+        final held = <String, TalkMessage>{};
+        serve(p.b, (m) => held[m.procedureName] = m);
+        final deadline = Outcome(p.a.request('DEADLINE', Uint8List(0)));
+        final renew = Outcome(p.a.request('RENEW', Uint8List(0)));
+        async.flushMicrotasks();
+        held['DEADLINE']!.extend(deadline: day * 60);
+        held['RENEW']!.extend(renew: day * 60);
+        async.flushMicrotasks();
+        expect(p.bToA.map((f) => f.extension), [
+          (deadline: max, renew: null),
+          (deadline: null, renew: max),
+        ]);
+        // The responder still gives up the buffer before the requester.
+        async.elapse(max - day * 20 - ms1);
+        expect(held.values.map((m) => m.canReply), everyElement(isTrue));
+        async.elapse(ms1);
+        expect(held.values.map((m) => m.canReply), everyElement(isFalse));
+        async.flushMicrotasks();
+        for (final outcome in [deadline, renew]) {
+          expect(
+            outcome.error,
+            isA<TalkAbortException>().having(
+              (e) => e.code,
+              'code',
+              StatusCode.deadlineExceeded,
+            ),
+          );
+        }
+        p.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     test('the responder timeout follows its own declaration: items renew, '
         'the default gap is gone', () {
       fakeAsync((async) {
@@ -2350,6 +2508,161 @@ void main() {
       expect(held.single.canReply, isTrue);
       held.single.reply(Uint8List(0));
       await talk.close();
+    });
+
+    // A cancel handled inside the send of a reply is handled once the send
+    // returns: after a final reply it is ignored (the request is answered),
+    // after anything else it is answered ABORT CANCELLED as usual. Either
+    // way the request gets exactly one final response.
+
+    bool isFinal(TalkFrame f) =>
+        f.responseId == 1 &&
+        (f.kind == TalkKind.message || f.kind == TalkKind.abort);
+
+    /// Ends the test: no timer may be left, before or after the close.
+    void finish(FakeAsync async, SyncResponder r) {
+      expect(async.pendingTimers, isEmpty);
+      r.talk.close();
+      async.flushMicrotasks();
+      expect(async.pendingTimers, isEmpty);
+    }
+
+    TalkFrame cancelled(int id) => TalkFrame(
+      kind: TalkKind.abort,
+      responseId: id,
+      payload: Status.of(StatusCode.cancelled).encode(),
+    );
+
+    test('a cancel during the final reply gets no second final', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal);
+        r.request.reply(bytes([1]));
+        async.flushMicrotasks();
+        expect(r.finals, [
+          TalkFrame(kind: TalkKind.message, responseId: 1, payload: bytes([1])),
+        ]);
+        expect(r.request.canReply, isFalse);
+        expect(r.request.isCancelled, isFalse, reason: 'answered first');
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during replyAbort keeps the application status', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal);
+        r.request.replyAbort(const Status(300, 'mine'));
+        async.flushMicrotasks();
+        expect(r.finals, hasLength(1));
+        expect(r.finals.single.kind, TalkKind.abort);
+        expect(r.finals.single.status, const Status(300, 'mine'));
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during a chained reply leaves the chained request as '
+        'the final', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal);
+        final chained = r.request.startReplyRequest(
+          bytes([2]),
+          timeout: Duration.zero,
+        );
+        final answer = Outcome(chained.response);
+        async.flushMicrotasks();
+        expect(r.finals, hasLength(1));
+        expect(r.finals.single.requestId, chained.requestId);
+        expect(r.talk.incomingRequestCount, 0);
+        expect(r.talk.outgoingRequestCount, 1);
+        // The peer answers the chained final of what it cancelled.
+        r.send(cancelled(chained.requestId));
+        async.flushMicrotasks();
+        expect(answer.error, isA<TalkAbortException>());
+        expect(r.talk.outgoingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during a final that fails to send is answered', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal, refuse: true);
+        expect(
+          () => r.request.reply(bytes([1])),
+          throwsStatus(StatusCode.frameTooLarge),
+        );
+        async.flushMicrotasks();
+        expect(r.finals, hasLength(1));
+        expect(r.finals.single.status.known, StatusCode.cancelled);
+        expect(r.request.isCancelled, isTrue);
+        expect(r.request.canReply, isFalse);
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during a stream item is answered after it', () {
+      fakeAsync((async) {
+        final r = SyncResponder(stream: true);
+        async.flushMicrotasks();
+        r.cancelDuring((f) => f.kind == TalkKind.streamItem);
+        r.request.replyItem(bytes([1]));
+        async.flushMicrotasks();
+        expect(r.sent.map((f) => f.kind), [
+          TalkKind.streamItem,
+          TalkKind.abort,
+        ]);
+        expect(r.finals.single.status.known, StatusCode.cancelled);
+        expect(r.request.isCancelled, isTrue);
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during an item request is answered after it', () {
+      fakeAsync((async) {
+        final r = SyncResponder(stream: true);
+        async.flushMicrotasks();
+        r.cancelDuring((f) => f.kind == TalkKind.streamItem);
+        final item = r.request.startReplyItemRequest(
+          bytes([1]),
+          timeout: Duration.zero,
+        );
+        final answer = Outcome(item.response);
+        async.flushMicrotasks();
+        expect(r.sent.map((f) => (f.kind, f.requestId)), [
+          (TalkKind.streamItem, item.requestId),
+          (TalkKind.abort, 0),
+        ]);
+        expect(r.finals.single.status.known, StatusCode.cancelled);
+        expect(r.talk.incomingRequestCount, 0);
+        r.send(cancelled(item.requestId));
+        async.flushMicrotasks();
+        expect(answer.error, isA<TalkAbortException>());
+        finish(async, r);
+      });
+    });
+
+    test('a cancel during EXTEND is answered after it', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring((f) => f.kind == TalkKind.extend);
+        r.request.extend(deadline: const Duration(minutes: 1));
+        async.flushMicrotasks();
+        expect(r.sent.map((f) => f.kind), [TalkKind.extend, TalkKind.abort]);
+        expect(r.finals.single.status.known, StatusCode.cancelled);
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
     });
   });
 
