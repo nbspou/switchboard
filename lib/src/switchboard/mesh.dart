@@ -7,7 +7,9 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
@@ -23,6 +25,7 @@ import '../status.dart';
 import '../talk/talk_channel.dart';
 import 'channel_policy.dart';
 import 'incoming_channel.dart';
+import 'relay.dart';
 import 'slot_gate.dart';
 import 'switchboard.dart';
 
@@ -214,18 +217,70 @@ class MeshNode {
     return _publish(type, handler, instance, endpoints, null);
   }
 
+  /// Publishes [relay] as this node's `_relay` service ([Services.relay]):
+  /// registers the type like [publish] (with [instance] and [endpoints],
+  /// by default the node's listening endpoints, which consumers and
+  /// instances must be able to reach) and dispatches `_relay` channels to
+  /// [RelayService.handler]. The record's metadata is the identity string
+  /// (UTF-8) of the node's [Switchboard.credential], which consumers name
+  /// as the receiver of their `IDENT` (wiki page "Switchboard Identity and
+  /// Credentials", section "Finding a relay"); a node without a credential
+  /// publishes empty metadata, and a warning is logged, since consumers
+  /// then cannot name it (and it cannot broker). The credential needs
+  /// `register` for `_relay`.
+  ///
+  /// Throws [ArgumentError] when [relay] forwards through another node.
+  /// Fails like [publish].
+  Future<int> publishRelay(
+    RelayService relay, {
+    int instance = 0,
+    List<Uri>? endpoints,
+  }) {
+    if (!identical(relay.switchboard, switchboard)) {
+      throw ArgumentError.value(
+        relay,
+        'relay',
+        'forwards through another node',
+      );
+    }
+    if (_leaving) {
+      return Future.error(
+        SwitchboardException.of(StatusCode.failedPrecondition, 'left mesh'),
+      );
+    }
+    final identity = switchboard.credential?.identity;
+    if (identity == null) {
+      _log.warning(
+        'publishing a relay without a credential: consumers cannot name it '
+        'when they identify, and it cannot broker connections',
+      );
+    }
+    return _publish(
+      Services.relay,
+      relay.handler,
+      instance,
+      endpoints,
+      null,
+      metadata: identity == null
+          ? null
+          : Uint8List.fromList(utf8.encode(identity)),
+    );
+  }
+
   Future<int> _publish(
     Name type,
     ChannelHandler handler,
     int instance,
     List<Uri>? endpoints,
-    void Function(int id)? onId,
-  ) {
+    void Function(int id)? onId, {
+    Uint8List? metadata,
+  }) {
     ServiceAddress? current;
     return client.register(
       type,
       endpoints ?? switchboard.listeningEndpoints,
       instance: instance,
+      metadata: metadata,
       onAssigned: (id) {
         if (_leaving) {
           return;

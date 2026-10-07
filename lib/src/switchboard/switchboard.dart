@@ -13,6 +13,7 @@ import 'dart:math' show Random;
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../address/channel_address.dart';
@@ -40,6 +41,7 @@ import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'memory_endpoints.dart';
 import 'outgoing_policy.dart';
+import 'relay_config.dart';
 import 'resolver.dart';
 import 'slot_channel.dart';
 import 'slot_reopen.dart';
@@ -116,7 +118,8 @@ class Switchboard {
   /// The credential's identity is the [MuxConnection.localIdentity] of
   /// every connection, which peers' identifications must name, if they
   /// name anyone. Instances registered without endpoints are reached by
-  /// having them dial this node ([broker], [brokerEndpoint]).
+  /// having them dial this node ([broker], [brokerEndpoint]), or, by a
+  /// node that listens nowhere, through a [relay].
   ///
   /// Throws [ArgumentError] when [credential] names a holder key and
   /// [holderKey] is missing or another, and for a negative
@@ -142,6 +145,7 @@ class Switchboard {
     this.identifyFor,
     this.identityTimeout = const Duration(seconds: 10),
     this.expectedIdentityFor,
+    this.relay,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        _identity = credential,
        muxOptions = verifier == null
@@ -280,8 +284,9 @@ class Switchboard {
   /// to have, named in the receiver field of its `IDENT` there, so that
   /// the peer cannot relay the identification to a third node; consulted
   /// on every identification on an initiated connection that is not given
-  /// a receiver. Null (the default), or a null answer, names nobody. See
-  /// [ExpectedIdentity].
+  /// a receiver. Null (the default), or a null answer, names nobody,
+  /// except on a connection to a relay, which is named by the identity
+  /// its record carries (see [relay]). See [ExpectedIdentity].
   final ExpectedIdentity? expectedIdentityFor;
 
   /// Resolves service types for [openChannel] and [openTalk]. May be
@@ -360,8 +365,10 @@ class Switchboard {
   /// instance, whose [ServiceRecord.metadata] may carry a per-instance key
   /// published by a trusted registrar. A channel
   /// opened on a connection this node accepted ([openChannelOn]) has no
-  /// destination endpoint and carries an empty payload. Null (the
-  /// default): [defaultPayload] everywhere.
+  /// destination endpoint and carries an empty payload. A channel through
+  /// a [relay] is asked about with the relay's endpoint and the
+  /// destination's record. Null (the default): [defaultPayload]
+  /// everywhere.
   ///
   /// A payload the caller passes always wins: the `payload` of
   /// [openChannel], a non-empty [ChannelAddress.payload] for
@@ -377,6 +384,43 @@ class Switchboard {
   /// [listeningEndpoints]. It must be reachable from the instances, and
   /// its listener's policy is the policy of the brokered connections.
   Uri? brokerEndpoint;
+
+  /// Whether instances registered without endpoints can dial this node
+  /// ([broker]): it has a [brokerEndpoint] or listens somewhere. A node
+  /// that cannot broker reaches such instances through its [relay], if it
+  /// has one.
+  bool get canBroker => brokerEndpoint != null || _endpoints.isNotEmpty;
+
+  /// The relays through which this node reaches the instances registered
+  /// without endpoints when it cannot broker them itself ([canBroker] is
+  /// false: no [brokerEndpoint], no listener), wiki page "Switchboard
+  /// Identity and Credentials", section "Relay". Null (the default): no
+  /// relay; opening a channel to such an instance fails as brokering does
+  /// (`UNAVAILABLE`, naming the missing listener). May be replaced at any
+  /// time; channels already open are unaffected.
+  ///
+  /// When [openChannel] (and [openTalk], [openChannelToSlot],
+  /// [openTalkToSlot], and `PeerSet`) selects a record without endpoints
+  /// on a node that cannot broker, the channel goes through a relay: the
+  /// node finds the relays ([resolveRelays]: the records of
+  /// [RelayConfig.type] in the resolver, round robin with failover, or
+  /// [RelayConfig.endpoints]), connects to the first that answers through
+  /// the pool, like [connect] (identifying there as on any connection it
+  /// initiates, naming the relay's identity from its record's metadata
+  /// unless [expectedIdentityFor] names another), and opens a channel of
+  /// type [RelayConfig.type] (instance 0, no shard) whose application
+  /// payload is the open payload the channel would have had to the
+  /// destination: the header with the type, the selected instance and the
+  /// shard slot, then the application payload, chosen as for a direct
+  /// channel (the caller's, else what [credentialFor] gives for the
+  /// relay's endpoint and the destination's record, else
+  /// [defaultPayload]). The relay forwards that payload unchanged, so the
+  /// destination sees the node's credential; the relay sees it too. The
+  /// returned channel is the `_relay` channel: a refusal by the relay or
+  /// by the destination arrives as its close status. A node that can
+  /// broker never uses a relay, and [selectAndConnect], [broker] and the
+  /// proxy never do.
+  RelayConfig? relay;
 
   final Map<Name, Map<int, ChannelHandler>> _services = {};
 
@@ -959,7 +1003,16 @@ class Switchboard {
   /// [StatusCode.invalidArgument] for a `tcp` URI without host or port or
   /// a `mem` URI without id, and with [StatusCode.failedPrecondition]
   /// after [close].
-  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy}) {
+  Future<MuxConnection> connect(Uri endpoint, {ChannelPolicy? policy}) =>
+      _connect(endpoint, policy, null);
+
+  /// [connect]; a new connection is established for [record] (named as
+  /// [dial] names it in the `IDENT`).
+  Future<MuxConnection> _connect(
+    Uri endpoint,
+    ChannelPolicy? policy,
+    ServiceRecord? record,
+  ) {
     if (_closing) {
       return Future.error(_closedException());
     }
@@ -988,7 +1041,7 @@ class Switchboard {
     if (existing != null) {
       return existing;
     }
-    final dial = _dialing[key] = _dialPooled(endpoint, key, policy);
+    final dial = _dialing[key] = _dialPooled(endpoint, key, policy, record);
     _track(dial.then<void>((_) {}, onError: (_) {}));
     return dial;
   }
@@ -1009,7 +1062,9 @@ class Switchboard {
   ///
   /// The node identifies on it as on any connection it initiates, naming
   /// the receiver [expectedIdentityFor] gives for [endpoint] and [record]
-  /// (the resolver's record the connection is for, if any). With an
+  /// (the resolver's record the connection is for, if any), or, when the
+  /// hook names nobody and [record] is a relay's (of [Services.relay], or
+  /// of the type of [relay]), the identity in the record's metadata. With an
   /// [intent] or a [receiver] it identifies whatever [identifyFor] and
   /// [identifyOutgoing] say, sending [intent] (at most 64 bytes) and
   /// naming [receiver] (at most 255 bytes of UTF-8; empty names nobody)
@@ -1117,9 +1172,10 @@ class Switchboard {
     Uri endpoint,
     Object key,
     ChannelPolicy? policy,
+    ServiceRecord? record,
   ) async {
     try {
-      final connection = await _dial(endpoint, policy);
+      final connection = await _dial(endpoint, policy, record: record);
       final pooled = _pool[key] ??= [];
       pooled.add(connection);
       unawaited(
@@ -1178,7 +1234,10 @@ class Switchboard {
     final normalised = _normalised(endpoint);
     if (credential != null &&
         (intent != null || receiver != null || _identifiesTo(normalised))) {
-      final named = receiver ?? _expectedIdentity(normalised, record);
+      final named =
+          receiver ??
+          _expectedIdentity(normalised, record) ??
+          _relayIdentity(record);
       try {
         await connection.identify(
           credential,
@@ -1216,6 +1275,28 @@ class Switchboard {
     } on Object catch (e, st) {
       _log.warning('identifyFor failed for $endpoint', e, st);
       return false;
+    }
+  }
+
+  /// The identity of the relay [record] describes, from its metadata (a
+  /// record of [Services.relay], or of the type of [relay]): null for any
+  /// other record, and for metadata that is empty, not UTF-8, or too long
+  /// for the receiver field of an `IDENT`.
+  String? _relayIdentity(ServiceRecord? record) {
+    if (record == null ||
+        record.metadata.isEmpty ||
+        record.metadata.length > MuxIdent.maxReceiverLength) {
+      return null;
+    }
+    final type = record.address.type;
+    if (type != Services.relay && type != relay?.type) {
+      return null;
+    }
+    try {
+      return utf8.decode(record.metadata);
+    } on FormatException {
+      _log.fine('relay ${record.address}: metadata is not an identity');
+      return null;
     }
   }
 
@@ -1865,7 +1946,9 @@ class Switchboard {
   /// An instance whose record has no endpoints is reached through the
   /// naming service's `CONNECT` when the resolver is a
   /// [BrokeringResolver]: the instance dials this node (see [broker]), and
-  /// the connection is pooled for that instance until it ends.
+  /// the connection is pooled for that instance until it ends. This never
+  /// goes through a [relay]: the connection returned is always to the
+  /// instance itself.
   ///
   /// Throws [SwitchboardException] with [StatusCode.notFound] if no
   /// instance is known, or none that [where] accepts,
@@ -1880,6 +1963,27 @@ class Switchboard {
     Resolver? resolver,
     bool excludeOwnEndpoints = false,
     bool Function(ServiceRecord record)? where,
+  }) async {
+    final route = await _selectRoute(
+      address,
+      shard: shard,
+      resolver: resolver,
+      excludeOwnEndpoints: excludeOwnEndpoints,
+      where: where,
+      mayRelay: false,
+    );
+    return (route.record, route.connection);
+  }
+
+  /// [selectAndConnect]; with [mayRelay], an instance without endpoints
+  /// is reached through the [relay] when this node cannot broker.
+  Future<_Route> _selectRoute(
+    ServiceAddress address, {
+    int? shard,
+    Resolver? resolver,
+    bool excludeOwnEndpoints = false,
+    bool Function(ServiceRecord record)? where,
+    required bool mayRelay,
   }) async {
     _checkOpen();
     final r = resolver ?? this.resolver;
@@ -1933,6 +2037,7 @@ class Switchboard {
           0,
           excludeOwnEndpoints,
           r,
+          mayRelay,
         );
       }
     }
@@ -1962,7 +2067,14 @@ class Switchboard {
     final start = shard != null
         ? shard % accepted.length
         : _selectStart(address.type, accepted.length);
-    return _connectFirst(address, accepted, start, excludeOwnEndpoints, r);
+    return _connectFirst(
+      address,
+      accepted,
+      start,
+      excludeOwnEndpoints,
+      r,
+      mayRelay,
+    );
   }
 
   /// The records of instance [instance] of [type] among [records].
@@ -1990,16 +2102,20 @@ class Switchboard {
 
   /// Connects to the first reachable of [candidates], starting at [start]
   /// and going round; an instance without endpoints is brokered through
-  /// [resolver] when it can.
-  Future<(ServiceRecord, MuxConnection)> _connectFirst(
+  /// [resolver] when it can, or, with [mayRelay] on a node that cannot
+  /// broker, reached through the [relay].
+  Future<_Route> _connectFirst(
     ServiceAddress address,
     List<ServiceRecord> candidates,
     int start,
     bool excludeOwnEndpoints,
     Resolver resolver,
+    bool mayRelay,
   ) async {
     final n = candidates.length;
     final failures = <String>[];
+    // One relay connection for every candidate that needs it.
+    Future<(ServiceRecord, MuxConnection)>? relayed;
     for (var i = 0; i < n; i++) {
       final record = candidates[(start + i) % n];
       for (final endpoint in record.endpoints) {
@@ -2023,7 +2139,7 @@ class Switchboard {
                   metadata: record.metadata,
                 )
               : record;
-          return (selected, connection);
+          return _Route(selected, connection);
         } on SwitchboardException catch (e) {
           if (_closing) {
             rethrow;
@@ -2033,13 +2149,34 @@ class Switchboard {
         }
       }
       if (record.endpoints.isEmpty) {
+        final config = mayRelay && !canBroker ? relay : null;
+        if (config != null && !record.address.isAny) {
+          try {
+            final (via, connection) = await (relayed ??= _connectRelay(
+              config,
+              resolver,
+            ));
+            _log.fine(
+              '$address: ${record.address} through the relay ${via.address} '
+              'at ${_dialled[connection] ?? _remotes[connection]}',
+            );
+            return _Route(record, connection, relayType: config.type);
+          } on SwitchboardException catch (e) {
+            if (_closing) {
+              rethrow;
+            }
+            _log.fine('$address: relaying to ${record.address}: ${e.status}');
+            failures.add('${record.address} (relayed): ${e.status}');
+            continue;
+          }
+        }
         if (resolver is! BrokeringResolver || record.address.isAny) {
           failures.add('${record.address}: no endpoints');
           continue;
         }
         try {
           final connection = await _brokeredPooled(record.address, resolver);
-          return (record, connection);
+          return _Route(record, connection);
         } on SwitchboardException catch (e) {
           if (_closing) {
             rethrow;
@@ -2052,6 +2189,107 @@ class Switchboard {
     throw SwitchboardException.of(
       StatusCode.unavailable,
       'no reachable instance of $address (${failures.join('; ')})',
+    );
+  }
+
+  // Relays ----------------------------------------------------------------
+
+  /// The relays this node would open a relayed channel through now (see
+  /// [relay]), in the order it would try them: one record per explicit
+  /// [RelayConfig.endpoints] entry (instance 0, the configured identity as
+  /// metadata), or the records of [RelayConfig.type] that [resolver]
+  /// (default: the node's) knows with endpoints, sorted by instance; the
+  /// first is picked by the node's [selection] policy (each call moves the
+  /// round robin on) and the others follow in turn, for failover. Each
+  /// record's metadata is the relay's identity.
+  ///
+  /// For opening relayed channels on connections of the caller's own, as
+  /// `PeerSet` does: [dial] a relay's endpoint with its record, which names
+  /// the relay as the receiver of the node's `IDENT`.
+  ///
+  /// Fails with [SwitchboardException]: [StatusCode.failedPrecondition]
+  /// without a [relay], without a resolver to find the relays in, or
+  /// after [close]; [StatusCode.notFound] when no relay is known; and like
+  /// [Resolver.resolve].
+  Future<List<ServiceRecord>> resolveRelays({Resolver? resolver}) async {
+    _checkOpen();
+    final config = relay;
+    if (config == null) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'no relay configured',
+      );
+    }
+    return _relayCandidates(config, resolver ?? this.resolver);
+  }
+
+  Future<List<ServiceRecord>> _relayCandidates(
+    RelayConfig config,
+    Resolver? resolver,
+  ) async {
+    final explicit = config.endpoints;
+    final List<ServiceRecord> records;
+    if (explicit != null) {
+      final identity = config.identity;
+      final metadata = identity == null
+          ? null
+          : Uint8List.fromList(utf8.encode(identity));
+      records = [
+        for (final endpoint in explicit)
+          ServiceRecord(
+            ServiceAddress(config.type),
+            endpoints: [endpoint],
+            metadata: metadata,
+          ),
+      ];
+    } else {
+      if (resolver == null) {
+        throw SwitchboardException.of(
+          StatusCode.failedPrecondition,
+          'no resolver to find the relays in',
+        );
+      }
+      final known = await resolver.resolve(config.type);
+      _checkOpen();
+      records = [
+        for (final record in known)
+          if (record.address.type == config.type && record.endpoints.isNotEmpty)
+            record,
+      ]..sort((a, b) => a.address.instance.compareTo(b.address.instance));
+    }
+    if (records.isEmpty) {
+      throw SwitchboardException.of(
+        StatusCode.notFound,
+        'no relay of ${config.type} known',
+      );
+    }
+    final n = records.length;
+    final start = _selectStart(config.type, n);
+    return [for (var i = 0; i < n; i++) records[(start + i) % n]];
+  }
+
+  /// A pooled connection to the first relay that answers, with its record.
+  Future<(ServiceRecord, MuxConnection)> _connectRelay(
+    RelayConfig config,
+    Resolver resolver,
+  ) async {
+    final failures = <String>[];
+    for (final record in await _relayCandidates(config, resolver)) {
+      for (final endpoint in record.endpoints) {
+        try {
+          return (record, await _connect(endpoint, null, record));
+        } on SwitchboardException catch (e) {
+          if (_closing) {
+            rethrow;
+          }
+          _log.fine('relay ${record.address} at $endpoint: ${e.status}');
+          failures.add('$endpoint: ${e.status}');
+        }
+      }
+    }
+    throw SwitchboardException.of(
+      StatusCode.unavailable,
+      'no reachable relay (${failures.join('; ')})',
     );
   }
 
@@ -2149,30 +2387,68 @@ class Switchboard {
   /// are candidates (see [selectAndConnect]). Throws like
   /// [selectAndConnect], like [MuxConnection.open] (for example
   /// [StatusCode.resourceExhausted]), and like [credentialFor].
+  ///
+  /// An instance without endpoints is brokered (see [selectAndConnect]),
+  /// or, on a node that cannot broker, reached through its [relay]: the
+  /// channel returned is then the relay channel, whose open payload
+  /// carries the destination's.
   Future<MuxChannel> openChannel(
     ServiceAddress address, {
     int? shard,
     Uint8List? payload,
     bool Function(ServiceRecord record)? where,
   }) async {
+    final (channel, _) = await openSelected(
+      address,
+      ChannelAddress(type: address.type, shard: shard, payload: payload),
+      where: where,
+      implicitPayload: payload == null,
+      mayRelay: true,
+    );
+    return channel;
+  }
+
+  /// Selects and connects like [selectAndConnect] (through the [relay]
+  /// when [mayRelay] and the node cannot broker the instance selected)
+  /// and opens a channel with [header] there, its instance set to the
+  /// selected one and its host hint removed; with [implicitPayload], the
+  /// application payload is the node's for the connection and the record
+  /// selected (see [payloadFor]). A pooled connection that went away or
+  /// filled up in the meantime is replaced once. Returns the channel and
+  /// the header of the destination (inside the relay channel's payload
+  /// when relayed). For [openChannel], [openChannelToSlot]'s `MOVED` retry
+  /// and the proxy. Throws like [openChannel].
+  @internal
+  Future<(MuxChannel, ChannelAddress)> openSelected(
+    ServiceAddress address,
+    ChannelAddress header, {
+    Resolver? resolver,
+    bool excludeOwnEndpoints = false,
+    bool Function(ServiceRecord record)? where,
+    bool implicitPayload = false,
+    bool mayRelay = false,
+  }) async {
     for (var attempt = 0; ; attempt++) {
-      final (record, connection) = await selectAndConnect(
+      final route = await _selectRoute(
         address,
-        shard: shard,
+        shard: header.shard,
+        resolver: resolver,
+        excludeOwnEndpoints: excludeOwnEndpoints,
         where: where,
+        mayRelay: mayRelay,
       );
-      final implicit = payload ?? _implicitPayload(connection, record);
-      final application = implicit is Future<Uint8List>
-          ? await implicit
-          : implicit;
-      final header = ChannelAddress(
-        type: address.type,
-        instance: record.address.instance,
-        shard: shard,
-        payload: application,
+      var selected = header.copyWith(
+        instance: route.record.address.instance,
+        clearHost: true,
       );
+      if (implicitPayload) {
+        final implicit = _implicitPayload(route.connection, route.record);
+        selected = selected.copyWith(
+          payload: implicit is Future<Uint8List> ? await implicit : implicit,
+        );
+      }
       try {
-        return connection.open(header.encode());
+        return (route.open(selected), selected);
       } on SwitchboardException catch (e) {
         if (!_retryOpen(e, attempt)) {
           rethrow;
@@ -2222,24 +2498,27 @@ class Switchboard {
     Uint8List? payload,
     bool Function(ServiceRecord record)? where,
   }) async {
-    final first = await openChannel(
+    final header = ChannelAddress(type: type, shard: slot, payload: payload);
+    final (first, selected) = await openSelected(
       ServiceAddress(type),
-      shard: slot,
-      payload: payload,
+      header,
       where: where,
+      implicitPayload: payload == null,
+      mayRelay: true,
     );
-    final rejectedBy = ChannelAddress.decode(first.openPayload).instance;
+    final rejectedBy = selected.instance;
     return SlotChannel(
       type,
       slot,
       first,
       (moved) => reopenAtSlotOwner(
         this,
-        ChannelAddress(type: type, shard: slot, payload: payload),
+        header,
         rejectedBy,
         moved,
         where: where,
-        payloadFor: payload == null ? _implicitPayload : null,
+        implicitPayload: payload == null,
+        mayRelay: true,
       ),
       maxHeldBytes: muxOptions.maxChannelBufferBytes,
     );
@@ -2493,6 +2772,28 @@ class Switchboard {
     StatusCode.failedPrecondition,
     'switchboard is closed',
   );
+}
+
+/// Where an open goes: the destination's [record] (its instance the one
+/// to put in the header) and the [connection] to send the OPEN on, to the
+/// instance itself, or to a relay of [relayType].
+class _Route {
+  _Route(this.record, this.connection, {this.relayType});
+
+  final ServiceRecord record;
+  final MuxConnection connection;
+  final Name? relayType;
+
+  /// Opens the channel with [header], the destination's: inside a relay
+  /// channel's payload when relayed.
+  MuxChannel open(ChannelAddress header) {
+    final relay = relayType;
+    return connection.open(
+      relay == null
+          ? header.encode()
+          : ChannelAddress(type: relay, payload: header.encode()).encode(),
+    );
+  }
 }
 
 /// The intent and receiver of an identification of the node.

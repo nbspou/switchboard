@@ -171,6 +171,28 @@ class PeerEvent {
 /// [Peer.endpoint]. After every loss the set brokers again, with the same
 /// backoff, hooks and online rules.
 ///
+/// On a node that cannot broker ([Switchboard.canBroker] false: it listens
+/// nowhere) but has a [Switchboard.relay], a record without endpoints is
+/// reached through a relay instead (wiki page "Switchboard Identity and
+/// Credentials", section "Relay", "Staying connected"): each attempt
+/// dials the relays [Switchboard.resolveRelays] gives, in that order and
+/// within [connectTimeout] as for a record's endpoints, naming each
+/// relay's identity from its record when it identifies, and keeps the
+/// first that answers as the peer's own connection ([Peer.viaRelay],
+/// [Peer.endpoint] the relay's endpoint). The per-peer [channel] and the
+/// channels of [openChannel] are opened on it as relay channels carrying
+/// the peer's open payload. A connection to a relay that is lost, or that
+/// the relay sends GOAWAY on, is replaced as any other, through whichever
+/// relay resolves next; a per-peer channel that ends while the peer is
+/// online is opened again on the same relay connection after the backoff,
+/// and when that fails (the relay cannot reach the peer) the connection
+/// is left and the next attempt goes through the relays again. The PING
+/// round trip of the set-up is answered by the relay, before the peer has
+/// seen the channel: for a relayed peer, only an [onOpen] that exchanges
+/// something with the peer confirms that the channel reached it, so give
+/// relayed peers a per-peer channel and an [onOpen] that does. A node that
+/// can neither broker nor relay fails each attempt as brokering does.
+///
 /// A peer is online only once it is usable: once connected, `onConnect`
 /// runs, then the per-peer [channel] (if any) is opened, a PING round trip
 /// on the connection makes sure the peer did not refuse it on arrival, and
@@ -653,10 +675,9 @@ class PeerSet {
       );
     }
     return connection.open(
-      ChannelAddress(
-        type: type,
-        instance: instance,
-        payload: application,
+      Peer._wrap(
+        ChannelAddress(type: type, instance: instance, payload: application),
+        peer._relayType,
       ).encode(),
     );
   }
@@ -746,8 +767,16 @@ class Peer {
   DateTime? _nextAttemptAt;
   int _attempt = 0;
   Uri? _endpoint;
+
+  /// The type of the relay channels while [_connection] is a connection
+  /// to a relay.
+  Name? _relayType;
   MuxConnection? _connection;
   MuxChannel? _channel;
+
+  /// Whether the per-peer channel [_channel] was set up (its PING round
+  /// trip and `onOpen` done); false while it is being set up.
+  bool _channelUp = false;
 
   /// The last event of the online, offline and held kind reported (null:
   /// none yet).
@@ -808,10 +837,16 @@ class Peer {
   /// per-peer channel is re-opened on such a connection).
   int get attempt => _attempt;
 
-  /// The endpoint of [connection] while it is set; null for a brokered
-  /// connection (the peer registered without endpoints and dialled this
-  /// node).
+  /// The endpoint of [connection] while it is set: the record's endpoint
+  /// that answered, or the relay's endpoint for a peer reached through a
+  /// relay ([viaRelay]); null for a brokered connection (the peer
+  /// registered without endpoints and dialled this node).
   Uri? get endpoint => _endpoint;
+
+  /// Whether [connection] is a connection to a relay, which forwards the
+  /// peer's channels (see [PeerSet], about records without endpoints);
+  /// false while not connected.
+  bool get viaRelay => _relayType != null;
 
   /// The peer's connection: set from the moment it is established
   /// (during [PeerState.connecting], while the hooks run) until it is lost
@@ -925,7 +960,10 @@ class Peer {
   /// false, leaving the peer held, when the record is elsewhere.
   bool _readopt(ServiceRecord record) {
     final endpoint = _endpoint;
-    if (endpoint != null && !record.endpoints.contains(endpoint)) {
+    final elsewhere = _relayType != null
+        ? record.endpoints.isNotEmpty
+        : endpoint != null && !record.endpoints.contains(endpoint);
+    if (elsewhere) {
       return false;
     }
     _holdTimer?.cancel();
@@ -993,21 +1031,65 @@ class Peer {
   /// Dials the endpoints of the record in order; the first that answers
   /// is the connection. With [PeerSet.connectTimeout], each endpoint gets
   /// the time left divided by the endpoints left. A record without
-  /// endpoints is brokered instead.
+  /// endpoints is brokered instead, or reached through a relay by a node
+  /// that cannot broker and has one.
   Future<void> _dialFirst(Object token) async {
     if (_record.endpoints.isEmpty) {
-      await _brokerConnection(token);
+      final switchboard = _set.switchboard;
+      if (switchboard.relay != null && !switchboard.canBroker) {
+        await _relayConnection(token);
+      } else {
+        await _brokerConnection(token);
+      }
       return;
     }
-    final endpoints = List.of(_record.endpoints);
-    final budget = _set.connectTimeout;
-    final clock = Stopwatch()..start();
-    Status? failure;
-    for (var i = 0; i < endpoints.length; i++) {
+    await _dialEach(token, [
+      for (final endpoint in _record.endpoints) (endpoint, _record),
+    ], relayed: false);
+  }
+
+  /// Dials the relays of the node in the order it gives them
+  /// ([Switchboard.resolveRelays]), as [_dialFirst] dials a record's
+  /// endpoints.
+  Future<void> _relayConnection(Object token) async {
+    final List<ServiceRecord> relays;
+    try {
+      relays = await _set.switchboard.resolveRelays(resolver: _set.resolver);
+    } on Object catch (e) {
       if (!identical(_token, token)) {
         return;
       }
-      final endpoint = endpoints[i];
+      _token = null;
+      _connectFailed(
+        e is SwitchboardException
+            ? e.status
+            : Status.of(StatusCode.unavailable, 'no relay: $e'),
+      );
+      return;
+    }
+    await _dialEach(token, [
+      for (final relay in relays)
+        for (final endpoint in relay.endpoints) (endpoint, relay),
+    ], relayed: true);
+  }
+
+  /// Dials [targets], endpoints with the record each is dialled for, in
+  /// order; the first that answers is the connection, to a relay when
+  /// [relayed]. With [PeerSet.connectTimeout], each endpoint gets the time
+  /// left divided by the endpoints left.
+  Future<void> _dialEach(
+    Object token,
+    List<(Uri, ServiceRecord)> targets, {
+    required bool relayed,
+  }) async {
+    final budget = _set.connectTimeout;
+    final clock = Stopwatch()..start();
+    Status? failure;
+    for (var i = 0; i < targets.length; i++) {
+      if (!identical(_token, token)) {
+        return;
+      }
+      final (endpoint, record) = targets[i];
       Duration? bound;
       if (budget > Duration.zero) {
         final left = budget - clock.elapsed;
@@ -1018,11 +1100,11 @@ class Peer {
           );
           break;
         }
-        bound = left ~/ (endpoints.length - i);
+        bound = left ~/ (targets.length - i);
       }
       final MuxConnection connection;
       try {
-        connection = await _dial(endpoint, bound);
+        connection = await _dial(endpoint, bound, record);
       } on Object catch (e) {
         failure = e is SwitchboardException
             ? e.status
@@ -1036,7 +1118,11 @@ class Peer {
         return;
       }
       _token = null;
-      _onConnected(connection, endpoint);
+      _onConnected(
+        connection,
+        endpoint,
+        relayType: relayed ? record.address.type : null,
+      );
       return;
     }
     if (!identical(_token, token)) {
@@ -1044,7 +1130,11 @@ class Peer {
     }
     _token = null;
     _connectFailed(
-      failure ?? Status.of(StatusCode.unavailable, 'record has no endpoints'),
+      failure ??
+          Status.of(
+            StatusCode.unavailable,
+            relayed ? 'no relay endpoints' : 'record has no endpoints',
+          ),
     );
   }
 
@@ -1095,14 +1185,18 @@ class Peer {
     _onConnected(connection, null);
   }
 
-  /// Dials [endpoint], giving up after [bound] if given; a connection that
-  /// lands after that is sent GOAWAY at once ([PeerSet.close] waits for
-  /// it).
-  Future<MuxConnection> _dial(Uri endpoint, Duration? bound) {
+  /// Dials [endpoint] for [record] (the peer's, or a relay's), giving up
+  /// after [bound] if given; a connection that lands after that is sent
+  /// GOAWAY at once ([PeerSet.close] waits for it).
+  Future<MuxConnection> _dial(
+    Uri endpoint,
+    Duration? bound,
+    ServiceRecord record,
+  ) {
     final dialing = _set.switchboard.dial(
       endpoint,
       policy: _set.policy,
-      record: _record,
+      record: record,
     );
     if (bound == null) {
       return dialing;
@@ -1136,9 +1230,14 @@ class Peer {
     _setState(PeerState.offline, status, retryDelay: delay);
   }
 
-  void _onConnected(MuxConnection connection, Uri? endpoint) {
+  void _onConnected(
+    MuxConnection connection,
+    Uri? endpoint, {
+    Name? relayType,
+  }) {
     _connection = connection;
     _endpoint = endpoint;
+    _relayType = relayType;
     _established = false;
     _livedLong = false;
     _lifetimeTimer = Timer(_set.maxBackoff, () {
@@ -1152,7 +1251,11 @@ class Peer {
         .then((status) => _onPeerGoAway(connection, status))
         .ignore();
     _log.fine(
-      '$this: ${endpoint == null ? 'brokered' : 'connected to $endpoint'}',
+      '$this: ${endpoint == null
+          ? 'brokered'
+          : relayType == null
+          ? 'connected to $endpoint'
+          : 'connected to the relay at $endpoint'}',
     );
     unawaited(_setUp(connection));
   }
@@ -1176,7 +1279,13 @@ class Peer {
       return;
     }
     _established = true;
-    _log.info('$this: online at ${_endpoint ?? 'a brokered connection'}');
+    _log.info(
+      '$this: online at ${_endpoint == null
+          ? 'a brokered connection'
+          : _relayType == null
+          ? '$_endpoint'
+          : 'the relay at $_endpoint'}',
+    );
     _setState(PeerState.online, _lastStatus);
   }
 
@@ -1318,6 +1427,7 @@ class Peer {
     assert(identical(_connection, connection));
     _connection = null;
     _endpoint = null;
+    _relayType = null;
     _lifetimeTimer?.cancel();
     _lifetimeTimer = null;
     if (_established) {
@@ -1349,6 +1459,7 @@ class Peer {
   /// the failure is handled ([_channelFailed]), or the connection or the
   /// channel was left meanwhile, and returns false.
   Future<bool> _openPerPeerChannel(MuxConnection connection) async {
+    _channelUp = false;
     final template = _set.channel!;
     var payload = template.payload;
     if (payload.isEmpty) {
@@ -1377,7 +1488,7 @@ class Peer {
     );
     final MuxChannel channel;
     try {
-      channel = connection.open(address.encode());
+      channel = connection.open(_wrap(address, _relayType).encode());
     } on SwitchboardException catch (e) {
       _log.info('$this: cannot open the channel: ${e.status}');
       _channelFailed(connection, e.status);
@@ -1420,16 +1531,27 @@ class Peer {
         return false;
       }
     }
+    _channelUp = true;
     return true;
   }
 
+  /// [header], a channel's to the peer: as is, or inside the payload of a
+  /// relay channel of [relayType].
+  static ChannelAddress _wrap(ChannelAddress header, Name? relayType) =>
+      relayType == null
+      ? header
+      : ChannelAddress(type: relayType, payload: header.encode());
+
   /// The per-peer channel on [connection], the current connection, could
   /// not be set up, or ended, with [status]. Before the peer went online
-  /// on [connection], and for a status that would repeat, the connection
+  /// on [connection], for a status that would repeat, and for a channel
+  /// through a relay that could not be set up again, the connection
   /// fails; otherwise the peer is offline and the channel is set up again
   /// after its backoff.
   void _channelFailed(MuxConnection connection, Status status) {
-    if (!_established || _isTerminal(status)) {
+    if (!_established ||
+        _isTerminal(status) ||
+        (_relayType != null && !_channelUp)) {
       _failConnection(connection, status);
       return;
     }

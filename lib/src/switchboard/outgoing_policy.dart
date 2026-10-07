@@ -53,6 +53,11 @@ typedef EndpointPolicy = ChannelPolicy? Function(Uri endpoint);
 /// [ServiceRecord.metadata] a trusted registrar publishes, is looked up
 /// here.
 ///
+/// For a channel through a relay (`Switchboard.relay`), [endpoint] is the
+/// relay's, which sees the payload as it forwards it, and [record] is the
+/// destination's (a record without endpoints), whose instance receives
+/// the payload unchanged: the hook decides for both.
+///
 /// Null sends an empty application payload: once this hook is set, the
 /// node's `defaultPayload` is never attached implicitly, so a credential
 /// meant for the mesh does not reach a destination the hook does not
@@ -88,9 +93,13 @@ typedef EndpointCredential = FutureOr<Uint8List?> Function(
 ///
 /// [endpoint] is normalised as for [EndpointPolicy]. [record] is the
 /// resolver's record the connection is established for when the caller
-/// knows it (`PeerSet`, and `Switchboard.dial` given one), else null (the
-/// pooled connections of `Switchboard.connect` and the open methods, which
+/// knows it (`PeerSet`, `Switchboard.dial` given one, and the connection
+/// to a relay the open methods establish), else null (the pooled
+/// connections of `Switchboard.connect` and the open methods, which
 /// several records may share).
+///
+/// For a relay's record (`_relay`, or the type of `Switchboard.relay`), a
+/// null answer names the identity the record's metadata carries.
 ///
 /// Null (or empty) names nobody: any peer that verifies the credential
 /// accepts the `IDENT`, so a peer that relays the handshake can pass as

@@ -12,12 +12,12 @@ import 'dart:typed_data';
 import 'package:logging/logging.dart';
 
 import '../address/channel_address.dart';
-import '../address/service_address.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
+import 'forwarding.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
 import 'resolver.dart';
@@ -314,7 +314,7 @@ ChannelHandler proxyHandler(
   }
   final permitted = allow ?? _notReserved;
   // Channels being forwarded, per client connection.
-  final forwarding = Expando<int>('forwarded channels');
+  final forwarding = ForwardingBound(maxChannelsPerConnection);
   final locates = _LocateBuckets(maxLocatesPerConnection, locateRefillInterval);
   final Status Function(Status status)? hide = revealOwners ? null : _hideOwner;
   return (incoming) async {
@@ -341,16 +341,14 @@ ChannelHandler proxyHandler(
       return;
     }
     final client = incoming.connection;
-    final count = forwarding[client] ?? 0;
-    if (maxChannelsPerConnection > 0 && count >= maxChannelsPerConnection) {
+    if (!forwarding.enter(client)) {
       _log.info(
-        'proxy: $incoming refused, $count channels of this connection '
-        'are being forwarded',
+        'proxy: $incoming refused, ${forwarding.countOf(client)} channels '
+        'of this connection are being forwarded',
       );
       await incoming.reject(genericStatus(StatusCode.resourceExhausted));
       return;
     }
-    forwarding[client] = count + 1;
     try {
       if (authorize != null) {
         final (authorized, refusal) = await _authorize(
@@ -409,9 +407,14 @@ ChannelHandler proxyHandler(
           }
         }
       }
-      final _Backend backend;
+      final ForwardTarget backend;
       try {
-        backend = await _openBackend(switchboard, address, type, resolver);
+        backend = await openForwarded(
+          switchboard,
+          address,
+          type,
+          resolver: resolver,
+        );
       } on SwitchboardException catch (e) {
         _log.fine('proxy: $incoming: ${e.status}');
         await incoming.reject(genericStatus(e.code ?? StatusCode.unavailable));
@@ -423,7 +426,7 @@ ChannelHandler proxyHandler(
         '${channel.connection}',
       );
       final header = backend.header;
-      if (!backend.relayed &&
+      if (!backend.hostHint &&
           shard != null &&
           r is SlotResolver &&
           r.slotTable(type) != null) {
@@ -453,8 +456,7 @@ ChannelHandler proxyHandler(
       }
       await _pipe(_MuxEnd(incoming.channel), _MuxEnd(channel), toA: hide);
     } finally {
-      final left = (forwarding[client] ?? 1) - 1;
-      forwarding[client] = left > 0 ? left : null;
+      forwarding.exit(client);
     }
   };
 }
@@ -591,96 +593,4 @@ Future<(ChannelAddress?, StatusCode)> _authorize(
 /// The `authorize` hook of [proxyHandler] did not answer in time.
 class _AuthorizeTimedOut implements Exception {
   const _AuthorizeTimedOut();
-}
-
-/// The outgoing channel of a proxied channel, the header it was opened
-/// with, and whether it went to a host hint rather than through the
-/// resolver.
-typedef _Backend = ({MuxChannel channel, ChannelAddress header, bool relayed});
-
-/// Opens the outgoing channel. A missing resolver or a closing node
-/// (`FAILED_PRECONDITION` locally) is reported as `UNAVAILABLE`: to the
-/// client, the proxy is simply unable to forward.
-Future<_Backend> _openBackend(
-  Switchboard switchboard,
-  ChannelAddress address,
-  Name type,
-  Resolver? resolver,
-) async {
-  try {
-    return await _openBackendChannel(switchboard, address, type, resolver);
-  } on SwitchboardException catch (e) {
-    if (e.code == StatusCode.failedPrecondition) {
-      throw SwitchboardException.of(StatusCode.unavailable, e.status.reason);
-    }
-    rethrow;
-  }
-}
-
-Future<_Backend> _openBackendChannel(
-  Switchboard switchboard,
-  ChannelAddress address,
-  Name type,
-  Resolver? resolver,
-) async {
-  final host = address.host;
-  for (var attempt = 0; ; attempt++) {
-    final MuxConnection connection;
-    final ChannelAddress header;
-    final relayed = host != null && switchboard.allowHostHint;
-    if (relayed) {
-      final endpoint = _hostHintEndpoint(host);
-      if (switchboard.isOwnEndpoint(endpoint)) {
-        _log.warning('proxy: host hint $host points at this node itself');
-        throw SwitchboardException.of(
-          StatusCode.unavailable,
-          'host hint $host is this node',
-        );
-      }
-      connection = await switchboard.connect(endpoint);
-      header = address.copyWith(clearHost: true);
-    } else {
-      final (record, selected) = await switchboard.selectAndConnect(
-        ServiceAddress(type, address.instance),
-        shard: address.shard,
-        resolver: resolver,
-        excludeOwnEndpoints: true,
-      );
-      connection = selected;
-      header = address.copyWith(
-        instance: record.address.instance,
-        clearHost: true,
-      );
-    }
-    try {
-      return (
-        channel: connection.open(header.encode()),
-        header: header,
-        relayed: relayed,
-      );
-    } on SwitchboardException catch (e) {
-      // A pooled connection may have received GOAWAY, or filled up to the
-      // peer's channel limit, in the meantime; one retry replaces it.
-      if (attempt > 0 ||
-          (e.code != StatusCode.failedPrecondition &&
-              e.code != StatusCode.resourceExhausted)) {
-        rethrow;
-      }
-    }
-  }
-}
-
-Uri _hostHintEndpoint(String host) {
-  try {
-    final uri = Uri.parse(host.contains('://') ? host : 'tcp://$host');
-    if (uri.host.isEmpty) {
-      throw const FormatException('no host');
-    }
-    return uri;
-  } on FormatException catch (e) {
-    throw SwitchboardException.of(
-      StatusCode.invalidArgument,
-      'bad host hint "$host": ${e.message}',
-    );
-  }
 }

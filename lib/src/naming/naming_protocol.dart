@@ -98,6 +98,14 @@ class Services {
 
   /// The naming service.
   static final Name naming = Name('_ns');
+
+  /// The relay for instances that listen nowhere, reached by consumers
+  /// that listen nowhere either: the application payload of a `_relay`
+  /// channel is the complete open payload of the channel to relay, and
+  /// the metadata of a `_relay` record is the relay's identity string
+  /// (UTF-8). See the wiki page "Switchboard Identity and Credentials",
+  /// section "Relay", and `RelayService`.
+  static final Name relay = Name('_relay');
 }
 
 // All decoders in this file ignore trailing bytes after a complete

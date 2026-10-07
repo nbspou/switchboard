@@ -11,8 +11,9 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 /// the TCP stream transport, the server side WebSocket transports, the
 /// `Switchboard` mesh node, `MeshNode` (a node joined to a naming service),
 /// `namingClientFor`, `PeerSet` (a connected set of the instances of a
-/// type), and the instance side of sharding (`SlotGate`, `SlotLifecycle`,
-/// `SlotGates`, `SlotChannel`).
+/// type), the `_relay` service (`RelayService`, `RelayConfig`), and the
+/// instance side of sharding (`SlotGate`, `SlotLifecycle`, `SlotGates`,
+/// `SlotChannel`).
 ///
 /// See the wiki section "Switchboard" for the protocol specification.
 library;
@@ -23,6 +24,8 @@ export 'src/switchboard/mesh.dart';
 export 'src/switchboard/outgoing_policy.dart';
 export 'src/switchboard/peer_set.dart';
 export 'src/switchboard/proxy.dart';
+export 'src/switchboard/relay.dart';
+export 'src/switchboard/relay_config.dart';
 export 'src/switchboard/slot_channel.dart';
 export 'src/switchboard/slot_gate.dart';
 export 'src/switchboard/switchboard.dart';

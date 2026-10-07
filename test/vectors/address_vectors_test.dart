@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:switchboard/src/address/channel_address.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/name.dart';
+import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/status.dart';
 import 'package:test/test.dart';
 
@@ -62,6 +63,60 @@ void main() {
       shard: 2,
       host: 'h',
       payload: 'FF',
+    );
+  });
+
+  group('relay open payloads', () {
+    // A `_relay` channel (instance 0, no shard) whose application payload
+    // is the complete open payload of the channel to relay.
+    void relayed(
+      String label,
+      String hex,
+      String innerHex, {
+      required Name type,
+      int instance = 0,
+      int? shard,
+      String payload = '',
+    }) {
+      test(label, () {
+        final bytes = hexBytes(hex);
+        final outer = ChannelAddress.decode(bytes);
+        expect(outer.type, Services.relay);
+        expect(outer.type, Name('_relay'));
+        expect(outer.instance, 0);
+        expect(outer.shard, isNull);
+        expect(outer.host, isNull);
+        expect(outer.payload, hexBytes(innerHex));
+        final inner = ChannelAddress.decode(outer.payload);
+        expect(inner.type, type);
+        expect(inner.instance, instance);
+        expect(inner.shard, shard);
+        expect(inner.payload, hexBytes(payload));
+        expect(
+          ChannelAddress(
+            type: Services.relay,
+            payload: inner.encode(),
+          ).encode(),
+          bytes,
+        );
+      });
+    }
+
+    relayed(
+      '"worker-g" instance 0x2A, app payload 01 02',
+      '01 5F 72 65 6C 61 79 00 00 '
+          '03 77 6F 72 6B 65 72 2D 67 2A 00 00 00 00 00 01 02',
+      '03 77 6F 72 6B 65 72 2D 67 2A 00 00 00 00 00 01 02',
+      type: Name('worker-g'),
+      instance: 0x2A,
+      payload: '01 02',
+    );
+    relayed(
+      '"chat" shard 7',
+      '01 5F 72 65 6C 61 79 00 00 05 63 68 61 74 00 00 00 00 07 00 00 00',
+      '05 63 68 61 74 00 00 00 00 07 00 00 00',
+      type: Name('chat'),
+      shard: 7,
     );
   });
 

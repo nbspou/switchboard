@@ -9,6 +9,7 @@ import '../address/channel_address.dart';
 import '../identity/credential.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
+import '../naming/naming_protocol.dart';
 import '../status.dart';
 
 /// The policy of a connection: decides whether the peer may address
@@ -83,18 +84,18 @@ abstract final class ChannelPolicies {
     };
   }
 
-  /// The naming service type, which [scoped] admits for every identified
-  /// peer.
-  static final Name _naming = Name('_ns');
-
   /// Admits a channel only if the peer's credential has an [Right.open]
   /// scope for its type (wiki page "Switchboard Identity and
   /// Credentials", section "Where credentials are checked"); refuses the
   /// others with `PERMISSION_DENIED`. A channel without a service type is
   /// checked as the empty name, which only a `*` pattern matches. The
-  /// naming service `_ns` is admitted for every identified peer: it checks
-  /// the credential's naming rights (`register`, `watch`, ...) itself, and
-  /// a worker that may open nothing must still register.
+  /// naming service `_ns` ([Services.naming]) is admitted for every
+  /// identified peer: it checks the credential's naming rights
+  /// (`register`, `watch`, ...) itself, and a worker that may open nothing
+  /// must still register. So is the relay `_relay` ([Services.relay]):
+  /// it checks the consumer's `open` scope for the type of every channel
+  /// it relays itself (`RelayService`), since the channel it opens on
+  /// arrives as a `_relay` channel.
   ///
   /// A peer that has not identified (or whose credential expired) is
   /// refused with `UNAUTHENTICATED` when [requireIdentity] (the default),
@@ -130,7 +131,9 @@ abstract final class ChannelPolicies {
       return true;
     }
     final type = address.type ?? Name.empty;
-    return type == _naming || identity.allows(Right.open, type);
+    return type == Services.naming ||
+        type == Services.relay ||
+        identity.allows(Right.open, type);
   }
 
   /// Admits every channel of an identified peer, and refuses a peer that

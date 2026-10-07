@@ -10,14 +10,12 @@ Author: Jan Boon <jan.boon@kaetemi.be>
 library;
 
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
 
 import '../address/channel_address.dart';
 import '../address/service_address.dart';
 import '../mux/mux_channel.dart';
-import '../mux/mux_connection.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
 import 'resolver.dart';
@@ -39,11 +37,13 @@ final Logger _log = Logger('Switchboard.Router');
 ///
 /// The replacement carries [header] with the instance set to the selected
 /// one and no host hint; the application payload is unchanged unless
-/// [payloadFor] is given, which then chooses it for the connection and
-/// record selected (the per-destination credential of
+/// [implicitPayload] is set, which then has the node choose it for the
+/// connection and record selected (the per-destination credential of
 /// `Switchboard.openChannelToSlot`). [resolver]
 /// defaults to the node's; [excludeOwnEndpoints] as in
-/// [Switchboard.selectAndConnect]. [mayLocate], when given, is asked
+/// [Switchboard.selectAndConnect]; with [mayRelay] an owner without
+/// endpoints is reached through the node's relay when the node cannot
+/// broker (`Switchboard.relay`). [mayLocate], when given, is asked
 /// before a `LOCATE`; false gives up (null). [where] filters the records
 /// as in [Switchboard.selectAndConnect]: a target it refuses fails with
 /// [StatusCode.notFound], whereas a target the resolver does not know
@@ -58,8 +58,8 @@ Future<MuxChannel?> reopenAtSlotOwner(
   bool excludeOwnEndpoints = false,
   bool Function()? mayLocate,
   bool Function(ServiceRecord record)? where,
-  FutureOr<Uint8List> Function(MuxConnection connection, ServiceRecord record)?
-  payloadFor,
+  bool implicitPayload = false,
+  bool mayRelay = false,
 }) async {
   final type = header.type!;
   final slot = header.shard!;
@@ -93,52 +93,33 @@ Future<MuxChannel?> reopenAtSlotOwner(
       return null;
     }
   }
-  for (var attempt = 0; ; attempt++) {
-    var refused = false;
-    final filter = where == null
-        ? null
-        : (ServiceRecord record) {
-            final accepted = where(record);
-            refused |= !accepted;
-            return accepted;
-          };
-    final ServiceRecord record;
-    final MuxConnection connection;
-    try {
-      (record, connection) = await switchboard.selectAndConnect(
-        ServiceAddress(type, target),
-        shard: slot,
-        resolver: r,
-        excludeOwnEndpoints: excludeOwnEndpoints,
-        where: filter,
-      );
-    } on SwitchboardException catch (e) {
-      if (e.code != StatusCode.notFound || refused) {
-        rethrow;
-      }
-      // Not in the resolver's table (yet): nowhere to go.
-      _log.fine('$type/$slot: MOVED by $rejectedBy, ${e.status}');
-      return null;
-    }
-    var replacement = header.copyWith(
-      instance: record.address.instance,
-      clearHost: true,
+  var refused = false;
+  final filter = where == null
+      ? null
+      : (ServiceRecord record) {
+          final accepted = where(record);
+          refused |= !accepted;
+          return accepted;
+        };
+  try {
+    // A pooled connection that went away or filled up in the meantime is
+    // replaced once.
+    final (channel, _) = await switchboard.openSelected(
+      ServiceAddress(type, target),
+      header,
+      resolver: r,
+      excludeOwnEndpoints: excludeOwnEndpoints,
+      where: filter,
+      implicitPayload: implicitPayload,
+      mayRelay: mayRelay,
     );
-    if (payloadFor != null) {
-      replacement = replacement.copyWith(
-        payload: await payloadFor(connection, record),
-      );
+    return channel;
+  } on SwitchboardException catch (e) {
+    if (e.code != StatusCode.notFound || refused) {
+      rethrow;
     }
-    try {
-      return connection.open(replacement.encode());
-    } on SwitchboardException catch (e) {
-      // A pooled connection may have received GOAWAY, or filled up, in
-      // the meantime; one retry replaces it.
-      if (attempt > 0 ||
-          (e.code != StatusCode.failedPrecondition &&
-              e.code != StatusCode.resourceExhausted)) {
-        rethrow;
-      }
-    }
+    // Not in the resolver's table (yet): nowhere to go.
+    _log.fine('$type/$slot: MOVED by $rejectedBy, ${e.status}');
+    return null;
   }
 }
