@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -29,6 +30,22 @@ String text(Uint8List data) => utf8.decode(data);
 
 Matcher hasCode(StatusCode code) =>
     isA<Status>().having((s) => s.known, 'code', code);
+
+Matcher throwsCode(StatusCode code) =>
+    throwsA(isA<SwitchboardException>().having((e) => e.code, 'code', code));
+
+/// The messages the gate logs at [level] or above from now on, until the
+/// test ends.
+List<String> gateLogs(Level level) {
+  final records = <String>[];
+  final logs = Logger.root.onRecord.listen((r) {
+    if (r.loggerName == 'Switchboard.Router' && r.level >= level) {
+      records.add(r.message);
+    }
+  });
+  addTearDown(logs.cancel);
+  return records;
+}
 
 /// A MOVED status naming [owner] at [epoch] (0: unknown).
 Matcher isMoved([int owner = 0, int epoch = 0]) => isA<Status>()
@@ -68,8 +85,9 @@ class TestLifecycle extends SlotLifecycle {
   /// Served channels, by slot, in arrival order.
   final Map<int, List<IncomingChannel>> served = {};
 
-  /// Called for every served channel; the default echoes `slot:data`.
-  void Function(IncomingChannel channel, int slot)? onServe;
+  /// Called for every served channel, its result returned by [serve]; the
+  /// default echoes `slot:data`.
+  FutureOr<void> Function(IncomingChannel channel, int slot)? onServe;
 
   /// The contexts of the latest load and drain.
   SlotRequestContext? loadContext;
@@ -109,13 +127,12 @@ class TestLifecycle extends SlotLifecycle {
   Future<void> unload(int slot) async => log.add('unload $slot');
 
   @override
-  void serve(IncomingChannel channel, int slot) {
+  FutureOr<void> serve(IncomingChannel channel, int slot) {
     log.add('serve $slot ${text(channel.address.payload)}');
     (served[slot] ??= []).add(channel);
     final hook = onServe;
     if (hook != null) {
-      hook(channel, slot);
-      return;
+      return hook(channel, slot);
     }
     channel.channel.stream.listen(
       (data) => channel.channel.send(bytes('$slot:${text(data)}')),
@@ -377,6 +394,41 @@ void main() {
       await gate.onAssign(assign(1));
       expect(await peer.open(shard: 1).done, hasCode(StatusCode.internal));
     });
+
+    test('an async serve that fails after an await closes the channel with '
+        'INTERNAL; the error does not escape', () async {
+      final severe = gateLogs(Level.SEVERE);
+      final escaped = <Object>[];
+      // Channels are dispatched in a guarded zone: an error the gate let
+      // escape would land there.
+      runZonedGuarded(newGate, (e, _) => escaped.add(e));
+      var calls = 0;
+      lifecycle.onServe = (channel, slot) async {
+        calls++;
+        await settle();
+        throw StateError('async boom');
+      };
+      await gate.onAssign(assign(1));
+      expect(
+        await peer.open(shard: 1).done.timeout(limit),
+        hasCode(StatusCode.internal),
+      );
+      // A queued channel, served by RESUME rather than by the dispatch.
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = peer.open(shard: 1);
+      await settle();
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      expect(await queued.done.timeout(limit), hasCode(StatusCode.internal));
+      expect(calls, 2);
+      await settle();
+      expect(escaped, isEmpty);
+      expect(severe, hasLength(2));
+      expect(severe, everyElement(contains('failed')));
+      // The gate goes on serving.
+      lifecycle.onServe = null;
+      expect(await ask(peer.open(shard: 1), 'x'), '1:x');
+      expect(gate.serves(1), isTrue);
+    });
   });
 
   group('hand-over', () {
@@ -615,6 +667,113 @@ void main() {
         ),
       );
     });
+
+    test('DRAIN naming no instance or this one: FAILED_PRECONDITION, the '
+        'slot goes on being served', () async {
+      final warnings = gateLogs(Level.WARNING);
+      newGate();
+      await gate.onAssign(assign(1));
+      final served = peer.open(shard: 1);
+      final answers = StreamQueue(served.stream.map(text));
+      served.send(bytes('x'));
+      expect(await answers.next.timeout(limit), '1:x');
+      for (final to in [0, 1]) {
+        await expectLater(
+          gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: to)),
+          throwsCode(StatusCode.failedPrecondition),
+        );
+      }
+      expect(gate.serves(1), isTrue);
+      served.send(bytes('y'));
+      expect(await answers.next.timeout(limit), '1:y');
+      expect(lifecycle.log, isNot(contains(startsWith('drain'))));
+      expect(warnings, [contains('DRAIN'), contains('DRAIN')]);
+    });
+
+    test('FORWARD naming this instance: FAILED_PRECONDITION, nothing piped '
+        'back into this node, the queue refused with MOVED', () async {
+      final warnings = gateLogs(Level.WARNING);
+      newGate();
+      // The new owner named is this instance, whose record is this node's
+      // own listener, where the gate is registered: forwarding there would
+      // dispatch the queued channel into this gate again, a loop.
+      final self = await node.listenMemory();
+      final resolver = StaticResolver([
+        ServiceRecord(ServiceAddress(kv, 1), endpoints: [self]),
+      ]);
+      addTearDown(resolver.close);
+      node.resolver = resolver;
+      var arrivals = 0;
+      node.registerService(kv, (incoming) {
+        arrivals++;
+        return gate.handler(incoming);
+      }, instance: 1);
+      await gate.onAssign(assign(1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      final queued = peer.open(shard: 1);
+      await settle();
+      await expectLater(
+        gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 1)),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      // Never read here: MOVED. The naming client dropped the slot on
+      // FORWARD, so the gate stops serving it.
+      expect(await queued.done.timeout(limit), isMoved());
+      expect(gate.stateOf(1), isNull);
+      expect(lifecycle.log.last, 'unload 1');
+      expect(await peer.open(shard: 1).done.timeout(limit), isMoved());
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(arrivals, 0);
+      expect(lifecycle.served, isEmpty);
+      // No instance: refused as well, even for a slot not here.
+      await expectLater(
+        gate.onForward(ForwardRequest(kv, 2, epoch: 2, to: 0)),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      expect(warnings, [contains('FORWARD'), contains('FORWARD')]);
+    });
+
+    test(
+      'a new owner whose record is this node\'s own listener: nothing '
+      'is forwarded there, the queue and late arrivals get UNAVAILABLE',
+      () async {
+        newGate();
+        final self = await node.listenMemory();
+        final resolver = StaticResolver([
+          ServiceRecord(ServiceAddress(kv, 2), endpoints: [self]),
+        ]);
+        addTearDown(resolver.close);
+        node.resolver = resolver;
+        // This node takes every instance of the type: a channel piped back
+        // to it would reach the forwarding gate again.
+        var arrivals = 0;
+        node.registerService(
+          kv,
+          (incoming) {
+            arrivals++;
+            return gate.handler(incoming);
+          },
+          instance: 1,
+          acceptAnyInstance: true,
+        );
+        await gate.onAssign(assign(1));
+        await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+        final queued = peer.open(shard: 1);
+        await settle();
+        await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+        expect(
+          await queued.done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+        expect(
+          await peer.open(shard: 1).done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(arrivals, 0);
+        expect(gate.stateOf(1), SlotGateState.forwarding);
+      },
+    );
 
     test('RESUME and FORWARD of unknown slots do nothing', () async {
       newGate();
@@ -931,6 +1090,32 @@ void main() {
       [3, 5],
     ]);
   });
+
+  test('a discard that fails, at once or after an await, is logged; the '
+      'error does not escape', () async {
+    final warnings = gateLogs(Level.WARNING);
+    final escaped = <Object>[];
+    final discarded = <List<int>>[];
+    final failing = _FailingDiscard(discarded);
+    lifecycle = failing;
+    final gates = SlotGates()
+      ..add(SlotGate(node, client, kv, lifecycle: lifecycle));
+    // Called in a guarded zone: an error the gate let escape would land
+    // there.
+    runZonedGuarded(() {
+      gates.onDiscard(kv, [3, 5]);
+      failing.atOnce = true;
+      gates.onDiscard(kv, [7]);
+    }, (e, _) => escaped.add(e));
+    await until(() => warnings.length == 2);
+    await settle();
+    expect(discarded, [
+      [3, 5],
+      [7],
+    ]);
+    expect(escaped, isEmpty);
+    expect(warnings, everyElement(contains('discard')));
+  });
 }
 
 /// Records [SlotLifecycle.discard] calls.
@@ -941,4 +1126,27 @@ class _DiscardLog extends TestLifecycle {
 
   @override
   void discard(List<int> slots) => discarded.add(slots);
+}
+
+/// Records [SlotLifecycle.discard] calls, then fails: after an await, or
+/// at once when [atOnce] is set.
+class _FailingDiscard extends TestLifecycle {
+  _FailingDiscard(this.discarded);
+
+  final List<List<int>> discarded;
+  bool atOnce = false;
+
+  @override
+  FutureOr<void> discard(List<int> slots) {
+    discarded.add(slots);
+    if (atOnce) {
+      throw StateError('discard failed at once');
+    }
+    return _failLater();
+  }
+
+  static Future<void> _failLater() async {
+    await settle();
+    throw StateError('discard failed after an await');
+  }
 }

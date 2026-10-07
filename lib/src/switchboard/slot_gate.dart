@@ -120,22 +120,24 @@ abstract class SlotLifecycle {
   Future<void> unload(int slot) async {}
 
   /// Serves [channel], addressed to [slot], which this instance serves.
-  /// The handler owns the channel as a [ChannelHandler] does; a throw
-  /// closes it with `INTERNAL`.
+  /// The handler owns the channel as a [ChannelHandler] does, and may be
+  /// asynchronous: a throw, or a returned future that fails, closes it
+  /// with `INTERNAL` (logged).
   ///
   /// Unless the gate was created with `trackChannels: false`, the channel
-  /// counts as work in flight for [slot] until it ends, so a migration
-  /// waits for it ([SlotGate.drainTimeout]); call [SlotGate.detach] for a
-  /// long-lived channel, and gate its requests with
-  /// [SlotGate.serveRequest].
-  void serve(IncomingChannel channel, int slot);
+  /// counts as work in flight for [slot] until it ends (not until the
+  /// returned future completes), so a migration waits for it
+  /// ([SlotGate.drainTimeout]); call [SlotGate.detach] for a long-lived
+  /// channel, and gate its requests with [SlotGate.serveRequest].
+  FutureOr<void> serve(IncomingChannel channel, int slot);
 
   /// `HOLDING` reported [slots] as no longer held by this instance: their
   /// local storage should be discarded. Called for every `HOLDING`
   /// response, the one sent by `MeshNode.publishSharded` and those the
   /// naming client sends again after a reconnect
-  /// ([SlotHandler.onDiscard]). The default does nothing.
-  void discard(List<int> slots) {}
+  /// ([SlotHandler.onDiscard]). May be asynchronous; a throw, or a
+  /// returned future that fails, is logged. The default does nothing.
+  FutureOr<void> discard(List<int> slots) {}
 }
 
 /// Where a [SlotGate] stands with one slot.
@@ -429,14 +431,28 @@ class SlotGate implements SlotHandler {
         }),
       );
     }
+    final FutureOr<void> served;
     try {
-      lifecycle.serve(incoming, slot);
+      served = lifecycle.serve(incoming, slot);
     } on Object catch (e, st) {
-      _log.severe('$type gate: serving $incoming failed', e, st);
+      _serveFailed(incoming, e, st);
+      return;
+    }
+    if (served is Future<void>) {
       unawaited(
-        incoming.reject(Status.of(StatusCode.internal, 'handler failed')),
+        served.then<void>(
+          (_) {},
+          onError: (Object e, StackTrace st) => _serveFailed(incoming, e, st),
+        ),
       );
     }
+  }
+
+  void _serveFailed(IncomingChannel incoming, Object error, StackTrace st) {
+    _log.severe('$type gate: serving $incoming failed', error, st);
+    unawaited(
+      incoming.reject(Status.of(StatusCode.internal, 'handler failed')),
+    );
   }
 
   /// Pipes [incoming] to the new owner of [s] with its open payload, the
@@ -461,12 +477,15 @@ class SlotGate implements SlotHandler {
     });
   }
 
-  /// Opens a channel to instance [to] of [type] with [header].
+  /// Opens a channel to instance [to] of [type] with [header], never to
+  /// this node's own listeners (a record of [to] that points back here
+  /// would dispatch the channel into this gate again).
   Future<MuxChannel> _open(int to, ChannelAddress header) async {
     final bytes = header.encode();
     for (var attempt = 0; ; attempt++) {
       final (_, connection) = await switchboard.selectAndConnect(
         ServiceAddress(type, to),
+        excludeOwnEndpoints: true,
       );
       try {
         return connection.open(bytes);
@@ -838,7 +857,8 @@ class SlotGate implements SlotHandler {
   /// there is work to wait for; after it the slot's tracked channels still
   /// open are closed with `RELOCATED` naming the new owner and epoch), then
   /// runs [SlotLifecycle.drain], which receives [context]. Fails with
-  /// `FAILED_PRECONDITION` for a slot not served here.
+  /// `FAILED_PRECONDITION` for a slot not served here, and for a new owner
+  /// that is no instance (0) or this one, leaving the slot served.
   @override
   Future<void> onDrain(
     DrainRequest request, [
@@ -846,6 +866,10 @@ class SlotGate implements SlotHandler {
   ]) async {
     _checkType(request.type);
     final slot = request.slot;
+    final selfForward = _selfForward('DRAIN', slot, request.to);
+    if (selfForward != null) {
+      throw selfForward;
+    }
     final s = _slots[slot];
     if (s == null ||
         (s.state != SlotGateState.serving && s.state != SlotGateState.locked)) {
@@ -914,6 +938,14 @@ class SlotGate implements SlotHandler {
   /// `FORWARD`: pipes the queued channels to the new owner in arrival
   /// order, forwards the queued requests, and keeps forwarding for
   /// [forwardGrace]; then [SlotLifecycle.unload].
+  ///
+  /// A new owner that is no instance (0) or this one fails with
+  /// `FAILED_PRECONDITION`: forwarding there would bring the slot's
+  /// channels back into this gate. The slot, which the naming client
+  /// dropped on `FORWARD`, then stops being served here as on revocation:
+  /// its queue is refused with `MOVED`, its tracked channels are closed
+  /// with `RELOCATED`, and [SlotLifecycle.unload] runs (a slot already
+  /// being forwarded goes on as it was).
   @override
   Future<void> onForward(
     ForwardRequest request, [
@@ -922,6 +954,13 @@ class SlotGate implements SlotHandler {
     _checkType(request.type);
     final slot = request.slot;
     final s = _slots[slot];
+    final selfForward = _selfForward('FORWARD', slot, request.to);
+    if (selfForward != null) {
+      if (s != null && s.state != SlotGateState.forwarding) {
+        await _stop(slot);
+      }
+      throw selfForward;
+    }
     if (s == null) {
       return;
     }
@@ -983,12 +1022,44 @@ class SlotGate implements SlotHandler {
   }
 
   /// A `HOLDING` response listed [slots] as no longer held here: passes
-  /// them to [SlotLifecycle.discard].
+  /// them to [SlotLifecycle.discard], whose failure is logged.
   @override
   void onDiscard(Name type, List<int> slots) {
     _checkType(type);
     _log.info('$type gate: discarding ${slots.length} slots');
-    lifecycle.discard(slots);
+    final FutureOr<void> discarded;
+    try {
+      discarded = lifecycle.discard(slots);
+    } on Object catch (e, st) {
+      _discardFailed(slots, e, st);
+      return;
+    }
+    if (discarded is Future<void>) {
+      unawaited(
+        discarded.then<void>(
+          (_) {},
+          onError: (Object e, StackTrace st) => _discardFailed(slots, e, st),
+        ),
+      );
+    }
+  }
+
+  void _discardFailed(List<int> slots, Object error, StackTrace st) {
+    _log.warning('$type gate: discarding slots $slots failed', error, st);
+  }
+
+  /// The error for a [procedure] of [slot] whose new owner [to] is no
+  /// instance or this one (logged), else null.
+  SwitchboardException? _selfForward(String procedure, int slot, int to) {
+    if (to != 0 && to != instance) {
+      return null;
+    }
+    final owner = to == 0 ? 'no instance' : 'this instance';
+    _log.warning('$type gate: $procedure of slot $slot to $owner refused');
+    return SwitchboardException.of(
+      StatusCode.failedPrecondition,
+      '$procedure of $type/$slot names $owner as the new owner',
+    );
   }
 
   void _checkType(Name requested) {

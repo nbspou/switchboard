@@ -24,6 +24,13 @@ const fast = MuxOptions(
   keepAliveInterval: null,
   keepAliveTimeout: Duration(milliseconds: 100),
 );
+
+/// Waits up to 10 s for the channels on a connection it leaves.
+const patient = MuxOptions(
+  goAwayGrace: Duration(seconds: 10),
+  keepAliveInterval: null,
+  keepAliveTimeout: Duration(milliseconds: 100),
+);
 const limit = Duration(seconds: 5);
 
 Duration ms(int n) => Duration(milliseconds: n);
@@ -72,11 +79,12 @@ var _names = 0;
 /// whatever instance it is addressed as (a registrar registered it), with
 /// a Talk echo `<id>:<payload>`. It records every OPEN payload as received.
 class Worker {
-  Worker(this.id)
+  Worker(this.id, {this.options = fast})
     : name = 'worker-$id-${_names++}-${Random().nextInt(1 << 30)}';
 
   final int id;
   final String name;
+  final MuxOptions options;
   Switchboard? sb;
   final List<Uint8List> raw = [];
   final List<MuxConnection> accepted = [];
@@ -102,7 +110,7 @@ class Worker {
       );
 
   Future<void> start() async {
-    final node = sb = Switchboard(muxOptions: fast);
+    final node = sb = Switchboard(muxOptions: options);
     node.registerService(gpu, _serve, acceptAnyInstance: true);
     node.connections.listen(accepted.add);
     await node.listenMemory(
@@ -134,6 +142,12 @@ class Worker {
       }
     });
   }
+
+  /// Sends GOAWAY `GOING_AWAY` on the last connection accepted, which stays
+  /// up for the channels on it (at most the grace of [options]); completes
+  /// once it has closed.
+  Future<void> goAway() =>
+      accepted.last.goAway(Status.of(StatusCode.goingAway, 'worker rebooting'));
 
   /// Pushes a channel to [back] into the consumer on the last connection
   /// accepted, and returns how it ended.
@@ -1045,6 +1059,164 @@ void main() {
         expect(peer.state, PeerState.connecting);
         expect(peer.attempt, 2);
         expect(calls, 2);
+        unawaited(set.close());
+        unawaited(w.stop());
+        unawaited(consumer.close());
+        unawaited(resolver.close());
+        async.elapse(const Duration(seconds: 1));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+  });
+
+  group('a worker\'s GOAWAY on a live connection (fake_async)', () {
+    String describe(PeerEvent e) =>
+        '${e.type.name}${e.status == null ? '' : ' ${e.status!.known?.name}'}';
+
+    test('offline with its status, online at once on a new connection with '
+        'the per-peer channel opened there; the old one drains', () {
+      fakeAsync((async) {
+        final resolver = StaticResolver();
+        final consumer = Switchboard(muxOptions: fast);
+        // It waits for the channels on the connection it leaves.
+        final w = Worker(1, options: patient);
+        unawaited(w.start());
+        async.flushMicrotasks();
+        resolver.add(w.record());
+        final opened = <MuxChannel>[];
+        final set = PeerSet.watch(
+          consumer,
+          gpu,
+          resolver: resolver,
+          channel: ChannelAddress(type: gpu),
+          onOpen: (peer, channel) => opened.add(channel),
+          initialBackoff: ms(500),
+          maxBackoff: const Duration(seconds: 4),
+          jitter: 0,
+        );
+        final events = <String>[];
+        set.events.listen((e) => events.add(describe(e)));
+        async.elapse(ms(10));
+        final peer = set.peers[1]!;
+        expect(peer.isOnline, isTrue);
+        final first = peer.connection!;
+        var firstClosed = false;
+        first.done.then((_) => firstClosed = true).ignore();
+        Status? firstChannelEnd;
+        peer.channel!.done.then((s) => firstChannelEnd = s).ignore();
+        // An application channel on the first connection.
+        TalkChannel? talk;
+        set.openTalk(1).then((t) => talk = t).ignore();
+        async.elapse(ms(10));
+        final answers = <String>[];
+        void ask(String question) => talk!
+            .request('Q', bytes(question))
+            .then((m) => answers.add(text(m.payload)))
+            .ignore();
+        ask('before');
+        async.elapse(ms(10));
+        expect(answers, ['1:before']);
+        // The worker goes away, its connection staying up meanwhile.
+        var workerLeft = false;
+        w.accepted.single.done.then((_) => workerLeft = true).ignore();
+        unawaited(w.goAway());
+        async.elapse(ms(10));
+        // At once (the backoff is 500 ms), on a new connection.
+        expect(peer.isOnline, isTrue);
+        expect(peer.connection, isNot(same(first)));
+        expect(peer.lastStatus, hasCode(StatusCode.goingAway));
+        expect(peer.lastStatus!.reason, 'worker rebooting');
+        expect(w.accepted, hasLength(2));
+        expect(events, ['added', 'online', 'offline goingAway', 'online']);
+        // The per-peer channel was closed GOING_AWAY and opened again on
+        // the new connection, onOpen with it.
+        expect(firstChannelEnd, hasCode(StatusCode.goingAway));
+        expect(opened, hasLength(2));
+        expect(peer.channel, same(opened.last));
+        expect(w.accepted.last.channels, hasLength(1));
+        // The old connection is left to the application's channel.
+        expect(w.accepted.first.channels, hasLength(1));
+        ask('during');
+        async.elapse(ms(10));
+        expect(answers, ['1:before', '1:during']);
+        expect(firstClosed, isFalse);
+        expect(workerLeft, isFalse);
+        // Once that channel is closed, it closes.
+        unawaited(talk!.close());
+        async.elapse(ms(10));
+        expect(firstClosed, isTrue);
+        expect(workerLeft, isTrue);
+        expect(peer.isOnline, isTrue);
+        expect(events, hasLength(4));
+        unawaited(set.close());
+        unawaited(w.stop());
+        unawaited(consumer.close());
+        unawaited(resolver.close());
+        async.elapse(const Duration(seconds: 1));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('a second GOAWAY before the connection lasted maxBackoff: offline, '
+        'the next attempt after the backoff; after a connection that '
+        'lasted, at once again', () {
+      fakeAsync((async) {
+        final resolver = StaticResolver();
+        final consumer = Switchboard(muxOptions: fast);
+        final w = Worker(1);
+        unawaited(w.start());
+        async.flushMicrotasks();
+        resolver.add(w.record());
+        final set = PeerSet.watch(
+          consumer,
+          gpu,
+          resolver: resolver,
+          channel: ChannelAddress(type: gpu),
+          initialBackoff: ms(500),
+          maxBackoff: const Duration(seconds: 4),
+          jitter: 0,
+        );
+        final events = <String>[];
+        set.events.listen((e) => events.add(describe(e)));
+        async.elapse(ms(10));
+        final peer = set.peers[1]!;
+        expect(peer.isOnline, isTrue);
+        // The first GOAWAY: online again at once.
+        unawaited(w.goAway());
+        async.elapse(ms(10));
+        expect(peer.isOnline, isTrue);
+        expect(w.accepted, hasLength(2));
+        // The second, 100 ms into that connection: the backoff applies.
+        async.elapse(ms(100));
+        unawaited(w.goAway());
+        async.elapse(ms(10));
+        expect(peer.state, PeerState.offline);
+        expect(peer.lastStatus, hasCode(StatusCode.goingAway));
+        expect(peer.connection, isNull);
+        expect(peer.nextAttemptAt, isNotNull);
+        async.elapse(ms(480));
+        expect(peer.state, PeerState.offline);
+        expect(w.accepted, hasLength(2));
+        async.elapse(ms(20));
+        expect(peer.isOnline, isTrue);
+        expect(w.accepted, hasLength(3));
+        // That connection lasts beyond maxBackoff: a GOAWAY on it
+        // reconnects at once again.
+        async.elapse(const Duration(seconds: 5));
+        unawaited(w.goAway());
+        async.elapse(ms(10));
+        expect(peer.isOnline, isTrue);
+        expect(w.accepted, hasLength(4));
+        expect(events, [
+          'added',
+          'online',
+          'offline goingAway',
+          'online',
+          'offline goingAway',
+          'online',
+          'offline goingAway',
+          'online',
+        ]);
         unawaited(set.close());
         unawaited(w.stop());
         unawaited(consumer.close());
