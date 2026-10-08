@@ -1094,10 +1094,12 @@ class MuxConnection {
   // a new OPEN never overtakes an old CLOSE.
 
   final Map<int, _OutQueue> _outQueues = {};
-  // Ordered sets allow a closed channel's turn to be removed at once,
-  // even while the transport never becomes ready to drain the lists.
-  final LinkedHashSet<_OutQueue> _ordinaryTurns = LinkedHashSet<_OutQueue>();
-  final LinkedHashSet<_OutQueue> _bulkTurns = LinkedHashSet<_OutQueue>();
+  // Intrusive lists: taking the first turn, adding one and removing the
+  // turn of a closed channel (while the transport does not drain the
+  // lists) are constant time. A LinkedHashSet would not do: on the VM its
+  // first element is found by scanning past the ones removed before it.
+  final LinkedList<_OutQueue> _ordinaryTurns = LinkedList<_OutQueue>();
+  final LinkedList<_OutQueue> _bulkTurns = LinkedList<_OutQueue>();
   int _ordinarySinceBulk = 0;
   int _heldOutputFrames = 0;
   int _heldOutputBytes = 0;
@@ -1179,7 +1181,6 @@ class MuxConnection {
 
   /// Puts [queue] at the end of the turns of its channel's tier.
   void _takeTurn(_OutQueue queue) {
-    queue.listed = true;
     final link = _links[queue.id];
     if (link != null && link.channel.priority == MuxPriority.bulk) {
       _bulkTurns.add(queue);
@@ -1190,9 +1191,10 @@ class MuxConnection {
 
   void _reprioritize(MuxChannelLink link) {
     final queue = _outQueues[link.id];
-    if (queue == null || !identical(_links[link.id], link)) return;
-    _ordinaryTurns.remove(queue);
-    _bulkTurns.remove(queue);
+    if (queue == null || !queue.listed || !identical(_links[link.id], link)) {
+      return;
+    }
+    queue.unlink();
     _takeTurn(queue);
   }
 
@@ -1203,14 +1205,12 @@ class MuxConnection {
       final _OutQueue queue;
       if (_ordinaryTurns.isNotEmpty &&
           (!bulkWaiting || _ordinarySinceBulk < options.bulkZipper)) {
-        queue = _ordinaryTurns.first;
-        _ordinaryTurns.remove(queue);
+        queue = _ordinaryTurns.first..unlink();
         if (bulkWaiting) {
           _ordinarySinceBulk++;
         }
       } else if (bulkWaiting) {
-        queue = _bulkTurns.first;
-        _bulkTurns.remove(queue);
+        queue = _bulkTurns.first..unlink();
         _ordinarySinceBulk = 0;
       } else {
         return null;
@@ -1218,7 +1218,6 @@ class MuxConnection {
       if (queue.frames.isNotEmpty) {
         return queue;
       }
-      queue.listed = false;
     }
   }
 
@@ -1251,7 +1250,6 @@ class MuxConnection {
     _heldOutputFrames--;
     _heldOutputBytes -= frame.bytes.length;
     if (queue.frames.isEmpty) {
-      queue.listed = false;
       _outQueues.remove(queue.id);
     } else {
       _takeTurn(queue);
@@ -1333,9 +1331,9 @@ class MuxConnection {
         rest.add(frame);
       }
     }
-    _ordinaryTurns.remove(queue);
-    _bulkTurns.remove(queue);
-    queue.listed = false;
+    if (queue.listed) {
+      queue.unlink();
+    }
     queue.frames.clear();
     for (final frame in rest) {
       _writeOpening(frame.bytes, frame.opens);
@@ -2203,15 +2201,16 @@ class _Host implements MuxChannelHost {
   int get peerMaxFrameSize => _connection._peerMaxFrameSize;
 }
 
-/// The frames of one channel id waiting for the transport.
-class _OutQueue {
+/// The frames of one channel id waiting for the transport; an entry of a
+/// turn list while it has frames and it is not being written from.
+final class _OutQueue extends LinkedListEntry<_OutQueue> {
   _OutQueue(this.id);
 
   final int id;
   final Queue<_OutFrame> frames = Queue<_OutFrame>();
 
   /// Whether the queue is in a turn list.
-  bool listed = false;
+  bool get listed => list != null;
 }
 
 /// An encoded frame waiting for the transport.
