@@ -361,6 +361,14 @@ class NamingService {
 
   final List<_Held> _held = [];
 
+  /// The sessions served over each connection, whose `IDENT`s are followed
+  /// by one listener per connection ([_awaitIdentity]) however many
+  /// channels it carries and has carried: a listener per channel would
+  /// stay attached to the connection after its channel ended, until the
+  /// next `IDENT`. An entry stays, without sessions, while its listener
+  /// waits.
+  final Map<MuxConnection, Set<_Session>> _connections = {};
+
   /// Read-only live view of the table: every registered record by address.
   late final Map<ServiceAddress, ServiceRecord> table = UnmodifiableMapView(
     _table,
@@ -485,7 +493,7 @@ class NamingService {
     );
     _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
-    _listenIdentity(session);
+    _followIdentity(session);
     // Observe the connection before waiting for the payload verifier: its
     // credential can expire while that check is still in flight.
     _watchIdentity(session);
@@ -580,6 +588,7 @@ class NamingService {
     for (final session in sessions) {
       _drop(session);
     }
+    _connections.clear();
     await Future.wait([
       for (final session in sessions) session.channel.close(goingAway),
     ]);
@@ -949,22 +958,41 @@ class NamingService {
     });
   }
 
-  /// Observe later IDENTs as well as requests: a replacement credential
-  /// may expire sooner, or identify a previously anonymous connection.
-  /// The subscription can be cancelled when just this channel ends.
-  void _listenIdentity(_Session session) {
+  /// Follows the later `IDENT`s of the connection of [session], not only
+  /// its requests: a replacement credential may expire sooner, or identify
+  /// a connection that was anonymous.
+  void _followIdentity(_Session session) {
     final connection = session.connection;
-    if (connection == null || !connection.isOpen || !session.active) {
+    if (connection == null || !connection.isOpen) {
       return;
     }
-    session.identitySubscription = connection.identityChanged.asStream().listen(
-      (_) {
-        if (session.active && connection.isOpen) {
-          _watchIdentity(session);
-          _listenIdentity(session);
-        }
-      },
-    );
+    final sessions = _connections[connection];
+    if (sessions != null) {
+      sessions.add(session);
+      return;
+    }
+    _connections[connection] = {session};
+    _awaitIdentity(connection);
+  }
+
+  /// Waits for the next `IDENT` of [connection], or its end, and has every
+  /// session it carries look at its identity again. Stops, forgetting the
+  /// connection, once it carries no session or has ended.
+  void _awaitIdentity(MuxConnection connection) {
+    connection.identityChanged.then((_) {
+      final sessions = _connections[connection];
+      if (sessions == null) {
+        return;
+      }
+      if (sessions.isEmpty || !connection.isOpen) {
+        _connections.remove(connection);
+        return;
+      }
+      for (final session in sessions.toList()) {
+        _watchIdentity(session);
+      }
+      _awaitIdentity(connection);
+    }).ignore();
   }
 
   void _onExpiry(_Session session) {
@@ -1495,6 +1523,8 @@ class NamingService {
     session.active = false;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
+    // The entry stays while its listener waits (see [_connections]).
+    _connections[session.connection]?.remove(session);
     _held.removeWhere((h) => identical(h.session, session));
     _endWatches(session);
     final owned = session.owned.toList();
@@ -1559,8 +1589,6 @@ class _Session {
   /// A connection identity has taken precedence over any OPEN credential.
   bool byConnection = false;
 
-  StreamSubscription<void>? identitySubscription;
-
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
 
@@ -1589,8 +1617,6 @@ class _Session {
 
   /// Stops listening to the channel.
   void cancel() {
-    identitySubscription?.cancel().ignore();
-    identitySubscription = null;
     subscription?.cancel().ignore();
     subscription = null;
   }

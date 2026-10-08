@@ -16,6 +16,8 @@ import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/address/service_address.dart';
 import 'package:switchboard/src/bytes.dart';
+import 'package:switchboard/src/identity/peer_identity.dart';
+import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_client.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
@@ -171,6 +173,27 @@ void main() {
         1,
       );
       expect(h.service.table.values.single.metadata, hasLength(4096));
+    });
+
+    test('follows the IDENTs of a connection with one listener, however '
+        'many channels it carried', () async {
+      final connection = _IdentityEvents();
+      for (var i = 0; i < 20; i++) {
+        final link = StreamChannelController<Uint8List>();
+        h.service.serve(
+          TalkChannel(link.local, options: serverOptions),
+          connection: connection,
+        );
+        final client = TalkChannel(link.foreign, options: clientOptions);
+        await register(client, 'npc');
+        await client.close();
+      }
+      await until(() => h.service.channelCount == 0);
+      expect(connection.waiting, 1);
+      // An IDENT once no channel is left: the service stops listening.
+      connection.changeIdentity();
+      await pump();
+      expect(connection.waiting, 0);
     });
 
     test('a REGISTER without the metadata field has empty metadata', () async {
@@ -1728,3 +1751,55 @@ class ScriptedConnector {
 
 /// [value] as UTF-8 bytes.
 Uint8List text(String value) => Uint8List.fromList(utf8.encode(value));
+
+/// A connection that never identifies until [changeIdentity], and counts the
+/// listeners waiting for its next `IDENT`.
+class _IdentityEvents implements MuxConnection {
+  Completer<void> _event = Completer<void>();
+
+  /// Listeners on the current [identityChanged].
+  int waiting = 0;
+
+  /// A valid `IDENT` (of nobody, as far as [peerIdentity] goes).
+  void changeIdentity() {
+    final event = _event;
+    _event = Completer<void>();
+    waiting = 0;
+    event.complete();
+  }
+
+  @override
+  bool get isOpen => true;
+
+  @override
+  PeerIdentity? get peerIdentity => null;
+
+  @override
+  Future<void> get identityChanged => _Counted(_event.future, () => waiting++);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// [inner], calling [onListen] for every listener.
+class _Counted implements Future<void> {
+  _Counted(this.inner, this.onListen);
+
+  final Future<void> inner;
+  final void Function() onListen;
+
+  @override
+  Future<R> then<R>(
+    FutureOr<R> Function(void value) onValue, {
+    Function? onError,
+  }) {
+    onListen();
+    return inner.then(onValue, onError: onError);
+  }
+
+  @override
+  Stream<void> asStream() => Stream.fromFuture(this);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
