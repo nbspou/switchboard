@@ -213,7 +213,7 @@ class MuxLimits { final int maxFrameSize; final int maxChannels; encode/decode }
 
 class MuxOptions {
   final int maxFrameSize;          // what we accept, announced with LIMITS; default 1 MiB (a smaller FrameLimited transport limit is announced instead)
-  final int maxChannels;           // what we accept; default 65536 (0 = unlimited)
+  final int maxChannels;           // caps open channels and, independently, the incoming backlog (including closed channels); default 65536 (0 = unlimited)
   final bool shortIdsOnly;         // embedded style peer: refuse long ids; default false
   final Duration? keepAliveInterval;   // PING after this much silence; default 10 s; null disables
   final Duration keepAliveTimeout;     // close if nothing arrives after PING; default 10 s; also bounds close(), then the transport is aborted
@@ -223,7 +223,7 @@ class MuxOptions {
   final int maxChannelBufferBytes;     // per channel receive buffer while unread or paused; default 4 MiB (0 = unlimited); beyond: CLOSE resourceExhausted
   final int receiveHighWaterMarkBytes; // all channel buffers; default 16 MiB (0 = never); above: stop reading the transport until half
   final Duration closeConfirmTimeout;  // MuxChannel.close() wait for the peer's CLOSE; default 30 s (Duration.zero = forever)
-  final int maxOpenPayloadBytes;       // OPEN payloads held for the peer's open channels; default 16 MiB, at most half of receiveHighWaterMarkBytes (so 8 MiB with the defaults); 0 = no budget of its own; beyond: CLOSE resourceExhausted
+  final int maxOpenPayloadBytes;       // OPEN payloads held for the peer's open or undelivered channels; default 16 MiB, at most half of receiveHighWaterMarkBytes (so 8 MiB with the defaults); 0 = no budget of its own; beyond: CLOSE resourceExhausted
   final CredentialVerifier? identityVerifier;   // checks the peer's IDENT; null: IDENT ignored (NONCE still answered)
   final Duration identityTimeout;      // identify()'s default bound; default 10 s; zero = none
   final bool requireNamedIdent;        // refuse an IDENT that names no receiver (GOAWAY UNAUTHENTICATED); default false; a naming service's host sets it
@@ -245,8 +245,8 @@ class MuxConnection {
   MuxLimits? get peerLimits;
   int get openChannelCount;
   Iterable<MuxChannel> get channels;
-  int get bufferedBytes;                    // bytes in all channel receive buffers, plus the OPEN payloads held for the peer's open channels
-  int get openPayloadBytes;                 // OPEN payloads held for the peer's open channels
+  int get bufferedBytes;                    // bytes in all channel receive buffers, plus the OPEN payloads held for the peer's open or undelivered channels
+  int get openPayloadBytes;                 // OPEN payloads held for the peer's open or undelivered channels
   bool get isReceivePaused;                 // transport reading paused by receiveHighWaterMarkBytes
   int get unconfirmedCloseCount;            // ids awaiting the peer's CLOSE without a channel
   Future<void> identify(Credential credential, {HolderKey? holderKey, Uint8List? intent, String? receiver, Duration? timeout});   // see "Identity"
@@ -274,7 +274,7 @@ class MuxChannel implements StreamChannel<Uint8List> {
 
 Behaviour notes:
 
-* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels`, if its payload would take the held OPEN payloads beyond the budget (`maxOpenPayloadBytes`, at most half of `receiveHighWaterMarkBytes`), after our GOAWAY, or once `incoming` was cancelled, reply CLOSE (`resourceExhausted`, `resourceExhausted`, `goingAway`, `unavailable`) instead; the channel never surfaces and only its id is kept until the peer confirms. A second OPEN on such an id before the confirmation is a protocol error, as is OPEN on any id that is open or half closed.
+* Receiving OPEN: create the channel, add to `incoming`. If `openChannelCount >= options.maxChannels` or the incoming backlog has that many channels (including closed ones), if its payload would take the held OPEN payloads beyond the budget (`maxOpenPayloadBytes`, at most half of `receiveHighWaterMarkBytes`), after our GOAWAY, or once `incoming` was cancelled, reply CLOSE (`resourceExhausted`, `resourceExhausted`, `goingAway`, `unavailable`) instead; the channel never surfaces and only its id is kept until the peer confirms. A second OPEN on such an id before the confirmation is a protocol error, as is OPEN on any id that is open or half closed.
 * Protocol errors: send GOAWAY `protocolError` with reason, close transport, `done` completes with `protocolError`. A stream binding preamble with another version gives GOAWAY `unsupported`; a frame over the transport limit gives GOAWAY `frameTooLarge`.
 * Ids: allocate incrementally from 2 or 3, step 2, skipping reserved ids, ids in use and ids awaiting a CLOSE confirmation, wrapping within the short range (below 0x10000) first. The long range (from 0x10000 or 0x10001, wrapping at 0xFFFFFFFFFFFF) is used only while every short id of our parity is in use; with `shortIdsOnly` that is `resourceExhausted` instead. A long-lived connection to a short-id-only peer therefore keeps working however many channels come and go. `nextChannelIdForTesting` sets the short cursor for ids below 0x10000, else the long one.
 * Keep-alive: timer restarted on any incoming frame; on expiry send PING; if nothing arrives within `keepAliveTimeout`, close with `connectionLost`. No probing while the mux paused reading (`receiveHighWaterMarkBytes`); while the transport throttles its input because of our output, the peer reading that output counts as hearing from it.
@@ -293,7 +293,8 @@ Text for the integrator, suitable for the "Switchboard Mux" wiki page:
 >
 > * **Per-channel receive buffer.** Data received on a channel that the application is not reading (no listener yet, or paused) is buffered up to a cap (default 4 MiB, each subframe counted as its length plus a small overhead so floods of empty subframes count too). Beyond it the channel is closed with CLOSE `RESOURCE_EXHAUSTED` and its buffer dropped. This is a channel error, not a connection error; DATA still in flight is dropped until the peer confirms.
 > * **Connection receive high-water mark.** When the buffers of all channels together exceed a mark (default 16 MiB), the implementation stops reading the transport, which pushes back on the peer through TCP (or the WebSocket's) flow control, and resumes at half the mark. Keep-alive does not probe while reading is paused, since the silence is local.
-> * **Held OPEN payloads.** A channel keeps its OPEN payload for its whole life, so the payloads of the channels a peer opened count toward the connection's buffered bytes until each channel is closed, and their total is capped (default 16 MiB, and never more than half of the receive high-water mark, so that held payloads alone cannot keep the reading paused: the CLOSE frames that release them must still be read). An OPEN beyond the cap receives CLOSE `RESOURCE_EXHAUSTED`.
+> * **Held OPEN payloads.** A channel keeps its OPEN payload for its whole life, so the payloads of the channels a peer opened count toward the connection's buffered bytes until each channel is both closed and delivered (or its delivery is cancelled), and their total is capped (default 16 MiB, and never more than half of the receive high-water mark, so that held payloads alone cannot keep the reading paused: the CLOSE frames that release them must still be read). An OPEN beyond the cap receives CLOSE `RESOURCE_EXHAUSTED`.
+> * **Incoming backlog.** Channels awaiting delivery on `incoming`, including channels already closed by the peer, are capped by `maxChannels` independently of the open channel count. More OPENs receive CLOSE `RESOURCE_EXHAUSTED`. This bounds floods of empty OPEN/CLOSE pairs without dropping accepted channels or their DATA before the application can read them.
 > * **Rejected OPENs.** A rejected OPEN (over the channel cap, after GOAWAY, or when no longer accepting channels) costs only its id until the peer's confirming CLOSE arrives; no channel state or open payload is kept. If more than a cap of such ids (default 1024) are unconfirmed, the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. A second OPEN on a rejected id before its confirmation is a protocol error.
 > * **Reason truncation.** Reasons in CLOSE and GOAWAY are shortened at a UTF-8 character boundary so that the status payload is at most 1024 bytes and the frame fits the limit the peer announced with LIMITS (GOAWAY must anyway, as a control payload over 1024 bytes is a protocol error).
 > * **Close confirmation timeout.** If the peer does not confirm a CLOSE within a timeout (default 30 s), the channel is reported closed locally with its first status. Nothing is sent; the id stays reserved until the peer's CLOSE arrives after all or the connection ends, because the peer may still consider the channel open and its late frames must not land on a new channel with the same id. Such ids count toward the rejected-OPEN cap.

@@ -343,6 +343,10 @@ class MuxChannelLink {
   /// Channel id.
   int get id => channel.id;
 
+  /// Whether the connection still holds this channel for incoming delivery.
+  /// Kept separately so queue removal and membership checks stay constant time.
+  bool incomingPending = false;
+
   /// Whether the peer's CLOSE has been received.
   bool get closeReceived => channel._closeReceived;
 
