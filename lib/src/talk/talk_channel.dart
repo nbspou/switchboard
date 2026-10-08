@@ -1157,6 +1157,13 @@ class TalkChannel {
         frame,
         bulk: bulk,
         onBulk: (out) {
+          final stopped = pending.bulkStopped;
+          if (stopped != null) {
+            // The frame waited for the peer's LIMITS, and the request was
+            // cancelled or failed locally meanwhile.
+            out.cancel(stopped);
+            return;
+          }
           out.track(pending.bulkOuts);
           // The request's payload going out is progress: the requester
           // timeout restarts with each chunk the receiver takes.
@@ -2256,6 +2263,11 @@ class _Outgoing {
   /// Bulk payloads of the request itself, being sent.
   final Set<_BulkOut> bulkOuts = {};
 
+  /// Set once the request failed locally: the status its payload is
+  /// stopped with, also when it starts only after (its frame waited for
+  /// the peer's LIMITS).
+  Status? bulkStopped;
+
   /// Reply payloads still in transfer, even after their streamed messages
   /// were delivered. Local cancellation must not rely on the peer to stop.
   final Set<_BulkIn> bulkIns = {};
@@ -2410,10 +2422,11 @@ class _Outgoing {
     if (error is! TalkAbortException || error.isChannelAbort) {
       // A local failure: the payload of the request is not wanted any
       // more. After the peer's abort response, its receiver decides.
+      final stopped = bulkStopped = error.status.isOk
+          ? Status.of(StatusCode.cancelled)
+          : error.status;
       for (final out in bulkOuts) {
-        out.cancel(
-          error.status.isOk ? Status.of(StatusCode.cancelled) : error.status,
-        );
+        out.cancel(stopped);
       }
     }
     final sink = this.sink;

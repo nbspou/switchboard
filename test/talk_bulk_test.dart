@@ -497,6 +497,33 @@ void main() {
     });
   });
 
+  test('a request cancelled while it waits for the peer\'s LIMITS does not '
+      'start its upload', () {
+    fakeAsync((async) {
+      final (client, server) = muxPair();
+      // A peer that takes the channels but never reads nor closes them.
+      final taken = <MuxChannel>[];
+      server.incoming.listen(taken.add);
+      final talk = TalkChannel(client.open(Uint8List(0)));
+      final source = StreamController<List<int>>();
+      final request = talk.startRequest(
+        'PUT',
+        Uint8List(0),
+        bulk: source.stream,
+      );
+      request.cancel();
+      // The LIMITS arrive: the request, its bulk channel and the cancel go
+      // out, in that order.
+      async.elapse(Duration.zero);
+      expect(taken, hasLength(2));
+      expect(source.hasListener, isFalse);
+      source.close();
+      client.close();
+      server.close();
+      async.elapse(quiet.keepAliveTimeout);
+    });
+  });
+
   group('idle timeout', () {
     /// A Talk channel and its far end over [muxPair], in fake time, the
     /// bulk channels of both sides routed; then a function closing both.
