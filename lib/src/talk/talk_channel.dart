@@ -1058,7 +1058,7 @@ class TalkChannel {
         frame,
         bulk: bulk,
         onBulk: (out) {
-          pending.bulkOuts.add(out);
+          out.track(pending.bulkOuts);
           // The request's payload going out is progress: the requester
           // timeout restarts with each chunk the receiver takes.
           out.onProgress = () {
@@ -1515,7 +1515,9 @@ class TalkChannel {
       ..length = message._bulkRef!.length
       ..onProgress = message._onBulkProgress;
     // Until its bytes were all read, or it was abandoned.
-    _bulkIns.add(b);
+    if (b._endStatus == null) {
+      _bulkIns.add(b);
+    }
     final pending = _outgoing[message.responseId];
     if (pending != null) {
       pending.bulkIns.add(b);
@@ -2116,7 +2118,7 @@ class _Outgoing {
   final _Lane lane = _Lane();
 
   /// Bulk payloads of the request itself, being sent.
-  final List<_BulkOut> bulkOuts = [];
+  final Set<_BulkOut> bulkOuts = {};
 
   /// Reply payloads still in transfer, even after their streamed messages
   /// were delivered. Local cancellation must not rely on the peer to stop.
@@ -2445,7 +2447,7 @@ class _Message extends TalkMessage {
   _Lane? _lane;
 
   /// Bulk payloads of the replies to this request, being sent.
-  final List<_BulkOut> _bulkOuts = [];
+  final Set<_BulkOut> _bulkOuts = {};
 
   /// Called as the bulk payload of this message is read: restarts the
   /// timeouts that its transfer counts as progress for.
@@ -2756,7 +2758,7 @@ class _Message extends TalkMessage {
         ),
         bulk: bulk,
         onBulk: (out) {
-          _bulkOuts.add(out);
+          out.track(_bulkOuts);
           onBulk?.call(out);
         },
         onFailure: onFailure,
@@ -2883,7 +2885,7 @@ class _Message extends TalkMessage {
         ),
         bulk: bulk,
         onBulk: (out) {
-          _bulkOuts.add(out);
+          out.track(_bulkOuts);
           // An item's payload going out is progress, as the item was.
           out.onProgress = _replied;
           onBulk?.call(out);

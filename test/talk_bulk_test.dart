@@ -14,6 +14,7 @@ Authors:
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:mirrors';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -150,6 +151,62 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  // These retention checks inspect bookkeeping without adding diagnostic
+  // API to Talk. The functional payload checks alone cannot detect a leak.
+  int retained(Object owner, String field) {
+    final mirror = reflect(owner);
+    final symbol = MirrorSystem.getSymbol(
+      field,
+      mirror.type.owner as LibraryMirror,
+    );
+    return (mirror.getField(symbol).reflectee as Iterable).length;
+  }
+
+  test(
+    'bulk channels finished before their references are not retained',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final messages = StreamQueue(server.messages);
+      final raw = talk.raw as MuxChannel;
+      for (var number = 1; number <= 10; number++) {
+        final bulk = raw.openAfter(TalkBulkOpen(raw.id, number).encode());
+        await bulk.send(pattern(100));
+        await bulk.close();
+        await pumpEventQueue();
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('NOTE'),
+            bulk: true,
+            payload: TalkBulkReference(number, length: 100).encode(),
+          ).encode(),
+        );
+        expect((await messages.next).payload, pattern(100));
+      }
+      expect(retained(server, '_bulkIns'), 0);
+      await messages.cancel();
+    },
+  );
+
+  test('a stream request does not retain completed bulk sends', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    final received = Completer<TalkMessage>();
+    server.messages.listen(received.complete);
+    final request = talk.streamRequest('LIST', Uint8List(0));
+    final items = StreamQueue(request.items);
+    final message = await received.future;
+    for (var i = 0; i < 10; i++) {
+      await message.replyItemBulk(Stream.value(pattern(100)));
+      expect((await items.next).payload, pattern(100));
+    }
+    expect(retained(message, '_bulkOuts'), 0);
+    message.reply(Uint8List(0));
+    await request.done;
+    await items.cancel();
+  });
+
   test(
     'a peer cancel abandons a bulk request still waiting for dispatch',
     () async {

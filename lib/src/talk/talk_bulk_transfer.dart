@@ -79,6 +79,15 @@ class _BulkOut {
   final Completer<void> _done = Completer<void>()..future.ignore();
   bool _stopped = false;
   StreamIterator<List<int>>? _iterator;
+  Set<_BulkOut>? _owner;
+
+  /// The request keeps active sends for cancellation, not its history.
+  void track(Set<_BulkOut> owner) {
+    if (!_done.isCompleted) {
+      _owner = owner;
+      owner.add(this);
+    }
+  }
 
   /// Called each time a chunk was handed to the bulk channel (its window
   /// took it): the transfer progresses.
@@ -162,6 +171,8 @@ class _BulkOut {
 
   void _channelDone(Status status) {
     talk._bulkOuts.remove(this);
+    _owner?.remove(this);
+    _owner = null;
     if (!_stopped) {
       // The receiver closed it (it does not want the rest), or the
       // connection ended.
@@ -412,10 +423,10 @@ class _BulkIn {
   }
 
   void _onEnd() {
-    talk._bulkIns.remove(this);
     unawaited(
       channel.done.then((status) {
         _endStatus = status;
+        talk._bulkIns.remove(this);
         if (!_dropping) {
           _onDone?.call(status);
         }
