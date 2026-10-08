@@ -1570,6 +1570,52 @@ void main() {
       expect(h.service.table, isEmpty);
     });
 
+    test('a replacement refused before sending drops the old record', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(maxOutgoingRequests: 1),
+      );
+      final client = newClient(limited);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      await client.register(type, [uriA], instance: 1);
+      // This request holds the only outgoing request slot while a
+      // replacement of the already registered record is attempted.
+      final other = client.register(type, [uriA], instance: 2);
+      await expectLater(
+        client.register(type, [uriB], instance: 1),
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await other.timeout(timeout);
+      await until(() => !h.service.table.containsKey(ServiceAddress(type, 1)));
+      await until(() => limited.calls == 2 && client.isSynced);
+      expect(h.service.table.keys, [ServiceAddress(type, 2)]);
+    });
+
+    test('a refused replacement also retires an in-flight REGISTER', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(maxOutgoingRequests: 1),
+      );
+      final client = newClient(limited);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final first = client.register(type, [uriA], instance: 1);
+      final failed = expectLater(
+        first,
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await expectLater(
+        client.register(type, [uriB], instance: 1),
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await failed;
+      await until(() => limited.calls == 2 && client.isSynced);
+      expect(h.service.table, isEmpty);
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();

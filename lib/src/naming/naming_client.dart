@@ -612,6 +612,8 @@ class NamingClient {
   /// endpoints and metadata (publishing `UP` if either changed), only the
   /// newest registration is remembered, and the earlier call's future
   /// completes (or fails) like this one.
+  /// If the replacement is refused, the client drops the channel so that
+  /// the superseded record cannot remain published without being tracked.
   ///
   /// [onAssigned], if given, is called synchronously with the instance id
   /// whenever the registration gets an id different from the one it had:
@@ -1123,6 +1125,12 @@ class NamingClient {
     }
     _entries.remove(entry);
     entry.completer.completeError(error, stackTrace);
+    if (entry.replacesRegistration) {
+      session.lose(
+        Status.of(StatusCode.aborted, 'replacement REGISTER failed'),
+        'replacement REGISTER $address failed; dropping the old record',
+      );
+    }
   }
 
   /// Whether a failed request may still have taken effect: the naming
@@ -1139,6 +1147,7 @@ class NamingClient {
   void _supersede(_Entry older, _Entry newer) {
     _entries.remove(older);
     older.superseded = true;
+    newer.replacesRegistration = true;
     if (!older.completer.isCompleted) {
       newer.completer.future.then(
         older.completer.complete,
@@ -1351,6 +1360,9 @@ class _Entry {
 
   /// Replaced by a newer registration of the same address.
   bool superseded = false;
+
+  /// Supersedes an entry whose record may still exist on the channel.
+  bool replacesRegistration = false;
 
   /// Refusals of re-registration in a row.
   int refusals = 0;
