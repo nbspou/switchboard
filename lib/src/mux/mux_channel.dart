@@ -184,7 +184,14 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// for its own direction, at any time: it applies to the frames the
   /// scheduler picks from then on, and to the splitting of payloads [send]
   /// takes from then on.
-  MuxPriority priority = MuxPriority.normal;
+  MuxPriority get priority => _priority;
+  MuxPriority _priority = MuxPriority.normal;
+
+  set priority(MuxPriority value) {
+    if (_priority == value) return;
+    _priority = value;
+    _link.host.reprioritize(_link);
+  }
 
   /// Whether DATA may be sent: the state is [MuxChannelState.open].
   bool get canSend => _state == MuxChannelState.open;
@@ -959,6 +966,9 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 /// Connection side hooks used by [MuxChannelLink].
 @internal
 abstract interface class MuxChannelHost {
+  /// Moves queued output to [link]'s current priority tier.
+  void reprioritize(MuxChannelLink link);
+
   /// The connection's options.
   MuxOptions get options;
 

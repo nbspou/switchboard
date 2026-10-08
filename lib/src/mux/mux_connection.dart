@@ -1164,6 +1164,14 @@ class MuxConnection {
     }
   }
 
+  void _reprioritize(MuxChannelLink link) {
+    final queue = _outQueues[link.id];
+    if (queue == null || !identical(_links[link.id], link)) return;
+    _ordinaryTurns.remove(queue);
+    _bulkTurns.remove(queue);
+    _takeTurn(queue);
+  }
+
   /// The queue whose turn it is, or null when none holds a frame.
   _OutQueue? _nextTurn() {
     while (true) {
@@ -2105,6 +2113,9 @@ class _Host implements MuxChannelHost {
   _Host(this._connection);
 
   final MuxConnection _connection;
+
+  @override
+  void reprioritize(MuxChannelLink link) => _connection._reprioritize(link);
 
   @override
   MuxOptions get options => _connection.options;

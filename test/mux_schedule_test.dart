@@ -89,6 +89,23 @@ class RateSink implements StreamSink<List<int>> {
 void main() {
   group('output scheduler', () {
     test(
+      'a priority change moves already queued frames to the new tier',
+      () async {
+        final (a, _, gate) = gatedPair();
+        addTearDown(a.close);
+        await a.ping();
+        final first = a.open(empty);
+        final second = a.open(empty);
+        await first.send(tagged(first, 1));
+        await second.send(tagged(second, 2));
+        first.priority = MuxPriority.bulk;
+        gate.allow(2);
+        await pumpEventQueue();
+        expect(order(gate), [(second.id, 2), (first.id, 1)]);
+      },
+    );
+
+    test(
       'closed channels leave no scheduler turns while output is blocked',
       () async {
         final (a, b, gate) = gatedPair();
