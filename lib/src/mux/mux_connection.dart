@@ -372,6 +372,10 @@ class MuxConnection {
         receiveLimit = transportLimit;
       }
     }
+    // The peer may reply synchronously while our LIMITS is written.
+    // Establish the wait first so that such a reply ends it permanently.
+    _limitsKnown =
+        !options.awaitPeerLimits || options.keepAliveTimeout <= Duration.zero;
     _subscription = transport.stream.listen(
       _onFrame,
       onError: _onTransportError,
@@ -388,10 +392,7 @@ class MuxConnection {
         ).toFrame(),
       );
     }
-    if (options.awaitPeerLimits &&
-        options.keepAliveTimeout > Duration.zero &&
-        !_closing) {
-      _limitsKnown = false;
+    if (!_limitsKnown && !_closing) {
       _limitsTimer = Timer(options.keepAliveTimeout, () {
         _limitsTimer = null;
         if (!_limitsKnown) {

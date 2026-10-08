@@ -16,6 +16,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
@@ -319,6 +320,29 @@ void main() {
   group('DATA waits for the peer LIMITS', () {
     final waiting = rawOptions.copyWith(awaitPeerLimits: true);
 
+    test(
+      'LIMITS delivered synchronously during construction ends the wait',
+      () async {
+        final transport = StreamChannelController<Uint8List>(sync: true);
+        final peer = transport.foreign.stream.listen((bytes) {
+          if (isControl(MuxFrame.decode(bytes), MuxControlType.limits)) {
+            transport.foreign.sink.add(hexBytes(limitsHex(256)));
+          }
+        });
+        addTearDown(peer.cancel);
+        final mux = MuxConnection(
+          transport.local,
+          isInitiator: true,
+          options: quiet,
+        );
+        addTearDown(mux.close);
+        expect(mux.peerLimits?.initialWindow, 256);
+        final channel = mux.open(empty);
+        expect(channel.sendWindow, 256);
+        await channel.send(Uint8List(10));
+      },
+    );
+
     for (final slot in [false, true]) {
       test(
         'addStream reports a size refusal after LIMITS arrives (slot: $slot)',
@@ -326,6 +350,8 @@ void main() {
           final (mux, raw) = rawPair(options: waiting);
           addTearDown(mux.close);
           final channel = mux.open(empty);
+          // Closed through the connection in teardown.
+          // ignore: close_sinks
           final sink = slot
               ? SlotChannel(Name('test'), 0, channel, (_) async => null).sink
               : channel.sink;
