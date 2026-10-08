@@ -157,7 +157,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   bool _admitting = false;
 
   /// A completed future, returned by [send] for a subframe sent at once.
-  static final Future<void> _sentAtOnce = Future<void>.value();
+  /// Made in the caller's zone each time: one shared future would run the
+  /// callbacks of every later caller in the zone that first made it (under
+  /// fake_async, a zone whose microtasks nobody runs any more).
+  static Future<void> get _sentAtOnce => Future<void>.value();
 
   // Flow control, receiving side: what the peer may still send, the
   // window credit is returned against (half of it is the batch), what was

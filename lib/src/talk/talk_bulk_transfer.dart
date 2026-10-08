@@ -180,12 +180,16 @@ class _BulkOut {
 
   /// [bytes] as views of [TalkOptions.bulkChunkSize] bytes, without a
   /// copy.
-  Stream<List<int>> _pieces(Uint8List bytes) async* {
+  Stream<List<int>> _pieces(Uint8List bytes) {
     final chunk = talk.options.bulkChunkSize;
-    for (var offset = 0; offset < bytes.length; offset += chunk) {
-      final end = offset + chunk < bytes.length ? offset + chunk : bytes.length;
-      yield Uint8List.sublistView(bytes, offset, end);
-    }
+    return Stream<List<int>>.fromIterable([
+      for (var offset = 0; offset < bytes.length; offset += chunk)
+        Uint8List.sublistView(
+          bytes,
+          offset,
+          offset + chunk < bytes.length ? offset + chunk : bytes.length,
+        ),
+    ]);
   }
 
   Future<void> _pumpStream(Stream<List<int>> source) async {
