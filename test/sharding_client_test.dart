@@ -15,6 +15,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:fake_async/fake_async.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/address/service_address.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_client.dart';
@@ -1092,6 +1093,113 @@ void main() {
       });
     });
 
+    test('a DRAIN whose wait for work in flight times out drains anyway, '
+        'and the migration completes', () {
+      fakeAsync((async) {
+        const drainTimeout = Duration(seconds: 30);
+        final h = Harness(handoverTimeout: handover);
+        final nodeA = Switchboard();
+        final nodeB = Switchboard();
+        final lifeA = _Keeper();
+        late final SlotGate gateA;
+        late final SlotGate gateB;
+        final extendsA = <TalkFrame>[];
+        final a = start(
+          async,
+          h,
+          1,
+          null,
+          extendsA,
+          handlerFor: (client) => gateA = SlotGate(
+            nodeA,
+            client,
+            zone,
+            lifecycle: lifeA,
+            drainTimeout: drainTimeout,
+            instance: 1,
+          ),
+        );
+        final b = start(
+          async,
+          h,
+          2,
+          null,
+          [],
+          handlerFor: (client) => gateB = SlotGate(
+            nodeB,
+            client,
+            zone,
+            lifecycle: _Keeper(),
+            instance: 2,
+          ),
+        );
+        unawaited(a.claim(zone, 2));
+        async.elapse(ms10);
+        expect(gateA.serves(2), isTrue);
+        // A request for the slot that outlives drainTimeout.
+        const untimed = TalkOptions(
+          requestTimeout: Duration.zero,
+          replyTimeout: Duration.zero,
+        );
+        final link = StreamChannelController<Uint8List>();
+        final caller = TalkChannel(link.local, options: untimed);
+        final callee = TalkChannel(link.foreign, options: untimed);
+        final held = Completer<void>();
+        callee.messages.listen(
+          (m) => gateA.serveRequest(m, 2, (m) => held.future),
+        );
+        caller.request('GET', Uint8List(0)).ignore();
+        async.elapse(ms10);
+        final (operator, _) = h.link();
+        final phases = <String>[];
+        final migrate = operator.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 2, to: 2).encode(),
+        );
+        migrate.items.listen(
+          (m) => phases.add(PhaseItem.decode(m.payload).phase.name),
+        );
+        Object? outcome;
+        migrate.done.then(
+          (_) => outcome = 'done',
+          onError: (Object e) {
+            outcome = e;
+          },
+        );
+        async.elapse(drainTimeout - ms50);
+        expect(phases, ['draining']);
+        expect(lifeA.drained, isEmpty);
+        async.elapse(ms50 * 2);
+        // Drained anyway, on a DRAIN that is still current.
+        expect(lifeA.drained, ['drain 2 e2 to2 cancelled false']);
+        async.elapse(ms10);
+        expect(outcome, 'done');
+        expect(phases, ['draining', 'assigning', 'forwarding', 'done']);
+        expect(h.service.slotTable(zone)![2].owner, 2);
+        // The wait, a second more and the client's buffer; then an empty
+        // EXTEND giving the drain the naming service's default timeout.
+        expect(extendsA.map((f) => f.extension), [
+          (
+            deadline:
+                drainTimeout +
+                const Duration(seconds: 1) +
+                clientOptions.extendBuffer,
+            renew: null,
+          ),
+          (deadline: null, renew: null),
+        ]);
+        held.complete();
+        unawaited(caller.close());
+        unawaited(callee.close());
+        unawaited(operator.close());
+        unawaited(gateA.close());
+        unawaited(gateB.close());
+        unawaited(nodeA.close());
+        unawaited(nodeB.close());
+        finish(async, h, [a, b]);
+      });
+    });
+
     test('MIGRATE passes the deadline the old owner declares on DRAIN on to '
         'the requester', () {
       fakeAsync((async) {
@@ -1183,4 +1291,32 @@ class _Loader extends SlotLifecycle {
   @override
   void serve(IncomingChannel channel, int slot) =>
       unawaited(channel.reject(Status.of(StatusCode.unavailable)));
+}
+
+/// A lifecycle that loads at once without holding, keeps the channels it
+/// serves open, and records its drains.
+class _Keeper extends SlotLifecycle {
+  final List<String> drained = [];
+
+  @override
+  Future<AssignResult> load(
+    int slot, {
+    required int epoch,
+    required int holder,
+    required bool shared,
+    SlotRequestContext? context,
+  }) async => AssignResult.notHolding;
+
+  @override
+  Future<void> drain(
+    int slot, {
+    required int epoch,
+    required int to,
+    SlotRequestContext? context,
+  }) async => drained.add(
+    'drain $slot e$epoch to$to cancelled ${context?.isCancelled}',
+  );
+
+  @override
+  void serve(IncomingChannel channel, int slot) {}
 }

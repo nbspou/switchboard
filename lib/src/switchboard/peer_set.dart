@@ -204,7 +204,9 @@ class PeerEvent {
 /// (with any status), fail the attempt: the set leaves the connection with
 /// GOAWAY and the peer is offline (with [StatusCode.internal] for a hook,
 /// the channel's close status for the channel) until the next attempt
-/// after the backoff. The hooks run again after every reconnect.
+/// after the backoff. The hooks run again after every reconnect. A hook
+/// may close the set, at once or later; its timeout is cancelled with the
+/// connection.
 ///
 /// The per-peer channel behaves like a `PersistentChannel` of a
 /// `ReconnectingClient`: when it ends while the connection stays up, the
@@ -277,7 +279,8 @@ class PeerSet {
   /// backoff schedule of each peer, as for `ReconnectingClient`.
   /// [connectTimeout] bounds each connection attempt (dialling the
   /// endpoints one after the other) and each step of the set-up (each
-  /// hook, the PING round trip); [Duration.zero] waits for ever.
+  /// hook, credential selection, the PING round trip); [Duration.zero]
+  /// waits for ever.
   /// [removalHoldDown] is how long a peer whose record left the resolver
   /// is kept ([PeerState.held]) before it is removed; [Duration.zero]
   /// removes it at once. [policy] is the policy of the set's connections,
@@ -644,7 +647,13 @@ class PeerSet {
   /// GOAWAY; it works while the peer is connecting with its hooks running,
   /// while its per-peer channel is being re-opened, and while it is held)
   /// or the set is closed, and like [MuxConnection.open] and
-  /// [Switchboard.credentialFor].
+  /// [Switchboard.credentialFor]. Without [payload], the credential is
+  /// chosen for the peer's connection and record as they are at the call;
+  /// when either changes before it is chosen (the peer reconnected, moved
+  /// or was removed, or the set closed), the open fails with
+  /// [StatusCode.failedPrecondition] and nothing is sent, so a credential
+  /// chosen for one destination never reaches another. Opening again once
+  /// the peer is usable chooses one for its new connection.
   Future<MuxChannel> openChannel(int instance, {Uint8List? payload}) async {
     if (_closed) {
       throw SwitchboardException.of(
@@ -659,21 +668,21 @@ class PeerSet {
         'no peer ${ServiceAddress(type, instance)}',
       );
     }
-    var connection = peer._usable;
+    final connection = peer._usable;
     if (connection == null) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         '${peer.address} is ${peer.state.name}',
       );
     }
+    final record = peer.record;
     final application =
-        payload ??
-        await switchboard.payloadFor(connection, record: peer.record);
-    connection = peer._usable;
-    if (connection == null) {
+        payload ?? await switchboard.payloadFor(connection, record: record);
+    if (!identical(connection, peer._usable) ||
+        !identical(record, peer.record)) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
-        '${peer.address} is ${peer.state.name}',
+        '${peer.address} changed while choosing its credential',
       );
     }
     return connection.open(
@@ -1312,15 +1321,6 @@ class Peer {
       return Status.of(code, '$name failed');
     }
 
-    final FutureOr<Object?> result;
-    try {
-      result = hook();
-    } on Object catch (e, st) {
-      return failed(e, st);
-    }
-    if (result is! Future<Object?>) {
-      return null;
-    }
     final wait = Completer<Status?>();
     _hookWait = wait;
     final timeout = _set.connectTimeout;
@@ -1334,23 +1334,41 @@ class Peer {
         }
       });
     }
-    result
-        .then<void>(
-          (_) {
-            if (!wait.isCompleted) {
-              wait.complete(null);
-            }
-          },
-          onError: (Object e, StackTrace st) {
-            if (wait.isCompleted) {
-              // Left, or timed out, already.
-              _log.fine('$this: $name failed late: $e');
-              return;
-            }
-            wait.complete(failed(e, st));
-          },
-        )
-        .ignore();
+    final FutureOr<Object?> result;
+    try {
+      result = hook();
+    } on Object catch (e, st) {
+      if (!wait.isCompleted) {
+        wait.complete(failed(e, st));
+      }
+      if (identical(_hookWait, wait)) {
+        _endHook();
+      }
+      return wait.future;
+    }
+    if (result is! Future<Object?>) {
+      if (!wait.isCompleted) {
+        wait.complete(null);
+      }
+    } else {
+      result
+          .then<void>(
+            (_) {
+              if (!wait.isCompleted) {
+                wait.complete(null);
+              }
+            },
+            onError: (Object e, StackTrace st) {
+              if (wait.isCompleted) {
+                // Left, or timed out, already.
+                _log.fine('$this: $name failed late: $e');
+                return;
+              }
+              wait.complete(failed(e, st));
+            },
+          )
+          .ignore();
+    }
     final outcome = await wait.future;
     if (identical(_hookWait, wait)) {
       _endHook();
@@ -1465,20 +1483,18 @@ class Peer {
     final template = _set.channel!;
     var payload = template.payload;
     if (payload.isEmpty) {
-      try {
+      final failure = await _bounded('credential', () async {
         payload = await _set.switchboard.payloadFor(
           connection,
           record: _record,
         );
-      } on Object catch (e, st) {
-        _log.warning('$this: no payload for the channel', e, st);
-        _failConnection(
-          connection,
-          Status.of(StatusCode.internal, 'credential failed'),
-        );
+        return null;
+      });
+      if (!identical(_connection, connection) || _channel != null) {
         return false;
       }
-      if (!identical(_connection, connection) || _channel != null) {
+      if (failure != null) {
+        _failConnection(connection, failure);
         return false;
       }
     }

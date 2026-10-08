@@ -34,7 +34,9 @@ final Logger _log = Logger('Switchboard.Client');
 /// synchronous throw, counts as a failed attempt, retried after the
 /// backoff. A [SwitchboardException] reports its status in
 /// [ClientState.lastStatus]; anything else is reported as
-/// [StatusCode.unavailable].
+/// [StatusCode.unavailable]. The connector may stop or close its client
+/// synchronously; an abandoned attempt installs no timeout, and any transport
+/// it returns later is discarded.
 typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();
 
 /// Phase of a [ReconnectingClient]'s connection.
@@ -583,7 +585,7 @@ class ReconnectingClient {
     } on Object catch (e, st) {
       attempt = Future.error(e, st);
     }
-    if (connectTimeout > Duration.zero) {
+    if (identical(_attemptToken, token) && connectTimeout > Duration.zero) {
       _connectTimer = Timer(connectTimeout, () {
         _connectTimer = null;
         if (identical(_attemptToken, token)) {

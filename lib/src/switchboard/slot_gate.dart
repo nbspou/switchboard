@@ -39,6 +39,11 @@ int _nextEpoch(int epoch) => epoch >= maxU32 ? 1 : epoch + 1;
 /// next one).
 const Duration _forwardIdle = Duration(seconds: 1);
 
+/// How much longer than [SlotGate.drainTimeout] a `DRAIN` that waits for
+/// work in flight declares, so that the naming client does not give it up
+/// at the moment the gate stops waiting and drains anyway.
+const Duration _drainStart = Duration(seconds: 1);
+
 /// What a sharded service does with its slots: the application side of a
 /// [SlotGate]. Extend this class (the gate attaches itself to it, see
 /// [gate]); do not implement it.
@@ -50,6 +55,12 @@ const Duration _forwardIdle = Duration(seconds: 1);
 /// service to instances" and "The hand-over, step by step".
 abstract class SlotLifecycle {
   SlotGate? _gate;
+
+  /// The loads and unloads of each slot still running, by whichever gate
+  /// this lifecycle was attached to: until they end, an `ASSIGN` of the
+  /// slot is refused, so that the cleanup of an earlier generation never
+  /// touches the state of a later one.
+  final Map<int, int> _busy = {};
 
   /// The gate this lifecycle is attached to. Throws [StateError] before
   /// the gate is created.
@@ -82,6 +93,13 @@ abstract class SlotLifecycle {
   /// long with [SlotRequestContext.extend], at the steps where it knows
   /// (the transfer started, its size is known, a phase completed), and
   /// stops when [SlotRequestContext.onCancel] completes.
+  ///
+  /// Until this completes, and the [unload] that follows it if the slot
+  /// was revoked or the gate closed meanwhile, an `ASSIGN` of [slot] is
+  /// refused with `UNAVAILABLE` (the naming service offers it again after
+  /// its backoff, or to another instance), even on another gate this
+  /// lifecycle is attached to later: a load that never completes keeps
+  /// the slot from this instance.
   Future<AssignResult> load(
     int slot, {
     required int epoch,
@@ -106,11 +124,10 @@ abstract class SlotLifecycle {
   /// slot's state.
   ///
   /// [context] is the `DRAIN` request (null when the gate is driven without
-  /// one). A drain that may take longer than the naming service waits
-  /// declares how long with [SlotRequestContext.extend]: its
-  /// `handoverTimeout` (60 s by default) when nothing was declared, or the
-  /// [SlotGate.drainTimeout] the gate declared when it had to wait for work
-  /// in flight.
+  /// one). A drain that may take longer than the naming service waits, its
+  /// `handoverTimeout` (60 s by default) from this call (the gate restarts
+  /// that timeout when it had to wait for work in flight), declares how
+  /// long with [SlotRequestContext.extend].
   Future<void> drain(
     int slot, {
     required int epoch,
@@ -122,7 +139,8 @@ abstract class SlotLifecycle {
   /// period of a migration, after the slot was revoked or released, or
   /// when the gate closes. Drop the slot's state unless this instance
   /// keeps its storage (it is still the holder). The default does
-  /// nothing.
+  /// nothing. Until it completes, an `ASSIGN` of [slot] is refused with
+  /// `UNAVAILABLE` (see [load]).
   Future<void> unload(int slot) async {}
 
   /// Serves [channel], addressed to [slot], which this instance serves.
@@ -220,11 +238,15 @@ enum SlotGateState {
 /// [close]) it rejects the queue with `MOVED`, closes the slot's tracked
 /// channels with `RELOCATED` ([relocatedStatus]) and calls
 /// [SlotLifecycle.unload].
+/// A handler that locks or revokes the slot while its queue is being served
+/// leaves the remaining work subject to that new state.
 class SlotGate implements SlotHandler {
   /// Creates the gate of [type] on [switchboard], serving the slot
   /// requests [client] receives, with the application's [lifecycle] (which
   /// it attaches to; a lifecycle serves one gate at a time, and may be
-  /// attached to a new gate once its gate is closed).
+  /// attached to a new gate once its gate is closed; the new gate refuses
+  /// to assign a slot whose load or unload by the closed gate is still
+  /// running, see [onAssign]).
   ///
   /// [instance] is the id [type] is registered as (set it once known; it
   /// is used to tell this instance from others in the mirror).
@@ -276,11 +298,15 @@ class SlotGate implements SlotHandler {
   /// called anyway. Default 30 s.
   final Duration drainTimeout;
 
-  /// Most channels queued at a time, over all slots. Default 1024.
+  /// Most channels queued at a time, over all slots, including forwarding
+  /// opens waiting for a connection. Default 1024. A cancelled forwarding
+  /// open keeps its place in this bound until its open attempt settles.
   final int maxQueuedChannels;
 
   /// Most requests queued by [serveRequest] at a time, over all slots; a
   /// queued request leaves the queue when it can no longer be answered.
+  /// Also bounds requests waiting for a forwarding channel to open; those
+  /// keep their place until the open attempt settles, even if cancelled.
   /// Default 1024.
   final int maxQueuedRequests;
 
@@ -468,21 +494,29 @@ class SlotGate implements SlotHandler {
   /// instance set to the new owner's. The outgoing channels are opened one
   /// after the other, so the new owner sees them in arrival order.
   void _forwardChannelOf(_GateSlot s, IncomingChannel incoming) {
+    if (_queuedChannels >= maxQueuedChannels) {
+      unawaited(incoming.reject(genericStatus(StatusCode.unavailable)));
+      return;
+    }
+    _queuedChannels++;
     final to = s.to;
     s.opening = s.opening.then((_) async {
-      final MuxChannel target;
       try {
-        target = await _open(
+        if (!incoming.channel.canSend) {
+          return;
+        }
+        final target = await _open(
           to,
           incoming.address.copyWith(instance: to, clearHost: true),
         );
+        _log.fine('$type gate: $incoming forwarded to $type/$to');
+        unawaited(pipeChannels(incoming.channel, target));
       } on Object catch (e) {
         _log.info('$type gate: cannot forward $incoming to $to: $e');
         unawaited(incoming.reject(genericStatus(StatusCode.unavailable)));
-        return;
+      } finally {
+        _queuedChannels--;
       }
-      _log.fine('$type gate: $incoming forwarded to $type/$to');
-      unawaited(pipeChannels(incoming.channel, target));
     });
   }
 
@@ -621,6 +655,11 @@ class SlotGate implements SlotHandler {
     if (message.expectsReply && !message.canReply) {
       return;
     }
+    if (_queuedRequests >= maxQueuedRequests) {
+      _abort(message, genericStatus(StatusCode.unavailable));
+      return;
+    }
+    _queuedRequests++;
     final credential = payload ?? _arrivalPayload(message);
     // One forwarding channel per distinct credential: the bytes as the key.
     final key = String.fromCharCodes(credential);
@@ -636,6 +675,8 @@ class SlotGate implements SlotHandler {
       _abort(message, genericStatus(StatusCode.unavailable));
       _relayEnded(s, f);
       return;
+    } finally {
+      _queuedRequests--;
     }
     try {
       await forwardMessage(message, target);
@@ -758,9 +799,12 @@ class SlotGate implements SlotHandler {
     }
   }
 
-  /// Waits until [s] has no work in flight, at most [drainTimeout], which
-  /// it declares to the naming service through [context] when it has to
-  /// wait. Returns false when the wait timed out.
+  /// Waits until [s] has no work in flight, at most [drainTimeout], or
+  /// until [context] is cancelled. When it has to wait, it declares the
+  /// wait to the naming service through [context], [_drainStart] longer so
+  /// that the `DRAIN` outlives it, and once the wait is over restarts the
+  /// naming service's default timeout for [SlotLifecycle.drain]. Returns
+  /// false when the wait timed out.
   Future<bool> _waitIdle(
     _GateSlot s,
     int slot,
@@ -769,10 +813,11 @@ class SlotGate implements SlotHandler {
     if (s.isIdle) {
       return true;
     }
-    context?.extend(deadline: drainTimeout);
+    context?.extend(deadline: drainTimeout + _drainStart);
     final idle = s.idle = Completer<void>();
     try {
-      await idle.future.timeout(drainTimeout);
+      await Future.any([idle.future, if (context != null) context.onCancel])
+          .timeout(drainTimeout);
       return true;
     } on TimeoutException {
       _log.warning(
@@ -781,7 +826,12 @@ class SlotGate implements SlotHandler {
       );
       return false;
     } finally {
-      s.idle = null;
+      if (identical(s.idle, idle)) {
+        s.idle = null;
+      }
+      if (context != null && !context.isCancelled) {
+        context.extend();
+      }
     }
   }
 
@@ -805,7 +855,12 @@ class SlotGate implements SlotHandler {
   /// comes back) has stale state here: its queue is refused with `MOVED`,
   /// forwarding stops, [SlotLifecycle.unload] runs, then
   /// [SlotLifecycle.load], which receives [context]. Refused with
-  /// `UNAVAILABLE` after [close].
+  /// `UNAVAILABLE` after [close], and while [lifecycle] still runs a load
+  /// or unload of the slot, even for a generation that was revoked, or for
+  /// a closed gate it was attached to before (see [SlotLifecycle.load]).
+  /// A cancelled [context] never admits queued work: a load that finishes
+  /// after cancellation is unloaded, its queue refused with `MOVED`, and
+  /// the assignment fails with `CANCELLED`.
   @override
   Future<AssignResult> onAssign(
     AssignRequest request, [
@@ -813,11 +868,45 @@ class SlotGate implements SlotHandler {
   ]) async {
     _checkType(request.type);
     final slot = request.slot;
+    if (lifecycle._busy.containsKey(slot)) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'slot $type/$slot is still loading or unloading',
+      );
+    }
+    _enterBusy(slot);
+    try {
+      return await _assign(request, context);
+    } finally {
+      _exitBusy(slot);
+    }
+  }
+
+  void _enterBusy(int slot) =>
+      lifecycle._busy.update(slot, (n) => n + 1, ifAbsent: () => 1);
+
+  void _exitBusy(int slot) {
+    final left = lifecycle._busy[slot]! - 1;
+    if (left == 0) {
+      lifecycle._busy.remove(slot);
+    } else {
+      lifecycle._busy[slot] = left;
+    }
+  }
+
+  Future<AssignResult> _assign(
+    AssignRequest request,
+    SlotRequestContext? context,
+  ) async {
+    final slot = request.slot;
     if (_closed) {
       throw SwitchboardException.of(
         StatusCode.unavailable,
         '$type gate closed',
       );
+    }
+    if (context?.isCancelled ?? false) {
+      throw SwitchboardException.of(StatusCode.cancelled, 'ASSIGN cancelled');
     }
     final existing = _slots[slot];
     switch (existing?.state) {
@@ -846,6 +935,17 @@ class SlotGate implements SlotHandler {
       // Owned by another instance since it was locked or handed over: its
       // state is stale, its queue (never read) refused with MOVED.
       await _retire(existing, slot);
+      if (!identical(_slots[slot], s)) {
+        throw SwitchboardException.of(
+          StatusCode.unavailable,
+          'slot $type/$slot stopped before loading',
+        );
+      }
+    }
+    if (context?.isCancelled ?? false) {
+      _slots.remove(slot);
+      _refuseQueue(s, movedStatus(slot));
+      throw SwitchboardException.of(StatusCode.cancelled, 'ASSIGN cancelled');
     }
     final AssignResult result;
     try {
@@ -863,11 +963,17 @@ class SlotGate implements SlotHandler {
       }
       rethrow;
     }
-    if (!identical(_slots[slot], s)) {
-      // Stopped while loading (closed or revoked).
+    final cancelled = context?.isCancelled ?? false;
+    if (!identical(_slots[slot], s) || cancelled) {
+      // Stopped while loading (closed, revoked or cancelled). Do not
+      // release the queue before the naming client notices cancellation.
+      if (identical(_slots[slot], s)) {
+        _slots.remove(slot);
+        _refuseQueue(s, movedStatus(slot));
+      }
       await _unload(slot);
       throw SwitchboardException.of(
-        StatusCode.unavailable,
+        cancelled ? StatusCode.cancelled : StatusCode.unavailable,
         'slot $type/$slot stopped while loading',
       );
     }
@@ -881,12 +987,17 @@ class SlotGate implements SlotHandler {
   }
 
   /// `DRAIN`: locks the slot, waits for its work in flight (at most
-  /// [drainTimeout], declared to the naming service through [context] when
-  /// there is work to wait for; after it the slot's tracked channels still
-  /// open are closed with `RELOCATED` naming the new owner and epoch), then
-  /// runs [SlotLifecycle.drain], which receives [context]. Fails with
-  /// `FAILED_PRECONDITION` for a slot not served here, and for a new owner
-  /// that is no instance (0) or this one, leaving the slot served.
+  /// [drainTimeout]; when there is work to wait for, the wait is declared
+  /// to the naming service through [context], a second longer, and its
+  /// default timeout restarted once the wait is over; after it the slot's
+  /// tracked channels still open are closed with `RELOCATED` naming the
+  /// new owner and epoch), then runs [SlotLifecycle.drain], which receives
+  /// [context]. Fails with `FAILED_PRECONDITION` for a slot not served
+  /// here, and for a new owner that is no instance (0) or this one,
+  /// leaving the slot served. A [context] cancelled while it waits (the
+  /// naming service gave the `DRAIN` up, or the channel to it was lost)
+  /// ends the wait and fails with `CANCELLED`, leaving the slot locked
+  /// until `RESUME` with nothing closed or drained.
   @override
   Future<void> onDrain(
     DrainRequest request, [
@@ -916,6 +1027,10 @@ class SlotGate implements SlotHandler {
         StatusCode.unavailable,
         'slot $type/$slot stopped while draining',
       );
+    }
+    if (context?.isCancelled ?? false) {
+      // Rolled back (RESUME follows): nothing is handed over for it.
+      throw SwitchboardException.of(StatusCode.cancelled, 'DRAIN cancelled');
     }
     if (!idle) {
       _relocateTracked(s, slot, to: request.to, epoch: request.epoch);
@@ -1106,10 +1221,21 @@ class SlotGate implements SlotHandler {
 
   /// Serves what was queued while loading or locked.
   void _release(_GateSlot s, int slot) {
-    for (final incoming in _takeQueue(s)) {
-      _serve(s, incoming, slot);
+    bool serving() =>
+        identical(_slots[slot], s) && s.state == SlotGateState.serving;
+
+    // Remove one at a time: application handlers may lock or revoke the
+    // slot synchronously, and the remaining queue belongs to that state.
+    while (serving() && s.channels.isNotEmpty) {
+      final incoming = s.channels.removeFirst();
+      _queuedChannels--;
+      if (incoming.channel.canSend) {
+        _serve(s, incoming, slot);
+      }
     }
-    for (final parked in _takeRequests(s)) {
+    while (serving() && s.requests.isNotEmpty) {
+      final parked = s.requests.removeFirst();
+      _queuedRequests--;
       if (parked.message.expectsReply && !parked.message.canReply) {
         parked.finish();
         continue;
@@ -1185,10 +1311,13 @@ class SlotGate implements SlotHandler {
   }
 
   Future<void> _unload(int slot) async {
+    _enterBusy(slot);
     try {
       await lifecycle.unload(slot);
     } on Object catch (e, st) {
       _log.warning('$type gate: unloading slot $slot failed', e, st);
+    } finally {
+      _exitBusy(slot);
     }
   }
 
@@ -1220,7 +1349,8 @@ class SlotGate implements SlotHandler {
   /// service is not told), and refuses later `ASSIGN`s. Channels arriving
   /// later are refused with `MOVED`, requests through [serveRequest]
   /// answered `ABORT MOVED`. The lifecycle may then be attached to a new
-  /// gate (its [SlotLifecycle.gate] is this one until then).
+  /// gate (its [SlotLifecycle.gate] is this one until then); loads and
+  /// unloads still running here keep their slots from it until they end.
   Future<void> close() async {
     _closed = true;
     await Future.wait([for (final slot in _slots.keys.toList()) _stop(slot)]);
