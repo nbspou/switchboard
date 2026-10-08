@@ -52,7 +52,8 @@ part of 'talk_channel.dart';
 /// the two real peers apply end to end, with `EXTEND` forwarded.
 ///
 /// The returned future completes once [incoming] and every request
-/// forwarded on its behalf have ended. It never completes with an error.
+/// forwarded on its behalf have ended, including their bulk transfers.
+/// It never completes with an error.
 /// If [incoming] can no longer be answered (it was already answered or
 /// cancelled), nothing is forwarded.
 ///
@@ -68,15 +69,30 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
   }
   final procedure = incoming.frame.procedure ?? Name.empty;
   if (!incoming.expectsReply) {
+    final done = Completer<void>();
+    void failed(SwitchboardException error) {
+      _log.fine('forwarded ${incoming.frame} dropped: $error');
+      incoming._bulk?.abandon();
+      done.complete();
+    }
+
     try {
       final (payload, bulk) = incoming._forwardPayload();
-      target._send(procedure, payload, bulk: bulk);
+      target._sendFrame(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: procedure,
+          payload: payload,
+        ),
+        bulk: bulk,
+        onSent: (out) =>
+            done.complete(out?.done.then<void>((_) {}, onError: (Object _) {})),
+        onFailure: failed,
+      );
     } on SwitchboardException catch (e) {
-      _log.fine('forwarded ${incoming.frame} dropped: $e');
-      // Its payload, if streamed, will not be read either.
-      incoming._bulk?.abandon();
+      failed(e);
     }
-    return Future<void>.value();
+    return done.future;
   }
   final stream = incoming.expectsStream;
   return _Relay.start(incoming, (relay) {
@@ -120,6 +136,10 @@ class _Relay implements _ResponseSink {
   /// The forwarded request ended.
   bool _ended = false;
 
+  /// The outgoing handle is not installed until the initial send returns.
+  bool _starting = true;
+  bool _finishing = false;
+
   /// Requests forwarded on behalf of replies to [incoming], still going.
   int _nested = 0;
 
@@ -137,6 +157,7 @@ class _Relay implements _ResponseSink {
     }
     final relay = _Relay._(incoming);
     if (!incoming.canReply) {
+      relay._starting = false;
       relay._end();
       return relay._done.future;
     }
@@ -157,7 +178,9 @@ class _Relay implements _ResponseSink {
       }
       relay._abortIncoming(_localFailure(status));
       relay._end();
-      return relay._done.future;
+    } finally {
+      relay._starting = false;
+      relay._checkDone();
     }
     final cancel = relay._cancelWhenSent;
     if (cancel != null) {
@@ -190,8 +213,18 @@ class _Relay implements _ResponseSink {
   }
 
   void _checkDone() {
-    if (_ended && _nested == 0 && !_done.isCompleted) {
-      _done.complete();
+    if (_ended && _nested == 0 && !_starting && !_finishing) {
+      _finishing = true;
+      // The final header ends the request before its bytes necessarily
+      // arrive. Keep the forwarding owner (notably a slot gate's idle
+      // close) alive until both the upload and all replies have drained.
+      final transfers = [...?_out?.bulkOuts, ...incoming._bulkOuts];
+      _done.complete(
+        Future.wait<void>([
+          for (final out in transfers)
+            out.done.then<void>((_) {}, onError: (Object _) {}),
+        ]).then<void>((_) {}),
+      );
     }
   }
 

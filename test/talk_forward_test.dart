@@ -1202,6 +1202,51 @@ void main() {
       expect(answer.payload, [7, 8]);
     });
 
+    test('forwarding a plain message waits for its bulk payload', () async {
+      final (client, front) = await muxTalk(
+        far: TalkOptions(streamBulk: (_) => true),
+      );
+      final (back, backend) = await muxTalk();
+      final source = StreamController<List<int>>();
+      var forwarded = false;
+      front.messages.listen((message) {
+        forwardMessage(message, back).then((_) => forwarded = true);
+      });
+      final received = backend.messages.first;
+      client.send('NOTE', Uint8List(0), bulk: source.stream);
+      await pumpEventQueue();
+      expect(forwarded, isFalse);
+      source.add(pattern(100000));
+      await source.close();
+      expect((await received).payload, pattern(100000));
+      await pumpEventQueue();
+      expect(forwarded, isTrue);
+    });
+
+    test('forwarding stays active until the bulk reply has finished', () async {
+      final (client, front) = await muxTalk();
+      final (back, backend) = await muxTalk();
+      final source = StreamController<List<int>>();
+      var forwarded = false;
+      front.messages.listen((message) {
+        forwardMessage(message, back).then((_) {
+          forwarded = true;
+          // A forwarding owner may release its target when the exchange
+          // ends, as the slot gate does after its idle delay.
+          back.close();
+        });
+      });
+      backend.messages.listen((message) => message.replyBulk(source.stream));
+      final response = client.request('GET', Uint8List(0));
+      await pumpEventQueue();
+      expect(forwarded, isFalse);
+      source.add(pattern(100000));
+      await source.close();
+      expect((await response).payload, pattern(100000));
+      await pumpEventQueue();
+      expect(forwarded, isTrue);
+    });
+
     test('a cancel stops the piped payload on both hops', () async {
       final (client, backend) = await chain(backendStreams: true);
       final failed = Completer<Object>();

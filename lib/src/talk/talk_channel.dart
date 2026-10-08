@@ -821,6 +821,7 @@ class TalkChannel {
     TalkFrame frame, {
     _BulkSource? bulk,
     void Function(_BulkOut out)? onBulk,
+    void Function(_BulkOut? out)? onSent,
     void Function(SwitchboardException error)? onFailure,
   }) {
     if (_closing) {
@@ -836,6 +837,7 @@ class TalkChannel {
           if (out != null) {
             onBulk?.call(out);
           }
+          onSent?.call(out);
         } on Object catch (e) {
           final error = e is SwitchboardException
               ? e
@@ -853,6 +855,7 @@ class TalkChannel {
     if (out != null) {
       onBulk?.call(out);
     }
+    onSent?.call(out);
   }
 
   /// Whether a frame sent now waits in [_deferred]: frames wait there
