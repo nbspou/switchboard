@@ -723,7 +723,9 @@ class RelayConfig { RelayConfig({Name? type /* _relay */, List<Uri>? endpoints /
 /// inner payload malformed, untyped, with a host hint, or of a reserved type: INVALID_ARGUMENT;
 /// identified consumer without `open` for the inner type: PERMISSION_DENIED (checked again when
 /// the consumer identifies while the inner channel is being opened, which is then closed
-/// CANCELLED); maxChannelsPerConnection reached (0 = none): RESOURCE_EXHAUSTED; then
+/// CANCELLED); with requireIdentity, an identity that expires while opening likewise closes the
+/// inner channel CANCELLED and refuses the consumer UNAUTHENTICATED;
+/// maxChannelsPerConnection reached (0 = none): RESOURCE_EXHAUSTED; then
 /// openForwarded (selection as selectAndConnect, never to own listeners; records with endpoints
 /// filtered out unless allowEndpoints): no record NOT_FOUND, only records with endpoints
 /// FAILED_PRECONDITION, brokering failed UNAVAILABLE;
