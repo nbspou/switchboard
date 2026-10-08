@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/talk/talk_bulk.dart';
 import 'package:switchboard/src/talk/talk_frame.dart';
 import 'package:test/test.dart';
 
@@ -137,11 +138,47 @@ final List<(String, String, TalkFrame)> positive = [
       requestId: 0xFFFFFF,
     ),
   ),
+  (
+    'Request "PUT" id 1 with a bulk payload: bulk number 1, 1048576 bytes',
+    '43 50 55 54 00 00 00 00 00 01 00 00 01 00 00 00 00 00 10 00 00 00',
+    TalkFrame(
+      kind: TalkKind.message,
+      procedure: Name('PUT'),
+      requestId: 1,
+      bulk: true,
+      payload: TalkBulkReference(1, length: 1048576).encode(),
+    ),
+  ),
+  (
+    'Final response to 1 with a bulk payload: bulk number 1, length unknown',
+    '44 01 00 00 01 00 00 00 FF FF FF FF FF FF',
+    TalkFrame(
+      kind: TalkKind.message,
+      responseId: 1,
+      bulk: true,
+      payload: TalkBulkReference(1).encode(),
+    ),
+  ),
+  (
+    'Stream item to 2 with a bulk payload: bulk number 2, 0 bytes',
+    '54 02 00 00 02 00 00 00 00 00 00 00 00 00',
+    TalkFrame(
+      kind: TalkKind.streamItem,
+      responseId: 2,
+      bulk: true,
+      payload: TalkBulkReference(2, length: 0).encode(),
+    ),
+  ),
 ];
 
 /// Negative vectors from the wiki (each MUST be a channel protocol error).
 const List<(String, String)> negative = [
-  ('Reserved bit 0x40', '41 48 45 4C 4C 4F 00 00 00'),
+  ('BULK on an abort', '64 01 00 00 05 00'),
+  ('BULK on an extend', '74 01 00 00'),
+  (
+    'BULK with a 4-byte reference',
+    '43 50 55 54 00 00 00 00 00 01 00 00 01 00 00 00',
+  ),
   ('STREAM without HAS_REQUEST', '09 48 45 4C 4C 4F 00 00 00'),
   ('Request id 0', '03 48 45 4C 4C 4F 00 00 00 00 00 00'),
   ('STREAM_ITEM without HAS_RESPONSE', '11 48 45 4C 4C 4F 00 00 00'),
@@ -156,6 +193,17 @@ const List<(String, String)> negative = [
 /// vectors.
 const List<(String, String)> negativeExtra = [
   ('Reserved bit 0x80', '81 48 45 4C 4C 4F 00 00 00'),
+  ('BULK with an empty reference', '41 48 45 4C 4C 4F 00 00 00'),
+  (
+    'BULK with an 11-byte reference',
+    '41 48 45 4C 4C 4F 00 00 00 01 00 00 00 00 00 00 00 00 00 00',
+  ),
+  (
+    'BULK reference to bulk number 0',
+    '41 48 45 4C 4C 4F 00 00 00 00 00 00 00 05 00 00 00 00 00',
+  ),
+  ('BULK on a cancel', '62 02 00 00 01 00'),
+  ('BULK on a channel abort', '60 10 00'),
   ('Empty input', ''),
   ('Response id 0', '04 00 00 00'),
   ('Chained with response id 0', '06 01 00 00 00 00 00'),
@@ -182,6 +230,38 @@ void main() {
         expect(hexString(expected.encode()), hexString(bytes));
       });
     }
+
+    test('bulk references decode', () {
+      expect(
+        TalkFrame.decode(
+          hexBytes(
+            '43 50 55 54 00 00 00 00 00 01 00 00 01 00 00 00 00 00 10 00 00 00',
+          ),
+        ).bulkReference,
+        TalkBulkReference(1, length: 1048576),
+      );
+      final unknown = TalkFrame.decode(
+        hexBytes('44 01 00 00 01 00 00 00 FF FF FF FF FF FF'),
+      ).bulkReference;
+      expect(unknown.number, 1);
+      expect(unknown.length, isNull);
+      final empty = TalkFrame.decode(
+        hexBytes('54 02 00 00 02 00 00 00 00 00 00 00 00 00'),
+      ).bulkReference;
+      expect(empty.number, 2);
+      expect(empty.length, 0);
+      // The largest values survive the 48-bit arithmetic on the web too.
+      final largest = TalkBulkReference(
+        TalkBulkReference.maxNumber,
+        length: TalkBulkReference.maxLength,
+      );
+      expect(hexString(largest.encode()), 'FF FF FF FF FE FF FF FF FF FF');
+      expect(TalkBulkReference.decode(largest.encode()), largest);
+      expect(
+        () => TalkFrame.decode(hexBytes('04 01 00 00')).bulkReference,
+        throwsStateError,
+      );
+    });
 
     test('abort statuses decode', () {
       expect(

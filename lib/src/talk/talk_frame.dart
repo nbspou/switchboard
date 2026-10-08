@@ -12,6 +12,7 @@ import 'dart:typed_data';
 import '../bytes.dart';
 import '../name.dart';
 import '../status.dart';
+import 'talk_bulk.dart';
 
 /// The kind of a Talk message, bits `0x30` of the flags byte.
 ///
@@ -36,7 +37,9 @@ enum TalkKind {
 ///
 /// A [requestId] or [responseId] of 0 means the field is absent (0 is never
 /// a valid id on the wire). A null [procedure] means the procedure field is
-/// absent, which receivers treat as the all-zero name.
+/// absent, which receivers treat as the all-zero name. With [bulk] the
+/// payload field is a [TalkBulkReference] to a bulk channel carrying the
+/// payload (see [TalkBulkReference]).
 ///
 /// See the wiki page "Polyverse Switchboard Talk" for the layout and the flag rules.
 class TalkFrame {
@@ -47,6 +50,7 @@ class TalkFrame {
     this.requestId = 0,
     this.responseId = 0,
     this.stream = false,
+    this.bulk = false,
     Uint8List? payload,
   }) : payload = payload ?? _emptyPayload;
 
@@ -65,8 +69,13 @@ class TalkFrame {
   /// Mask of the kind field.
   static const int kindMask = 0x30;
 
-  /// Reserved bits; receiving either set is a channel protocol error.
-  static const int reservedMask = 0xC0;
+  /// Flag bit: the payload is on a bulk channel; the payload field is a
+  /// [TalkBulkReference]. Valid on [TalkKind.message] and
+  /// [TalkKind.streamItem].
+  static const int flagBulk = 0x40;
+
+  /// Reserved bit; receiving it set is a channel protocol error.
+  static const int reservedMask = 0x80;
 
   /// Largest valid request or response id (`u24`).
   static const int maxId = 0xFFFFFF;
@@ -95,8 +104,34 @@ class TalkFrame {
   /// The `STREAM` flag: the sender accepts `STREAM_ITEM` responses.
   final bool stream;
 
+  /// The `BULK` flag: [payload] is a [TalkBulkReference], and the payload
+  /// itself travels on the bulk channel it names.
+  final bool bulk;
+
   /// The payload. After [decode] this is a view into the decoded buffer.
+  /// With [bulk], the 10-byte bulk reference ([bulkReference]).
   final Uint8List payload;
+
+  /// The bulk reference a [bulk] frame carries as its payload. Throws
+  /// [StateError] for a frame without [bulk], and [ProtocolException] for
+  /// a malformed reference (which [decode] never returns).
+  TalkBulkReference get bulkReference {
+    if (!bulk) {
+      throw StateError('only BULK frames carry a bulk reference');
+    }
+    return TalkBulkReference.decode(payload);
+  }
+
+  /// A copy of this frame with [bulk] set and [reference] as its payload.
+  TalkFrame withBulk(TalkBulkReference reference) => TalkFrame(
+    kind: kind,
+    procedure: procedure,
+    requestId: requestId,
+    responseId: responseId,
+    stream: stream,
+    bulk: true,
+    payload: reference.encode(),
+  );
 
   /// True when [requestId] is present.
   bool get hasRequest => requestId != 0;
@@ -110,7 +145,8 @@ class TalkFrame {
       (hasRequest ? flagHasRequest : 0) |
       (hasResponse ? flagHasResponse : 0) |
       (stream ? flagStream : 0) |
-      (kind.index << 4);
+      (kind.index << 4) |
+      (bulk ? flagBulk : 0);
 
   /// The status carried by an [TalkKind.abort] frame.
   ///
@@ -194,10 +230,18 @@ class TalkFrame {
       hasRequest: hasRequest,
       hasResponse: hasResponse,
       stream: stream,
+      bulk: bulk,
       payloadLength: payload.length,
     );
     if (error != null) {
       throw ArgumentError(error);
+    }
+    if (bulk) {
+      try {
+        TalkBulkReference.decode(payload);
+      } on ProtocolException catch (e) {
+        throw ArgumentError(e.status.reason);
+      }
     }
     final length =
         1 +
@@ -229,10 +273,12 @@ class TalkFrame {
 
   /// Decodes one Talk message.
   ///
-  /// Throws [ProtocolException] for a truncated header, reserved bits, an
-  /// invalid flag combination, an invalid procedure name, or a violation of
-  /// the kind rules (an `EXTEND` payload that is neither empty nor
-  /// [extendPayloadLength] bytes long among them).
+  /// Throws [ProtocolException] for a truncated header, the reserved bit,
+  /// an invalid flag combination, an invalid procedure name, or a violation
+  /// of the kind rules (an `EXTEND` payload that is neither empty nor
+  /// [extendPayloadLength] bytes long among them, `BULK` on an `ABORT` or
+  /// an `EXTEND`, and a bulk reference that is not a valid
+  /// [TalkBulkReference]).
   static TalkFrame decode(Uint8List bytes) {
     final reader = ByteReader(bytes);
     try {
@@ -247,6 +293,7 @@ class TalkFrame {
       final hasRequest = flags & flagHasRequest != 0;
       final hasResponse = flags & flagHasResponse != 0;
       final stream = flags & flagStream != 0;
+      final bulk = flags & flagBulk != 0;
       final procedure = hasProcedure ? reader.name('procedure') : null;
       final requestId = hasRequest ? reader.u24('request id') : 0;
       if (hasRequest && requestId == 0) {
@@ -263,10 +310,14 @@ class TalkFrame {
         hasRequest: hasRequest,
         hasResponse: hasResponse,
         stream: stream,
+        bulk: bulk,
         payloadLength: payload.length,
       );
       if (error != null) {
         throw ProtocolException(error);
+      }
+      if (bulk) {
+        TalkBulkReference.decode(payload);
       }
       return TalkFrame(
         kind: kind,
@@ -274,6 +325,7 @@ class TalkFrame {
         requestId: requestId,
         responseId: responseId,
         stream: stream,
+        bulk: bulk,
         payload: payload,
       );
     } on FormatException catch (e) {
@@ -290,10 +342,19 @@ class TalkFrame {
     required bool hasRequest,
     required bool hasResponse,
     required bool stream,
+    required bool bulk,
     required int payloadLength,
   }) {
     if (stream && !hasRequest) {
       return 'STREAM without HAS_REQUEST';
+    }
+    if (bulk) {
+      if (kind == TalkKind.abort || kind == TalkKind.extend) {
+        return 'BULK on ${kind == TalkKind.abort ? 'ABORT' : 'EXTEND'}';
+      }
+      if (payloadLength != TalkBulkReference.encodedLength) {
+        return 'BULK reference of $payloadLength bytes';
+      }
     }
     switch (kind) {
       case TalkKind.message:
@@ -335,6 +396,7 @@ class TalkFrame {
         other.requestId != requestId ||
         other.responseId != responseId ||
         other.stream != stream ||
+        other.bulk != bulk ||
         other.payload.length != payload.length) {
       return false;
     }
@@ -353,6 +415,7 @@ class TalkFrame {
     requestId,
     responseId,
     stream,
+    bulk,
     payload.length,
   );
 
@@ -370,6 +433,9 @@ class TalkFrame {
     }
     if (stream) {
       parts.add('stream');
+    }
+    if (bulk) {
+      parts.add('bulk');
     }
     parts.add('${payload.length} bytes');
     return 'TalkFrame(${parts.join(', ')})';

@@ -16,6 +16,7 @@ import '../address/service_address.dart';
 import '../bytes.dart';
 import '../name.dart';
 import '../status.dart';
+import '../talk/talk_bulk.dart';
 
 /// Talk procedure names of the naming service.
 class Procedures {
@@ -110,6 +111,13 @@ class Services {
   /// (UTF-8). See the wiki page "Polyverse Switchboard Identity and Credentials",
   /// section "Relay", and `RelayService`.
   static final Name relay = Name('_relay');
+
+  /// Bulk channels: the payload of one Talk message of another channel of
+  /// the same connection; the application payload names that channel and
+  /// the bulk number ([TalkBulkOpen]). Routed to the parent's Talk layer
+  /// before any listener policy. See the wiki page "Polyverse Switchboard
+  /// Talk", section "Bulk payloads".
+  static final Name bulk = TalkBulkOpen.type;
 }
 
 // All decoders in this file ignore trailing bytes after a complete

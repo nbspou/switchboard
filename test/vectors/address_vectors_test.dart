@@ -15,6 +15,7 @@ import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/talk/talk_bulk.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -127,6 +128,45 @@ void main() {
       '05 63 68 61 74 00 00 00 00 07 00 00 00',
       type: Name('chat'),
       shard: 7,
+    );
+  });
+
+  test('_bulk, parent channel 2, bulk number 1', () {
+    final bytes = hexBytes(
+      '01 5F 62 75 6C 6B 00 00 00 02 00 00 00 00 00 01 00 00 00',
+    );
+    final address = ChannelAddress.decode(bytes);
+    expect(address.type, Services.bulk);
+    expect(address.type, Name('_bulk'));
+    expect(address.instance, 0);
+    expect(address.shard, isNull);
+    expect(address.host, isNull);
+    expect(TalkBulkOpen.isBulk(address), isTrue);
+    final open = TalkBulkOpen.decode(address);
+    expect(open.parentId, 2);
+    expect(open.number, 1);
+    expect(TalkBulkOpen(2, 1).encode(), bytes);
+    // A long parent id, and the largest number, on the web too.
+    final long = TalkBulkOpen(0xFFFFFFFFFFFE, 0xFFFFFFFF);
+    final decoded = TalkBulkOpen.decode(ChannelAddress.decode(long.encode()));
+    expect(decoded.parentId, 0xFFFFFFFFFFFE);
+    expect(decoded.number, 0xFFFFFFFF);
+    // Truncated, or bulk number 0: a protocol error.
+    expect(
+      () => TalkBulkOpen.decode(
+        ChannelAddress.decode(
+          hexBytes('01 5F 62 75 6C 6B 00 00 00 02 00 00 00 00 00 01 00 00'),
+        ),
+      ),
+      throwsA(isA<ProtocolException>()),
+    );
+    expect(
+      () => TalkBulkOpen.decode(
+        ChannelAddress.decode(
+          hexBytes('01 5F 62 75 6C 6B 00 00 00 02 00 00 00 00 00 00 00 00 00'),
+        ),
+      ),
+      throwsA(isA<ProtocolException>()),
     );
   });
 
