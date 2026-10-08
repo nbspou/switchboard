@@ -723,6 +723,47 @@ void main() {
       });
     });
 
+    test('a forwarded payload waiting for a paused reader is neither cut '
+        'nor timed out', () {
+      fakeAsync((async) {
+        final piping = TalkOptions(streamBulk: (_) => true);
+        final (client, front, closeFront) = fakeTalk(
+          async,
+          near: piping,
+          far: piping,
+        );
+        final (back, backend, closeBack) = fakeTalk(async, near: piping);
+        front.messages.listen((m) => forwardMessage(m, back).ignore());
+        backend.messages.listen(
+          (m) => m
+              .replyBulk(Stream.value(pattern(300000)), length: 300000)
+              .ignore(),
+        );
+        final (outcome, _) = watch(client.request('GET', Uint8List(0)));
+        async.elapse(Duration.zero);
+        final response = outcome() as TalkMessage;
+        final received = BytesBuilder();
+        var ended = false;
+        final reading = response.bulk.listen(
+          received.add,
+          onError: (Object e) => fail('$e'),
+          onDone: () => ended = true,
+        )..pause();
+        // Every hop waits for the client, which does not read: longer than
+        // the idle timeout, and than the close confirmation timeout of the
+        // forwarded bulk channel, whose source ended meanwhile.
+        async.elapse(const Duration(minutes: 2));
+        expect(ended, isFalse);
+        reading.resume();
+        async.elapse(Duration.zero);
+        expect(ended, isTrue);
+        expect(received.takeBytes(), pattern(300000));
+        reading.cancel();
+        closeFront();
+        closeBack();
+      });
+    });
+
     test('an unclaimed bulk channel goes idle too', () {
       fakeAsync((async) {
         final (talk, server, close) = fakeTalk(

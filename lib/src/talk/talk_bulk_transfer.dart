@@ -309,6 +309,8 @@ class _BulkOut {
     _from = from;
     from._grant();
     var received = 0;
+    // The last send: they complete in order.
+    var sending = Future<void>.value();
     from._attach(
       (data) {
         final length = data.length;
@@ -329,7 +331,7 @@ class _BulkOut {
           return;
         }
         try {
-          channel
+          sending = channel
               .send(data)
               .then(
                 (_) => from._consume(length),
@@ -352,7 +354,11 @@ class _BulkOut {
             ),
           );
         } else {
-          _finish(null);
+          // The CLOSE would wait behind what still waits for credit, but
+          // its confirmation is timed from now: a reader slower than that
+          // would see the payload cut. Closed once the window took it all,
+          // as a payload sent from a source is.
+          unawaited(sending.then((_) => _finish(null)));
         }
       },
     );
