@@ -469,6 +469,35 @@ void main() {
   });
 
   group('receive window', () {
+    test(
+      'grant inside an automatic listener counts the delivered frame',
+      () async {
+        final (mux, raw) = rawPair(
+          options: rawOptions.copyWith(
+            announceLimits: true,
+            initialWindow: MuxLimits.maxWindow,
+          ),
+        );
+        addTearDown(mux.close);
+        final channel = mux.open(empty);
+        final checked = Completer<Object?>();
+        channel.stream.listen((_) {
+          try {
+            channel.grant(1);
+            checked.complete();
+          } on Object catch (error) {
+            checked.complete(error);
+          }
+        });
+        raw.send(hexString(MuxFrame.data(channel.id, empty).encode()));
+        expect(await checked.future, isArgumentError);
+        expect(
+          channel.receiveWindow,
+          MuxLimits.maxWindow - MuxCredit.frameOverhead,
+        );
+      },
+    );
+
     /// A channel the mux opened over [raw], after the mux's LIMITS of
     /// [window].
     Future<(MuxConnection, RawPeer, MuxChannel)> opened(

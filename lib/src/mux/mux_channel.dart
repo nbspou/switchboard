@@ -910,7 +910,6 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   void _drain() {
     _drainScheduled = false;
-    var consumed = 0;
     while (_queue.isNotEmpty && _incoming.hasListener && !_incoming.isPaused) {
       final payload = _queue.removeFirst();
       final cost = MuxCredit.costOf(payload.length);
@@ -920,13 +919,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
         // Held by the listener until it reports it consumed.
         _held += cost;
       } else {
-        consumed += cost;
+        // Already taken when the callback runs. Keep the cost in the
+        // accounting if it calls grant; return the batch after delivery.
+        _unreturned += cost;
       }
       _incoming.add(payload);
     }
-    if (consumed != 0) {
-      _consume(consumed);
-    }
+    _consume(0);
     if (_endRequested && _queue.isEmpty && !_incoming.isClosed) {
       unawaited(_incoming.close());
     }
