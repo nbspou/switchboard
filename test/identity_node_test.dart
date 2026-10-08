@@ -167,6 +167,20 @@ Future<(Switchboard, Uri)> server(
 Future<String> open(Switchboard client, Uri endpoint, Name type) async =>
     answerOf(await client.openChannelAt(endpoint, ChannelAddress(type: type)));
 
+class _BrokerResolver extends StaticResolver implements BrokeringResolver {
+  _BrokerResolver(this.onConnect);
+
+  final Future<String> Function(Uri endpoint, Uint8List intent) onConnect;
+
+  @override
+  Future<String> connectTo(
+    ServiceAddress address,
+    Uri endpoint,
+    Uint8List intent, {
+    Duration? timeout,
+  }) => onConnect(endpoint, intent);
+}
+
 void main() {
   setUpAll(() async {
     authority = await CredentialIssuer.ed25519FromSeed(
@@ -179,6 +193,28 @@ void main() {
     npcKey = await HolderKey.generate();
     gateKey = await HolderKey.generate();
     workerKey = await HolderKey.generate();
+  });
+
+  test('a dial-back arriving before CONNECT fails is sent GOAWAY', () async {
+    final worker = await node(
+      credential: await workerCredential(),
+      holderKey: workerKey,
+    );
+    late MuxConnection dialled;
+    final resolver = _BrokerResolver((endpoint, intent) async {
+      dialled = await worker.dial(endpoint, intent: intent);
+      // The worker identified successfully, but its CONNECT reply is lost
+      // or rejected before the naming service confirms the request.
+      throw SwitchboardException.of(StatusCode.unavailable);
+    });
+    addTearDown(resolver.close);
+    final consumer = await node(resolver: resolver);
+    await consumer.listenMemory();
+    await expectLater(
+      consumer.broker(ServiceAddress(npc, 1)),
+      throwsCode(StatusCode.unavailable),
+    );
+    expect(await dialled.done.timeout(limit), hasCode(StatusCode.goingAway));
   });
 
   for (final scheme in ['mem', 'tcp']) {

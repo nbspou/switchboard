@@ -1481,7 +1481,9 @@ class Switchboard {
   /// connection is accepted: the policy of the listener it arrived on
   /// applies to the channels the instance opens on it, and channels this
   /// node opens on it carry the payload of an accepted connection (see
-  /// [payloadFor]).
+  /// [payloadFor]). If brokering fails, a connection that already arrived
+  /// is sent GOAWAY too, even if the naming service's answer failed before
+  /// the connection could be checked.
   ///
   /// The connection is not pooled: the caller owns it and ends it with
   /// [MuxConnection.goAway], as with [dial]. [openChannel] and the other
@@ -1632,9 +1634,10 @@ class Switchboard {
           _abandoned.remove(_abandoned.first);
         }
       }
-      if (connection != null) {
-        unawaited(connection.goAway());
-      }
+      // The dial-back may already have arrived while CONNECT was still
+      // pending. Its failure must close that connection even when we
+      // never reached the await of arrived.future above.
+      arrived.future.then((connection) => connection.goAway()).ignore();
       _log.fine('brokering $address failed: $e');
       if (_closing) {
         throw _closedException();
