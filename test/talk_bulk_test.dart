@@ -416,6 +416,29 @@ void main() {
     expect(received, ['SMALL 50 false', 'BIG 200 true', 'AFTER 10 false']);
   });
 
+  test(
+    'a large answer to a request completes while its requester drains',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final answering = Completer<TalkMessage>();
+      server.messages.listen(answering.complete);
+      final big = talk.request('GET', Uint8List(0));
+      final request = await answering.future;
+      // The client sends GOAWAY: no new channels toward it, but the bulk
+      // channel of an answer on a channel it opened is not a new one.
+      final drained = peers.client.goAway();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(peers.server.peerGoingAway, isTrue);
+      request.reply(pattern(150000));
+      final answer = await big;
+      expect(answer.isBulk, isTrue);
+      expect(answer.payload, pattern(150000));
+      await talk.close();
+      await drained;
+    },
+  );
+
   test('a lower bulkThreshold sends bulk earlier', () async {
     final peers = await Peers.connect();
     final (talk, server) = await peers.open(

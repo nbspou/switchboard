@@ -502,12 +502,18 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// could overtake while the message waits for credit or for the
   /// transport.
   ///
+  /// Such a channel continues work the connection admitted already, so a
+  /// GOAWAY, sent or received, does not refuse it (a peer of this
+  /// implementation admits a `_bulk` OPEN for an open channel after its
+  /// own GOAWAY likewise): an answer in flight can still carry a bulk
+  /// payload while the connection drains.
+  ///
   /// If this channel stops sending before the OPEN goes out (the peer
   /// closed it, the connection ended, or this channel's close confirmation
   /// timed out with the OPEN still waiting for credit), the new channel is
   /// never opened: it ends at once with [StatusCode.cancelled], its id
-  /// released. Throws like [MuxConnection.open], and with
-  /// [StatusCode.failedPrecondition] when [canSend] is false.
+  /// released. Throws like [MuxConnection.open] (except after a GOAWAY),
+  /// and with [StatusCode.failedPrecondition] when [canSend] is false.
   MuxChannel openAfter(Uint8List openPayload) {
     if (!canSend) {
       throw SwitchboardException.of(

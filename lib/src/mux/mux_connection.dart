@@ -19,12 +19,15 @@ import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
+import '../address/channel_address.dart';
+import '../bytes.dart';
 import '../identity/credential.dart';
 import '../identity/credential_verifier.dart';
 import '../identity/ed25519.dart';
 import '../identity/holder_key.dart';
 import '../identity/peer_identity.dart';
 import '../identity/secure_random.dart';
+import '../name.dart';
 import '../status.dart';
 import '../transport/transport_capabilities.dart';
 import 'mux_channel.dart';
@@ -792,13 +795,17 @@ class MuxConnection {
   /// the caller hands it to the output scheduler in its place
   /// ([MuxChannel.openAfter]).
   MuxChannelLink _openLink(Uint8List openPayload, {required bool openWritten}) {
-    if (_closing || _goAwaySent) {
+    // A channel opened after another one ([MuxChannel.openAfter]: a Talk
+    // bulk channel) continues work the connection admitted already: a
+    // GOAWAY, ours or the peer's, does not stop it.
+    final continuation = !openWritten;
+    if (_closing || (_goAwaySent && !continuation)) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'connection is closing',
       );
     }
-    if (_peerGoAway != null) {
+    if (_peerGoAway != null && !continuation) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'peer is going away',
@@ -1423,7 +1430,7 @@ class MuxConnection {
     }
     Status? rejection;
     final payloadBudget = _openPayloadBudget;
-    if (_goAwaySent) {
+    if (_goAwaySent && !_continuesOpenChannel(payload)) {
       rejection = Status.of(StatusCode.goingAway);
     } else if (_incomingCancelled) {
       rejection = Status.of(StatusCode.unavailable, 'not accepting channels');
@@ -1470,6 +1477,26 @@ class MuxConnection {
     _undelivered.add(link);
     _scheduleIncomingDrain();
   }
+
+  /// Whether [openPayload] opens a Talk bulk channel (the reserved type
+  /// `_bulk`) for a channel open on this connection: it carries the
+  /// payload of a message of that channel, work admitted before our GOAWAY,
+  /// so the GOAWAY does not refuse it (wiki "Talk", "Bulk payloads").
+  bool _continuesOpenChannel(Uint8List openPayload) {
+    try {
+      final address = ChannelAddress.decode(openPayload);
+      if (address.type != _bulkType || address.payload.length < 10) {
+        return false;
+      }
+      final parent = ByteReader(address.payload).u48();
+      final link = _links[parent];
+      return link != null && !link.closeReceived;
+    } on ProtocolException {
+      return false;
+    }
+  }
+
+  static final Name _bulkType = Name('_bulk');
 
   /// [MuxOptions.maxOpenPayloadBytes], or half of
   /// [MuxOptions.receiveHighWaterMarkBytes] if that is smaller; null for
