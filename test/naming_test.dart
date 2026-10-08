@@ -1769,6 +1769,53 @@ void main() {
       expect(assigned, [5]);
     });
 
+    test('a remembered registration waiting to be made again keeps its '
+        'endpoints when its id goes to a new registration', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(
+          replyTimeout: Duration(milliseconds: 200),
+          requestTimeout: Duration(milliseconds: 300),
+          maxOutgoingRequests: 2,
+        ),
+      );
+      final client = NamingClient(
+        limited.call,
+        reconnectDelay: const Duration(milliseconds: 300),
+      );
+      clients.add(client);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final uris = [
+        for (var i = 1; i <= 3; i++) Uri.parse('tcp://10.0.0.$i:9000'),
+      ];
+      final third = <int>[];
+      expect(await client.register(type, [uris[0]]), 1);
+      expect(await client.register(type, [uris[1]]), 2);
+      expect(await client.register(type, [uris[2]], onAssigned: third.add), 3);
+      // A fresh naming service: 1 and 2 are registered again, 3 waits for
+      // its retry (the channel sends two requests at a time).
+      final h2 = Harness();
+      addTearDown(h2.close);
+      limited.harness = h2;
+      await h.service.close();
+      await until(() => h2.service.table.length == 2);
+      expect(await client.register(type, [uriB]), 3);
+      await until(() => h2.service.table.length == 4);
+      final published = {
+        for (final r in h2.service.table.values)
+          r.address.instance: r.endpoints,
+      };
+      expect(published, {
+        1: [uris[0]],
+        2: [uris[1]],
+        3: [uriB],
+        4: [uris[2]],
+      });
+      expect(third, [3, 4]);
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();

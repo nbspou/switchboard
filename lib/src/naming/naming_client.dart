@@ -1026,7 +1026,9 @@ class NamingClient {
       }
       return;
     }
-    if (entry.completer.isCompleted && assigned != entry.instance) {
+    if (entry.completer.isCompleted &&
+        entry.instance != 0 &&
+        assigned != entry.instance) {
       _log.warning(
         're-registered ${ServiceAddress(entry.type, entry.instance)} as '
         '${ServiceAddress(entry.type, assigned)}',
@@ -1037,17 +1039,29 @@ class NamingClient {
     entry.session = session;
     entry.refusals = 0;
     // At most one remembered registration per address: an older one that
-    // ended up with the same id (it asked for any id and was given the one
-    // this entry asked for) is superseded by this, the later answer.
-    for (final older in [
+    // ended up with the same id on this channel (it asked for any id and
+    // was given the one this entry asked for) is superseded by this, the
+    // later answer. A remembered one that is not registered on this channel
+    // (it waits to be registered again) has lost its id to this entry, and
+    // asks for a new one when it is.
+    for (final other in [
       for (final e in _entries)
         if (!identical(e, entry) &&
             e.type == entry.type &&
             e.instance == assigned &&
-            e.completer.isCompleted)
+            e.completer.isCompleted &&
+            !identical(e.pending, session))
           e,
     ]) {
-      _supersede(older, entry);
+      if (identical(other.session, session)) {
+        _supersede(other, entry);
+      } else {
+        _log.warning(
+          '${ServiceAddress(entry.type, assigned)} went to another '
+          'registration of this client; asking for a new id',
+        );
+        other.instance = 0;
+      }
     }
     // Whatever it replaced, it replaced.
     entry.replacesOn = null;
