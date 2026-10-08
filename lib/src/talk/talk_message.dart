@@ -70,7 +70,9 @@ abstract class TalkMessage {
 
   /// True once the peer cancelled this request, or once the request can no
   /// longer be answered: the responder timeout expired, the channel closed,
-  /// or the peer reused its id. Work on the request should stop.
+  /// the peer reused its id, or the listener it was delivered to threw
+  /// before answering it (the channel then answered `ABORT INTERNAL`). Work
+  /// on the request should stop.
   bool get isCancelled;
 
   /// Completes when [isCancelled] becomes true. Never completes for a
@@ -208,16 +210,18 @@ abstract class TalkMessage {
   /// with its status.
   ///
   /// When the request is cancelled ([onCancel]: the peer cancelled it, the
-  /// responder timeout expired, or the channel closed) the subscription to
-  /// [items] is cancelled and nothing more is sent; when the peer
-  /// cancelled, the channel has already answered `ABORT CANCELLED`. Each
-  /// item restarts the responder timeout (or renews it by the declared
-  /// renewal); a source slower than [TalkOptions.replyTimeout] between
-  /// items should be paired with [setReplyTimeout] or with an [extend]
-  /// that declares a deadline or a renewal.
+  /// responder timeout expired, the channel closed, or the listener that
+  /// called this threw) the subscription to [items] is cancelled and
+  /// nothing more is sent; when the peer cancelled, the channel has already
+  /// answered `ABORT CANCELLED`. Each item restarts the responder timeout
+  /// (or renews it by the declared renewal); a source slower than
+  /// [TalkOptions.replyTimeout] between items should be paired with
+  /// [setReplyTimeout] or with an [extend] that declares a deadline or a
+  /// renewal.
   ///
   /// The future completes once the answer has ended (or the subscription
-  /// was cancelled); it never completes with an error. Throws
+  /// was cancelled); it never completes with an error. Errors from
+  /// cancelling the source subscription are logged and handled. Throws
   /// synchronously, without listening to [items], like [replyItem] (also
   /// if the request is not a stream request) and with [ArgumentError] if
   /// [procedure] is not a valid name.
@@ -231,14 +235,25 @@ abstract class TalkMessage {
     _checkStreamReply();
     final done = Completer<void>();
     late final StreamSubscription<Uint8List> subscription;
+    var stopping = false;
     void finish() {
       if (!done.isCompleted) {
         done.complete();
       }
     }
 
-    void stop() {
-      unawaited(subscription.cancel().whenComplete(finish));
+    Future<void> stop() async {
+      if (stopping || done.isCompleted) {
+        return;
+      }
+      stopping = true;
+      try {
+        await subscription.cancel();
+      } catch (e, st) {
+        _log.fine('cancelling stream reply source failed', e, st);
+      } finally {
+        finish();
+      }
     }
 
     void abort(Object error, StackTrace stackTrace) {
@@ -267,19 +282,19 @@ abstract class TalkMessage {
     subscription = items.listen(
       (item) {
         if (!canReply) {
-          stop();
+          unawaited(stop());
           return;
         }
         try {
           replyItem(item, name: wire);
         } on SwitchboardException catch (e, st) {
           abort(e, st);
-          stop();
+          unawaited(stop());
         }
       },
       onError: (Object error, StackTrace stackTrace) {
         abort(error, stackTrace);
-        stop();
+        unawaited(stop());
       },
       onDone: () {
         if (canReply) {
@@ -291,7 +306,8 @@ abstract class TalkMessage {
         }
         finish();
       },
-      cancelOnError: true,
+      // Cancel ourselves so cleanup failures are handled by stop(), and
+      // the abort does not wait for the source's cleanup to finish.
     );
     onCancel.then((_) => stop()).ignore();
     return done.future;

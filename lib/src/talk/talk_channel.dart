@@ -31,6 +31,10 @@ part 'talk_forward.dart';
 
 final Logger _log = Logger('Switchboard.Talk');
 
+/// JavaScript timers overflow above a signed 32-bit millisecond delay.
+/// Longer expiries are rearmed from the monotonic deadline in chunks.
+const Duration _maxTimerDelay = Duration(milliseconds: 0x7FFFFFFF);
+
 /// Per-channel Talk policy.
 class TalkOptions {
   /// Creates options; the defaults are the reference defaults of the wiki.
@@ -144,16 +148,18 @@ class TalkAbortException extends SwitchboardException {
 /// * Exceptions thrown by application listeners never affect the channel.
 ///   If a listener of [messages] or [TalkStream.items] throws synchronously
 ///   while handling a request it has not yet answered, the exception is
-///   logged and the request is answered with `ABORT INTERNAL`. Exceptions
-///   in asynchronous code (for example the body of an `await for`) cannot
-///   be seen by the channel; such a request is answered by the responder
-///   timeout.
+///   logged and the request is answered with `ABORT INTERNAL` and marked
+///   cancelled ([TalkMessage.onCancel]), so that work started on it stops,
+///   a [forwardMessage] of it included. Exceptions in asynchronous code
+///   (for example the body of an `await for`) cannot be seen by the
+///   channel; such a request is answered by the responder timeout.
 /// * Error events on [messages] and [TalkStream.items] whose listener has
 ///   no `onError` handler are logged, never reported as unhandled. Futures
 ///   returned by the request API never report unhandled errors either.
 class TalkChannel {
-  /// Wraps [channel]. Starts listening to its stream immediately. A null
-  /// [options] means the defaults.
+  /// Wraps [channel]. Starts listening to its stream immediately, and
+  /// never pauses it: what waits for the application is held here (see
+  /// [messages]). A null [options] means the defaults.
   TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions? options})
     : raw = channel,
       options = options ?? const TalkOptions() {
@@ -183,7 +189,18 @@ class TalkChannel {
   final Queue<_Message> _orderedOutcomes = Queue<_Message>();
 
   /// Incoming plain messages and requests, in arrival order. Responses
-  /// never appear here. Single subscription; buffered until listened.
+  /// never appear here. Single subscription; buffered until listened, and
+  /// while the subscription is paused.
+  ///
+  /// That buffer has no byte bound. The channel reads its raw channel as
+  /// frames arrive, so the receive buffer cap of a mux channel
+  /// (`MuxOptions.maxChannelBufferBytes`) and the connection's receive
+  /// high-water mark count nothing held here. Only the peer's unanswered
+  /// requests among it are bounded, by number
+  /// ([TalkOptions.maxIncomingRequests]); plain messages are not, nor are
+  /// requests answered while they wait (by the responder timeout or a
+  /// cancel). Facing a peer that is not trusted, listen at once and do not
+  /// stay paused for long. [TalkStream.items] buffers the same way.
   ///
   /// A channel abort from the peer is delivered as an error event (a
   /// [TalkAbortException] carrying its status) and then the stream ends;
@@ -314,7 +331,10 @@ class TalkChannel {
   /// the subscription is paused the answer waits, so the body of an
   /// `await for` loop over [messages] must not wait for an ordered
   /// request. Local failures (timeout, [TalkRequest.cancel], the end of
-  /// the channel) are reported at once.
+  /// the channel) are reported at once. An answer that arrived before
+  /// them has ended the request: it is still delivered in its place, also
+  /// after the channel ended ([messages] goes on delivering what it
+  /// holds), and while the subscription stays paused it waits.
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
@@ -893,6 +913,8 @@ class TalkChannel {
         pending.fail(error);
       }
     }
+    // Answers in [_orderedOutcomes] arrived before the end: they keep their
+    // place in [_messages], which still delivers what it holds once closed.
     final incoming = _incoming.values.toList();
     _incoming.clear();
     _undeliveredRequests.clear();
@@ -1143,11 +1165,10 @@ class _Outgoing {
 
   /// Keeps the id of a cancelled request for [duration] at most.
   void armRelease(Duration duration) {
-    stopTimer();
-    _armedEnd = null;
-    if (duration > Duration.zero) {
-      timer = Timer(duration, () => channel._onRequestTimeout(this));
-    }
+    expiry
+      ..gap = duration
+      ..start(monotonicNow());
+    _arm();
   }
 
   /// When [timer] fires, if it was armed by [_arm].
@@ -1167,7 +1188,14 @@ class _Outgoing {
     if (left.isNegative) {
       left = Duration.zero;
     }
-    timer = Timer(left, () => channel._onRequestTimeout(this));
+    if (left > _maxTimerDelay) {
+      timer = Timer(_maxTimerDelay, () {
+        timer = null;
+        _arm();
+      });
+    } else {
+      timer = Timer(left, () => channel._onRequestTimeout(this));
+    }
   }
 
   /// [value] within [TalkOptions.minExtension] and
@@ -1779,7 +1807,14 @@ class _Message extends TalkMessage {
     if (left.isNegative) {
       left = Duration.zero;
     }
-    _timer = Timer(left, _onTimeout);
+    if (left > _maxTimerDelay) {
+      _timer = Timer(_maxTimerDelay, () {
+        _timer = null;
+        _arm();
+      });
+    } else {
+      _timer = Timer(left, _onTimeout);
+    }
   }
 
   void _onTimeout() {
@@ -1794,12 +1829,24 @@ class _Message extends TalkMessage {
 
   /// Answers with an abort on the channel's behalf, if still unanswered.
   /// Never while the final reply is being sent: that is the one final.
+  /// Guards this send too, since a synchronous peer may cancel during it.
   void _abortQuietly(Status status) {
     if (_finished || _finalizing || !expectsReply) {
       return;
     }
-    channel._rejectRequest(requestId, status);
-    _finish();
+    _sendReply(() => channel._rejectRequest(requestId, status), isFinal: true);
+  }
+
+  /// The listener this request was delivered to threw before answering it:
+  /// answers `ABORT INTERNAL` on its behalf and, as on the responder
+  /// timeout, marks the request cancelled, so that work started on it (a
+  /// [forwardMessage] of it included) stops.
+  void _handlerFailed() {
+    if (_finished || _finalizing || !expectsReply) {
+      return;
+    }
+    _abortQuietly(Status.of(StatusCode.internal, 'message handler failed'));
+    _markCancelled();
   }
 
   /// The peer cancelled the request: answer it with the final the protocol
@@ -1907,9 +1954,7 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
       } catch (e, st) {
         _log.severe('message handler threw on ${message.procedureName}', e, st);
         if (message is _Message) {
-          message._abortQuietly(
-            Status.of(StatusCode.internal, 'message handler failed'),
-          );
+          message._handlerFailed();
         }
       }
     });
