@@ -205,29 +205,32 @@ class _SlotManager {
 
   /// The longest a hand-over request to an instance waits for its answer
   /// until the instance declares otherwise: [NamingService.handoverTimeout],
-  /// else [NamingService.handoverMaxDuration]; null when neither bounds it.
-  Duration? get _stepBound {
+  /// else, for a request [bounded] overall (`ASSIGN`, `DRAIN`),
+  /// [NamingService.handoverMaxDuration]; null when neither bounds it.
+  Duration? _stepBound(bool bounded) {
     if (service.handoverTimeout > Duration.zero) {
       return service.handoverTimeout;
     }
-    if (service.handoverMaxDuration > Duration.zero) {
+    if (bounded && service.handoverMaxDuration > Duration.zero) {
       return service.handoverMaxDuration;
     }
     return null;
   }
 
-  /// [value] lowered to [NamingService.handoverMaxDuration].
-  Duration? _clampHandover(Duration? value) {
+  /// [value] lowered to [NamingService.handoverMaxDuration] for a request
+  /// [bounded] by it; as it is for another (`FORWARD`).
+  Duration? _clampHandover(Duration? value, bool bounded) {
     final bound = service.handoverMaxDuration;
-    return value != null && bound > Duration.zero && value > bound
+    return bounded && value != null && bound > Duration.zero && value > bound
         ? bound
         : value;
   }
 
-  /// A hand-over request for [busy] was sent to an instance: its waiters
-  /// are told how long the service waits for the answer.
-  void stepStarted(_Busy busy) {
-    final bound = _stepBound;
+  /// A hand-over request for [busy] was sent to an instance ([bounded] as
+  /// in [ask]): its waiters are told how long the service waits for the
+  /// answer.
+  void stepStarted(_Busy busy, {required bool bounded}) {
+    final bound = _stepBound(bounded);
     busy.until = bound == null ? null : monotonicNow() + bound;
     if (bound != null) {
       _tell(busy, bound, null);
@@ -237,12 +240,18 @@ class _SlotManager {
   /// The instance working on [busy] sent `EXTEND` declaring [deadline] and
   /// [renew] (both null: it restarted the service's default timeout):
   /// passed on to the waiters, the migration request it serves with the
-  /// same values.
-  void relay(_Busy busy, Duration? deadline, Duration? renew) {
-    deadline = _clampHandover(deadline);
-    renew = _clampHandover(renew);
+  /// same values. Only a request [bounded] by
+  /// [NamingService.handoverMaxDuration] has them lowered to it.
+  void relay(
+    _Busy busy,
+    Duration? deadline,
+    Duration? renew, {
+    required bool bounded,
+  }) {
+    deadline = _clampHandover(deadline, bounded);
+    renew = _clampHandover(renew, bounded);
     if (deadline == null && renew == null) {
-      deadline = _stepBound;
+      deadline = _stepBound(bounded);
       if (deadline == null) {
         return;
       }
@@ -1466,13 +1475,14 @@ class _SlotManager {
         timeout: service.handoverTimeout,
         onExtend: busy == null
             ? null
-            : (deadline, renew) => relay(busy, deadline, renew),
+            : (deadline, renew) =>
+                  relay(busy, deadline, renew, bounded: bounded),
       );
     } on SwitchboardException catch (e) {
       return Future.error(e);
     }
     if (busy != null) {
-      stepStarted(busy);
+      stepStarted(busy, bounded: bounded);
     }
     final completer = Completer<TalkMessage>();
     void onGone() {

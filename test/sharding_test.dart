@@ -1056,6 +1056,46 @@ void main() {
       expect(async.pendingTimers, isEmpty);
     }
 
+    test('a FORWARD is not bounded: what it declares reaches the MIGRATE '
+        'as declared', () {
+      fakeAsync((async) {
+        final h = Harness(handoverMaxDuration: const Duration(seconds: 1));
+        final log = <String>[];
+        final (a, _, router) = zones(async, h, log);
+        a.heartbeat = false;
+        a.declare = (procedure) =>
+            procedure == 'FORWARD' ? const Duration(seconds: 30) : null;
+        a.onForward = (_) => Future<void>.delayed(const Duration(seconds: 10));
+        final declared = <Duration?>[];
+        final m = router.channel.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 1, to: 2).encode(),
+          onExtend: (deadline, renew) => declared.add(deadline),
+        );
+        m.items.listen(null, onError: (Object _) {});
+        Object? outcome;
+        m.done.then<void>(
+          (_) => outcome = Status.ok,
+          onError: (Object e) => outcome = e,
+        );
+        async.elapse(const Duration(seconds: 11));
+        expect(log, [
+          '1 DRAIN 1 e2 to2',
+          '2 ASSIGN 1 e2 h1',
+          '1 FORWARD 1 e2 to2',
+        ]);
+        // As declared, plus the buffer each side adds to what it declares.
+        expect(
+          declared.last,
+          const Duration(seconds: 30) +
+              clientOptions.extendBuffer +
+              serverOptions.extendBuffer,
+        );
+        expect(outcome, Status.ok);
+        closeWithoutTimers(async, h);
+      });
+    });
+
     test('a DRAIN running longer is cancelled and the migration rolled '
         'back', () {
       fakeAsync((async) {
