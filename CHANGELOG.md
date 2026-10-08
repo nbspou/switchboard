@@ -268,6 +268,19 @@ The protocol specification lives in the project wiki (section
   stalled at their windows (only a backlog beyond `maxUnclaimedBulk`
   payloads holding more than the budget fails one `RESOURCE_EXHAUSTED`),
   and the idle timeout does not run meanwhile.
+- Connections to a node's own listeners: a connection the node initiates
+  to an endpoint `isOwnEndpoint` recognises (TCP, WebSocket or `mem`) is an
+  in-process `MemoryTransport` pair instead of a socket to itself. One side
+  is accepted as that listener accepts a connection (its policy, dispatch,
+  `connections`, GOAWAY on `close`, `local` as `IncomingChannel.remote`),
+  the other is the initiated connection, pooled by the endpoint as given
+  and identified, credentialed and flow-controlled as over a socket; no
+  wire change. This covers a node opening channels to a service it hosts,
+  `MeshNode.join` to the naming service the node hosts, `dial` and
+  `PeerSet` to its own endpoint, and a dial-back to itself. The proxy, the
+  relay and slot gate forwarding still never connect to the node's own
+  listeners. `Switchboard(localConnections: false)` dials them through a
+  socket as before.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row

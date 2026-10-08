@@ -526,6 +526,7 @@ Every limit is an option. The wiki page "Polyverse Switchboard Dart Reference Im
 * `dart test` runs the whole suite on the VM. `dart test -P node` runs the codec, test vector and identity tests compiled to JavaScript on Node.js, which checks the 32 and 48-bit arithmetic of the wire codecs and the pure Dart Ed25519.
 * `tool/aot_smoke.sh` compiles a small mesh (naming service, a published service, a watching client) to a native executable with `dart compile exe` and runs it. The test suite runs on the JIT, which does not catch optimiser bugs of native binaries: Dart 3.13.5 crashed the naming service's WATCH handler under AOT until `Name.==` was kept out of line ([dart-lang/sdk#64528](https://github.com/dart-lang/sdk/issues/64528)). Run it before pinning a commit for native deployments.
 * `Switchboard.listenMemory` gives a node an in-process `mem://` endpoint, so a whole mesh (naming service included) can run in one isolate, for tests or a single-process mode; `mem://` URIs mean nothing outside that isolate, so publish them to a naming service only when every node is in it.
+* A node that connects to one of its own listeners, TCP, WebSocket or `mem` (a node that hosts the naming service and joins it through its own endpoint, or opens a channel to a service it publishes), does so in-process, without a socket: the listener's policy applies and the connection is otherwise the same as over a socket (pool, identity, credentials, flow control). `Switchboard(localConnections: false)` dials its own endpoints like any other.
 
 ## Specification
 
