@@ -57,6 +57,8 @@ abstract final class WebSocketTransport {
   /// (0 for no limit) fails the stream the same way with a
   /// [SwitchboardException] carrying [StatusCode.frameTooLarge]. The
   /// WebSocket is always closed with code 1000.
+  /// Cancelling the stream subscription, even while paused, leaves the
+  /// sink writable and keeps reading to observe the peer closing.
   ///
   /// [maxFrameSize] should agree with `MuxOptions.maxFrameSize`. The
   /// check runs on complete messages: the WebSocket implementation has
@@ -121,7 +123,7 @@ class _WebSocketTransportChannel
       onListen: _onListen,
       onPause: () => _wsSub?.pause(),
       onResume: () => _wsSub?.resume(),
-      onCancel: () => _listenerGone = true,
+      onCancel: _onCancel,
     );
     _sink = _WebSocketTransportSink(this);
     // Failures also surface on the stream; keep [ready] from reporting an
@@ -154,6 +156,13 @@ class _WebSocketTransportChannel
       return;
     }
     _wsSub = _ws.stream.listen(_onMessage, onError: _onError, onDone: _onDone);
+  }
+
+  void _onCancel() {
+    _listenerGone = true;
+    // Cancellation does not call onResume for a paused subscription.
+    // Keep reading so the peer's close still closes our sink.
+    _wsSub?.resume();
   }
 
   void _onMessage(Object? message) {

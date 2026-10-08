@@ -392,6 +392,26 @@ void main() {
       await closed;
     });
 
+    test('cancelling a paused stream keeps reading until peer close', () async {
+      final input = StreamController<List<int>>();
+      final output = StreamController<List<int>>();
+      final transport = StreamTransport.wrap(input.stream, output.sink);
+      addTearDown(transport.abort);
+      final written = output.stream.toList();
+      final subscription = transport.stream.listen((_) {})..pause();
+      await pumpEventQueue();
+      expect(input.isPaused, isTrue);
+      await subscription.cancel();
+      expect(input.isPaused, isFalse);
+      transport.sink.add(hexBytes('AA'));
+      await input.close();
+      await transport.sink.done;
+      expect(
+        hexString((await written).expand((b) => b).toList()),
+        '$preambleHex 01 00 00 00 AA',
+      );
+    });
+
     test('the static codec helpers are the stream framing ones', () {
       expect(StreamTransport.encodePreamble(), StreamFraming.encodePreamble());
       expect(
@@ -624,6 +644,19 @@ void main() {
       expect(await qs.hasNext, isFalse);
       expect(await qc.hasNext, isFalse);
       expect(ws.closeCode, WebSocketTransport.normalClosure);
+    });
+
+    test('cancelling a paused stream still observes peer close', () async {
+      final client = await WebSocketTransport.connect(uri);
+      addTearDown(client.sink.close);
+      final ws = await accepted.next;
+      final serverDrained = ws.drain<void>();
+      final subscription = client.stream.listen((_) {})..pause();
+      await pumpEventQueue();
+      await subscription.cancel();
+      await ws.close();
+      await client.sink.done.timeout(const Duration(seconds: 1));
+      await serverDrained;
     });
 
     test('a text message is a protocol error', () async {

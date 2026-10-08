@@ -94,6 +94,9 @@ abstract final class StreamTransport {
   /// closing [output] (which first writes the buffered bytes) takes longer
   /// than [closeTimeout], the transport gives up: it calls [abort], if
   /// given, which should destroy the underlying connection.
+  /// Cancelling the stream subscription, even while paused, leaves the
+  /// sink writable and keeps reading to observe the peer closing; input
+  /// paused for output throttling stays paused until the output drains.
   static StreamTransportChannel wrap(
     Stream<List<int>> input,
     StreamSink<List<int>> output, {

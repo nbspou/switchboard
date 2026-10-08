@@ -87,6 +87,8 @@ Rules:
 
 A transport is a `StreamChannel<Uint8List>` whose stream yields one mux frame per event and whose sink takes one mux frame per `add`. Closing the sink closes the transport. The stream ends when the transport is closed by either side; errors on the stream mean the transport failed. After a stream error the sink stays writable until the listener has seen the error and the end of the stream, so the mux can still send GOAWAY.
 
+Cancelling a transport's stream subscription leaves its sink writable and keeps reading (discarding frames) to observe the peer closing. Cancellation releases any pause from that subscription, including when it was cancelled while paused; a separate pause for output throttling remains until the output drains.
+
 Optional capabilities, discovered by the mux with type tests (`transport_capabilities.dart`, exported from `core.dart`):
 
 ```dart
