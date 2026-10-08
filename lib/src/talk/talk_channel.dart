@@ -18,6 +18,7 @@ import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
 import '../monotonic.dart';
+import '../mux/mux_channel.dart';
 import '../name.dart';
 import '../status.dart';
 import '../status_closable.dart';
@@ -132,6 +133,18 @@ class TalkAbortException extends SwitchboardException {
 /// request started with `ordered: true` has its answer delivered in wire
 /// order with [messages] instead (see [startRequest]).
 ///
+/// Flow control: over a mux channel, Talk returns the credit of a frame
+/// when the application has taken what it carried: a plain message or a
+/// request when [messages] hands it to its listener, a stream item when
+/// [TalkStream.items] does, the answer to an `ordered` request when it is
+/// delivered in its place. Frames the channel consumes itself (a final
+/// response completing a future, aborts, `EXTEND`, cancels, frames for ids
+/// it does not know or gave up on, requests it refuses, messages nobody
+/// will read) return their credit at once, and so does a reply relayed by
+/// [forwardMessage], whose far side's credit governs. A stream that is
+/// paused or not listened to therefore stalls its channel once the window
+/// is used up (see [messages]), and only that channel.
+///
 /// Failure handling:
 ///
 /// * A malformed frame or a violation of the kind rules from the peer
@@ -161,9 +174,24 @@ class TalkChannel {
   /// Wraps [channel]. Starts listening to its stream immediately, and
   /// never pauses it: what waits for the application is held here (see
   /// [messages]). A null [options] means the defaults.
+  ///
+  /// Over a [MuxChannel] (or a slot channel carrying one) the channel is
+  /// put in [MuxChannel.manualCredit] before it is listened to, and the
+  /// credit of every frame goes back to the peer when the application has
+  /// taken what the frame carried, so that the channel's window bounds
+  /// what is held here (see [messages]). Over any other `StreamChannel`
+  /// nothing is flow controlled.
   TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions? options})
     : raw = channel,
       options = options ?? const TalkOptions() {
+    final r = raw;
+    if (r is MuxChannel) {
+      r.manualCredit = true;
+      _consume = r.consumed;
+    } else if (r is MuxChannelCarrier) {
+      (r as MuxChannelCarrier).manualCredit = true;
+      _consume = (r as MuxChannelCarrier).consumed;
+    }
     _subscription = raw.stream.listen(
       _onData,
       onError: _onError,
@@ -182,6 +210,13 @@ class TalkChannel {
   late final StreamController<TalkMessage> _messages =
       StreamController<TalkMessage>(onCancel: _onMessagesCancelled);
 
+  /// Reports frames consumed to a flow-controlled raw channel; null when
+  /// the raw channel is not one.
+  void Function(int bytes, {int subframes})? _consume;
+
+  /// The credit of the frames waiting in [_messages].
+  final _Held _messagesHeld = _Held();
+
   /// Requests added to [_messages] and not yet handed to its listener.
   final Queue<_Message> _undeliveredRequests = Queue<_Message>();
 
@@ -193,15 +228,21 @@ class TalkChannel {
   /// never appear here. Single subscription; buffered until listened, and
   /// while the subscription is paused.
   ///
-  /// That buffer has no byte bound. The channel reads its raw channel as
-  /// frames arrive, so a mux channel counts them consumed when they are
-  /// read: its flow-control window and the connection's receive high-water
-  /// mark count nothing held here. Only the peer's unanswered
-  /// requests among it are bounded, by number
-  /// ([TalkOptions.maxIncomingRequests]); plain messages are not, nor are
-  /// requests answered while they wait (by the responder timeout or a
-  /// cancel). Facing a peer that is not trusted, listen at once and do not
-  /// stay paused for long. [TalkStream.items] buffers the same way.
+  /// Flow control: over a mux channel, the credit of a message goes back
+  /// to the peer when the message is handed to the listener, not when it
+  /// arrives. So what this buffer holds is bounded by the channel's
+  /// window ([MuxChannel.receiveWindow], 64 KiB by default): a
+  /// subscription that is paused, or not there yet, stalls the peer on
+  /// this channel once the window is used up, and only this channel;
+  /// everything the peer sends on it then waits, responses to our own
+  /// requests included. Listen for as long as the peer may send messages,
+  /// or cancel the subscription. Frames the channel consumes itself
+  /// (responses completing a request, aborts, `EXTEND`, cancels, frames
+  /// for requests given up on, messages dropped or refused) return their
+  /// credit at once. [TalkStream.items] is flow controlled the same way.
+  /// Over a raw `StreamChannel` that is not a mux channel nothing bounds
+  /// this buffer; only the peer's unanswered requests are bounded, by
+  /// number ([TalkOptions.maxIncomingRequests]).
   ///
   /// A channel abort from the peer is delivered as an error event (a
   /// [TalkAbortException] carrying its status) and then the stream ends;
@@ -215,6 +256,7 @@ class TalkChannel {
   late final Stream<TalkMessage> messages = _GuardedStream(
     _messages.stream,
     _undeliveredRequests,
+    _messagesHeld,
   );
 
   final Map<int, _Outgoing> _outgoing = {};
@@ -663,6 +705,7 @@ class TalkChannel {
   void _deliverMessage(_Message message) {
     if (_messagesCancelled) {
       _log.fine('no message listener, dropping ${message.frame}');
+      _creditMessage(message);
       message._abortQuietly(
         Status.of(StatusCode.unimplemented, 'no message listener'),
       );
@@ -671,11 +714,14 @@ class TalkChannel {
     if (message.expectsReply) {
       _undeliveredRequests.add(message);
     }
+    _messagesHeld.hold(message);
     _messages.add(message);
   }
 
   void _onMessagesCancelled() {
     _messagesCancelled = true;
+    // What the controller still holds is dropped.
+    _drainHeld(_messagesHeld);
     final undelivered = _undeliveredRequests.toList();
     _undeliveredRequests.clear();
     for (final message in undelivered) {
@@ -697,11 +743,13 @@ class TalkChannel {
   /// nobody listens, or nobody will.
   void _deliverOrdered(_Message marker, void Function() outcome) {
     if (_messagesCancelled || !_messages.hasListener || _messages.isClosed) {
+      _creditMessage(marker);
       outcome();
       return;
     }
     marker._outcome = outcome;
     _orderedOutcomes.add(marker);
+    _messagesHeld.hold(marker);
     _messages.add(marker);
   }
 
@@ -709,32 +757,87 @@ class TalkChannel {
   // Receiving
 
   void _onData(Uint8List data) {
+    final wire = data.length;
     if (_closing) {
+      _credit(wire);
       return;
     }
     final TalkFrame frame;
     try {
       frame = TalkFrame.decode(data);
     } on ProtocolException catch (e) {
+      _credit(wire);
       _protocolError(e.status.reason);
       return;
     }
     switch (frame.kind) {
       case TalkKind.message:
-        _onMessage(frame);
+        _onMessage(frame, wire);
       case TalkKind.streamItem:
-        _onStreamItem(frame);
+        _onStreamItem(frame, wire);
       case TalkKind.abort:
+        _credit(wire);
         _onAbort(frame);
       case TalkKind.extend:
+        _credit(wire);
         _onExtend(frame);
     }
   }
 
-  void _onMessage(TalkFrame frame) {
+  // ---------------------------------------------------------------------
+  // Flow control
+
+  /// Reports [frames] frames of [bytes] bytes together consumed to the raw
+  /// channel, so that their credit goes back to the peer. Does nothing over
+  /// a raw channel that is not flow controlled.
+  void _credit(int bytes, {int frames = 1}) {
+    final consume = _consume;
+    if (consume == null || frames == 0) {
+      return;
+    }
+    try {
+      consume(bytes, subframes: frames);
+    } on StateError catch (e) {
+      // Accounting mismatch: logged, never fatal to the channel.
+      _log.warning('credit accounting: $e');
+    }
+  }
+
+  /// Returns the credit of [message], once: it was handed to the
+  /// application, or consumed by the channel.
+  void _creditMessage(_Message message, [_Held? held]) {
+    final bytes = message._creditBytes;
+    if (bytes == 0) {
+      return;
+    }
+    message._creditBytes = 0;
+    if (held != null && !held.drained) {
+      held.bytes -= bytes;
+      held.frames--;
+    }
+    _credit(bytes);
+  }
+
+  /// Returns the credit of everything [held] still holds: the controller
+  /// it counts for will deliver nothing more.
+  void _drainHeld(_Held held) {
+    if (held.drained) {
+      return;
+    }
+    held.drained = true;
+    final bytes = held.bytes;
+    final frames = held.frames;
+    held
+      ..bytes = 0
+      ..frames = 0;
+    _credit(bytes, frames: frames);
+  }
+
+  void _onMessage(TalkFrame frame, int wire) {
     if (!frame.hasResponse) {
-      final message = _Message(this, frame);
+      final message = _Message(this, frame).._creditBytes = wire;
       if (frame.hasRequest && !_register(message)) {
+        _creditMessage(message);
         return;
       }
       _deliverMessage(message);
@@ -742,12 +845,14 @@ class TalkChannel {
     }
     final pending = _outgoing[frame.responseId];
     if (pending == null) {
+      _credit(wire);
       _unknownResponse(frame);
       return;
     }
     _outgoing.remove(pending.id);
     pending.stopTimer();
     if (pending.abandoned) {
+      _credit(wire);
       if (frame.hasRequest) {
         _rejectRequest(
           frame.requestId,
@@ -756,24 +861,28 @@ class TalkChannel {
       }
       return;
     }
-    final message = _Message(this, frame);
+    final message = _Message(this, frame).._creditBytes = wire;
     if (frame.hasRequest) {
       _register(message);
     }
     if (pending.ordered) {
+      // Credit when the answer is delivered, in its place.
       _deliverOrdered(message, () => pending.complete(message));
     } else {
+      _creditMessage(message);
       pending.complete(message);
     }
   }
 
-  void _onStreamItem(TalkFrame frame) {
+  void _onStreamItem(TalkFrame frame, int wire) {
     final pending = _outgoing[frame.responseId];
     if (pending == null) {
+      _credit(wire);
       _unknownResponse(frame);
       return;
     }
     if (pending.abandoned) {
+      _credit(wire);
       if (frame.hasRequest) {
         _rejectRequest(
           frame.requestId,
@@ -783,11 +892,12 @@ class TalkChannel {
       return;
     }
     if (!pending.isStream) {
+      _credit(wire);
       _protocolError('STREAM_ITEM for non-stream request ${pending.id}');
       return;
     }
     pending.replied();
-    final message = _Message(this, frame);
+    final message = _Message(this, frame).._creditBytes = wire;
     if (frame.hasRequest) {
       _register(message);
     }
@@ -1127,6 +1237,9 @@ class _Outgoing {
 
   /// Item requests added to [items] and not yet handed to its listener.
   final Queue<_Message> undeliveredItems = Queue<_Message>();
+
+  /// The credit of the items waiting in [items].
+  final _Held itemsHeld = _Held();
   final Completer<TalkMessage> completer = Completer<TalkMessage>();
   Timer? timer;
 
@@ -1218,12 +1331,19 @@ class _Outgoing {
   void addItem(_Message message) {
     final sink = this.sink;
     if (sink != null) {
+      // Forwarded: the far side's credit governs.
+      channel._creditMessage(message);
       _guard(() => sink.item(message), 'forwarding an item');
+      return;
+    }
+    if (items!.isClosed) {
+      channel._creditMessage(message);
       return;
     }
     if (message.expectsReply) {
       undeliveredItems.add(message);
     }
+    itemsHeld.hold(message);
     items!.add(message);
   }
 
@@ -1286,6 +1406,7 @@ class _Outgoing {
   /// The [items] subscription was cancelled, or ended. Undelivered item
   /// requests are refused, and the request is cancelled if outstanding.
   void _onItemsCancelled() {
+    channel._drainHeld(itemsHeld);
     final undelivered = undeliveredItems.toList();
     undeliveredItems.clear();
     for (final message in undelivered) {
@@ -1331,7 +1452,11 @@ class _TalkRequest extends TalkRequest {
 
 class _TalkStream extends TalkStream {
   _TalkStream(this._pending)
-    : items = _GuardedStream(_pending.items!.stream, _pending.undeliveredItems);
+    : items = _GuardedStream(
+        _pending.items!.stream,
+        _pending.undeliveredItems,
+        _pending.itemsHeld,
+      );
 
   final _Outgoing _pending;
 
@@ -1362,6 +1487,11 @@ class _Message extends TalkMessage {
 
   @override
   final TalkFrame frame;
+
+  /// The credit of the frame that carried this message, until it is
+  /// returned ([TalkChannel._creditMessage]); 0 after, and for messages
+  /// of a channel that is not flow controlled.
+  int _creditBytes = 0;
 
   /// A final reply was sent, or the request can no longer be answered.
   bool _finished;
@@ -1902,10 +2032,11 @@ class _Message extends TalkMessage {
 /// instead of being reported as unhandled. Keeps the queue of undelivered
 /// requests up to date as events reach the listener.
 class _GuardedStream extends Stream<TalkMessage> {
-  _GuardedStream(this._source, this._undelivered);
+  _GuardedStream(this._source, this._undelivered, this._held);
 
   final Stream<TalkMessage> _source;
   final Queue<_Message> _undelivered;
+  final _Held _held;
 
   @override
   StreamSubscription<TalkMessage> listen(
@@ -1917,6 +2048,7 @@ class _GuardedStream extends Stream<TalkMessage> {
     return _GuardedSubscription(
         _source.listen(null, onDone: onDone, cancelOnError: cancelOnError),
         _undelivered,
+        _held,
       )
       ..onData(onData)
       ..onError(onError);
@@ -1924,13 +2056,20 @@ class _GuardedStream extends Stream<TalkMessage> {
 }
 
 class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
-  _GuardedSubscription(super.sourceSubscription, this._undelivered);
+  _GuardedSubscription(super.sourceSubscription, this._undelivered, this._held);
 
   final Queue<_Message> _undelivered;
+
+  /// The credit of the frames the source holds: what reaches the listener
+  /// goes back to the peer (the delivery point of flow control).
+  final _Held _held;
 
   @override
   void onData(void Function(TalkMessage data)? handleData) {
     super.onData((message) {
+      if (message is _Message) {
+        message.channel._creditMessage(message, _held);
+      }
       if (message is _Message && message._outcome != null) {
         // The answer to an ordered request, in its place among the
         // messages; never shown to the listener.
@@ -1970,4 +2109,23 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
     // A remote abort is a normal event; the status is also on `done`.
     _log.fine('talk stream error without onError handler: $error');
   }
+}
+
+/// The credit of the frames a stream controller holds for its listener:
+/// their wire bytes, returned one by one as they are delivered, all at once
+/// when the subscription is cancelled ([drained]).
+class _Held {
+  int bytes = 0;
+  int frames = 0;
+
+  /// Counts the credit of [message], added to the controller.
+  void hold(_Message message) {
+    if (message._creditBytes != 0) {
+      bytes += message._creditBytes;
+      frames++;
+    }
+  }
+
+  /// The controller delivers nothing more; its credit went back.
+  bool drained = false;
 }

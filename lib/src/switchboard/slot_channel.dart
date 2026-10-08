@@ -64,7 +64,9 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// (`MovedStatus.fromStatus` reads them). It is never retried: the work
 /// may have taken effect, and only the application knows whether it can
 /// be repeated.
-class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
+class SlotChannel
+    with StreamChannelMixin<Uint8List>
+    implements StatusClosable, MuxChannelCarrier {
   /// Wraps [channel], the first channel opened for [slot] of [type];
   /// [reopen] opens the replacement. Created by
   /// `Switchboard.openChannelToSlot` and `proxyHandler`, with the node's
@@ -131,6 +133,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   /// The current underlying channel: the first one, or the replacement
   /// after a retry.
+  @override
   MuxChannel get channel => _current;
 
   /// Whether the channel was rejected with `MOVED` and replaced.
@@ -189,6 +192,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// replacement.
   bool get manualCredit => _manualCredit;
 
+  @override
   set manualCredit(bool value) {
     _manualCredit = value;
     _current.manualCredit = value;
@@ -196,6 +200,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   /// As [MuxChannel.consumed], on the current channel: subframes come from
   /// the replacement only if none came from the first channel.
+  @override
   void consumed(int bytes, {int subframes = 1}) =>
       _current.consumed(bytes, subframes: subframes);
 

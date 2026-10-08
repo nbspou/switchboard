@@ -57,6 +57,24 @@ enum MuxPriority {
   bulk,
 }
 
+/// A channel that carries its subframes on a [MuxChannel] it may replace
+/// before anything was sent or received on it (a slot channel retried
+/// after `MOVED`), and passes flow control on to it: what a layer reading
+/// it on the application's behalf (Talk) needs of the mux channel under
+/// it. A [MuxChannel] is its own carrier and does not implement this.
+@internal
+abstract interface class MuxChannelCarrier {
+  /// The mux channel the subframes travel on now.
+  MuxChannel get channel;
+
+  /// As [MuxChannel.manualCredit], for the current channel and a
+  /// replacement.
+  set manualCredit(bool value);
+
+  /// As [MuxChannel.consumed], on the current channel.
+  void consumed(int bytes, {int subframes = 1});
+}
+
 /// One channel of a [MuxConnection].
 ///
 /// A [StreamChannel] of subframes: [stream] yields incoming DATA payloads
