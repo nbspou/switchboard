@@ -223,6 +223,46 @@ void main() {
     await talk.close();
   });
 
+  test('items nobody listens to stall the channel until their request '
+      'ends, not longer', () async {
+    final raw = client.open(Uint8List(0));
+    final talk = TalkChannel(
+      raw,
+      options: const TalkOptions(requestTimeout: Duration(milliseconds: 200)),
+    );
+    final serverTalk = TalkChannel(await accepted.next);
+    serverTalk.messages.listen((m) {
+      if (m.procedureName == 'LIST') {
+        for (var i = 0; i < 100; i++) {
+          m.replyItem(Uint8List(1000));
+        }
+        m.reply(Uint8List(0));
+      } else {
+        m.reply(Uint8List.fromList([1]));
+      }
+    });
+    // Only `done` is awaited: the items fill the window, the final cannot
+    // follow, and the request times out.
+    final stream = talk.streamRequest('LIST', Uint8List(0));
+    await expectLater(
+      stream.done,
+      throwsA(
+        isA<SwitchboardException>().having(
+          (e) => e.code,
+          'code',
+          StatusCode.deadlineExceeded,
+        ),
+      ),
+    );
+    // Its end returned the items' credit: the channel flows again.
+    expect(raw.heldBytes, 0);
+    final answer = await talk
+        .request('PING', Uint8List(0))
+        .timeout(const Duration(seconds: 2));
+    expect(answer.payload, [1]);
+    await talk.close();
+  });
+
   test('cancelling a stream\'s items returns what they held', () async {
     final (talk, serverTalk, raw, _) = await talkPair(client, server);
     serverTalk.messages.listen((m) {

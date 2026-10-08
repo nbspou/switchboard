@@ -28,7 +28,9 @@ abstract class TalkStream {
   /// back to the peer when the item is handed to the listener, so the
   /// channel's window bounds the buffer: a subscription that is paused, or
   /// never made, stalls the whole channel once the window is used up (the
-  /// final response included). Listen, or cancel the subscription.
+  /// final response included) until the request ends, by its timeout
+  /// say, when what the items hold goes back at once (they stay
+  /// deliverable). Listen, or cancel the subscription.
   ///
   /// Ends normally when the final response arrives. Emits an error and ends
   /// when the request fails: a [TalkAbortException] when the peer aborts

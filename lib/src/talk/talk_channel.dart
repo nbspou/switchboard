@@ -1300,7 +1300,11 @@ class TalkChannel {
       return;
     }
     message._creditBytes = 0;
-    if (held != null && !held.drained) {
+    if (held != null) {
+      if (held.drained) {
+        // Returned already with everything the controller held.
+        return;
+      }
       held.bytes -= bytes;
       held.frames--;
     }
@@ -1310,6 +1314,20 @@ class TalkChannel {
   /// Returns the credit of everything [held] still holds: the controller
   /// it counts for will deliver nothing more.
   void _drainHeld(_Held held) {
+    _returnHeld(held);
+    // Bulk payloads of the dropped messages will not be read.
+    final bulk = List.of(held.bulk);
+    held.bulk.clear();
+    for (final message in bulk) {
+      message._heldBulk = false;
+      message._bulk?.abandon();
+    }
+  }
+
+  /// Returns the credit of everything [held] still holds, which stays
+  /// deliverable: nothing more will be added to its controller (the stream
+  /// request ended), so it is bounded without the window.
+  void _returnHeld(_Held held) {
     if (held.drained) {
       return;
     }
@@ -1320,13 +1338,6 @@ class TalkChannel {
       ..bytes = 0
       ..frames = 0;
     _credit(bytes, frames: frames);
-    // Bulk payloads of the dropped messages will not be read.
-    final bulk = List.of(held.bulk);
-    held.bulk.clear();
-    for (final message in bulk) {
-      message._heldBulk = false;
-      message._bulk?.abandon();
-    }
   }
 
   // ---------------------------------------------------------------------
@@ -2183,6 +2194,9 @@ class _Outgoing {
       return;
     }
     items?.close().ignore();
+    // No more items will come: what waits for a listener that never comes
+    // must not stall the channel.
+    channel._returnHeld(itemsHeld);
     completer.complete(message);
   }
 
@@ -2223,6 +2237,7 @@ class _Outgoing {
       items.addError(error);
       items.close().ignore();
     }
+    channel._returnHeld(itemsHeld);
   }
 
   /// The peer sent [frame], an `EXTEND`.
