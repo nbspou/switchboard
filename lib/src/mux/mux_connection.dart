@@ -113,9 +113,10 @@ class MuxOptions {
   /// A reply or connection close cancels the probe timer even when the
   /// transport delivers it synchronously during the PING write.
   ///
-  /// While a transport implementing [OutputBufferedTransport] has stopped
-  /// reading because of our unsent output, the peer reading that output
-  /// counts as hearing from it.
+  /// While our output to a transport implementing [OutputBufferedTransport]
+  /// is backed up (the transport stopped reading because of it, or the
+  /// output scheduler holds frames the transport has not taken), the peer
+  /// reading that output counts as hearing from it.
   final Duration keepAliveTimeout;
 
   /// How long [MuxConnection.goAway] waits for open channels to finish.
@@ -1786,8 +1787,9 @@ class MuxConnection {
     _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
   }
 
-  /// Whether the transport is throttled by its output and the peer has
-  /// read some of it since the last check.
+  /// Whether our output is backed up (the transport throttles its input
+  /// because of it, or the output scheduler holds frames the transport
+  /// has not taken) and the peer has read some of it since the last check.
   bool _outputProgressed() {
     final transport = _transport;
     if (transport is! OutputBufferedTransport) {
@@ -1796,7 +1798,8 @@ class MuxConnection {
     final output = transport as OutputBufferedTransport;
     final accepted = output.acceptedOutputBytes;
     final progressed =
-        output.isInputThrottled && accepted != _lastAcceptedOutput;
+        (output.isInputThrottled || _heldOutputFrames > 0) &&
+        accepted != _lastAcceptedOutput;
     _lastAcceptedOutput = accepted;
     return progressed;
   }

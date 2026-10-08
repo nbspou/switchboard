@@ -673,6 +673,46 @@ void main() {
     await toMux.close();
   });
 
+  test('keep-alive counts a peer that reads output the scheduler holds as '
+      'alive', () async {
+    final toMux = StreamController<List<int>>();
+    final output = SlowSink();
+    final transport = StreamTransport.wrap(toMux.stream, output);
+    final mux = MuxConnection(
+      transport,
+      isInitiator: true,
+      options: rawOptions.copyWith(
+        keepAliveInterval: const Duration(milliseconds: 20),
+        keepAliveTimeout: const Duration(milliseconds: 20),
+      ),
+    );
+    // A window of 64 KiB: the transport takes the first frames, the
+    // scheduler holds the rest.
+    final channel = mux.open(empty);
+    for (var i = 0; i < 64; i++) {
+      unawaited(channel.send(Uint8List(1000)));
+    }
+    await pumpEventQueue();
+    expect(transport.isInputThrottled, isFalse);
+    expect(mux.heldOutputBytes, greaterThan(32 * 1000));
+    // Nothing arrives, but the peer reads a chunk every 10 ms: longer than
+    // interval and timeout together, the connection stays.
+    for (var i = 0; i < 15; i++) {
+      output.take();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect(mux.heldOutputBytes, greaterThan(0));
+    expect(mux.isOpen, isTrue);
+    // The peer stops reading: keep-alive gives up.
+    expect(
+      await mux.done.timeout(const Duration(seconds: 5)),
+      hasCode(StatusCode.connectionLost),
+    );
+    await mux.close();
+    await output.close();
+    await toMux.close();
+  });
+
   group('reasons', () {
     test('truncation is UTF-8 safe', () {
       for (final (char, bytes) in [('x', 1), ('é', 2), ('€', 3), ('😀', 4)]) {
