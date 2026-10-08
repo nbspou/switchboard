@@ -172,7 +172,7 @@ class WebSocketServerTransport {   // dart:io, exported from switchboard.dart on
   /// Reader: masking required, RSV bits, reserved opcodes, fragmented or > 125 byte control frames,
   /// stray continuations: ProtocolException + close 1002; text: ProtocolException + close 1003;
   /// the sum of a message's fragments is checked against maxFrameSize (0 = none) on each fragment
-  /// header, before buffering it, and so is the fragment count against maxMessageFragments:
+  /// header, before buffering it (compare against the remaining budget, so a 63-bit fragment length cannot overflow the accumulated length), and so is the fragment count against maxMessageFragments:
   /// SwitchboardException(frameTooLarge) + close 1009; fragments are buffered together in pieces
   /// (at least 64 KiB while more follow, at most 1 MiB), so a message costs about its size however
   /// it is fragmented; ping -> pong; client close echoed with its code, stream ends. Writer: unmasked

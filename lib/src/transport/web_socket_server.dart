@@ -76,7 +76,8 @@ abstract final class WebSocketServerTransport {
   /// * A text message is a [ProtocolException] (close code 1003).
   /// * Binary messages, fragmented or not, become frames. The sum of the
   ///   fragments of a message is checked against [maxFrameSize] (0 = no
-  ///   limit) before each fragment is buffered; a message over it, or in
+  ///   limit) before each fragment is buffered, without overflowing on
+  ///   63-bit frame lengths; a message over it, or in
   ///   more than [maxMessageFragments] frames, fails the stream with a
   ///   [SwitchboardException] carrying [StatusCode.frameTooLarge] and
   ///   closes with code 1009. Fragments are buffered together, so a message
@@ -582,14 +583,14 @@ class _WebSocketFraming extends ByteFraming {
     _payloadLength = length;
     _payloadRead = 0;
     if (opcode == opBinary || opcode == opContinuation) {
-      final limit = maxMessageSize;
-      // Checked before anything of the fragment is buffered.
-      if (limit > 0 && _messageLength + length > limit) {
+      final limit = maxMessageSize > 0 ? maxMessageSize : 0x7FFFFFFFFFFFFFFF;
+      // Subtract before comparing: a 63-bit length plus earlier fragments
+      // can overflow a Dart int, even with a small message limit.
+      if (length > limit - _messageLength) {
         _closeCode = closeMessageTooBig;
         throw SwitchboardException.of(
           StatusCode.frameTooLarge,
-          'message of at least ${_messageLength + length} bytes exceeds '
-          'limit of $limit',
+          'message exceeds limit of $limit bytes',
         );
       }
       const maxFragments = WebSocketServerTransport.maxMessageFragments;
