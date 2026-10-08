@@ -180,16 +180,22 @@ class RecordingContext implements SlotRequestContext {
       declared.add((deadline, renew));
 }
 
-/// Holds forwarding opens so their queue and cancellation can be inspected.
+/// Holds forwarding opens so their queue and cancellation can be inspected,
+/// or fails them before returning a future.
 class DelayedResolver extends StaticResolver {
   DelayedResolver(super.records);
 
   final Completer<void> proceed = Completer<void>();
 
+  /// [resolve] throws at once instead of returning a future.
+  bool throwAtOnce = false;
+
   @override
-  Future<List<ServiceRecord>> resolve(Name type) async {
-    await proceed.future;
-    return super.resolve(type);
+  Future<List<ServiceRecord>> resolve(Name type) {
+    if (throwAtOnce) {
+      throw SwitchboardException.of(StatusCode.unavailable, 'resolver down');
+    }
+    return proceed.future.then((_) => super.resolve(type));
   }
 }
 
@@ -788,6 +794,27 @@ void main() {
       },
     );
 
+    test('a forwarding open that fails at once gives its place back', () async {
+      final resolver = DelayedResolver([
+        ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+      ])..throwAtOnce = true;
+      resolver.proceed.complete();
+      node.resolver = resolver;
+      addTearDown(resolver.close);
+      newGate(maxQueuedChannels: 1);
+      await gate.onAssign(assign(1));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      for (var i = 0; i < 3; i++) {
+        expect(
+          await peer.open(shard: 1).done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+      }
+      // Refused by the bound if a failed open had kept its place.
+      resolver.throwAtOnce = false;
+      expect(await ask(peer.open(shard: 1), 'new'), 'to:new');
+    });
+
     test('after the grace period: unload, then MOVED', () async {
       newGate(forwardGrace: const Duration(milliseconds: 30));
       await gate.onAssign(assign(1));
@@ -1158,6 +1185,35 @@ void main() {
         await talk.close();
       },
     );
+
+    test('a forwarding channel that fails at once gives the request\'s '
+        'place back', () async {
+      final resolver = DelayedResolver([
+        ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+      ])..throwAtOnce = true;
+      resolver.proceed.complete();
+      node.resolver = resolver;
+      addTearDown(resolver.close);
+      newGate(maxQueuedRequests: 1, trackChannels: false);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      target.registerService(kv, (incoming) {
+        incoming.talk().messages.listen((m) => m.reply(m.payload));
+      }, instance: 2);
+      for (var i = 0; i < 3; i++) {
+        await expectLater(
+          talk.request('GET', bytes('x$i'), timeout: limit),
+          throwsCode(StatusCode.unavailable),
+        );
+      }
+      // Refused by the bound if a failed open had kept its place.
+      resolver.throwAtOnce = false;
+      expect(text((await talk.request('GET', bytes('new'))).payload), 'new');
+      await talk.close();
+    });
 
     test('served, queued while locked, forwarded after FORWARD', () async {
       newGate(trackChannels: false);
