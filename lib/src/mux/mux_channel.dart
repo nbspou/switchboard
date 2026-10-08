@@ -132,6 +132,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   final Queue<_PendingSend> _pendingSends = Queue<_PendingSend>();
   Status? _pendingClose;
   bool _closeQueued = false;
+  bool _admitting = false;
 
   /// A completed future, returned by [send] for a subframe sent at once.
   static final Future<void> _sentAtOnce = Future<void>.value();
@@ -147,8 +148,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   int _unreturned = 0;
   int _held = 0;
   bool _manualCredit = false;
-  // Set when the channel completes: what is held no longer counts toward
-  // the connection's buffers, and nothing is returned any more.
+  // Set when the channel completes: nothing is held or returned any more.
   bool _released = false;
 
   /// Current state.
@@ -206,11 +206,17 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// returns credit itself with [consumed]; false by default.
   ///
   /// While true, a subframe the [stream]'s listener takes does not count
-  /// as consumed: it stays held, counted toward the connection's buffered
-  /// bytes (see [MuxConnection.bufferedBytes]), until [consumed] reports
-  /// it, typically when the application has taken the message it belongs
-  /// to. Set it before listening. Setting it back to false counts what is
-  /// held as consumed.
+  /// as consumed: it stays held ([heldBytes]) until [consumed] reports it,
+  /// typically when the application has taken the message it belongs to,
+  /// or, in a proxy, when the other side has taken it. Set it before
+  /// listening. Setting it back to false counts what is held as consumed.
+  ///
+  /// What is held is bounded by the window, and does not count toward the
+  /// connection's [MuxConnection.bufferedBytes] and its receive high-water
+  /// mark: pausing the connection would not release it, since that takes
+  /// the application, or another connection, to read, and it would stall
+  /// every other channel of the connection (all the clients of a proxy
+  /// sharing a backend connection, for one that does not read).
   bool get manualCredit => _manualCredit;
 
   set manualCredit(bool value) {
@@ -221,12 +227,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     if (!value && _held > 0) {
       final cost = _held;
       _held = 0;
-      if (!_released) {
-        _link.host.noteBuffered(-cost);
-      }
       _consume(cost);
     }
   }
+
+  /// With [manualCredit]: the cost of the subframes [stream] delivered
+  /// that [consumed] has not reported yet. 0 once the channel is closed.
+  int get heldBytes => _held;
 
   /// With [manualCredit]: reports that [subframes] subframes delivered by
   /// [stream], [bytes] bytes long together, have been consumed, so that
@@ -253,7 +260,6 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       );
     }
     _held -= cost;
-    _link.host.noteBuffered(-cost);
     _consume(cost);
   }
 
@@ -272,7 +278,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       throw ArgumentError.value(bytes, 'bytes', 'must be positive');
     }
     final credit = bytes + _unreturned;
-    if (_receiveWindow + credit > MuxLimits.maxWindow) {
+    // What is queued and held comes back as credit too.
+    if (_receiveWindow + _queuedBytes + _held + credit > MuxLimits.maxWindow) {
       throw ArgumentError.value(
         bytes,
         'bytes',
@@ -447,6 +454,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
         'room for a chunk on channel $id',
       );
     }
+    if (_initialSendWindow <= MuxCredit.frameOverhead) {
+      throw SwitchboardException.of(
+        StatusCode.frameTooLarge,
+        'the initial window of $_initialSendWindow of channel $id leaves no '
+        'room for a chunk',
+      );
+    }
   }
 
   /// Hands over the chunks of [pending] the window takes; true once the
@@ -477,15 +491,14 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       if (room < n) {
         n = room;
       }
+      final start = pending.offset;
+      // Accounted before the write, which could come back here.
       _sendWindow -= MuxCredit.costOf(n);
+      pending.offset += n;
       _link.host.sendChannelFrame(
         _link,
-        MuxFrame.data(
-          id,
-          Uint8List.sublistView(data, pending.offset, pending.offset + n),
-        ),
+        MuxFrame.data(id, Uint8List.sublistView(data, start, start + n)),
       );
-      pending.offset += n;
     }
     return true;
   }
@@ -513,31 +526,45 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// Hands the waiting subframes the window now takes to the connection,
   /// in order, then our CLOSE if it waited behind them.
   void _admitPending() {
-    while (_pendingSends.isNotEmpty) {
-      final head = _pendingSends.first;
-      try {
-        // The peer may have lowered its frame limit meanwhile.
-        if (head.split) {
-          _checkChunkable();
-          if (!_admitChunks(head)) {
-            break;
+    if (_admitting) {
+      // A write that came back here (a synchronous transport and peer):
+      // the loop below takes what the new credit allows.
+      return;
+    }
+    _admitting = true;
+    try {
+      while (_pendingSends.isNotEmpty) {
+        final head = _pendingSends.first;
+        try {
+          // The peer may have lowered its frame limit meanwhile.
+          if (head.split) {
+            _checkChunkable();
+            if (!_admitChunks(head)) {
+              break;
+            }
+            _pendingSends.removeFirst();
+          } else {
+            final cost = MuxCredit.costOf(head.subframe.length);
+            if (cost > _sendWindow) {
+              break;
+            }
+            _checkSize(head.subframe.length);
+            _sendWindow -= cost;
+            _pendingSends.removeFirst();
+            _link.host.sendChannelFrame(
+              _link,
+              MuxFrame.data(id, head.subframe),
+            );
           }
-        } else {
-          final cost = MuxCredit.costOf(head.subframe.length);
-          if (cost > _sendWindow) {
-            break;
-          }
-          _checkSize(head.subframe.length);
-          _sendWindow -= cost;
-          _link.host.sendChannelFrame(_link, MuxFrame.data(id, head.subframe));
+        } on SwitchboardException catch (e) {
+          _pendingSends.removeFirst();
+          head.completer.completeError(e);
+          continue;
         }
-      } on SwitchboardException catch (e) {
-        _pendingSends.removeFirst();
-        head.completer.completeError(e);
-        continue;
+        head.completer.complete();
       }
-      _pendingSends.removeFirst();
-      head.completer.complete();
+    } finally {
+      _admitting = false;
     }
     final close = _pendingClose;
     if (_pendingSends.isEmpty && close != null) {
@@ -588,14 +615,27 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   }
 
   /// Sends our CLOSE now if it waits behind subframes waiting for credit,
-  /// failing them.
+  /// failing them: the close confirmation timed out. The CLOSE then
+  /// carries `DEADLINE_EXCEEDED` rather than an `OK` that would claim
+  /// everything was sent, and so does [done].
   void _flushPendingClose() {
-    final close = _pendingClose;
+    var close = _pendingClose;
     if (close == null) {
       return;
     }
     _pendingClose = null;
+    var bytes = 0;
+    for (final pending in _pendingSends) {
+      bytes += pending.subframe.length - pending.offset;
+    }
     _failPendingSends();
+    if (close.isOk) {
+      close = Status.of(
+        StatusCode.deadlineExceeded,
+        '$bytes bytes not sent: no credit within the close timeout',
+      );
+      _noteStatus(close);
+    }
     _queueClose(close);
   }
 
@@ -732,11 +772,11 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       final payload = _queue.removeFirst();
       final cost = MuxCredit.costOf(payload.length);
       _queuedBytes -= cost;
+      _link.host.noteBuffered(-cost);
       if (_manualCredit && !_released) {
         // Held by the listener until it reports it consumed.
         _held += cost;
       } else {
-        _link.host.noteBuffered(-cost);
         consumed += cost;
       }
       _incoming.add(payload);
@@ -755,13 +795,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _confirmTimer = null;
     _pendingClose = null;
     _failPendingSends();
-    if (!_released) {
-      _released = true;
-      if (_held != 0) {
-        _link.host.noteBuffered(-_held);
-        _held = 0;
-      }
-    }
+    _released = true;
+    _held = 0;
     _endRequested = true;
     _scheduleDrain();
     if (!_done.isCompleted) {
@@ -873,14 +908,14 @@ class MuxChannelLink {
     final ours = c._pendingClose;
     c._pendingClose = null;
     c._failPendingSends();
-    // DATA after the peer's CLOSE must not go out, and our own CLOSE, if
-    // it was queued behind such DATA, goes now.
-    host.dropQueuedData(this);
     c._closeSent = true;
     c._state = MuxChannelState.closed;
     // Free the id before sending the confirmation so that a peer reacting
     // to it synchronously may reuse the id.
     host.release(this);
+    // DATA after the peer's CLOSE must not go out, and our own CLOSE, if
+    // it was queued behind such DATA, goes now.
+    host.dropQueuedData(this);
     if (confirm) {
       c._closeQueued = true;
       host.sendFrame(MuxFrame.close(c.id));
@@ -894,10 +929,11 @@ class MuxChannelLink {
   /// carrying [status], dropping whatever it buffered.
   void closeUndelivered(Status status) {
     final c = channel;
-    c._discard();
+    // Closed first, so that dropping what it buffered returns no credit.
     if (c._state == MuxChannelState.open) {
       unawaited(c.close(status));
     }
+    c._discard();
   }
 
   /// Completes the channel locally because the peer did not confirm our
@@ -970,8 +1006,10 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
         break;
       }
       if (_channel.canSend) {
+        // A subframe the channel refuses (too large) fails the call.
+        final sent = _channel.send(subframe);
         try {
-          await _channel.send(subframe);
+          await sent;
         } on SwitchboardException {
           // Closed while waiting: dropped, as add drops it.
         }

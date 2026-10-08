@@ -189,7 +189,8 @@ The protocol specification lives in the project wiki (section
   refused, `maxSubframeLength`); `sink.addStream` waits for each subframe.
   Credit goes back once half the window is consumed: by default when the
   stream's listener takes a subframe, or, with `MuxChannel.manualCredit`,
-  when the layer reading for the application calls `consumed`;
+  when the layer reading for the application calls `consumed` (what it
+  holds meanwhile is bounded by the window and left out of the mark);
   `MuxChannel.grant` raises a window at once. An output scheduler holds
   DATA while a transport implementing `OutputReadyTransport` (the stream
   binding, `WebSocketServerChannel`) is not ready, and writes control

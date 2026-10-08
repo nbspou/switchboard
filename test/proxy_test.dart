@@ -82,6 +82,7 @@ class Piped {
   late MuxConnection proxyOut;
   late MuxConnection backendConnection;
   late MuxChannel client;
+  late MuxChannel inbound;
   late MuxChannel backend;
   late Future<void> pipe;
 }
@@ -114,7 +115,7 @@ Future<Piped> piped({
   p.client = clientConnection.open(bytes('header'));
   early?.call(p.client);
   await pumpEventQueue();
-  final inbound = await atProxy.next;
+  final inbound = p.inbound = await atProxy.next;
   final outbound = proxyOut.open(inbound.openPayload);
   p.pipe = pipeChannels(inbound, outbound);
   p.backend = await atBackend.next;
@@ -164,16 +165,45 @@ void main() {
       expect(sent, greaterThan(8));
       expect(sent * 8016, lessThanOrEqualTo(2 * 65536));
       expect(p.backend.bufferedBytes, 8 * 8016);
-      expect(p.proxyIn.bufferedBytes, lessThanOrEqualTo(65536));
-      expect(p.proxyIn.bufferedBytes, greaterThan(0));
+      expect(p.inbound.heldBytes, lessThanOrEqualTo(65536));
+      expect(p.inbound.heldBytes, greaterThan(0));
+      // Held for the other side, not counted by the connection's mark:
+      // only the OPEN payload is.
+      expect(p.proxyIn.bufferedBytes, p.inbound.openPayload.length);
       expect(p.client.sendWindow, lessThan(8016));
       backend.resume();
       await sending;
       await p.client.close();
       await p.pipe;
       expect(received, [for (var i = 0; i < 100; i++) i]);
-      expect(p.proxyIn.bufferedBytes, 0);
+      expect(p.inbound.heldBytes, 0);
       await backend.cancel();
+    });
+
+    test('a client that does not read holds the proxy\'s data within the '
+        'window, and does not pause the backend connection', () async {
+      final p = await piped(
+        options: fast.copyWith(receiveHighWaterMarkBytes: 20000),
+      );
+      // The client listens but never reads.
+      final paused = p.client.stream.listen((_) {})..pause();
+      for (var i = 0; i < 40; i++) {
+        unawaited(p.backend.send(Uint8List(8000)));
+      }
+      for (var i = 0; i < 5; i++) {
+        await p.backendConnection.ping();
+        await p.proxyOut.ping();
+      }
+      // The proxy holds what the client has no window for, without
+      // counting it toward the backend connection's mark: other channels
+      // on it, and its keep-alive, are not stalled.
+      expect(p.inbound.heldBytes, 0);
+      expect(p.proxyOut.isReceivePaused, isFalse);
+      expect(p.proxyOut.channels.single.heldBytes, inInclusiveRange(1, 65536));
+      expect(p.clientConnection.isReceivePaused, isTrue);
+      await paused.cancel();
+      await p.backend.close();
+      await p.pipe;
     });
 
     test('forwards large subframes', () async {

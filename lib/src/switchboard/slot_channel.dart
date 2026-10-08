@@ -436,8 +436,10 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
         break;
       }
       if (_channel.canSend) {
+        // A subframe the channel refuses (too large) fails the call.
+        final sent = _channel.send(subframe);
         try {
-          await _channel.send(subframe);
+          await sent;
         } on SwitchboardException {
           // Closed while waiting: dropped, as add drops it.
         }

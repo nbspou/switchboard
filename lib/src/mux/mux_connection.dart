@@ -500,13 +500,13 @@ class MuxConnection {
     for (final link in _links.values) link.channel,
   ];
 
-  /// Bytes received and not consumed yet over all channels, at their
-  /// flow-control cost (a subframe's length plus 16): buffered for a
-  /// stream's listener, or held by one with [MuxChannel.manualCredit]
-  /// until it reports them consumed; plus the OPEN payloads held for the
-  /// channels the peer opened until they are closed and delivered (see
-  /// [MuxOptions.maxOpenPayloadBytes]). Compared against
-  /// [MuxOptions.receiveHighWaterMarkBytes].
+  /// Bytes received and not delivered to a stream's listener yet over all
+  /// channels, at their flow-control cost (a subframe's length plus 16),
+  /// plus the OPEN payloads held for the channels the peer opened until
+  /// they are closed and delivered (see [MuxOptions.maxOpenPayloadBytes]).
+  /// Compared against [MuxOptions.receiveHighWaterMarkBytes]. What a
+  /// listener with [MuxChannel.manualCredit] holds is not counted (see
+  /// there); each channel's window bounds it.
   int get bufferedBytes => _bufferedBytes;
 
   /// Bytes of OPEN payloads held for the channels the peer opened that are

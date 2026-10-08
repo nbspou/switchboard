@@ -220,10 +220,44 @@ void main() {
         final waiting = channel.send(Uint8List(16));
         await channel.close();
         await expectLater(waiting, throwsStatus(StatusCode.failedPrecondition));
-        expect(await raw.nextHex(), '22 02 00');
+        // Not OK: what was sent did not all go out.
+        final close = await raw.next();
+        expect(close.command, MuxCommand.close);
+        final status = Status.decode(close.payload);
+        expect(status.known, StatusCode.deadlineExceeded);
+        expect(status.reason, contains('16 bytes not sent'));
+        expect(await channel.done, hasCode(StatusCode.deadlineExceeded));
         expect(mux.unconfirmedCloseCount, 1);
       },
     );
+
+    test('a bulk payload needs a window that takes a byte', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(limitsHex(16));
+      await settle(raw);
+      final channel = mux.open(empty)..priority = MuxPriority.bulk;
+      expect(
+        () => channel.send(Uint8List(10)),
+        throwsStatus(StatusCode.frameTooLarge),
+      );
+      // An empty subframe is not split, and fits.
+      await channel.send(empty);
+    });
+
+    test('sink.addStream fails on a subframe the channel refuses', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(limitsHex(1000));
+      await settle(raw);
+      final channel = mux.open(empty);
+      await expectLater(
+        channel.sink.addStream(
+          Stream.fromIterable([Uint8List(10), Uint8List(1000)]),
+        ),
+        throwsStatus(StatusCode.frameTooLarge),
+      );
+    });
 
     test('a lost connection fails waiting subframes', () async {
       final (mux, raw) = rawPair();
@@ -346,16 +380,17 @@ void main() {
         raw.send(data(84));
       }
       await settle(raw);
-      // Taken, not consumed: held, still counted by the connection.
+      // Taken, not consumed: held, not counted by the connection.
       expect(taken, hasLength(6));
       expect(channel.bufferedBytes, 0);
-      expect(mux.bufferedBytes, 600);
+      expect(channel.heldBytes, 600);
+      expect(mux.bufferedBytes, 0);
       expect(channel.receiveWindow, 400);
       channel.consumed(84);
       channel.consumed(168, subframes: 2);
       await settle(raw);
       expect(channel.receiveWindow, 400);
-      expect(mux.bufferedBytes, 300);
+      expect(channel.heldBytes, 300);
       // Half the window: returned.
       channel.consumed(taken[3].length);
       channel.consumed(taken[4].length);
@@ -372,7 +407,7 @@ void main() {
       // Back to automatic: what is held counts as consumed (100 bytes),
       // and delivery is consumption again.
       channel.manualCredit = false;
-      expect(mux.bufferedBytes, 0);
+      expect(channel.heldBytes, 0);
       raw.send(data(384));
       expect(
         MuxCredit.decode(
@@ -417,8 +452,20 @@ void main() {
           const MuxCredit(2, 10000),
         );
         expect(channel.receiveWindow, 11000);
-        await sub.cancel();
         expect(() => channel.grant(0), throwsArgumentError);
+        // What is buffered or held comes back as credit too: the window
+        // could go over 2^32 - 1.
+        sub.pause();
+        raw.send(data(584));
+        await settle(raw);
+        expect(channel.bufferedBytes, 600);
+        expect(channel.receiveWindow, 10400);
+        expect(
+          () => channel.grant(MuxLimits.maxWindow - 11000 + 1),
+          throwsArgumentError,
+        );
+        channel.grant(MuxLimits.maxWindow - 11000);
+        await sub.cancel();
         expect(() => channel.grant(MuxLimits.maxWindow), throwsArgumentError);
         expect(mux.isOpen, isTrue);
       },
@@ -566,11 +613,12 @@ void main() {
         );
         await a.ping();
         final atB = StreamQueue(b.incoming);
-        final channels = [for (var i = 0; i < 3; i++) a.open(empty)];
+        final channels = [for (var i = 0; i < 4; i++) a.open(empty)];
         final subs = <StreamSubscription<Uint8List>>[];
-        for (var i = 0; i < 3; i++) {
+        for (var i = 0; i < 4; i++) {
           final channel = await atB.next;
-          // One held by a layer with manual credit, two not read at all.
+          // The first held by a layer with manual credit, which does not
+          // count; three not read at all.
           channel.manualCredit = i == 0;
           subs.add(channel.stream.listen((_) {}));
           if (i > 0) {
@@ -583,8 +631,10 @@ void main() {
           }
         }
         await pumpEventQueue();
-        // Each channel holds its window, 64064 bytes, and the third pushes
-        // the total over the mark.
+        final layer = b.channels.firstWhere((c) => c.manualCredit);
+        expect(layer.heldBytes, 4 * 16016);
+        // Each channel not read holds up to its window, 64064 bytes, and
+        // the second pushes the total over the mark.
         expect(b.bufferedBytes, greaterThan(100000));
         expect(b.isReceivePaused, isTrue);
         // A ping is not answered while reading is paused.
@@ -592,13 +642,14 @@ void main() {
         unawaited(a.ping().then((_) => answered = true));
         await pumpEventQueue();
         expect(answered, isFalse);
-        // The layer consumes what it holds: reading resumes below half.
-        final layer = b.channels.firstWhere((c) => c.manualCredit);
-        layer.consumed(4 * 16000, subframes: 4);
+        // Two of them are read: reading resumes below half the mark, and
+        // the third holds its window.
         subs[1].resume();
+        subs[2].resume();
         await pumpEventQueue();
         expect(b.isReceivePaused, isFalse);
         expect(answered, isTrue);
+        expect(b.bufferedBytes, 4 * 16016);
         for (final sub in subs) {
           await sub.cancel();
         }

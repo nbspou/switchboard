@@ -48,7 +48,12 @@ final Logger _log = Logger('Switchboard.Router');
 /// `CONNECTION_LOST`, which is local only, is sent as `UNAVAILABLE`, and
 /// application codes (256 and above), which mux CLOSE must not carry, as
 /// `UNKNOWN`. A subframe that cannot be forwarded (it exceeds the frame
-/// limit the receiving peer announced) closes both sides with that error.
+/// limit the receiving peer announced, or costs more than half the window
+/// it grants: [MuxChannel.maxSubframeLength]) closes both sides with that
+/// error. Subframes are forwarded whole, so a proxy should not grant its
+/// clients more (window, frame size) than its backends grant it; a side
+/// whose [MuxChannel.priority] is [MuxPriority.bulk] splits what it sends
+/// instead, which suits a byte stream (a Talk bulk payload).
 ///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
