@@ -892,16 +892,93 @@ void main() {
   });
 
   group('timeouts', () {
+    /// The longest delay a JavaScript timer takes, a signed 32-bit number
+    /// of milliseconds (about 24.8 days); a longer one fires at once.
+    const maxTimerDelay = Duration(milliseconds: 0x7FFFFFFF);
+
+    void expectTimersInRange(FakeAsync async) => expect(
+      async.pendingTimers.map((t) => t.duration),
+      everyElement(lessThanOrEqualTo(maxTimerDelay)),
+      reason: 'longer timers fire at once on JavaScript',
+    );
+
+    test('long requester timeouts are armed in steps a JavaScript timer '
+        'takes, and expire on time', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(
+            requestTimeout: Duration(days: 30),
+            maxExtension: Duration.zero,
+          ),
+        );
+        final gap = Outcome(peer.talk.request('Q', Uint8List(0)));
+        final declared = Outcome(peer.talk.request('Q', Uint8List(0)));
+        async.flushMicrotasks();
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.extend,
+            responseId: 2,
+            payload: TalkFrame.extendPayload(
+              deadline: const Duration(days: 40),
+            ),
+          ),
+        );
+        async.flushMicrotasks();
+        expectTimersInRange(async);
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
+        expect(gap.isDone, isFalse);
+        async.elapse(const Duration(days: 1));
+        expect(gap.error, isStatus(StatusCode.deadlineExceeded));
+        async.elapse(const Duration(days: 9));
+        expectTimersInRange(async);
+        expect(declared.isDone, isFalse);
+        async.elapse(const Duration(days: 1));
+        expect(declared.error, isStatus(StatusCode.deadlineExceeded));
+        expect(peer.talk.outgoingRequestCount, 0);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
     test('long cancelled-id timeouts rearm until their deadline', () {
       fakeAsync((async) {
         final peer = RawPeer(
           options: const TalkOptions(requestTimeout: Duration(days: 30)),
         );
         peer.talk.startRequest('Q', Uint8List(0)).cancel();
+        expectTimersInRange(async);
         async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
         expect(peer.talk.outgoingRequestCount, 1);
         async.elapse(const Duration(days: 1));
         expect(peer.talk.outgoingRequestCount, 0);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('long responder deadlines are armed in steps a JavaScript timer '
+        'takes, and expire on time', () {
+      fakeAsync((async) {
+        final peer = RawPeer();
+        TalkMessage? held;
+        peer.talk.messages.listen((m) => held = m);
+        peer.send(
+          TalkFrame(kind: TalkKind.message, procedure: Name('Q'), requestId: 1),
+        );
+        async.flushMicrotasks();
+        held!.extend(deadline: const Duration(days: 30));
+        expectTimersInRange(async);
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
+        expect(held!.canReply, isTrue);
+        async.elapse(const Duration(days: 1));
+        expect(held!.canReply, isFalse);
+        expect(peer.received.last.kind, TalkKind.abort);
+        expect(peer.received.last.status.known, StatusCode.deadlineExceeded);
         expect(async.pendingTimers, isEmpty);
         peer.talk.close();
         async.flushMicrotasks();
