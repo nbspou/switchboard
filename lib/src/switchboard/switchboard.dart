@@ -41,6 +41,7 @@ import '../transport/web_socket_server.dart';
 import '../transport/web_socket_transport_io.dart';
 import 'channel_policy.dart';
 import 'generic_status.dart';
+import 'identity_wait.dart';
 import 'incoming_channel.dart';
 import 'memory_endpoints.dart';
 import 'outgoing_policy.dart';
@@ -1785,7 +1786,8 @@ class Switchboard {
   /// Holds [channel], which [policy] refused because the peer has not
   /// identified, until the peer identifies (then evaluates the policy
   /// again), the channel or the connection ends, or [identityTimeout]
-  /// passes (then refuses it with `UNAUTHENTICATED`). Never fails.
+  /// passes (then refuses it with `UNAUTHENTICATED`). A closed channel
+  /// leaves no per-channel listener on the pending identity event. Never fails.
   Future<void> _holdForIdentity(
     MuxConnection connection,
     MuxChannel channel,
@@ -1803,8 +1805,7 @@ class Switchboard {
       if (left <= Duration.zero) {
         break;
       }
-      await Future.any<void>([connection.identityChanged, channel.done])
-          .timeout(left, onTimeout: () {});
+      await waitForIdentityChange(channel, left);
       if (channel.state != MuxChannelState.open) {
         // Closed by the peer, or the connection ended.
         return;

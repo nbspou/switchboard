@@ -19,6 +19,7 @@ import '../naming/naming_protocol.dart';
 import '../status.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
+import 'identity_wait.dart';
 import 'incoming_channel.dart';
 import 'proxy.dart';
 import 'resolver.dart';
@@ -308,7 +309,8 @@ class RelayService {
 
   /// The identity the consumer of [incoming] presents once it identifies,
   /// within the node's [Switchboard.identityTimeout] (zero: not waited
-  /// for); null when it did not, or the channel ended meanwhile.
+  /// for); null when it did not, or the channel ended meanwhile. Closed
+  /// channels leave no per-channel listener on the pending identity event.
   Future<PeerIdentity?> _identified(IncomingChannel incoming) async {
     final connection = incoming.connection;
     final channel = incoming.channel;
@@ -322,8 +324,7 @@ class RelayService {
       if (left <= Duration.zero || channel.state != MuxChannelState.open) {
         return null;
       }
-      await Future.any<void>([connection.identityChanged, channel.done])
-          .timeout(left, onTimeout: () {});
+      await waitForIdentityChange(channel, left);
     }
     return connection.peerIdentity;
   }

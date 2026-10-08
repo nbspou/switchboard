@@ -340,6 +340,21 @@ MuxChannel openRelayed(MuxConnection connection, Uint8List inner) =>
 Future<Status> refusal(MuxConnection connection, Uint8List inner) =>
     openRelayed(connection, inner).done.timeout(limit);
 
+/// Counts subscriptions to the next identity event without depending on
+/// the Dart runtime's private future-listener representation.
+class _ObservedIdentityConnection extends MuxConnection {
+  _ObservedIdentityConnection(super.transport)
+    : super(isInitiator: false, options: fast);
+
+  int identityWaits = 0;
+
+  @override
+  Future<void> get identityChanged {
+    identityWaits++;
+    return super.identityChanged;
+  }
+}
+
 void main() {
   setUpAll(() async {
     authority = await CredentialIssuer.ed25519FromSeed(
@@ -348,6 +363,46 @@ void main() {
     );
     key = await HolderKey.generate();
   });
+
+  for (final timedOut in [false, true]) {
+    test('identity holds release ${timedOut ? 'timed-out' : 'closed'} '
+        'channels without accumulating future listeners', () async {
+      final host = await newNode(
+        requireNamedIdent: true,
+        identityTimeout: timedOut ? const Duration(milliseconds: 5) : limit,
+      );
+      final service = RelayService(host);
+      final (local, remote) = MemoryTransport.pair();
+      final incoming = _ObservedIdentityConnection(local);
+      final peer = MuxConnection(remote, isInitiator: true, options: fast);
+      addTearDown(incoming.close);
+      addTearDown(peer.close);
+      final work = <Future<void>>[];
+      incoming.incoming.listen((channel) {
+        work.add(
+          Future<void>.sync(() => service.handler(IncomingChannel(channel))),
+        );
+      });
+      for (var i = 0; i < 100; i++) {
+        final channel = openRelayed(
+          peer,
+          ChannelAddress(type: workerType).encode(),
+        );
+        await peer.ping();
+        if (timedOut) {
+          expect(
+            await channel.done.timeout(limit),
+            hasCode(StatusCode.unauthenticated),
+          );
+        } else {
+          await channel.close();
+        }
+      }
+      await Future.wait(work).timeout(limit);
+      expect(incoming.identityWaits, 1);
+      expect(incoming.openChannelCount, 0);
+    });
+  }
 
   test('scoped() admits _relay and _ns for every identified peer', () async {
     final mesh = await startMesh();
