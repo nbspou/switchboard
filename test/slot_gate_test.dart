@@ -88,6 +88,7 @@ class TestLifecycle extends SlotLifecycle {
   final List<String> log = [];
   Completer<void>? loadGate;
   Completer<void>? drainGate;
+  Completer<void>? unloadGate;
   Object? loadError;
   AssignResult result = AssignResult.holding;
 
@@ -133,7 +134,10 @@ class TestLifecycle extends SlotLifecycle {
   }
 
   @override
-  Future<void> unload(int slot) async => log.add('unload $slot');
+  Future<void> unload(int slot) async {
+    log.add('unload $slot');
+    await unloadGate?.future;
+  }
 
   @override
   FutureOr<void> serve(IncomingChannel channel, int slot) {
@@ -352,6 +356,86 @@ void main() {
         expect(await b.done.timeout(limit), isMoved());
       },
     );
+
+    test('a revoked load must finish cleanup before another ASSIGN', () async {
+      newGate();
+      final hold = lifecycle.loadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1));
+      loading.ignore();
+      await gate.onRevoke(kv, 1);
+      lifecycle.loadGate = null;
+      await expectLater(
+        gate.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      await gate.onAssign(assign(1, epoch: 2));
+      expect(lifecycle.log, ['load 1 e1 h0', 'unload 1', 'load 1 e2 h0']);
+      expect(await ask(peer.open(shard: 1), 'x'), '1:x');
+    });
+
+    test(
+      'a closed gate with a pending load keeps its lifecycle attached',
+      () async {
+        newGate();
+        final hold = lifecycle.loadGate = Completer<void>();
+        addTearDown(() {
+          if (!hold.isCompleted) hold.complete();
+        });
+        final loading = gate.onAssign(assign(1));
+        loading.ignore();
+        await gate.close();
+        expect(
+          () => SlotGate(node, client, kv, lifecycle: lifecycle),
+          throwsStateError,
+        );
+        expect(lifecycle.gate, same(gate));
+        hold.complete();
+        await expectLater(loading, throwsCode(StatusCode.unavailable));
+        final next = SlotGate(node, client, kv, lifecycle: lifecycle);
+        addTearDown(next.close);
+        await next.onAssign(assign(1, epoch: 2));
+        expect(next.serves(1), isTrue);
+      },
+    );
+
+    test('an unload must finish before another ASSIGN', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final hold = lifecycle.unloadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final revoking = gate.onRevoke(kv, 1);
+      await expectLater(
+        gate.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      hold.complete();
+      await revoking;
+      await gate.onAssign(assign(1, epoch: 2));
+      expect(gate.serves(1), isTrue);
+    });
+
+    test('closing during reassignment unload prevents the new load', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      final hold = lifecycle.unloadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1, epoch: 3));
+      loading.ignore();
+      await gate.close();
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      expect(lifecycle.log, ['load 1 e1 h0', 'unload 1']);
+    });
 
     test('a failed load refuses the queue and fails ASSIGN', () async {
       newGate();

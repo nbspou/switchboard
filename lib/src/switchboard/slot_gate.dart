@@ -226,14 +226,15 @@ class SlotGate implements SlotHandler {
   /// Creates the gate of [type] on [switchboard], serving the slot
   /// requests [client] receives, with the application's [lifecycle] (which
   /// it attaches to; a lifecycle serves one gate at a time, and may be
-  /// attached to a new gate once its gate is closed).
+  /// attached to a new gate once its gate is closed and its outstanding
+  /// loads and unloads have finished).
   ///
   /// [instance] is the id [type] is registered as (set it once known; it
   /// is used to tell this instance from others in the mirror).
   /// [trackChannels] makes every served channel count as work in flight
   /// until it ends (see [detach]). Throws [StateError] if [lifecycle] is
-  /// attached to another gate that is not closed, [RangeError] for
-  /// negative bounds.
+  /// attached to another gate that is not closed or still has loads or
+  /// unloads running, [RangeError] for negative bounds.
   SlotGate(
     this.switchboard,
     this.client,
@@ -250,7 +251,10 @@ class SlotGate implements SlotHandler {
     RangeError.checkNotNegative(maxQueuedChannels, 'maxQueuedChannels');
     RangeError.checkNotNegative(maxQueuedRequests, 'maxQueuedRequests');
     final attached = lifecycle._gate;
-    if (attached != null && !attached._closed) {
+    if (attached != null &&
+        (!attached._closed ||
+            attached._assigning.isNotEmpty ||
+            attached._unloading.isNotEmpty)) {
       throw StateError('$lifecycle is attached to another slot gate');
     }
     lifecycle._gate = this;
@@ -297,6 +301,10 @@ class SlotGate implements SlotHandler {
   int instance;
 
   final Map<int, _GateSlot> _slots = {};
+  // A revoked generation may still be loading or unloading. Its cleanup
+  // must finish before another assignment can touch the same slot's state.
+  final Set<int> _assigning = {};
+  final Set<int> _unloading = {};
   final Expando<_GateSlot> _servedBy = Expando<_GateSlot>('slot');
 
   /// The OPEN application payload of the channels requests arrived on.
@@ -807,13 +815,33 @@ class SlotGate implements SlotHandler {
   /// comes back) has stale state here: its queue is refused with `MOVED`,
   /// forwarding stops, [SlotLifecycle.unload] runs, then
   /// [SlotLifecycle.load], which receives [context]. Refused with
-  /// `UNAVAILABLE` after [close].
+  /// `UNAVAILABLE` after [close], or while an earlier load or unload of
+  /// this slot is still running, even if it has already been revoked.
   @override
   Future<AssignResult> onAssign(
     AssignRequest request, [
     SlotRequestContext? context,
   ]) async {
     _checkType(request.type);
+    final slot = request.slot;
+    if (_assigning.contains(slot) || _unloading.contains(slot)) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'slot $type/$slot is still loading or unloading',
+      );
+    }
+    _assigning.add(slot);
+    try {
+      return await _assign(request, context);
+    } finally {
+      _assigning.remove(slot);
+    }
+  }
+
+  Future<AssignResult> _assign(
+    AssignRequest request,
+    SlotRequestContext? context,
+  ) async {
     final slot = request.slot;
     if (_closed) {
       throw SwitchboardException.of(
@@ -848,6 +876,12 @@ class SlotGate implements SlotHandler {
       // Owned by another instance since it was locked or handed over: its
       // state is stale, its queue (never read) refused with MOVED.
       await _retire(existing, slot);
+      if (!identical(_slots[slot], s)) {
+        throw SwitchboardException.of(
+          StatusCode.unavailable,
+          'slot $type/$slot stopped before loading',
+        );
+      }
     }
     final AssignResult result;
     try {
@@ -1198,10 +1232,13 @@ class SlotGate implements SlotHandler {
   }
 
   Future<void> _unload(int slot) async {
+    _unloading.add(slot);
     try {
       await lifecycle.unload(slot);
     } on Object catch (e, st) {
       _log.warning('$type gate: unloading slot $slot failed', e, st);
+    } finally {
+      _unloading.remove(slot);
     }
   }
 
@@ -1232,8 +1269,9 @@ class SlotGate implements SlotHandler {
   /// Stops serving every slot here, as [release] does locally (the naming
   /// service is not told), and refuses later `ASSIGN`s. Channels arriving
   /// later are refused with `MOVED`, requests through [serveRequest]
-  /// answered `ABORT MOVED`. The lifecycle may then be attached to a new
-  /// gate (its [SlotLifecycle.gate] is this one until then).
+  /// answered `ABORT MOVED`. Once outstanding loads and unloads have also
+  /// finished, the lifecycle may be attached to a new gate (its
+  /// [SlotLifecycle.gate] is this one until then).
   Future<void> close() async {
     _closed = true;
     await Future.wait([for (final slot in _slots.keys.toList()) _stop(slot)]);
