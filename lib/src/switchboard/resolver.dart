@@ -262,8 +262,9 @@ class StaticResolver implements SlotResolver {
   @override
   Future<void> close() async {
     _closed = true;
-    await _events.close();
-    await _slotEvents.close();
+    // Not awaited: a paused listener would hold it for ever.
+    unawaited(_events.close());
+    unawaited(_slotEvents.close());
   }
 }
 

@@ -592,8 +592,10 @@ class NamingService {
     await Future.wait([
       for (final session in sessions) session.channel.close(goingAway),
     ]);
-    await _events.close();
-    await _slots.events.close();
+    // Not awaited: a listener that is paused (an `await for` body calling
+    // close, an idle StreamQueue) would hold it for ever.
+    unawaited(_events.close());
+    unawaited(_slots.events.close());
   }
 
   // ---------------------------------------------------------------------

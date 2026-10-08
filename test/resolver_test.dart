@@ -45,6 +45,18 @@ void main() {
       expect(r.slotOwner(type, 0)!.owner, 1);
     });
 
+    test('close completes while a listener of events is paused', () async {
+      final r = StaticResolver();
+      final events = r.events.listen((_) {});
+      final slots = r.slotEvents.listen((_) {});
+      events.pause();
+      slots.pause();
+      r.add(ServiceRecord(ServiceAddress(Name('npc'), 1)));
+      await r.close().timeout(const Duration(seconds: 2));
+      await events.cancel();
+      await slots.cancel();
+    });
+
     test('resolves by type and emits events', () async {
       final r = StaticResolver([
         ServiceRecord(

@@ -175,6 +175,18 @@ void main() {
       expect(h.service.table.values.single.metadata, hasLength(4096));
     });
 
+    test('close completes while a listener of events is paused', () async {
+      final service = NamingService(assignmentHold: Duration.zero);
+      final events = service.events.listen((_) {});
+      final slots = service.slotEvents.listen((_) {});
+      events.pause();
+      slots.pause();
+      service.registerLocal(Name('npc'), [uriA]);
+      await service.close().timeout(timeout);
+      await events.cancel();
+      await slots.cancel();
+    });
+
     test('follows the IDENTs of a connection with one listener, however '
         'many channels it carried', () async {
       final connection = _IdentityEvents();
@@ -1831,6 +1843,24 @@ void main() {
       await client.unregister(type, 8);
       await client.close();
       await pump();
+    });
+
+    test('close completes while a listener of events is paused', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final closed = Completer<void>();
+      final listening = () async {
+        await for (final _ in client.events) {
+          // The subscription is paused while this runs.
+          await client.close().timeout(timeout);
+          closed.complete();
+        }
+      }();
+      // Its UP comes first, and closing cancels the REGISTER.
+      client.register(Name('npc'), [uriA]).ignore();
+      await closed.future.timeout(timeout);
+      await listening.timeout(timeout);
     });
 
     test('unregister while the REGISTER is in flight', () async {

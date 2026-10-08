@@ -802,7 +802,9 @@ class NamingClient {
     if (!_firstSynced.isCompleted) {
       _firstSynced.completeError(cancelled);
     }
-    await _events.close();
+    // Not awaited: a listener that is paused (an `await for` body calling
+    // close, an idle StreamQueue) would hold it for ever.
+    unawaited(_events.close());
     await _slots.close();
   }
 
