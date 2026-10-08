@@ -51,11 +51,19 @@ part of 'talk_channel.dart';
 /// and the requests it sends have no requester timeout, so the timeouts of
 /// the two real peers apply end to end, with `EXTEND` forwarded.
 ///
-/// Buffering limitation: forwarded replies return their incoming parent
-/// channel credit when queued, without waiting for the outgoing channel's
-/// credit. Inline replies can therefore accumulate in the intermediary's
-/// output queue when the downstream reader stalls. The bytes of streamed
-/// bulk payloads do pass credit through hop by hop.
+/// Flow control passes through hop by hop (wiki page "Switchboard
+/// Proxying"): over mux channels, the credit of a frame that is forwarded
+/// goes back to its sender only once the frame forwarded for it went out
+/// on the other channel (its send window took it, or it was dropped), so
+/// that a reader that stops reading on one side stalls the sender on the
+/// other, rather than filling the intermediary. This holds for everything
+/// relayed back (items, the final response, chained and item requests,
+/// `EXTEND`), and for [incoming] itself when [forwardMessage] is called by
+/// the listener of [TalkChannel.messages] (or [TalkStream.items]) while it
+/// handles [incoming]; called later, the credit went back when the
+/// listener took it. The bytes of streamed bulk payloads are piped with
+/// their credit passed through the same way; a payload the intermediary
+/// reassembled is its own, sent from memory.
 ///
 /// The returned future completes once [incoming] and every request
 /// forwarded on its behalf have ended, including their bulk transfers.
@@ -79,9 +87,12 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
     void failed(SwitchboardException error) {
       _log.fine('forwarded ${incoming.frame} dropped: $error');
       incoming._bulk?.abandon();
-      done.complete();
+      if (!done.isCompleted) {
+        done.complete();
+      }
     }
 
+    final accepted = incoming._takeCredit();
     try {
       final (payload, bulk) = incoming._forwardPayload();
       target._sendFrame(
@@ -94,20 +105,26 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
         onSent: (out) =>
             done.complete(out?.done.then<void>((_) {}, onError: (Object _) {})),
         onFailure: failed,
+        onAccepted: accepted,
       );
     } on SwitchboardException catch (e) {
+      accepted();
       failed(e);
+    } catch (_) {
+      accepted();
+      rethrow;
     }
     return done.future;
   }
   final stream = incoming.expectsStream;
-  return _Relay.start(incoming, (relay) {
+  return _Relay.start(incoming, (relay, accepted) {
     final (payload, bulk) = incoming._forwardPayload();
     return target._startRequest(
       stream: stream,
       timeout: Duration.zero,
       sink: relay,
       bulk: bulk,
+      onAccepted: accepted,
       build: (id) => TalkFrame(
         kind: TalkKind.message,
         procedure: procedure,
@@ -153,10 +170,12 @@ class _Relay implements _ResponseSink {
   final Completer<void> _done = Completer<void>();
 
   /// Forwards [incoming] with [send], which sends the forwarded request
-  /// with the relay as its response sink.
+  /// with the relay as its response sink, and calls the function it gets
+  /// once that request went out (see [TalkChannel._sendFrame]), which
+  /// returns the credit of [incoming]'s frame if it is being handed over.
   static Future<void> start(
     _Message incoming,
-    _Outgoing Function(_Relay relay) send,
+    _Outgoing Function(_Relay relay, void Function() accepted) send,
   ) {
     if (incoming._forwarded) {
       throw StateError('request ${incoming.requestId} is already forwarded');
@@ -171,9 +190,11 @@ class _Relay implements _ResponseSink {
     // The far requester's own timeout applies; EXTEND is forwarded.
     incoming.setReplyTimeout(Duration.zero);
     incoming._cancelHook = relay._onIncomingCancelled;
+    final accepted = incoming._takeCredit();
     try {
-      relay._out = send(relay);
+      relay._out = send(relay, accepted);
     } catch (e, st) {
+      accepted();
       final Status status;
       if (e is SwitchboardException) {
         status = e.status;
@@ -258,27 +279,39 @@ class _Relay implements _ResponseSink {
     }
   }
 
-  /// Sends one response to [incoming]. If that fails, [incoming] is
-  /// answered with UNAVAILABLE instead and the forwarded request cancelled.
-  void _deliver(void Function() send) {
+  /// Sends one response to [incoming], relaying [source]: [send] calls
+  /// the function it gets once the response went out, which returns the
+  /// credit of [source]'s frame. If that fails, [incoming] is answered with
+  /// UNAVAILABLE instead and the forwarded request cancelled.
+  void _deliver(_Message source, void Function(void Function() accepted) send) {
     if (!incoming.canReply) {
       return;
     }
+    final accepted = source._takeCredit();
     try {
-      send();
+      send(accepted);
     } on SwitchboardException catch (e) {
+      accepted();
       _log.fine('response to request ${incoming.requestId} not sent: $e');
       _abortIncoming(_localFailure(e.status));
       _cancelOutgoing(Status.of(StatusCode.cancelled, 'requester unreachable'));
+    } catch (_) {
+      accepted();
+      rethrow;
     }
   }
 
   @override
   void item(_Message item) {
     if (!item.expectsReply) {
-      _deliver(() {
+      _deliver(item, (accepted) {
         final (payload, bulk) = item._forwardPayload();
-        incoming._replyItem(payload, item.frame.procedure, bulk: bulk);
+        incoming._replyItem(
+          payload,
+          item.frame.procedure,
+          bulk: bulk,
+          onAccepted: accepted,
+        );
       });
       return;
     }
@@ -289,7 +322,7 @@ class _Relay implements _ResponseSink {
       return;
     }
     _addNested(
-      start(item, (relay) {
+      start(item, (relay, accepted) {
         final (payload, bulk) = item._forwardPayload();
         return incoming._startItemRequest(
           payload,
@@ -298,6 +331,7 @@ class _Relay implements _ResponseSink {
           timeout: Duration.zero,
           sink: relay,
           bulk: bulk,
+          onAccepted: accepted,
         );
       }),
     );
@@ -306,9 +340,14 @@ class _Relay implements _ResponseSink {
   @override
   void complete(_Message message) {
     if (!message.expectsReply) {
-      _deliver(() {
+      _deliver(message, (accepted) {
         final (payload, bulk) = message._forwardPayload();
-        incoming._reply(payload, message.frame.procedure, bulk: bulk);
+        incoming._reply(
+          payload,
+          message.frame.procedure,
+          bulk: bulk,
+          onAccepted: accepted,
+        );
       });
     } else if (!message.canReply) {
       // The chained request was refused by the channel (incoming request
@@ -316,7 +355,7 @@ class _Relay implements _ResponseSink {
       _abortIncoming(_localFailure(Status.of(StatusCode.resourceExhausted)));
     } else {
       _addNested(
-        start(message, (relay) {
+        start(message, (relay, accepted) {
           final (payload, bulk) = message._forwardPayload();
           return incoming._startReplyRequest(
             payload,
@@ -325,6 +364,7 @@ class _Relay implements _ResponseSink {
             timeout: Duration.zero,
             sink: relay,
             bulk: bulk,
+            onAccepted: accepted,
           );
         }),
       );
@@ -345,8 +385,12 @@ class _Relay implements _ResponseSink {
   }
 
   @override
-  void extended(Uint8List payload) {
+  void extended(_Message message) {
     // Byte for byte: the far responder's buffer covers the hops.
-    _deliver(() => incoming._extendRaw(payload));
+    _deliver(
+      message,
+      (accepted) =>
+          incoming._extendRaw(message.frame.payload, onAccepted: accepted),
+    );
   }
 }
