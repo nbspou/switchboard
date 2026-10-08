@@ -412,11 +412,15 @@ const int _slotMoveFields = 10;
 /// after [overhead] bytes of headers fits both the 1024 byte bound this
 /// implementation keeps every CLOSE and GOAWAY status payload within and
 /// the peer's announced frame limit [peerMaxFrameSize] (0 when unknown).
-/// The local-only `CONNECTION_LOST` code becomes `UNAVAILABLE` on the wire.
+/// The local-only `CONNECTION_LOST` code becomes `UNAVAILABLE` on the wire;
+/// the bytes after the code are kept as they are, as for any relayed status.
 @internal
 Status fitStatus(Status status, int overhead, int peerMaxFrameSize) {
   if (status.known == StatusCode.connectionLost) {
-    status = Status.of(StatusCode.unavailable, status.reason);
+    final bytes = status.encode();
+    bytes[0] = StatusCode.unavailable.code & 0xFF;
+    bytes[1] = StatusCode.unavailable.code >> 8;
+    status = Status.decode(bytes);
   }
   var max = MuxControlMessage.maxControlPayload;
   if (peerMaxFrameSize > 0 && peerMaxFrameSize - overhead < max) {

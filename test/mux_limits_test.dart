@@ -732,6 +732,19 @@ void main() {
       );
       expect(await mux.done, status);
     });
+
+    test('only the code changes: the bytes after it are relayed', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      // As a peer that broke the rule sent it, the reason not even UTF-8.
+      final status = Status.decode(hexBytes('22 00 FF 41'));
+      unawaited(channel.close(status));
+      expect(hexString((await raw.next()).payload), '0E 00 FF 41');
+      raw.send('22 02 00');
+      expect(await channel.done, status);
+    });
   });
 
   group('application codes from the peer', () {
