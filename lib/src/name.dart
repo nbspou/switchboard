@@ -94,7 +94,7 @@ class Name {
   // the receiver is a nullable variable compared as `n == null || n == x`
   // inside the loop (the JIT does not), and a native binary then dies
   // with SIGSEGV on the first such loop with a null receiver. See
-  // tool/aot_smoke.dart.
+  // tool/aot_smoke.dart and https://github.com/dart-lang/sdk/issues/64528.
   @pragma('vm:never-inline')
   @override
   bool operator ==(Object other) {
