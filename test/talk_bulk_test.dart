@@ -291,33 +291,75 @@ void main() {
     await talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1000)));
   });
 
-  test(
-    'completed streams keep unread items within the reassembly budget',
-    () async {
-      final peers = await Peers.connect(
-        serverOptions: const TalkOptions(bulkThreshold: 100),
-      );
-      final (talk, server) = await peers.open(
-        options: const TalkOptions(maxInlinePayload: 1000),
-      );
-      server.messages.listen((message) {
-        message.replyItem(pattern(1000));
-        message.reply(Uint8List(0));
-      });
-      final first = talk.streamRequest('LIST', Uint8List(0));
-      await first.done;
-      final second = talk.streamRequest('LIST', Uint8List(0));
-      second.items.listen((_) => fail('over-budget item delivered'));
-      await expectLater(
-        second.done,
-        throwsStatus(StatusCode.resourceExhausted),
-      );
-      expect((await first.items.toList()).single.payload, pattern(1000));
-      final third = talk.streamRequest('LIST', Uint8List(0));
-      expect((await third.items.toList()).single.payload, pattern(1000));
-      await third.done;
-    },
-  );
+  test('a running stream keeps its unread items within the reassembly '
+      'budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    server.messages.listen((message) {
+      message
+        ..replyItem(pattern(1000))
+        ..replyItem(pattern(1000, 1))
+        ..reply(Uint8List(0));
+    });
+    final stream = talk.streamRequest('LIST', Uint8List(0));
+    await expectLater(stream.done, throwsStatus(StatusCode.resourceExhausted));
+    final items = StreamQueue(stream.items);
+    expect((await items.next).payload, pattern(1000));
+    await expectLater(items.next, throwsStatus(StatusCode.resourceExhausted));
+    // Nothing is left charged: the next stream gets the whole budget.
+    final next = talk.streamRequest('LIST', Uint8List(0));
+    final more = StreamQueue(next.items);
+    expect((await more.next).payload, pattern(1000));
+    await more.cancel();
+  });
+
+  test('the end of a stream releases the reassembly budget of its unread '
+      'items', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    server.messages.listen((message) {
+      message.replyItem(pattern(1000));
+      message.reply(Uint8List(0));
+    });
+    // Nobody ever listens to the items of the first: they are the
+    // application's once the stream ended, as their credit is.
+    final first = talk.streamRequest('LIST', Uint8List(0));
+    await first.done;
+    final second = talk.streamRequest('LIST', Uint8List(0));
+    await second.done;
+    expect((await second.items.toList()).single.payload, pattern(1000));
+    expect((await first.items.toList()).single.payload, pattern(1000));
+  });
+
+  test('an answer Talk takes itself has no share of the reassembly '
+      'budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    // A paused listener holds a reassembled message: the budget is used.
+    final held = <TalkMessage>[];
+    final subscription = talk.messages.listen(held.add)..pause();
+    server.messages.listen((message) => message.reply(pattern(1000, 2)));
+    server.send('NOTE', pattern(1000));
+    await pumpEventQueue();
+    final answer = await talk.request('GET', Uint8List(0));
+    expect(answer.payload, pattern(1000, 2));
+    subscription.resume();
+    await pumpEventQueue();
+    expect(held.single.payload, pattern(1000));
+    await subscription.cancel();
+  });
 
   test('unread reassemblies share a channel memory budget', () async {
     final peers = await Peers.connect(

@@ -136,9 +136,17 @@ class TalkOptions {
   /// with `RESOURCE_EXHAUSTED`, toward the sender (its bulk channel is
   /// closed with it, a request is answered with it) and the receiver.
   /// Default 16 MiB.
-  /// Also caps the total reassembled bytes still held by this channel for
-  /// delivery to the application. Exceeding that budget fails the payload
-  /// with `RESOURCE_EXHAUSTED`; delivery or discard releases its budget.
+  ///
+  /// Also caps the total of the reassembled payloads this channel holds
+  /// for the application, finished or not, of the messages behind a
+  /// listener ([TalkChannel.messages], [TalkStream.items], the answers of
+  /// `ordered` requests): exceeding it fails the payload with
+  /// `RESOURCE_EXHAUSTED`,
+  /// so that small `BULK` frames behind a paused listener cannot hold more.
+  /// Delivery, discard or failure releases a payload's share, and so does
+  /// the end of a stream request for its unread items (as their credit).
+  /// The final response completing a request's future is not counted: Talk
+  /// takes it itself.
   final int maxInlinePayload;
 
   /// Receiving: the window granted to a bulk channel being read whose
@@ -368,7 +376,8 @@ class TalkChannel {
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
 
-  /// Reassembly in progress and completed payloads not delivered yet.
+  /// The reassembly budget in use ([TalkOptions.maxInlinePayload]): the
+  /// payloads being reassembled for a listener, and those waiting for it.
   int _assemblyBytes = 0;
 
   /// The order of [messages], kept while bulk payloads arrive.
@@ -1333,10 +1342,6 @@ class TalkChannel {
   /// it counts for will deliver nothing more.
   void _drainHeld(_Held held) {
     _returnHeld(held);
-    for (final message in held.assembled) {
-      message._releaseAssembly();
-    }
-    held.assembled.clear();
     // Bulk payloads of the dropped messages will not be read.
     final bulk = List.of(held.bulk);
     held.bulk.clear();
@@ -1350,6 +1355,12 @@ class TalkChannel {
   /// deliverable: nothing more will be added to its controller (the stream
   /// request ended), so it is bounded without the window.
   void _returnHeld(_Held held) {
+    // So does their share of the reassembly budget: what an ended stream
+    // holds is the application's, and stays so if it never listens.
+    for (final message in held.assembled) {
+      message._releaseAssembly();
+    }
+    held.assembled.clear();
     if (held.drained) {
       return;
     }
@@ -1634,7 +1645,11 @@ class TalkChannel {
       return;
     }
     pending.finalReceived = true;
-    final message = _Message(this, frame).._creditBytes = wire;
+    final message = _Message(this, frame)
+      .._creditBytes = wire
+      // An answer completing a future is taken by Talk itself, not held
+      // for a listener: no share of the reassembly budget.
+      .._budgeted = pending.ordered;
     pending.finalMessage = message;
     if (frame.hasRequest) {
       _register(message);
@@ -2427,9 +2442,18 @@ class _Message extends TalkMessage {
   int _assemblyBytes = 0;
   bool _dropped = false;
 
+  /// Its reassembly counts toward the channel's budget: it is held for a
+  /// listener (see [TalkOptions.maxInlinePayload]).
+  bool _budgeted = true;
+
   bool _reserveAssembly(int bytes) {
-    if (_dropped ||
-        channel._assemblyBytes + bytes > channel.options.maxInlinePayload) {
+    if (_dropped) {
+      return false;
+    }
+    if (!_budgeted) {
+      return true;
+    }
+    if (channel._assemblyBytes + bytes > channel.options.maxInlinePayload) {
       return false;
     }
     _assemblyBytes += bytes;
@@ -3310,8 +3334,9 @@ class _Held {
   /// The messages held whose bulk payload is a stream nobody read yet.
   final List<_Message> bulk = [];
 
-  /// Reassembled payloads whose memory budget lasts until delivery, even
-  /// after a stream request ends and returns its parent-frame credit.
+  /// The held messages whose reassembled payload has a share of the
+  /// channel's budget, released as each is delivered, or all of them with
+  /// the credit ([TalkChannel._returnHeld]).
   final Set<_Message> assembled = {};
 
   /// Counts the credit of [message], added to the controller, and, with
