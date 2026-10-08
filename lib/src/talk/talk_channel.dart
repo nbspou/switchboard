@@ -141,9 +141,11 @@ class TalkOptions {
   /// Also caps the total of the reassembled payloads this channel holds
   /// for the application, finished or not, of the messages behind a
   /// listener ([TalkChannel.messages], [TalkStream.items], the answers of
-  /// `ordered` requests): exceeding it fails the payload with
-  /// `RESOURCE_EXHAUSTED`,
-  /// so that small `BULK` frames behind a paused listener cannot hold more.
+  /// `ordered` requests), streamed payloads not delivered yet counted at
+  /// what their bulk channel may hold (its window, or the declared length
+  /// if smaller): exceeding it fails the payload with `RESOURCE_EXHAUSTED`
+  /// (and the message, as a failed reassembly does), so that small `BULK`
+  /// frames behind a paused listener cannot hold more.
   /// Delivery, discard or failure releases a payload's share, and so does
   /// the end of a stream request for its unread items (as their credit).
   /// The final response completing a request's future is not counted: Talk
@@ -1668,7 +1670,22 @@ class TalkChannel {
         _log.warning('streamBulk failed; reassembling the payload', e, st);
       }
     }
-    if (stream) {
+    if (stream &&
+        !message._forSink &&
+        !message._reserveAssembly(_streamHold(b, message._bulkRef!.length))) {
+      // Until delivered, its bulk channel holds what its window lets the
+      // peer send, read by nobody: like a reassembly, a share of the
+      // budget of what waits behind a listener.
+      final status = Status.of(
+        StatusCode.resourceExhausted,
+        'bulk payloads waiting for the listener exceed the '
+        '${options.maxInlinePayload} byte budget',
+      );
+      b
+        ..close(status)
+        ..abandon();
+      message._bulkFailure = status;
+    } else if (stream) {
       message._streamBulk = true;
       message._startDeferredTimer();
     } else {
@@ -1690,6 +1707,21 @@ class TalkChannel {
           );
     }
     message._lane?.advance();
+  }
+
+  /// What the bulk channel of [b], a payload of [length] bytes (null:
+  /// unknown), may hold while nobody reads it: what arrived, and what its
+  /// window still lets the peer send.
+  static int _streamHold(_BulkIn b, int? length) {
+    var hold = 0;
+    for (final chunk in b._buffer) {
+      hold += chunk.length;
+    }
+    final channel = b.channel;
+    if (channel.state != MuxChannelState.closed) {
+      hold += channel.receiveWindow + channel.bufferedBytes;
+    }
+    return length != null && length < hold ? length : hold;
   }
 
   /// Ends the bulk payloads in transfer in both directions: the channel

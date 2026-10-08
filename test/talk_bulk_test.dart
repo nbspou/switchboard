@@ -361,6 +361,51 @@ void main() {
     await subscription.cancel();
   });
 
+  test('streamed payloads waiting for a paused listener share the budget, '
+      'at what their window lets the peer send', () async {
+    final peers = await Peers.connect(
+      serverOptions: TalkOptions(
+        maxInlinePayload: 200000,
+        streamBulk: (_) => true,
+      ),
+    );
+    final (talk, server) = await peers.open();
+    final seen = <TalkMessage>[];
+    final subscription = server.messages.listen(seen.add)..pause();
+    final sent = [
+      for (var i = 0; i < 6; i++)
+        talk
+            .request(
+              'PUT',
+              Uint8List(0),
+              bulk: Stream.value(pattern(100000, i)),
+              bulkLength: 100000,
+            )
+            .then<Object>((m) => m, onError: (Object e) => e),
+    ];
+    // A window (64 KiB) each: three fit, the others are refused.
+    for (final refused in sent.skip(3)) {
+      expect(
+        await refused,
+        isA<TalkAbortException>().having(
+          (e) => e.code,
+          'code',
+          StatusCode.resourceExhausted,
+        ),
+      );
+    }
+    subscription.resume();
+    await until(() => seen.length == 3);
+    for (var i = 0; i < 3; i++) {
+      expect(await collect(seen[i].bulk), pattern(100000, i));
+      seen[i].reply(Uint8List(0));
+    }
+    for (final answered in sent.take(3)) {
+      expect(await answered, isA<TalkMessage>());
+    }
+    await subscription.cancel();
+  });
+
   test('unread reassemblies share a channel memory budget', () async {
     final peers = await Peers.connect(
       serverOptions: const TalkOptions(maxInlinePayload: 1000),
