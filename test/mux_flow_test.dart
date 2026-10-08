@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 // Flow control (wiki page "Polyverse Switchboard Mux", section "Flow
