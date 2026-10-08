@@ -70,7 +70,9 @@ abstract class TalkMessage {
 
   /// True once the peer cancelled this request, or once the request can no
   /// longer be answered: the responder timeout expired, the channel closed,
-  /// or the peer reused its id. Work on the request should stop.
+  /// the peer reused its id, or the listener it was delivered to threw
+  /// before answering it (the channel then answered `ABORT INTERNAL`). Work
+  /// on the request should stop.
   bool get isCancelled;
 
   /// Completes when [isCancelled] becomes true. Never completes for a
@@ -208,13 +210,14 @@ abstract class TalkMessage {
   /// with its status.
   ///
   /// When the request is cancelled ([onCancel]: the peer cancelled it, the
-  /// responder timeout expired, or the channel closed) the subscription to
-  /// [items] is cancelled and nothing more is sent; when the peer
-  /// cancelled, the channel has already answered `ABORT CANCELLED`. Each
-  /// item restarts the responder timeout (or renews it by the declared
-  /// renewal); a source slower than [TalkOptions.replyTimeout] between
-  /// items should be paired with [setReplyTimeout] or with an [extend]
-  /// that declares a deadline or a renewal.
+  /// responder timeout expired, the channel closed, or the listener that
+  /// called this threw) the subscription to [items] is cancelled and
+  /// nothing more is sent; when the peer cancelled, the channel has already
+  /// answered `ABORT CANCELLED`. Each item restarts the responder timeout
+  /// (or renews it by the declared renewal); a source slower than
+  /// [TalkOptions.replyTimeout] between items should be paired with
+  /// [setReplyTimeout] or with an [extend] that declares a deadline or a
+  /// renewal.
   ///
   /// The future completes once the answer has ended (or the subscription
   /// was cancelled); it never completes with an error. Errors from

@@ -35,9 +35,11 @@ part of 'talk_channel.dart';
 ///   with `ABORT UNAVAILABLE`: the intermediary's own failures, such as its
 ///   `CONNECTION_LOST` or `DEADLINE_EXCEEDED`, are never presented as the
 ///   far peer's answer;
-/// * a cancel of [incoming], or the loss of its channel, cancels the
-///   forwarded request. A reply that cannot be delivered also cancels it,
-///   including a synchronous reply received while forwarding the request.
+/// * a cancel of [incoming] (see [TalkMessage.isCancelled]: the peer
+///   cancelled it, its channel was lost, or the listener that forwarded it
+///   then threw) cancels the forwarded request. A reply that cannot be
+///   delivered also cancels it, including a synchronous reply received
+///   while forwarding the request.
 ///
 /// Procedure names and payloads pass through byte for byte, including
 /// names that are not valid UTF-8; an absent procedure field on a response

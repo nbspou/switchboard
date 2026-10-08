@@ -641,6 +641,57 @@ void main() {
       });
     });
 
+    test('a listener that throws after forwarding cancels the forwarded '
+        'request', () async {
+      final toClient = StreamChannelController<Uint8List>();
+      final toBackend = StreamChannelController<Uint8List>();
+      final front = TalkChannel(toClient.local);
+      final back = TalkChannel(toBackend.local);
+      final forwards = <Future<void>>[];
+      front.messages.listen((m) {
+        forwards.add(forwardMessage(m, back));
+        throw StateError('handler bug');
+      });
+      final atClient = <TalkFrame>[];
+      final atBackend = <TalkFrame>[];
+      toClient.foreign.stream.listen((d) => atClient.add(TalkFrame.decode(d)));
+      toBackend.foreign.stream.listen((data) {
+        final frame = TalkFrame.decode(data);
+        atBackend.add(frame);
+        if (frame.kind == TalkKind.abort && frame.hasRequest) {
+          toBackend.foreign.sink.add(
+            TalkFrame(
+              kind: TalkKind.abort,
+              responseId: frame.requestId,
+              payload: Status.of(StatusCode.cancelled).encode(),
+            ).encode(),
+          );
+        }
+      });
+      toClient.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('LIST'),
+          requestId: 7,
+          stream: true,
+        ).encode(),
+      );
+      await pumpEventQueue();
+      final forwarded = Outcome(forwards.single);
+      await pumpEventQueue();
+      expect(forwarded.isDone, isTrue, reason: 'forwarding ended');
+      expect(atClient.single.kind, TalkKind.abort);
+      expect(atClient.single.responseId, 7);
+      expect(atClient.single.status.known, StatusCode.internal);
+      expect(atBackend.map((f) => (f.kind, f.requestId)), [
+        (TalkKind.message, 1),
+        (TalkKind.abort, 1),
+      ], reason: 'the backend is told to stop');
+      expect(front.incomingRequestCount, 0);
+      expect(back.outgoingRequestCount, 0);
+      await Future.wait([front.close(), back.close()]);
+    });
+
     test('non-UTF-8 procedure names pass through byte for byte', () async {
       final p = RawProxy();
       p.fromClient(

@@ -148,10 +148,11 @@ class TalkAbortException extends SwitchboardException {
 /// * Exceptions thrown by application listeners never affect the channel.
 ///   If a listener of [messages] or [TalkStream.items] throws synchronously
 ///   while handling a request it has not yet answered, the exception is
-///   logged and the request is answered with `ABORT INTERNAL`. Exceptions
-///   in asynchronous code (for example the body of an `await for`) cannot
-///   be seen by the channel; such a request is answered by the responder
-///   timeout.
+///   logged and the request is answered with `ABORT INTERNAL` and marked
+///   cancelled ([TalkMessage.onCancel]), so that work started on it stops,
+///   a [forwardMessage] of it included. Exceptions in asynchronous code
+///   (for example the body of an `await for`) cannot be seen by the
+///   channel; such a request is answered by the responder timeout.
 /// * Error events on [messages] and [TalkStream.items] whose listener has
 ///   no `onError` handler are logged, never reported as unhandled. Futures
 ///   returned by the request API never report unhandled errors either.
@@ -1836,6 +1837,18 @@ class _Message extends TalkMessage {
     _sendReply(() => channel._rejectRequest(requestId, status), isFinal: true);
   }
 
+  /// The listener this request was delivered to threw before answering it:
+  /// answers `ABORT INTERNAL` on its behalf and, as on the responder
+  /// timeout, marks the request cancelled, so that work started on it (a
+  /// [forwardMessage] of it included) stops.
+  void _handlerFailed() {
+    if (_finished || _finalizing || !expectsReply) {
+      return;
+    }
+    _abortQuietly(Status.of(StatusCode.internal, 'message handler failed'));
+    _markCancelled();
+  }
+
   /// The peer cancelled the request: answer it with the final the protocol
   /// requires, then tell the application. Held while a reply is being sent
   /// (see [_sendReply]).
@@ -1941,9 +1954,7 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
       } catch (e, st) {
         _log.severe('message handler threw on ${message.procedureName}', e, st);
         if (message is _Message) {
-          message._abortQuietly(
-            Status.of(StatusCode.internal, 'message handler failed'),
-          );
+          message._handlerFailed();
         }
       }
     });

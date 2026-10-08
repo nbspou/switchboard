@@ -723,6 +723,32 @@ void main() {
       await p.close();
     });
 
+    test('a request whose handler threw is marked cancelled', () async {
+      final p = Pair();
+      final seen = <String, TalkMessage>{};
+      p.b.messages.listen((m) {
+        seen[m.procedureName] = m;
+        if (m.procedureName == 'LATE') {
+          m.reply(bytes([1]));
+        }
+        throw StateError('handler bug');
+      });
+      await expectLater(
+        p.a.request('BOOM', Uint8List(0)),
+        throwsStatus(StatusCode.internal),
+      );
+      expect((await p.a.request('LATE', Uint8List(0))).payload, [1]);
+      final boom = seen['BOOM']!;
+      final onCancel = Outcome(boom.onCancel);
+      await pumpEventQueue();
+      expect(boom.isCancelled, isTrue, reason: 'work should stop');
+      expect(onCancel.isDone, isTrue);
+      expect(boom.canReply, isFalse);
+      expect(seen['LATE']!.isCancelled, isFalse, reason: 'it was answered');
+      expect(p.bToA.where((f) => f.kind == TalkKind.abort), hasLength(1));
+      await p.close();
+    });
+
     test('item listener exceptions abort the item request', () async {
       final p = Pair();
       serve(p.b, (m) async {
