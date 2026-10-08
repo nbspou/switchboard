@@ -23,6 +23,12 @@ Future<void> main() async {
   // The acceptor answers Talk requests on every channel the peer opens.
   acceptor.incoming.listen((channel) {
     final address = ChannelAddress.decode(channel.openPayload);
+    if (TalkBulkOpen.isBulk(address)) {
+      // The payload of a large message of another channel: its Talk layer
+      // takes it (a Switchboard node routes these itself).
+      TalkChannel.adoptBulk(channel);
+      return;
+    }
     print('acceptor: channel ${channel.id} opened for ${address.address}');
     TalkChannel(channel).messages.listen((message) {
       if (message.expectsReply) {

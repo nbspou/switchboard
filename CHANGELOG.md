@@ -200,6 +200,37 @@ The protocol specification lives in the project wiki (section
   bulk channel into chunks of `MuxOptions.bulkChunkSize` (64 KiB).
   `pipeChannels` (the proxy, the relay, the slot gate's forwarding) passes
   credit through hop by hop, and `SlotChannel.send` returns a future too.
+  A channel opened before the peer's first frame holds its DATA until the
+  peer's LIMITS arrives (`MuxOptions.awaitPeerLimits`, bounded by the
+  keep-alive timeout), so that a peer announcing a small window is held to
+  it from the first channel on. `MuxChannel.openAfter` opens a channel
+  whose OPEN keeps its place among another channel's frames. Talk returns
+  credit when the application takes a message: `messages` and
+  `TalkStream.items` hand it over, an ordered answer is delivered; what
+  Talk consumes itself (final responses, aborts, `EXTEND`, cancels, frames
+  it drops) returns it at once. A `messages` or `items` subscription that
+  is paused, or never made, now stalls its channel once the window is
+  spent (responses on it included), instead of buffering without bound;
+  listen, or cancel the subscription.
+- Protocol change, Talk: bulk payloads. Flag `0x40` of the Talk header is
+  `BULK`: the payload field is a 10-byte reference (`TalkBulkReference`:
+  `u32` bulk number, `u48` length, `0xFFFFFFFFFFFF` unknown) to a bulk
+  channel of the same connection whose open payload is the reserved type
+  `_bulk` naming the parent channel and the number (`TalkBulkOpen`,
+  `Services.bulk`). A message whose frame would exceed
+  `MuxChannel.maxSubframeLength` (or `TalkOptions.bulkThreshold`) goes this
+  way transparently; `send`, `request`, `startRequest` and `streamRequest`
+  take `bulk:` (a byte stream, paused by the bulk channel's credit) and
+  `bulkLength:`, and `TalkMessage.replyBulk` and `replyItemBulk` answer
+  with one. A received bulk payload is reassembled before its message is
+  delivered (up to `TalkOptions.maxInlinePayload`, 16 MiB; beyond,
+  `RESOURCE_EXHAUSTED` to both sides), so `payload` reads it like an
+  inline one; messages `TalkOptions.streamBulk` selects are delivered at
+  once and read as a stream (`TalkMessage.bulk`, `payloadBytes`,
+  `isBulk`, `bulkLength`). Messages keep their order either way. The
+  Switchboard routes `_bulk` channels to their parent's Talk layer before
+  any policy (`TalkChannel.adoptBulk` for raw mux users); `pipeChannels`,
+  `proxyHandler`, the relay and `forwardMessage` forward bulk payloads.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row

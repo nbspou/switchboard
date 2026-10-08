@@ -433,6 +433,12 @@ Future<void> main() async {
   // The acceptor answers Talk requests on every channel the peer opens.
   acceptor.incoming.listen((channel) {
     final address = ChannelAddress.decode(channel.openPayload);
+    if (TalkBulkOpen.isBulk(address)) {
+      // The payload of a large message of another channel: its Talk layer
+      // takes it (a Switchboard node routes these itself).
+      TalkChannel.adoptBulk(channel);
+      return;
+    }
     print('acceptor: channel ${channel.id} opened for ${address.address}');
     TalkChannel(channel).messages.listen((message) {
       if (message.expectsReply) {
@@ -455,6 +461,49 @@ Future<void> main() async {
 }
 ```
 
+### Bulk payloads
+
+A Talk message travels in one mux frame, which flow control keeps to half the window (32752 bytes by default). A larger message goes on a bulk channel of its own, transparently: `request('PUT', bigBytes)` and `reply(bigBytes)` just work, and the receiver's `payload` holds the reassembled bytes (up to `TalkOptions.maxInlinePayload`, 16 MiB). To move data that should never sit in memory, send a byte stream and read one:
+
+```dart
+// A file service: uploads and downloads as streams, paced by the reader.
+// The channel's application payload names the file.
+node.registerService(Name('files'), (incoming) {
+  final file = File('store/${utf8.decode(incoming.address.payload)}');
+  final talk = incoming.talk(
+    // Deliver PUT at once, its payload still arriving, instead of
+    // reassembling it first.
+    options: TalkOptions(streamBulk: (m) => m.procedureName == 'PUT'),
+  );
+  talk.messages.listen((m) async {
+    switch (m.procedureName) {
+      case 'PUT':
+        final sink = file.openWrite();
+        await sink.addStream(m.bulk); // credit goes back as the file takes it
+        await sink.close();
+        m.reply(Uint8List(0));
+      case 'GET':
+        await m.replyBulk(file.openRead(), length: await file.length());
+    }
+  });
+});
+
+// A client uploads a file.
+final upload = File('model.bin');
+final files = await client.openTalk(
+  ServiceAddress(Name('files')),
+  payload: utf8.encode('model.bin'),
+);
+await files.request(
+  'PUT',
+  Uint8List(0),
+  bulk: upload.openRead(), // read as the server's window allows
+  bulkLength: await upload.length(),
+);
+```
+
+A bulk message keeps its place among the channel's messages. Proxies, relays and `forwardMessage` pass bulk payloads through without reassembling them. A raw `MuxConnection` user routes the `_bulk` channels its peer opens with `TalkChannel.adoptBulk`, as in the example above.
+
 ## Security defaults and resource limits
 
 * **Listener policy.** `listenTcp` and `listenWebSocket` (and `accept` and `acceptWebSocket`) take a `policy` that decides which service types a peer on that listener may address. Without one everything is allowed, which is only safe on internal listeners. A listener reachable by untrusted peers must set a policy that refuses the reserved types: `ChannelPolicies.denyReserved`, or `ChannelPolicies.allowTypes` with an explicit list. Otherwise a peer can reach the naming service `_ns`, register services and receive other peers' channels and credentials.
@@ -464,7 +513,7 @@ Future<void> main() async {
 * **Relay.** `RelayService` relays only for identified consumers (by default), and only to the types their credential has `open` for; it refuses reserved types and host hints inside the relayed payload, so it cannot reach the naming service or chain relays, and forwards at most 1024 channels at a time per consumer connection. Its host should set `MuxOptions(requireNamedIdent: true)`, as the naming service's does (`RelayService` logs a warning otherwise). A node that listens never uses a relay.
 * **Rejections.** Statuses sent to peers carry a generic reason such as `permission denied`. Instance ids, endpoints and resolver state go to the local log only.
 * **Frame size.** Frames are limited to 1 MiB by default (`MuxOptions.maxFrameSize`, which a `Switchboard` also applies to its transports). The WebSocket listener uses `WebSocketServerTransport`, which checks the size of a message, all fragments counted, before buffering it, and never negotiates compression.
-* **Flow control.** Every channel has a credit window in each direction, 64 KiB by default (`MuxOptions.initialWindow`): a peer can send no more on a channel than the receiver granted, and a peer that tries ends its connection with GOAWAY `PROTOCOL_ERROR`. Credit goes back as the application consumes, so a channel nobody reads stalls on its own and the others keep flowing. `MuxChannel.send` returns a future that waits for credit. Above 16 MiB unconsumed over all channels, the connection stops reading the transport until half has drained. The number of channels, the OPEN payloads they hold and the unconfirmed CLOSEs are bounded too.
+* **Flow control.** Every channel has a credit window in each direction, 64 KiB by default (`MuxOptions.initialWindow`): a peer can send no more on a channel than the receiver granted, and a peer that tries ends its connection with GOAWAY `PROTOCOL_ERROR`. Credit goes back as the application consumes: Talk returns it when `messages` (or a stream's `items`) hands a message to the listener, so a channel whose messages nobody reads, or whose subscription is paused, stalls on its own once its window is spent (answers to its own requests included) and the others keep flowing; listen, or cancel the subscription. `MuxChannel.send` returns a future that waits for credit. DATA waits for the peer's LIMITS, so a peer announcing a small window is held to it from the first channel on. Above 16 MiB unconsumed over all channels, the connection stops reading the transport until half has drained. The number of channels, the OPEN payloads they hold and the unconfirmed CLOSEs are bounded too, and so are bulk payloads: 16 MiB reassembled per message, a 1 MiB window per bulk channel being read, 16 bulk channels opened ahead of their messages.
 * **Backpressure.** DATA that a slow peer cannot take yet waits in the mux, bounded by the windows, where control messages and ordinary channels go before bulk transfers (`MuxChannel.priority`). Other output (a peer that sends PINGs without reading) waits in the transport, which queues at most 16 MiB, then stops reading its input. A close that cannot drain in time destroys the connection.
 * **Liveness and timeouts.** The mux sends PING after 10 s of silence and drops the connection if nothing arrives within 10 s more. A Talk request fails after 15 s without a response, `EXTEND` or stream item, and a responder has 10 s to reply before the request is aborted for it, unless the responder declares a longer deadline with `TalkMessage.extend`.
 
