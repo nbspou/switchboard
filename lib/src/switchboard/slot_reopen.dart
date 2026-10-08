@@ -33,11 +33,11 @@ final Logger _log = Logger('Switchboard.Router');
 /// resolver's table has an entry with a higher epoch; when the status
 /// names none, the owner [SlotResolver.locateSlot] finds within
 /// [Switchboard.slotRefreshTimeout].
-/// An owner equal to [rejectedBy] does not count. With a newer table
-/// entry pointing back to [rejectedBy], the retry is
-/// abandoned rather than following the older rejection to another owner.
-/// Through a resolver without a table for the type, the target is the
-/// named owner, or the same address again (instance 0).
+/// An owner equal to [rejectedBy] does not count, except in a table entry
+/// with a higher epoch than the status: the slot came back to it after
+/// the rejection, so the retry goes to it. Through a resolver without a
+/// table for the type, the target is the named owner, or the same address
+/// again (instance 0).
 ///
 /// The replacement carries [header] with the instance set to the selected
 /// one and no host hint; the application payload is unchanged unless
@@ -79,10 +79,6 @@ Future<MuxChannel?> reopenAtSlotOwner(
         ((target == 0 && mirrored.owner != rejectedBy) ||
             (target != 0 && mirrored.epoch > named.epoch))) {
       target = mirrored.owner;
-    }
-    if (target == rejectedBy) {
-      _log.fine('$type/$slot: newer table still names $rejectedBy; no retry');
-      return null;
     }
     if (target == 0) {
       if (mayLocate != null && !mayLocate()) {

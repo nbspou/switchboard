@@ -73,6 +73,9 @@ enum Mode {
   /// Rejects with MOVED carrying [Backend.moved] at once.
   moved,
 
+  /// Rejects the first channel as [moved] does, then greets as [greet].
+  movedOnce,
+
   /// Closes with RELOCATED carrying [Backend.moved] at once.
   relocated,
 
@@ -126,6 +129,9 @@ class Backend {
         channel.send(bytes('$name ${incoming.address.shard}'));
         channel.stream.listen((d) => channel.send(bytes('$name:${text(d)}')));
       case Mode.moved:
+        unawaited(incoming.reject(moved));
+      case Mode.movedOnce:
+        mode = Mode.greet;
         unawaited(incoming.reject(moved));
       case Mode.relocated:
         unawaited(incoming.reject(this.moved.toStatus(relocated: true)));
@@ -334,24 +340,20 @@ void main() {
       expect(await greeting(channel), 'B 1');
     });
 
-    test(
-      'a newer table pointing back to the rejecting owner wins too',
-      () async {
-        a
-          ..mode = Mode.moved
-          ..moved = MovedStatus(owner: 2, epoch: 2);
-        final channel = await router.openChannelToSlot(svc, 1);
-        resolver.setSlot(svc, 1, const SlotEntry.owned(1, epoch: 3));
-        // The slot has already returned to A. Do not follow its stale MOVED
-        // to B, which no longer owns the slot.
-        b.mode = Mode.moved;
-        b.moved = MovedStatus(owner: 1, epoch: 3);
-        expect(await channel.done.timeout(limit), hasCode(StatusCode.moved));
-        expect(MovedStatus.fromStatus(await channel.done), a.moved);
-        expect(b.opened, isEmpty);
-        expect(resolver.located, isEmpty);
-      },
-    );
+    test('a newer table entry naming the rejecting owner wins too', () async {
+      a
+        ..mode = Mode.movedOnce
+        ..moved = MovedStatus(owner: 2, epoch: 2);
+      final channel = await router.openChannelToSlot(svc, 1);
+      // The slot came back to A after it rejected the channel: the retry
+      // goes to A, not to B, which the older MOVED names.
+      resolver.setSlot(svc, 1, const SlotEntry.owned(1, epoch: 3));
+      expect(await greeting(channel), 'A 1');
+      expect(channel.retried, isTrue);
+      expect(a.opened, hasLength(2));
+      expect(b.opened, isEmpty);
+      expect(resolver.located, isEmpty);
+    });
 
     test('nowhere else to go: MOVED is surfaced', () async {
       a.mode = Mode.moved;

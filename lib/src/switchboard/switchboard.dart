@@ -2483,7 +2483,8 @@ class Switchboard {
   /// was sent or received, it is retried once, with the same [payload]
   /// (default: the payload [openChannel] gives the new destination): to
   /// the owner the rejection names (`MovedStatus`), unless the resolver's
-  /// table has a more recent one; when it names none, to the owner the
+  /// table has a more recent one (even the instance that rejected: the
+  /// slot came back to it); when it names none, to the owner the
   /// resolver finds by asking ([SlotResolver.locateSlot], bounded by
   /// [slotRefreshTimeout]); through a resolver without slot tables, the
   /// same address again. When the
