@@ -3340,6 +3340,50 @@ void main() {
       await p.close();
     });
 
+    for (final sourceFails in [false, true]) {
+      test(
+        'replyStream: cleanup errors after ${sourceFails ? 'a source error' : 'a peer cancel'} '
+        'are handled',
+        () async {
+          final errors = await uncaughtErrors(() async {
+            final p = Pair();
+            var cancellations = 0;
+            final source = StreamController<Uint8List>(
+              onCancel: () {
+                cancellations++;
+                return Future<void>.error(StateError('cleanup failed'));
+              },
+            );
+            late Outcome<void> finished;
+            serve(p.b, (m) => finished = Outcome(m.replyStream(source.stream)));
+            final stream = p.a.streamRequest('X', Uint8List(0));
+            final answer = Outcome(stream.done);
+            stream.items.listen((_) {});
+            await pumpEventQueue();
+            if (sourceFails) {
+              source.addError(StateError('source failed'));
+            } else {
+              stream.cancel();
+            }
+            await pumpEventQueue();
+            expect(finished.isDone, isTrue);
+            expect(finished.error, isNull);
+            expect(cancellations, 1);
+            expect(
+              answer.error,
+              isStatus(
+                sourceFails ? StatusCode.internal : StatusCode.cancelled,
+              ),
+            );
+            expect(p.bToA.where((f) => f.kind == TalkKind.abort), hasLength(1));
+            await source.close();
+            await p.close();
+          });
+          expect(errors, isEmpty);
+        },
+      );
+    }
+
     test(
       'replyStream: the channel closing stops consuming the source',
       () async {
