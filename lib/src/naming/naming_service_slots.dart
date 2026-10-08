@@ -558,9 +558,10 @@ class _SlotManager {
   }
 
   /// Applies a `HOLDING` declaration of [slot] by instance [me]: a free
-  /// slot without holder gets [me] as holder; one being assigned to [me]
-  /// is fine; one being assigned fresh (holder 0) to another instance goes
-  /// to [waiting]; any other slot held elsewhere goes to [discard].
+  /// slot without holder gets [me] as holder; one being assigned fresh
+  /// (holder 0) gets [me] as holder if that `ASSIGN` fails
+  /// ([_Space.declared]), and goes to [waiting] when it is assigned to
+  /// another instance; any other slot held elsewhere goes to [discard].
   void _declareHeld(
     _Space space,
     int slot,
@@ -580,6 +581,10 @@ class _SlotManager {
         setEntry(space, slot, SlotEntry.free(holder: me, epoch: entry.epoch));
         return;
       }
+      // Decided by that ASSIGN: should it fail, the first instance that
+      // declared the slot meanwhile holds it, before anything else (a
+      // LOCATE trying the next instance) can assign the slot fresh again.
+      space.declared.putIfAbsent(slot, () => me);
       if (target != me) {
         waiting.add(slot);
       }
@@ -1562,6 +1567,21 @@ class _SlotManager {
       } else {
         space.pendingFor[target.instance] = n;
       }
+      final declarer = space.declared.remove(slot);
+      final now = space.entry(slot);
+      if (declarer != null &&
+          !closed &&
+          now.isFree &&
+          now.holder == 0 &&
+          live(type, declarer) != null) {
+        // Failed: the instance that declared holding the slot meanwhile is
+        // its holder, before the waiters wake.
+        setEntry(
+          space,
+          slot,
+          SlotEntry.free(holder: declarer, epoch: now.epoch),
+        );
+      }
       busy.release();
       scheduleBalance(space);
     }
@@ -2104,6 +2124,11 @@ class _Space {
   final Map<int, int> assigning = {};
   final Map<int, int> pendingFor = {};
 
+  /// The first instance that declared `HOLDING` of a slot while it was
+  /// being assigned fresh (holder 0), by slot: its holder if that `ASSIGN`
+  /// fails.
+  final Map<int, int> declared = {};
+
   /// Slots with an operation in progress (an `ASSIGN` or a migration).
   final Map<int, _Busy> busy = {};
 
@@ -2164,6 +2189,7 @@ class _Space {
     space = definition;
     clearBackoffs();
     entries.clear();
+    declared.clear();
     load.clear();
     grace.clear();
     parked.clear();

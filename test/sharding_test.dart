@@ -637,6 +637,60 @@ void main() {
       expect(table[0], const SlotEntry.free(holder: 1));
       expect(table[1], const SlotEntry.owned(2, holder: 2, epoch: 1));
     });
+
+    test('the holder declared during a failed fresh ASSIGN is the holder '
+        'before a LOCATE tries the next instance', () async {
+      final space = SlotSpace(userq, count: 16, lazy: true);
+      final a = instance(userq, 1);
+      final b = instance(userq, 2);
+      // Up and taking no slots: a holder others fetch from.
+      final holder = instance(userq, 3);
+      await a.start(space: space, capacity: 1);
+      await b.start(space: space, capacity: 1);
+      await holder.start(space: space, capacity: 0);
+      final refuse = Completer<void>();
+      a.onAssign = (_) async {
+        await refuse.future;
+        throw SwitchboardException.of(StatusCode.unavailable, 'not ready');
+      };
+      final (router, _) = h.link();
+      final r = Instance(h, userq, 0, log)..channel = router;
+      final located = r.locate(5);
+      await until(() => log.contains('1 ASSIGN 5 e1 h0'));
+      List<int>? discard;
+      unawaited(holder.holding([5]).then((d) => discard = d));
+      await Future<void>.delayed(ms50);
+      expect(discard, isNull, reason: 'waits for the ASSIGN to 1');
+      refuse.complete();
+      expect(await located, const LocateResponse(SlotState.owned, 2, 1));
+      await until(() => discard != null);
+      // The ASSIGN to 1 failed: 3 holds the slot, which 2 fetches from it.
+      expect(log, ['1 ASSIGN 5 e1 h0', '2 ASSIGN 5 e1 h3']);
+      expect(discard, isEmpty);
+    });
+
+    test('a slot being assigned fresh to the declaring instance keeps it as '
+        'holder when that ASSIGN fails', () async {
+      final space = SlotSpace(userq, count: 16, lazy: true);
+      final a = instance(userq, 1);
+      final b = instance(userq, 2);
+      await a.start(space: space, capacity: 1);
+      await b.start(space: space, capacity: 1);
+      final refuse = Completer<void>();
+      a.onAssign = (_) async {
+        await refuse.future;
+        throw SwitchboardException.of(StatusCode.unavailable, 'not ready');
+      };
+      final (router, _) = h.link();
+      final r = Instance(h, userq, 0, log)..channel = router;
+      final located = r.locate(5);
+      await until(() => log.contains('1 ASSIGN 5 e1 h0'));
+      // Answered at once: the slot is being assigned to a itself.
+      expect(await a.holding([5]), isEmpty);
+      refuse.complete();
+      expect(await located, const LocateResponse(SlotState.owned, 2, 1));
+      expect(log, ['1 ASSIGN 5 e1 h0', '2 ASSIGN 5 e1 h1']);
+    });
   });
 
   group('WATCH and LOOKUP', () {
