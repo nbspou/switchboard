@@ -2263,14 +2263,9 @@ class _Outgoing {
         ..abandon();
     }
     bulkIns.clear();
-    // A final waiting in the lane of `messages` (an ordered request): its
-    // payload is not wanted any more; it is dropped when its turn comes.
-    final last = finalMessage;
-    if (last != null && last._bulk != null) {
-      last._bulk!
-        ..close(Status.of(StatusCode.cancelled, 'request ended'))
-        ..abandon();
-    }
+    // An ordered answer can still be waiting for dispatch in the messages
+    // lane. Drop its reference now, so it cannot hold later messages up.
+    finalMessage?._drop();
     if (error is! TalkAbortException || error.isChannelAbort) {
       // A local failure: the payload of the request is not wanted any
       // more. After the peer's abort response, its receiver decides.
@@ -2482,7 +2477,11 @@ class _Message extends TalkMessage {
   /// The message will not be delivered: its credit goes back, its bulk
   /// payload is not wanted, a request is answered `CANCELLED`.
   void _drop() {
+    if (_dropped) {
+      return;
+    }
     _dropped = true;
+    _bulkFailure ??= Status.of(StatusCode.cancelled, 'message dropped');
     channel._creditMessage(this);
     final b = _bulk;
     if (b != null) {
@@ -2496,6 +2495,7 @@ class _Message extends TalkMessage {
       }
     }
     _abortQuietly(Status.of(StatusCode.cancelled, 'message dropped'));
+    _lane?.advance();
   }
 
   @override
@@ -3184,6 +3184,9 @@ class _Message extends TalkMessage {
     final cancelled = Status.of(StatusCode.cancelled, 'request cancelled');
     _bulk?.close(cancelled);
     _bulk?.abandon();
+    if (!_ready) {
+      _drop();
+    }
     for (final out in _bulkOuts) {
       out.cancel(cancelled);
     }

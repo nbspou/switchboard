@@ -150,6 +150,75 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  test(
+    'a peer cancel abandons a bulk request still waiting for dispatch',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final seen = <TalkMessage>[];
+      server.messages.listen(seen.add);
+      final raw = talk.raw as MuxChannel;
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('PUT'),
+          requestId: 1,
+          bulk: true,
+          payload: TalkBulkReference(1).encode(),
+        ).encode(),
+      );
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.abort,
+          requestId: 1,
+          payload: Status.of(StatusCode.cancelled).encode(),
+        ).encode(),
+      );
+      talk.send('AFTER', Uint8List.fromList([7]));
+      await pumpEventQueue();
+      expect(seen.single.payload, [7]);
+      final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      expect((await bulk.done).known, StatusCode.cancelled);
+      expect((server.raw as MuxChannel).heldBytes, 0);
+      expect(server.incomingRequestCount, 0);
+    },
+  );
+
+  test(
+    'cancelling an ordered bulk answer before dispatch releases its lane',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final seen = <TalkMessage>[];
+      talk.messages.listen(seen.add);
+      server.messages.listen((message) {
+        final raw = server.raw as MuxChannel;
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            responseId: message.requestId,
+            bulk: true,
+            payload: TalkBulkReference(1).encode(),
+          ).encode(),
+        );
+        server.send('AFTER', Uint8List.fromList([7]));
+      });
+      final request = talk.startRequest('GET', Uint8List(0), ordered: true);
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+      request.cancel();
+      await pumpEventQueue();
+      expect(seen.single.payload, [7]);
+      expect((talk.raw as MuxChannel).heldBytes, 0);
+      // Dispatch catches up after cancellation: no payload may be attached
+      // to the abandoned answer, and the parent remains usable.
+      final raw = server.raw as MuxChannel;
+      final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      expect((await bulk.done).known, StatusCode.cancelled);
+      expect(talk.isOpen, isTrue);
+    },
+  );
+
   test('failed reassembly releases its partial memory budget', () async {
     final peers = await Peers.connect(
       serverOptions: const TalkOptions(maxInlinePayload: 1000),
