@@ -217,8 +217,9 @@ class TalkAbortException extends SwitchboardException {
 /// delivered in its place. Frames the channel consumes itself (a final
 /// response completing a future, aborts, `EXTEND`, cancels, frames for ids
 /// it does not know or gave up on, requests it refuses, messages nobody
-/// will read) return their credit at once, and so does a reply relayed by
-/// [forwardMessage], whose far side's credit governs. A stream that is
+/// will read) return their credit at once. Replies relayed by
+/// [forwardMessage] currently return parent-frame credit at once too; see
+/// its buffering limitation. A stream that is
 /// paused or not listened to therefore stalls its channel once the window
 /// is used up (see [messages]), and only that channel.
 ///
@@ -2222,7 +2223,8 @@ class _Outgoing {
   void addItem(_Message message) {
     final sink = this.sink;
     if (sink != null) {
-      // Forwarded: the far side's credit governs.
+      // Forwarding queues synchronously; see forwardMessage's buffering
+      // limitation for parent-frame credit.
       channel._creditMessage(message);
       _guard(() => sink.item(message), 'forwarding an item');
       return;

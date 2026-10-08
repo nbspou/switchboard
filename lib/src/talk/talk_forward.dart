@@ -51,6 +51,12 @@ part of 'talk_channel.dart';
 /// and the requests it sends have no requester timeout, so the timeouts of
 /// the two real peers apply end to end, with `EXTEND` forwarded.
 ///
+/// Buffering limitation: forwarded replies return their incoming parent
+/// channel credit when queued, without waiting for the outgoing channel's
+/// credit. Inline replies can therefore accumulate in the intermediary's
+/// output queue when the downstream reader stalls. The bytes of streamed
+/// bulk payloads do pass credit through hop by hop.
+///
 /// The returned future completes once [incoming] and every request
 /// forwarded on its behalf have ended, including their bulk transfers.
 /// It never completes with an error.
