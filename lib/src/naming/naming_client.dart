@@ -1206,7 +1206,15 @@ class NamingClient {
     if (!older.completer.isCompleted) {
       newer.completer.future.then(
         older.completer.complete,
-        onError: older.completer.completeError,
+        onError: (Object error, StackTrace stackTrace) {
+          if (error is SwitchboardException &&
+              error.code == StatusCode.cancelled) {
+            // By [close] or [unregister], which do not report it as an
+            // unhandled error to a caller that dropped the future.
+            older.completer.future.ignore();
+          }
+          older.completer.completeError(error, stackTrace);
+        },
       );
     }
   }

@@ -1816,6 +1816,23 @@ void main() {
       expect(third, [3, 4]);
     });
 
+    test('close and unregister of superseded registrations whose futures '
+        'were dropped report no error', () async {
+      final client = newClient(connector);
+      connector.down = true;
+      unawaited(client.start());
+      await until(() => connector.calls >= 1);
+      final type = Name('npc');
+      for (final instance in [8, 9]) {
+        // Superseded: its future fails like the next one's, cancelled.
+        unawaited(client.register(type, [uriA], instance: instance));
+        client.register(type, [uriB], instance: instance).ignore();
+      }
+      await client.unregister(type, 8);
+      await client.close();
+      await pump();
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();
