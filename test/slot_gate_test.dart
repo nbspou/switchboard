@@ -609,8 +609,9 @@ void main() {
       expect(lifecycle.log.last, 'serve 1 late');
     });
 
-    test('DRAIN declares drainTimeout once when it waits for work in '
-        'flight; load and drain get the context', () async {
+    test('DRAIN declares its wait for work in flight, a second longer, '
+        'then restarts the default timeout; load and drain get the '
+        'context', () async {
       newGate();
       final loading = RecordingContext(kv, 1, 1);
       await gate.onAssign(assign(1), loading);
@@ -624,11 +625,13 @@ void main() {
         draining,
       );
       await settle();
-      expect(draining.declared, [(limit, null)]);
+      final declared = limit + const Duration(seconds: 1);
+      expect(draining.declared, [(declared, null)]);
       await busy.close();
       await drained.timeout(limit);
       expect(lifecycle.drainContext, same(draining));
-      expect(draining.declared, hasLength(1));
+      // The drain gets the naming service's default timeout again.
+      expect(draining.declared, [(declared, null), (null, null)]);
       // Nothing in flight: nothing to declare.
       await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
       final idle = RecordingContext(kv, 1, 3);
@@ -637,6 +640,32 @@ void main() {
           .timeout(limit);
       expect(idle.declared, isEmpty);
       expect(lifecycle.drainContext, same(idle));
+    });
+
+    test('a DRAIN cancelled while it waits for work in flight stops '
+        'waiting, closes nothing and does not drain', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final busy = peer.open(shard: 1, payload: 'busy');
+      final answers = StreamQueue(busy.stream.map(text));
+      busy.send(bytes('x'));
+      expect(await answers.next.timeout(limit), '1:x');
+      final draining = RecordingContext(kv, 1, 2);
+      final drained = expectLater(
+        gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2), draining),
+        throwsCode(StatusCode.cancelled),
+      );
+      await settle();
+      draining.cancelled.complete();
+      // Well before drainTimeout (5 s).
+      await drained.timeout(const Duration(seconds: 2));
+      expect(lifecycle.log, isNot(contains('drain 1 e2 to2')));
+      expect(busy.canSend, isTrue);
+      expect(gate.stateOf(1), SlotGateState.locked);
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      busy.send(bytes('y'));
+      expect(await answers.next.timeout(limit), '1:y');
+      await answers.cancel(immediate: true);
     });
 
     test('detached channels do not hold DRAIN', () async {

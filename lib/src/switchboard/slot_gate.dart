@@ -39,6 +39,11 @@ int _nextEpoch(int epoch) => epoch >= maxU32 ? 1 : epoch + 1;
 /// next one).
 const Duration _forwardIdle = Duration(seconds: 1);
 
+/// How much longer than [SlotGate.drainTimeout] a `DRAIN` that waits for
+/// work in flight declares, so that the naming client does not give it up
+/// at the moment the gate stops waiting and drains anyway.
+const Duration _drainStart = Duration(seconds: 1);
+
 /// What a sharded service does with its slots: the application side of a
 /// [SlotGate]. Extend this class (the gate attaches itself to it, see
 /// [gate]); do not implement it.
@@ -119,11 +124,10 @@ abstract class SlotLifecycle {
   /// slot's state.
   ///
   /// [context] is the `DRAIN` request (null when the gate is driven without
-  /// one). A drain that may take longer than the naming service waits
-  /// declares how long with [SlotRequestContext.extend]: its
-  /// `handoverTimeout` (60 s by default) when nothing was declared, or the
-  /// [SlotGate.drainTimeout] the gate declared when it had to wait for work
-  /// in flight.
+  /// one). A drain that may take longer than the naming service waits, its
+  /// `handoverTimeout` (60 s by default) from this call (the gate restarts
+  /// that timeout when it had to wait for work in flight), declares how
+  /// long with [SlotRequestContext.extend].
   Future<void> drain(
     int slot, {
     required int epoch,
@@ -795,9 +799,12 @@ class SlotGate implements SlotHandler {
     }
   }
 
-  /// Waits until [s] has no work in flight, at most [drainTimeout], which
-  /// it declares to the naming service through [context] when it has to
-  /// wait. Returns false when the wait timed out.
+  /// Waits until [s] has no work in flight, at most [drainTimeout], or
+  /// until [context] is cancelled. When it has to wait, it declares the
+  /// wait to the naming service through [context], [_drainStart] longer so
+  /// that the `DRAIN` outlives it, and once the wait is over restarts the
+  /// naming service's default timeout for [SlotLifecycle.drain]. Returns
+  /// false when the wait timed out.
   Future<bool> _waitIdle(
     _GateSlot s,
     int slot,
@@ -806,10 +813,11 @@ class SlotGate implements SlotHandler {
     if (s.isIdle) {
       return true;
     }
-    context?.extend(deadline: drainTimeout);
+    context?.extend(deadline: drainTimeout + _drainStart);
     final idle = s.idle = Completer<void>();
     try {
-      await idle.future.timeout(drainTimeout);
+      await Future.any([idle.future, if (context != null) context.onCancel])
+          .timeout(drainTimeout);
       return true;
     } on TimeoutException {
       _log.warning(
@@ -818,7 +826,12 @@ class SlotGate implements SlotHandler {
       );
       return false;
     } finally {
-      s.idle = null;
+      if (identical(s.idle, idle)) {
+        s.idle = null;
+      }
+      if (context != null && !context.isCancelled) {
+        context.extend();
+      }
     }
   }
 
@@ -974,12 +987,17 @@ class SlotGate implements SlotHandler {
   }
 
   /// `DRAIN`: locks the slot, waits for its work in flight (at most
-  /// [drainTimeout], declared to the naming service through [context] when
-  /// there is work to wait for; after it the slot's tracked channels still
-  /// open are closed with `RELOCATED` naming the new owner and epoch), then
-  /// runs [SlotLifecycle.drain], which receives [context]. Fails with
-  /// `FAILED_PRECONDITION` for a slot not served here, and for a new owner
-  /// that is no instance (0) or this one, leaving the slot served.
+  /// [drainTimeout]; when there is work to wait for, the wait is declared
+  /// to the naming service through [context], a second longer, and its
+  /// default timeout restarted once the wait is over; after it the slot's
+  /// tracked channels still open are closed with `RELOCATED` naming the
+  /// new owner and epoch), then runs [SlotLifecycle.drain], which receives
+  /// [context]. Fails with `FAILED_PRECONDITION` for a slot not served
+  /// here, and for a new owner that is no instance (0) or this one,
+  /// leaving the slot served. A [context] cancelled while it waits (the
+  /// naming service gave the `DRAIN` up, or the channel to it was lost)
+  /// ends the wait and fails with `CANCELLED`, leaving the slot locked
+  /// until `RESUME` with nothing closed or drained.
   @override
   Future<void> onDrain(
     DrainRequest request, [
@@ -1009,6 +1027,10 @@ class SlotGate implements SlotHandler {
         StatusCode.unavailable,
         'slot $type/$slot stopped while draining',
       );
+    }
+    if (context?.isCancelled ?? false) {
+      // Rolled back (RESUME follows): nothing is handed over for it.
+      throw SwitchboardException.of(StatusCode.cancelled, 'DRAIN cancelled');
     }
     if (!idle) {
       _relocateTracked(s, slot, to: request.to, epoch: request.epoch);
