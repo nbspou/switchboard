@@ -150,6 +150,83 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  test('cancelling a stream request closes a delivered item bulk channel '
+      'without relying on the peer', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open(
+      options: TalkOptions(streamBulk: (_) => true),
+    );
+    late MuxChannel bulk;
+    server.messages.listen((message) {
+      final raw = server.raw as MuxChannel;
+      // A peer that keeps sending the item after the request was cancelled.
+      bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          responseId: message.requestId,
+          bulk: true,
+          payload: TalkBulkReference(1).encode(),
+        ).encode(),
+      );
+    });
+    final request = talk.streamRequest('LIST', Uint8List(0));
+    final items = StreamQueue(request.items);
+    expect((await items.next).isBulk, isTrue);
+    request.cancel();
+    expect(
+      (await bulk.done.timeout(const Duration(seconds: 1))).known,
+      StatusCode.cancelled,
+    );
+    await items.cancel();
+  });
+
+  test('cancelling messages releases an ordered answer behind a bulk '
+      'message being reassembled', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    final source = StreamController<List<int>>();
+    server.messages.listen((message) {
+      server.send('NOTE', Uint8List(0), bulk: source.stream);
+      message.reply(Uint8List.fromList([7]));
+    });
+    final subscription = talk.messages.listen((_) => fail('not delivered'));
+    final response = talk.request('GET', Uint8List(0), ordered: true);
+    await pumpEventQueue();
+    await subscription.cancel();
+    expect((await response.timeout(const Duration(seconds: 1))).payload, [7]);
+    await pumpEventQueue();
+    expect(source.hasListener, isFalse);
+    expect((talk.raw as MuxChannel).heldBytes, 0);
+    await source.close();
+  });
+
+  for (final cancelBefore in [false, true]) {
+    test('cancelling messages ${cancelBefore ? 'before' : 'during'} bulk '
+        'reassembly refuses the unread request', () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final subscription = server.messages.listen((_) => fail('not delivered'));
+      if (cancelBefore) {
+        await subscription.cancel();
+      }
+      final source = StreamController<List<int>>();
+      final response = talk.request('PUT', Uint8List(0), bulk: source.stream);
+      await pumpEventQueue();
+      if (!cancelBefore) {
+        await subscription.cancel();
+      }
+      await expectLater(
+        response.timeout(const Duration(seconds: 1)),
+        throwsStatus(StatusCode.unimplemented),
+      );
+      await pumpEventQueue();
+      expect(source.hasListener, isFalse);
+      expect((server.raw as MuxChannel).heldBytes, 0);
+      await source.close();
+    });
+  }
+
   test('references without bulk OPENs have a bounded dispatch wait', () {
     fakeAsync((async) {
       final (client, server) = muxPair();

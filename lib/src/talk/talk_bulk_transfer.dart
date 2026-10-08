@@ -781,4 +781,21 @@ class _Lane {
       message?._drop();
     }
   }
+
+  /// Nobody will read incoming messages. Keep ordered answers, which
+  /// still belong to their requests, but refuse and drop everything else.
+  void dropIncoming(Status status) {
+    final entries = List.of(_queue);
+    _queue.clear();
+    for (final entry in entries) {
+      final message = entry.$1;
+      if (message != null && !message.frame.hasResponse) {
+        message._abortQuietly(status);
+        message._drop();
+      } else {
+        _queue.add(entry);
+      }
+    }
+    advance();
+  }
 }

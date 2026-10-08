@@ -405,7 +405,8 @@ class TalkChannel {
   ///
   /// If the subscription is cancelled, buffered requests that were never
   /// delivered and every later request are answered with
-  /// `ABORT UNIMPLEMENTED`.
+  /// `ABORT UNIMPLEMENTED`, including requests whose bulk payloads are
+  /// still being reassembled; their transfers are cancelled too.
   late final Stream<TalkMessage> messages = _GuardedStream(
     _messages.stream,
     _undeliveredRequests,
@@ -1216,6 +1217,9 @@ class TalkChannel {
         Status.of(StatusCode.unimplemented, 'no message listener'),
       );
     }
+    _messagesLane.dropIncoming(
+      Status.of(StatusCode.unimplemented, 'no message listener'),
+    );
     // Nothing is delivered any more: the waiting answers go at once.
     final outcomes = _orderedOutcomes.toList();
     _orderedOutcomes.clear();
@@ -1500,6 +1504,11 @@ class TalkChannel {
       ..onProgress = message._onBulkProgress;
     // Until its bytes were all read, or it was abandoned.
     _bulkIns.add(b);
+    final pending = _outgoing[message.responseId];
+    if (pending != null) {
+      pending.bulkIns.add(b);
+      unawaited(b.channel.done.then((_) => pending.bulkIns.remove(b)));
+    }
     var stream = message._forSink;
     final predicate = options.streamBulk;
     if (!stream && predicate != null) {
@@ -1564,6 +1573,18 @@ class TalkChannel {
 
   void _onMessage(TalkFrame frame, int wire) {
     if (!frame.hasResponse) {
+      if (_messagesCancelled) {
+        _credit(wire);
+        _discardBulk(frame);
+        if (frame.hasRequest) {
+          _incoming.remove(frame.requestId)?._abandon();
+          _rejectRequest(
+            frame.requestId,
+            Status.of(StatusCode.unimplemented, 'no message listener'),
+          );
+        }
+        return;
+      }
       final message = _Message(this, frame).._creditBytes = wire;
       if (frame.hasRequest && !_register(message)) {
         _creditMessage(message);
@@ -2084,6 +2105,10 @@ class _Outgoing {
   /// Bulk payloads of the request itself, being sent.
   final List<_BulkOut> bulkOuts = [];
 
+  /// Reply payloads still in transfer, even after their streamed messages
+  /// were delivered. Local cancellation must not rely on the peer to stop.
+  final Set<_BulkIn> bulkIns = {};
+
   /// The final response or abort arrived; it may wait in [lane] (or, for
   /// an ordered request, in the lane of `messages`) for a bulk payload, and
   /// the request stays in the channel's table until it is delivered.
@@ -2219,6 +2244,12 @@ class _Outgoing {
     }
     _failed = true;
     lane.drop();
+    for (final bulk in List.of(bulkIns)) {
+      bulk
+        ..close(Status.of(StatusCode.cancelled, 'request ended'))
+        ..abandon();
+    }
+    bulkIns.clear();
     // A final waiting in the lane of `messages` (an ordered request): its
     // payload is not wanted any more; it is dropped when its turn comes.
     final last = finalMessage;
