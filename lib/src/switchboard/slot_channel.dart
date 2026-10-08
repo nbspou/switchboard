@@ -207,7 +207,8 @@ class SlotChannel
 
   /// Gives up the retry: the channel stays on its current mux channel
   /// whatever ends it, as once something was sent. A forwarded bulk
-  /// channel, opened on the current mux channel, commits it.
+  /// channel, opened on the current mux channel in either direction,
+  /// commits it.
   @internal
   void commit() {
     _sent = true;

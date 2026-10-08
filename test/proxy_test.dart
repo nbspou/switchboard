@@ -1206,6 +1206,13 @@ void main() {
             );
           case 'moved':
             unawaited(incoming.reject(moved));
+          case 'bulkMoved':
+            channel.openAfter(TalkBulkOpen(channel.id, 1).encode());
+            unawaited(() async {
+              await channel.connection.ping();
+              await pumpEventQueue();
+              await incoming.reject(moved);
+            }());
           case 'movedAfter':
             channel.stream.first.then((_) => incoming.reject(moved)).ignore();
           case 'greetMoved':
@@ -1301,6 +1308,22 @@ void main() {
       expect(big.isBulk, isTrue);
       expect(big.payload, pattern(200000));
       await talk.close();
+    });
+
+    test('a bulk channel from the owner prevents a MOVED retry', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'bulkMoved:2:2';
+      final channel = await open(4);
+      final outcome = Completer<void>();
+      void ended() {
+        if (!outcome.isCompleted) outcome.complete();
+      }
+
+      channel.stream.listen((_) => ended());
+      unawaited(channel.done.then((_) => ended()));
+      await outcome.future;
+      expect(opened[2], isEmpty);
+      expect(await channel.done, hasCode(StatusCode.moved));
     });
 
     test('bulk payloads through a slot channel retried after MOVED', () async {

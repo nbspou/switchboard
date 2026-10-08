@@ -206,7 +206,7 @@ void _routeBulk(
   }
   BulkRoutes.register(
     mux,
-    (bulk, number) => _forwardBulk(bulk, number, to, twins, bound),
+    (bulk, number) => _forwardBulk(bulk, number, from, to, twins, bound),
   );
 }
 
@@ -215,6 +215,7 @@ void _routeBulk(
 void _forwardBulk(
   MuxChannel bulk,
   int number,
+  _End from,
   _End to,
   Set<Future<void>> twins,
   ForwardingBound? bound,
@@ -243,7 +244,8 @@ void _forwardBulk(
     return;
   }
   // The message referencing it follows on the slot channel: no retry
-  // elsewhere may separate them.
+  // elsewhere may separate them, whichever side opened the bulk channel.
+  from.commit();
   to.commit();
   twin.priority = MuxPriority.bulk;
   BulkRoutes.markBulk(twin);

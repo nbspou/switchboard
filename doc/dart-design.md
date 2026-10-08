@@ -1192,7 +1192,7 @@ Talk bulk payloads (wiki "Talk", "Bulk payloads"), deviations and proposed amend
 * Bulk numbers: the reference rejects a reference or an OPEN naming bulk number 0, and requires a receiver's bulk numbers to increase in OPEN order (they do: the sender numbers its OPENs from 1). Proposed: state that numbers increase with each OPEN, so that "already referenced" needs no set.
 * Naming metadata is capped at 4096 bytes by the naming protocol, so a REGISTER reaches bulk size through its endpoints (255 of up to 255 bytes); the 40 KiB REGISTER of the tests is 160 long endpoints and 4096 bytes of metadata.
 * Talk over a slot channel opens a bulk channel on the slot channel's current mux channel; while that channel is closing or being reopened after `MOVED` (nothing sent yet), a bulk payload throws `FAILED_PRECONDITION` where an inline message would be held for the replacement. Narrow (only the first message, racing the rejection).
-* A slot channel that forwards a bulk channel gives up its MOVED retry (the bulk channel and its message must reach the same owner); one that is being reopened when a bulk OPEN arrives refuses it `UNAVAILABLE`, and the message then fails at the new owner as a reference to an unknown bulk number. Narrow (the first message must be bulk and race the rejection); documented.
+* A slot channel that forwards a bulk channel in either direction gives up its MOVED retry (the bulk channel and its message must reach the same owner); one that is being reopened when a bulk OPEN arrives refuses it `UNAVAILABLE`, and the message then fails at the new owner as a reference to an unknown bulk number. Narrow (the first message must be bulk and race the rejection); documented.
 
 ## Tests
 
