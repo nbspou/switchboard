@@ -180,6 +180,19 @@ class RecordingContext implements SlotRequestContext {
       declared.add((deadline, renew));
 }
 
+/// Holds forwarding opens so their queue and cancellation can be inspected.
+class DelayedResolver extends StaticResolver {
+  DelayedResolver(super.records);
+
+  final Completer<void> proceed = Completer<void>();
+
+  @override
+  Future<List<ServiceRecord>> resolve(Name type) async {
+    await proceed.future;
+    return super.resolve(type);
+  }
+}
+
 /// A peer linked to the gate's dispatch over memory.
 class Peer {
   Peer(this.gate) {
@@ -707,6 +720,37 @@ void main() {
       expect(lifecycle.log, isNot(contains('unload 1')));
     });
 
+    test(
+      'forwarding opens remain bounded while resolution is stalled',
+      () async {
+        final resolver = DelayedResolver([
+          ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+        ]);
+        node.resolver = resolver;
+        addTearDown(resolver.close);
+        addTearDown(() {
+          if (!resolver.proceed.isCompleted) resolver.proceed.complete();
+        });
+        newGate(maxQueuedChannels: 1);
+        await gate.onAssign(assign(1));
+        await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+        final first = peer.open(shard: 1);
+        await settle();
+        await first.close();
+        // Closing and opening again cannot accumulate unbounded pending
+        // resolver calls or continuations outside the mux channel limit.
+        final excess = peer.open(shard: 1);
+        expect(
+          await excess.done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+        resolver.proceed.complete();
+        await node.connect(targetUri);
+        await settle();
+        expect(await ask(peer.open(shard: 1), 'new'), 'to:new');
+      },
+    );
+
     test('after the grace period: unload, then MOVED', () async {
       newGate(forwardGrace: const Duration(milliseconds: 30));
       await gate.onAssign(assign(1));
@@ -1037,6 +1081,46 @@ void main() {
         );
       };
     }
+
+    test(
+      'forwarded requests remain bounded while resolution is stalled',
+      () async {
+        final resolver = DelayedResolver([
+          ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+        ]);
+        node.resolver = resolver;
+        addTearDown(resolver.close);
+        addTearDown(() {
+          if (!resolver.proceed.isCompleted) resolver.proceed.complete();
+        });
+        newGate(maxQueuedRequests: 1, trackChannels: false);
+        talkLifecycle();
+        await gate.onAssign(assign(1));
+        final talk = TalkChannel(peer.open(shard: 1));
+        await settle();
+        await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+        target.registerService(kv, (incoming) {
+          incoming.talk().messages.listen((m) => m.reply(m.payload));
+        }, instance: 2);
+        final first = talk.startRequest('GET', bytes('first'));
+        final cancelled = expectLater(
+          first.response,
+          throwsCode(StatusCode.cancelled),
+        );
+        await settle();
+        first.cancel();
+        await cancelled;
+        await expectLater(
+          talk.request('GET', bytes('excess'), timeout: limit),
+          throwsCode(StatusCode.unavailable),
+        );
+        resolver.proceed.complete();
+        await node.connect(targetUri);
+        await settle();
+        expect(text((await talk.request('GET', bytes('new'))).payload), 'new');
+        await talk.close();
+      },
+    );
 
     test('served, queued while locked, forwarded after FORWARD', () async {
       newGate(trackChannels: false);

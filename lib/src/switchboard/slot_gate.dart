@@ -282,11 +282,15 @@ class SlotGate implements SlotHandler {
   /// called anyway. Default 30 s.
   final Duration drainTimeout;
 
-  /// Most channels queued at a time, over all slots. Default 1024.
+  /// Most channels queued at a time, over all slots, including forwarding
+  /// opens waiting for a connection. Default 1024. A cancelled forwarding
+  /// open keeps its place in this bound until its open attempt settles.
   final int maxQueuedChannels;
 
   /// Most requests queued by [serveRequest] at a time, over all slots; a
   /// queued request leaves the queue when it can no longer be answered.
+  /// Also bounds requests waiting for a forwarding channel to open; those
+  /// keep their place until the open attempt settles, even if cancelled.
   /// Default 1024.
   final int maxQueuedRequests;
 
@@ -478,21 +482,29 @@ class SlotGate implements SlotHandler {
   /// instance set to the new owner's. The outgoing channels are opened one
   /// after the other, so the new owner sees them in arrival order.
   void _forwardChannelOf(_GateSlot s, IncomingChannel incoming) {
+    if (_queuedChannels >= maxQueuedChannels) {
+      unawaited(incoming.reject(genericStatus(StatusCode.unavailable)));
+      return;
+    }
+    _queuedChannels++;
     final to = s.to;
     s.opening = s.opening.then((_) async {
-      final MuxChannel target;
       try {
-        target = await _open(
+        if (!incoming.channel.canSend) {
+          return;
+        }
+        final target = await _open(
           to,
           incoming.address.copyWith(instance: to, clearHost: true),
         );
+        _log.fine('$type gate: $incoming forwarded to $type/$to');
+        unawaited(pipeChannels(incoming.channel, target));
       } on Object catch (e) {
         _log.info('$type gate: cannot forward $incoming to $to: $e');
         unawaited(incoming.reject(genericStatus(StatusCode.unavailable)));
-        return;
+      } finally {
+        _queuedChannels--;
       }
-      _log.fine('$type gate: $incoming forwarded to $type/$to');
-      unawaited(pipeChannels(incoming.channel, target));
     });
   }
 
@@ -631,6 +643,11 @@ class SlotGate implements SlotHandler {
     if (message.expectsReply && !message.canReply) {
       return;
     }
+    if (_queuedRequests >= maxQueuedRequests) {
+      _abort(message, genericStatus(StatusCode.unavailable));
+      return;
+    }
+    _queuedRequests++;
     final credential = payload ?? _arrivalPayload(message);
     // One forwarding channel per distinct credential: the bytes as the key.
     final key = String.fromCharCodes(credential);
@@ -646,6 +663,8 @@ class SlotGate implements SlotHandler {
       _abort(message, genericStatus(StatusCode.unavailable));
       _relayEnded(s, f);
       return;
+    } finally {
+      _queuedRequests--;
     }
     try {
       await forwardMessage(message, target);
