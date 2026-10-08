@@ -1101,7 +1101,8 @@ class NamingService {
   /// Answers `RENEW` with a credential re-issued by [issuer]: the
   /// channel's own (an empty payload, or its bytes), or the one in the
   /// payload, which must be valid ([verifier]) and, on an identified
-  /// channel, carry its identity.
+  /// channel, carry its identity. The renewal of the channel's own payload
+  /// credential replaces it; that of another credential does not.
   Future<void> _renew(
     _Session session,
     TalkMessage message,
@@ -1135,6 +1136,10 @@ class NamingService {
       _abort(message, _unauthenticated);
       return;
     }
+    // Only the channel's own payload credential is renewed in place: one
+    // sent in the request may name a holder key, which the payload cannot
+    // prove, or carry other scopes.
+    final ownPayload = identical(current, session.payloadCredential);
     final hook = renewable;
     if (hook != null) {
       var allowed = false;
@@ -1165,11 +1170,7 @@ class NamingService {
       _abort(message, Status.of(StatusCode.failedPrecondition, 'cannot renew'));
       return;
     }
-    final payload = session.payloadCredential;
-    if (session.active &&
-        payload != null &&
-        payload.identity == renewed.identity &&
-        payload.kind == renewed.kind) {
+    if (session.active && ownPayload) {
       // The channel is identified by its payload: the renewal is its
       // identity from now on.
       session.payloadCredential = renewed;

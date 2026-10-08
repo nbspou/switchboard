@@ -870,6 +870,32 @@ void main() {
       });
     });
 
+    test('RENEW of another credential of the same identity does not become '
+        'the payload credential', () async {
+      final mesh = await Mesh.start();
+      final client = await node(verify: false);
+      final bearer = await issue('x', workerScopes, bearer: true);
+      // Same identity and kind, wider, and bound to a holder key: it
+      // identifies only by IDENT, and proves nothing in a payload.
+      final held = await issue('x', adminScopes);
+      final c = await channelTo(client, mesh, payload: bearer.encode());
+      expect(await call(c, Procedures.watch, Uint8List(0)), denied);
+      final answer = await c.request(
+        'RENEW',
+        held.encode(),
+        name: Procedures.renew,
+      );
+      final renewed = Credential.decode(answer.payload);
+      expect(renewed.holderKey, held.holderKey);
+      expect(renewed.scopes, held.scopes);
+      // The channel is still identified by its own bearer credential.
+      expect(await call(c, Procedures.watch, Uint8List(0)), denied);
+      expect(
+        await call(c, Procedures.register, registerPayload(workerType)),
+        ok,
+      );
+    });
+
     test('MeshNode renews at two thirds of the lifetime; a credential that '
         'is not renewed ends the session at its expiry', () {
       fakeAsync((async) {
