@@ -122,7 +122,9 @@ typedef EndpointCredential = FutureOr<Uint8List?> Function(
 /// );
 /// ```
 ///
-/// A hook that throws names nobody (the error is logged).
+/// A hook that throws fails identification with `UNAUTHENTICATED` before
+/// sending an IDENT (the error is logged). Return null explicitly when an
+/// unnamed identification is intended.
 typedef ExpectedIdentity = String? Function(
   Uri endpoint,
   ServiceRecord? record,

@@ -541,6 +541,36 @@ void main() {
       expect(() => Switchboard().identifyOn(connection), throwsStateError);
     });
 
+    test('a failing expectedIdentityFor sends no unnamed IDENT', () async {
+      final (host, uri) = await server('mem');
+      final accepted = <MuxConnection>[];
+      host.connections.listen(accepted.add);
+      final client = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        expectedIdentityFor: (endpoint, record) => throw StateError('lookup'),
+      );
+      await expectLater(
+        client.connect(uri),
+        throwsCode(StatusCode.unauthenticated),
+      );
+      expect(accepted, hasLength(1));
+      expect(accepted.single.peerIdentity, isNull);
+      await accepted.single.done.timeout(limit);
+      final manual = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        identifyOutgoing: false,
+        expectedIdentityFor: (endpoint, record) => throw StateError('lookup'),
+      );
+      final connection = await manual.connect(uri);
+      await expectLater(
+        manual.identifyOn(connection),
+        throwsCode(StatusCode.unauthenticated),
+      );
+      expect(accepted.last.peerIdentity, isNull);
+    });
+
     test('expectedIdentityFor names the receiver', () async {
       final (_, uri) = await server(
         'mem',

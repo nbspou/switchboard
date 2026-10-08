@@ -1246,11 +1246,11 @@ class Switchboard {
     final normalised = _normalised(endpoint);
     if (credential != null &&
         (intent != null || receiver != null || _identifiesTo(normalised))) {
-      final named =
-          receiver ??
-          _expectedIdentity(normalised, record) ??
-          _relayIdentity(record);
       try {
+        final named =
+            receiver ??
+            _expectedIdentity(normalised, record) ??
+            _relayIdentity(record);
         await connection.identify(
           credential,
           holderKey: holderKey,
@@ -1313,7 +1313,8 @@ class Switchboard {
   }
 
   /// What [expectedIdentityFor] says for [endpoint] (normalised) and
-  /// [record]; a hook that throws names nobody.
+  /// [record]; a hook that throws fails identification, so a lookup error
+  /// cannot silently remove receiver binding from the proof.
   String? _expectedIdentity(Uri endpoint, ServiceRecord? record) {
     final hook = expectedIdentityFor;
     if (hook == null) {
@@ -1323,7 +1324,10 @@ class Switchboard {
       return hook(endpoint, record);
     } on Object catch (e, st) {
       _log.warning('expectedIdentityFor failed for $endpoint', e, st);
-      return null;
+      throw SwitchboardException.of(
+        StatusCode.unauthenticated,
+        'could not determine the expected identity',
+      );
     }
   }
 
@@ -1349,22 +1353,26 @@ class Switchboard {
     if (credential == null) {
       throw StateError('the node has no credential');
     }
-    final dialled = _dialled[connection];
-    final named =
-        receiver ??
-        _identified[connection]?.receiver ??
-        (dialled == null
-            ? null
-            : _expectedIdentity(_normalised(dialled), null));
-    return connection
-        .identify(
-          credential,
-          holderKey: holderKey,
-          intent: intent,
-          receiver: named,
-          timeout: identityTimeout,
-        )
-        .then((_) => _identified[connection] = _Identification(intent, named));
+    return Future<void>.sync(() {
+      final dialled = _dialled[connection];
+      final named =
+          receiver ??
+          _identified[connection]?.receiver ??
+          (dialled == null
+              ? null
+              : _expectedIdentity(_normalised(dialled), null));
+      return connection
+          .identify(
+            credential,
+            holderKey: holderKey,
+            intent: intent,
+            receiver: named,
+            timeout: identityTimeout,
+          )
+          .then(
+            (_) => _identified[connection] = _Identification(intent, named),
+          );
+    });
   }
 
   /// What [endpointPolicy] says for [endpoint]; a hook that throws refuses
