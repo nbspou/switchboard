@@ -156,8 +156,9 @@ class TalkAbortException extends SwitchboardException {
 ///   no `onError` handler are logged, never reported as unhandled. Futures
 ///   returned by the request API never report unhandled errors either.
 class TalkChannel {
-  /// Wraps [channel]. Starts listening to its stream immediately. A null
-  /// [options] means the defaults.
+  /// Wraps [channel]. Starts listening to its stream immediately, and
+  /// never pauses it: what waits for the application is held here (see
+  /// [messages]). A null [options] means the defaults.
   TalkChannel(StreamChannel<Uint8List> channel, {TalkOptions? options})
     : raw = channel,
       options = options ?? const TalkOptions() {
@@ -187,7 +188,18 @@ class TalkChannel {
   final Queue<_Message> _orderedOutcomes = Queue<_Message>();
 
   /// Incoming plain messages and requests, in arrival order. Responses
-  /// never appear here. Single subscription; buffered until listened.
+  /// never appear here. Single subscription; buffered until listened, and
+  /// while the subscription is paused.
+  ///
+  /// That buffer has no byte bound. The channel reads its raw channel as
+  /// frames arrive, so the receive buffer cap of a mux channel
+  /// (`MuxOptions.maxChannelBufferBytes`) and the connection's receive
+  /// high-water mark count nothing held here. Only the peer's unanswered
+  /// requests among it are bounded, by number
+  /// ([TalkOptions.maxIncomingRequests]); plain messages are not, nor are
+  /// requests answered while they wait (by the responder timeout or a
+  /// cancel). Facing a peer that is not trusted, listen at once and do not
+  /// stay paused for long. [TalkStream.items] buffers the same way.
   ///
   /// A channel abort from the peer is delivered as an error event (a
   /// [TalkAbortException] carrying its status) and then the stream ends;

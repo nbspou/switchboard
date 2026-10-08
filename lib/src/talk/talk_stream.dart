@@ -23,7 +23,8 @@ abstract class TalkStream {
   int get requestId;
 
   /// The `STREAM_ITEM` responses, in order. Single subscription; items are
-  /// buffered until listened.
+  /// buffered until listened, and while the subscription is paused, with no
+  /// byte bound, as for [TalkChannel.messages].
   ///
   /// Ends normally when the final response arrives. Emits an error and ends
   /// when the request fails: a [TalkAbortException] when the peer aborts
