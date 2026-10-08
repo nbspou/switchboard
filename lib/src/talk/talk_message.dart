@@ -81,7 +81,9 @@ abstract class TalkMessage {
   ///
   /// The stream ends with an error if the transfer failed: the status the
   /// sender closed the bulk channel with, `PROTOCOL_ERROR` for another
-  /// number of bytes than declared, `CONNECTION_LOST`. The message itself
+  /// number of bytes than declared, `DEADLINE_EXCEEDED` when the sender
+  /// sent nothing for [TalkOptions.bulkIdleTimeout] while this side waited
+  /// for it, `CONNECTION_LOST`. The message itself
   /// stands: a request is still answered as usual. Cancelling the
   /// subscription before the end tells the sender to stop (the bulk
   /// channel is closed `CANCELLED`). A streamed payload can be read once:

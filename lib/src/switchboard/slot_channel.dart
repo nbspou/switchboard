@@ -168,6 +168,7 @@ class SlotChannel
   /// the held subframes beyond [maxHeldBytes] is dropped and closes the
   /// channel with `RESOURCE_EXHAUSTED`, and its future fails with that
   /// status. A failure is never reported as unhandled.
+  @override
   Future<void> send(Uint8List subframe) {
     if (_closeRequested != null) {
       throw SwitchboardException.of(

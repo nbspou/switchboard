@@ -211,7 +211,10 @@ The protocol specification lives in the project wiki (section
   it drops) returns it at once. A `messages` or `items` subscription that
   is paused, or never made, now stalls its channel once the window is
   spent (responses on it included), instead of buffering without bound;
-  listen, or cancel the subscription.
+  listen, or cancel the subscription. `forwardMessage` passes credit
+  through hop by hop as well: the credit of what it relays (and of the
+  message it forwards, when the listener calls it) goes back once the
+  frame forwarded for it went out on the other channel.
 - Protocol change, Talk: bulk payloads. Flag `0x40` of the Talk header is
   `BULK`: the payload field is a 10-byte reference (`TalkBulkReference`:
   `u32` bulk number, `u48` length, `0xFFFFFFFFFFFF` unknown) to a bulk
@@ -227,7 +230,12 @@ The protocol specification lives in the project wiki (section
   `RESOURCE_EXHAUSTED` to both sides), so `payload` reads it like an
   inline one; messages `TalkOptions.streamBulk` selects are delivered at
   once and read as a stream (`TalkMessage.bulk`, `payloadBytes`,
-  `isBulk`, `bulkLength`). Messages keep their order either way. The
+  `isBulk`, `bulkLength`). Messages keep their order either way. What
+  waits behind a listener (reassembled payloads, streamed ones not
+  delivered yet) shares a budget of `maxInlinePayload` per channel, and
+  a bulk channel on which nothing arrives for `TalkOptions.bulkIdleTimeout`
+  (30 s) while this side waits is closed `DEADLINE_EXCEEDED`, its payload
+  failing with it. The
   Switchboard routes `_bulk` channels to their parent's Talk layer before
   any policy (`TalkChannel.adoptBulk` for raw mux users); `pipeChannels`,
   `proxyHandler`, the relay and `forwardMessage` forward bulk payloads.

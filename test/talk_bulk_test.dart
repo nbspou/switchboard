@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 // Talk bulk payloads (wiki page "Polyverse Switchboard Talk", section
@@ -13,9 +14,11 @@ Authors:
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:mirrors';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:switchboard/core.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
@@ -148,6 +151,762 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  // These retention checks inspect bookkeeping without adding diagnostic
+  // API to Talk. The functional payload checks alone cannot detect a leak.
+  int retained(Object owner, String field) {
+    final mirror = reflect(owner);
+    final symbol = MirrorSystem.getSymbol(
+      field,
+      mirror.type.owner as LibraryMirror,
+    );
+    return (mirror.getField(symbol).reflectee as Iterable).length;
+  }
+
+  test(
+    'bulk channels finished before their references are not retained',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final messages = StreamQueue(server.messages);
+      final raw = talk.raw as MuxChannel;
+      for (var number = 1; number <= 10; number++) {
+        final bulk = raw.openAfter(TalkBulkOpen(raw.id, number).encode());
+        await bulk.send(pattern(100));
+        await bulk.close();
+        await pumpEventQueue();
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('NOTE'),
+            bulk: true,
+            payload: TalkBulkReference(number, length: 100).encode(),
+          ).encode(),
+        );
+        expect((await messages.next).payload, pattern(100));
+      }
+      expect(retained(server, '_bulkIns'), 0);
+      await messages.cancel();
+    },
+  );
+
+  test('a stream request does not retain completed bulk sends', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    final received = Completer<TalkMessage>();
+    server.messages.listen(received.complete);
+    final request = talk.streamRequest('LIST', Uint8List(0));
+    final items = StreamQueue(request.items);
+    final message = await received.future;
+    for (var i = 0; i < 10; i++) {
+      await message.replyItemBulk(Stream.value(pattern(100)));
+      expect((await items.next).payload, pattern(100));
+    }
+    expect(retained(message, '_bulkOuts'), 0);
+    message.reply(Uint8List(0));
+    await request.done;
+    await items.cancel();
+  });
+
+  test(
+    'a peer cancel abandons a bulk request still waiting for dispatch',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final seen = <TalkMessage>[];
+      server.messages.listen(seen.add);
+      final raw = talk.raw as MuxChannel;
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('PUT'),
+          requestId: 1,
+          bulk: true,
+          payload: TalkBulkReference(1).encode(),
+        ).encode(),
+      );
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.abort,
+          requestId: 1,
+          payload: Status.of(StatusCode.cancelled).encode(),
+        ).encode(),
+      );
+      talk.send('AFTER', Uint8List.fromList([7]));
+      await pumpEventQueue();
+      expect(seen.single.payload, [7]);
+      final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      expect((await bulk.done).known, StatusCode.cancelled);
+      expect((server.raw as MuxChannel).heldBytes, 0);
+      expect(server.incomingRequestCount, 0);
+    },
+  );
+
+  test(
+    'cancelling an ordered bulk answer before dispatch releases its lane',
+    () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final seen = <TalkMessage>[];
+      talk.messages.listen(seen.add);
+      server.messages.listen((message) {
+        final raw = server.raw as MuxChannel;
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            responseId: message.requestId,
+            bulk: true,
+            payload: TalkBulkReference(1).encode(),
+          ).encode(),
+        );
+        server.send('AFTER', Uint8List.fromList([7]));
+      });
+      final request = talk.startRequest('GET', Uint8List(0), ordered: true);
+      await pumpEventQueue();
+      expect(seen, isEmpty);
+      request.cancel();
+      await pumpEventQueue();
+      expect(seen.single.payload, [7]);
+      expect((talk.raw as MuxChannel).heldBytes, 0);
+      // Dispatch catches up after cancellation: no payload may be attached
+      // to the abandoned answer, and the parent remains usable.
+      final raw = server.raw as MuxChannel;
+      final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      expect((await bulk.done).known, StatusCode.cancelled);
+      expect(talk.isOpen, isTrue);
+    },
+  );
+
+  test('failed reassembly releases its partial memory budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkChunkSize: 100),
+    );
+    server.messages.listen((message) => message.reply(Uint8List(0)));
+    await expectLater(
+      talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1100))),
+      throwsStatus(StatusCode.resourceExhausted),
+    );
+    await talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1000)));
+  });
+
+  test('a running stream keeps its unread items within the reassembly '
+      'budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    server.messages.listen((message) {
+      message
+        ..replyItem(pattern(1000))
+        ..replyItem(pattern(1000, 1))
+        ..reply(Uint8List(0));
+    });
+    final stream = talk.streamRequest('LIST', Uint8List(0));
+    await expectLater(stream.done, throwsStatus(StatusCode.resourceExhausted));
+    final items = StreamQueue(stream.items);
+    expect((await items.next).payload, pattern(1000));
+    await expectLater(items.next, throwsStatus(StatusCode.resourceExhausted));
+    // Nothing is left charged: the next stream gets the whole budget.
+    final next = talk.streamRequest('LIST', Uint8List(0));
+    final more = StreamQueue(next.items);
+    expect((await more.next).payload, pattern(1000));
+    await more.cancel();
+  });
+
+  test('the end of a stream releases the reassembly budget of its unread '
+      'items', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    server.messages.listen((message) {
+      message.replyItem(pattern(1000));
+      message.reply(Uint8List(0));
+    });
+    // Nobody ever listens to the items of the first: they are the
+    // application's once the stream ended, as their credit is.
+    final first = talk.streamRequest('LIST', Uint8List(0));
+    await first.done;
+    final second = talk.streamRequest('LIST', Uint8List(0));
+    await second.done;
+    expect((await second.items.toList()).single.payload, pattern(1000));
+    expect((await first.items.toList()).single.payload, pattern(1000));
+  });
+
+  test('an answer Talk takes itself has no share of the reassembly '
+      'budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(bulkThreshold: 100),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(maxInlinePayload: 1000),
+    );
+    // A paused listener holds a reassembled message: the budget is used.
+    final held = <TalkMessage>[];
+    final subscription = talk.messages.listen(held.add)..pause();
+    server.messages.listen((message) => message.reply(pattern(1000, 2)));
+    server.send('NOTE', pattern(1000));
+    await pumpEventQueue();
+    final answer = await talk.request('GET', Uint8List(0));
+    expect(answer.payload, pattern(1000, 2));
+    subscription.resume();
+    await pumpEventQueue();
+    expect(held.single.payload, pattern(1000));
+    await subscription.cancel();
+  });
+
+  test('streamed payloads waiting for a paused listener share the budget, '
+      'at what their window lets the peer send', () async {
+    final peers = await Peers.connect(
+      serverOptions: TalkOptions(
+        maxInlinePayload: 200000,
+        streamBulk: (_) => true,
+      ),
+    );
+    final (talk, server) = await peers.open();
+    final seen = <TalkMessage>[];
+    final subscription = server.messages.listen(seen.add)..pause();
+    final sent = [
+      for (var i = 0; i < 6; i++)
+        talk
+            .request(
+              'PUT',
+              Uint8List(0),
+              bulk: Stream.value(pattern(100000, i)),
+              bulkLength: 100000,
+            )
+            .then<Object>((m) => m, onError: (Object e) => e),
+    ];
+    // A window (64 KiB) each: three fit, the others are refused.
+    for (final refused in sent.skip(3)) {
+      expect(
+        await refused,
+        isA<TalkAbortException>().having(
+          (e) => e.code,
+          'code',
+          StatusCode.resourceExhausted,
+        ),
+      );
+    }
+    subscription.resume();
+    await until(() => seen.length == 3);
+    for (var i = 0; i < 3; i++) {
+      expect(await collect(seen[i].bulk), pattern(100000, i));
+      seen[i].reply(Uint8List(0));
+    }
+    for (final answered in sent.take(3)) {
+      expect(await answered, isA<TalkMessage>());
+    }
+    await subscription.cancel();
+  });
+
+  test('unread reassemblies share a channel memory budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkThreshold: 100),
+    );
+    final subscription = server.messages.listen((message) {
+      expect(message.payload, pattern(1000));
+      message.reply(Uint8List(0));
+    })..pause();
+    final first = talk.request('PUT', pattern(1000));
+    await pumpEventQueue();
+    final second = talk.request('PUT', pattern(1000));
+    await expectLater(
+      second.timeout(const Duration(seconds: 1)),
+      throwsStatus(StatusCode.resourceExhausted),
+    );
+    subscription.resume();
+    await first;
+    // Delivery releases the budget; subsequent large requests still work.
+    await talk.request('PUT', pattern(1000));
+    await subscription.cancel();
+  });
+
+  test('cancelling a stream request closes a delivered item bulk channel '
+      'without relying on the peer', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open(
+      options: TalkOptions(streamBulk: (_) => true),
+    );
+    late MuxChannel bulk;
+    server.messages.listen((message) {
+      final raw = server.raw as MuxChannel;
+      // A peer that keeps sending the item after the request was cancelled.
+      bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      raw.sink.add(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          responseId: message.requestId,
+          bulk: true,
+          payload: TalkBulkReference(1).encode(),
+        ).encode(),
+      );
+    });
+    final request = talk.streamRequest('LIST', Uint8List(0));
+    final items = StreamQueue(request.items);
+    expect((await items.next).isBulk, isTrue);
+    request.cancel();
+    expect(
+      (await bulk.done.timeout(const Duration(seconds: 1))).known,
+      StatusCode.cancelled,
+    );
+    await items.cancel();
+  });
+
+  test('cancelling messages releases an ordered answer behind a bulk '
+      'message being reassembled', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    final source = StreamController<List<int>>();
+    server.messages.listen((message) {
+      server.send('NOTE', Uint8List(0), bulk: source.stream);
+      message.reply(Uint8List.fromList([7]));
+    });
+    final subscription = talk.messages.listen((_) => fail('not delivered'));
+    final response = talk.request('GET', Uint8List(0), ordered: true);
+    await pumpEventQueue();
+    await subscription.cancel();
+    expect((await response.timeout(const Duration(seconds: 1))).payload, [7]);
+    await pumpEventQueue();
+    expect(source.hasListener, isFalse);
+    expect((talk.raw as MuxChannel).heldBytes, 0);
+    await source.close();
+  });
+
+  for (final cancelBefore in [false, true]) {
+    test('cancelling messages ${cancelBefore ? 'before' : 'during'} bulk '
+        'reassembly refuses the unread request', () async {
+      final peers = await Peers.connect();
+      final (talk, server) = await peers.open();
+      final subscription = server.messages.listen((_) => fail('not delivered'));
+      if (cancelBefore) {
+        await subscription.cancel();
+      }
+      final source = StreamController<List<int>>();
+      final response = talk.request('PUT', Uint8List(0), bulk: source.stream);
+      await pumpEventQueue();
+      if (!cancelBefore) {
+        await subscription.cancel();
+      }
+      await expectLater(
+        response.timeout(const Duration(seconds: 1)),
+        throwsStatus(StatusCode.unimplemented),
+      );
+      await pumpEventQueue();
+      expect(source.hasListener, isFalse);
+      expect((server.raw as MuxChannel).heldBytes, 0);
+      await source.close();
+    });
+  }
+
+  test('references without bulk OPENs have a bounded dispatch wait', () {
+    fakeAsync((async) {
+      final (client, server) = muxPair();
+      final talks = <TalkChannel>[];
+      server.incoming.listen((raw) => talks.add(TalkChannel(raw)));
+      final raw = client.open(Uint8List(0));
+      async.elapse(Duration.zero);
+      final baseline = async.nonPeriodicTimerCount;
+      for (var number = 1; number <= 100; number++) {
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            responseId: 1, // Unknown: consumed by Talk immediately.
+            bulk: true,
+            payload: TalkBulkReference(number).encode(),
+          ).encode(),
+        );
+      }
+      async.elapse(Duration.zero);
+      expect(
+        async.nonPeriodicTimerCount - baseline,
+        lessThanOrEqualTo(TalkOptions.defaultMaxUnclaimedBulk),
+      );
+      Status? end;
+      talks.single.done.then((status) => end = status);
+      async.elapse(Duration.zero);
+      expect(end?.known, StatusCode.protocolError);
+      expect(async.pendingTimers, isEmpty);
+      client.close();
+      server.close();
+      async.elapse(quiet.keepAliveTimeout);
+    });
+  });
+
+  test('a request cancelled while it waits for the peer\'s LIMITS does not '
+      'start its upload', () {
+    fakeAsync((async) {
+      final (client, server) = muxPair();
+      // A peer that takes the channels but never reads nor closes them.
+      final taken = <MuxChannel>[];
+      server.incoming.listen(taken.add);
+      final talk = TalkChannel(client.open(Uint8List(0)));
+      final source = StreamController<List<int>>();
+      final request = talk.startRequest(
+        'PUT',
+        Uint8List(0),
+        bulk: source.stream,
+      );
+      request.cancel();
+      // The LIMITS arrive: the request, its bulk channel and the cancel go
+      // out, in that order.
+      async.elapse(Duration.zero);
+      expect(taken, hasLength(2));
+      expect(source.hasListener, isFalse);
+      source.close();
+      client.close();
+      server.close();
+      async.elapse(quiet.keepAliveTimeout);
+    });
+  });
+
+  group('idle timeout', () {
+    /// A Talk channel and its far end over [muxPair], in fake time, the
+    /// bulk channels of both sides routed; then a function closing both.
+    (TalkChannel, TalkChannel, void Function()) fakeTalk(
+      FakeAsync async, {
+      TalkOptions near = const TalkOptions(),
+      TalkOptions far = const TalkOptions(),
+    }) {
+      final (client, server) = muxPair();
+      TalkChannel? accepted;
+      void route(MuxChannel channel) {
+        if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+          TalkChannel.adoptBulk(channel);
+        } else {
+          accepted = TalkChannel(channel, options: far);
+        }
+      }
+
+      client.incoming.listen(route);
+      server.incoming.listen(route);
+      final talk = TalkChannel(client.open(Uint8List(0)), options: near);
+      async.elapse(Duration.zero);
+      return (
+        talk,
+        accepted!,
+        () {
+          client.close();
+          server.close();
+          async.elapse(quiet.keepAliveTimeout);
+        },
+      );
+    }
+
+    /// What [future] completed with, as it completes.
+    (Object? Function(), bool Function()) watch(Future<Object?> future) {
+      Object? outcome;
+      var done = false;
+      future.then(
+        (value) {
+          outcome = value;
+          done = true;
+        },
+        onError: (Object error) {
+          outcome = error;
+          done = true;
+        },
+      );
+      return (() => outcome, () => done);
+    }
+
+    final Matcher deadlineExceeded = isA<SwitchboardException>().having(
+      (e) => e.code,
+      'code',
+      StatusCode.deadlineExceeded,
+    );
+
+    test('a request whose bulk payload stalls is answered DEADLINE_EXCEEDED '
+        'once no byte came for the timeout', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkChunkSize: 500),
+        );
+        server.messages.listen((_) => fail('not delivered'));
+        final source = StreamController<List<int>>();
+        final (outcome, done) = watch(
+          talk.request(
+            'PUT',
+            Uint8List(0),
+            bulk: source.stream,
+            timeout: Duration.zero,
+          ),
+        );
+        source.add(pattern(500));
+        async.elapse(const Duration(seconds: 20));
+        // A chunk restarts the timeout.
+        source.add(pattern(500));
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        expect(
+          outcome(),
+          isA<TalkAbortException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.deadlineExceeded,
+          ),
+        );
+        // The sender's transfer ended with its bulk channel.
+        expect(source.hasListener, isFalse);
+        expect(server.incomingRequestCount, 0);
+        source.close();
+        close();
+      });
+    });
+
+    test('a final response whose payload stalls fails its request', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(async);
+        final source = StreamController<List<int>>();
+        late Future<void> sent;
+        server.messages.listen((m) => sent = m.replyBulk(source.stream));
+        final (outcome, done) = watch(talk.request('GET', Uint8List(0)));
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        // This side's own failure, not an abort from the peer.
+        expect(
+          outcome(),
+          allOf(deadlineExceeded, isNot(isA<TalkAbortException>())),
+        );
+        final (sendOutcome, _) = watch(sent);
+        async.elapse(Duration.zero);
+        expect(sendOutcome(), deadlineExceeded);
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('an item whose payload stalls ends its stream', () {
+      fakeAsync((async) {
+        // The responder's own timeout would end the request first.
+        final (talk, server, close) = fakeTalk(
+          async,
+          far: const TalkOptions(replyTimeout: Duration.zero),
+        );
+        final source = StreamController<List<int>>();
+        server.messages.listen((m) => m.replyItemBulk(source.stream).ignore());
+        final stream = talk.streamRequest(
+          'LIST',
+          Uint8List(0),
+          timeout: Duration.zero,
+        );
+        final errors = <Object>[];
+        stream.items.listen((_) => fail('not delivered'), onError: errors.add);
+        final (outcome, done) = watch(stream.done);
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        expect(outcome(), deadlineExceeded);
+        expect(errors.single, deadlineExceeded);
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('a plain message whose payload stalls is dropped', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(async);
+        final seen = <TalkMessage>[];
+        talk.messages.listen(seen.add);
+        final source = StreamController<List<int>>();
+        server
+          ..send('NOTE', Uint8List(0), bulk: source.stream)
+          ..send('AFTER', Uint8List.fromList([7]));
+        async.elapse(const Duration(seconds: 29));
+        expect(seen, isEmpty);
+        async.elapse(const Duration(seconds: 2));
+        expect(seen.single.procedureName, 'AFTER');
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('a streamed payload the application reads errors', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: TalkOptions(streamBulk: (_) => true),
+        );
+        final errors = <Object>[];
+        final chunks = <Uint8List>[];
+        talk.messages.listen(
+          (m) => m.bulk.listen(chunks.add, onError: errors.add),
+        );
+        final source = StreamController<List<int>>();
+        server.send('NOTE', Uint8List(0), bulk: source.stream);
+        source.add(pattern(100));
+        async.elapse(const Duration(seconds: 29));
+        expect(errors, isEmpty);
+        async.elapse(const Duration(seconds: 2));
+        expect(errors.single, deadlineExceeded);
+        source.close();
+        close();
+      });
+    });
+
+    test('a payload waiting for its reader here does not time out', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: TalkOptions(streamBulk: (_) => true),
+        );
+        final received = BytesBuilder();
+        var ended = false;
+        StreamSubscription<Uint8List>? reading;
+        talk.messages.listen((m) {
+          reading = m.bulk.listen(
+            received.add,
+            onError: (Object e) => fail('$e'),
+            onDone: () => ended = true,
+          )..pause();
+        });
+        server.send(
+          'NOTE',
+          Uint8List(0),
+          bulk: Stream.value(pattern(200000)),
+          bulkLength: 200000,
+        );
+        // The window is used up: the sender waits for this side.
+        async.elapse(const Duration(minutes: 2));
+        expect(ended, isFalse);
+        reading!.resume();
+        async.elapse(Duration.zero);
+        expect(ended, isTrue);
+        expect(received.takeBytes(), pattern(200000));
+        // Nothing is in transfer: no timer is left.
+        expect(async.pendingTimers, isEmpty);
+        reading!.cancel();
+        close();
+      });
+    });
+
+    test('a forwarded payload waiting for a paused reader is neither cut '
+        'nor timed out', () {
+      fakeAsync((async) {
+        final piping = TalkOptions(streamBulk: (_) => true);
+        final (client, front, closeFront) = fakeTalk(
+          async,
+          near: piping,
+          far: piping,
+        );
+        final (back, backend, closeBack) = fakeTalk(async, near: piping);
+        front.messages.listen((m) => forwardMessage(m, back).ignore());
+        backend.messages.listen(
+          (m) => m
+              .replyBulk(Stream.value(pattern(300000)), length: 300000)
+              .ignore(),
+        );
+        final (outcome, _) = watch(client.request('GET', Uint8List(0)));
+        async.elapse(Duration.zero);
+        final response = outcome() as TalkMessage;
+        final received = BytesBuilder();
+        var ended = false;
+        final reading = response.bulk.listen(
+          received.add,
+          onError: (Object e) => fail('$e'),
+          onDone: () => ended = true,
+        )..pause();
+        // Every hop waits for the client, which does not read: longer than
+        // the idle timeout, and than the close confirmation timeout of the
+        // forwarded bulk channel, whose source ended meanwhile.
+        async.elapse(const Duration(minutes: 2));
+        expect(ended, isFalse);
+        reading.resume();
+        async.elapse(Duration.zero);
+        expect(ended, isTrue);
+        expect(received.takeBytes(), pattern(300000));
+        reading.cancel();
+        closeFront();
+        closeBack();
+      });
+    });
+
+    test('an unclaimed bulk channel goes idle too', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkOpenTimeout: Duration(minutes: 1)),
+        );
+        final seen = <TalkMessage>[];
+        talk.messages.listen(seen.add);
+        final raw = server.raw as MuxChannel;
+        final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+        Status? end;
+        bulk.done.then((status) => end = status);
+        async.elapse(const Duration(seconds: 29));
+        expect(end, isNull);
+        async.elapse(const Duration(seconds: 2));
+        expect(end?.known, StatusCode.deadlineExceeded);
+        // Its message fails when it comes: refused, the next one delivered.
+        raw.sink
+          ..add(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('PUT'),
+              requestId: 1,
+              bulk: true,
+              payload: TalkBulkReference(1).encode(),
+            ).encode(),
+          )
+          ..add(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('AFTER'),
+              payload: Uint8List(0),
+            ).encode(),
+          );
+        async.elapse(Duration.zero);
+        expect(seen.single.procedureName, 'AFTER');
+        expect(talk.incomingRequestCount, 0);
+        close();
+      });
+    });
+
+    test('Duration.zero sets no idle timeout', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkChunkSize: 500),
+          far: const TalkOptions(bulkIdleTimeout: Duration.zero),
+        );
+        server.messages.listen((m) => m.reply(m.payload.sublist(0, 1)));
+        final source = StreamController<List<int>>();
+        final (outcome, done) = watch(
+          talk.request(
+            'PUT',
+            Uint8List(0),
+            bulk: source.stream,
+            timeout: Duration.zero,
+          ),
+        );
+        source.add(pattern(500));
+        async.elapse(const Duration(minutes: 10));
+        expect(done(), isFalse);
+        source.add(pattern(500, 500));
+        source.close();
+        async.elapse(Duration.zero);
+        expect((outcome() as TalkMessage?)?.payload, [0]);
+        expect(async.pendingTimers, isEmpty);
+        close();
+      });
+    });
+  });
+
   for (final tcp in [false, true]) {
     group(tcp ? 'over TCP' : 'over memory', () {
       test('a request with a bulk payload of known length', () async {

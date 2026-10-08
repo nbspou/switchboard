@@ -57,6 +57,7 @@ class TalkOptions {
     this.bulkWindow = defaultBulkWindow,
     this.maxUnclaimedBulk = defaultMaxUnclaimedBulk,
     this.bulkOpenTimeout = const Duration(seconds: 10),
+    this.bulkIdleTimeout = const Duration(seconds: 30),
     this.streamBulk,
   });
 
@@ -136,6 +137,19 @@ class TalkOptions {
   /// with `RESOURCE_EXHAUSTED`, toward the sender (its bulk channel is
   /// closed with it, a request is answered with it) and the receiver.
   /// Default 16 MiB.
+  ///
+  /// Also caps the total of the reassembled payloads this channel holds
+  /// for the application, finished or not, of the messages behind a
+  /// listener ([TalkChannel.messages], [TalkStream.items], the answers of
+  /// `ordered` requests), streamed payloads not delivered yet counted at
+  /// what their bulk channel may hold (its window, or the declared length
+  /// if smaller): exceeding it fails the payload with `RESOURCE_EXHAUSTED`
+  /// (and the message, as a failed reassembly does), so that small `BULK`
+  /// frames behind a paused listener cannot hold more.
+  /// Delivery, discard or failure releases a payload's share, and so does
+  /// the end of a stream request for its unread items (as their credit).
+  /// The final response completing a request's future is not counted: Talk
+  /// takes it itself.
   final int maxInlinePayload;
 
   /// Receiving: the window granted to a bulk channel being read whose
@@ -147,13 +161,33 @@ class TalkOptions {
 
   /// Receiving: bulk channels the peer may open for this channel before
   /// the messages that reference them arrive; beyond, a bulk OPEN is closed
-  /// `RESOURCE_EXHAUSTED`. Default 16, the wiki's reference.
+  /// `RESOURCE_EXHAUSTED`. Also bounds references waiting for their bulk
+  /// OPEN to be dispatched; beyond, a channel protocol error. Default 16,
+  /// the wiki's reference.
   final int maxUnclaimedBulk;
 
   /// Receiving: how long a message waits for the bulk channel it
   /// references to be dispatched (its OPEN precedes it on the wire, but
   /// dispatch may lag). Expiry is a channel protocol error. Default 10 s.
   final Duration bulkOpenTimeout;
+
+  /// Receiving: how long a bulk channel the peer opened may go without a
+  /// byte while this side waits for one; then it is closed
+  /// `DEADLINE_EXCEEDED`, and its payload fails with that status as a
+  /// failed transfer does: reassembled, the message fails (a request is
+  /// answered `ABORT DEADLINE_EXCEEDED`, a final response fails its
+  /// request, an item ends its stream, a plain message is dropped);
+  /// streamed, its [TalkMessage.bulk] stream ends with that error;
+  /// forwarded, the bulk channel it is piped into is closed with it.
+  /// Restarted by every chunk that arrives, and by every chunk this side
+  /// consumes; it does not run while what arrived waits to be consumed
+  /// here (a reader that is paused, or a forwarded payload waiting for
+  /// the far side's window), since then the silence is this side's. The
+  /// request and reply timeouts do not cover a final response's payload,
+  /// nor a request's once delivered: this bounds a peer that keeps its
+  /// connection alive but stalls a transfer. [Duration.zero]: none.
+  /// Default 30 s.
+  final Duration bulkIdleTimeout;
 
   /// Receiving: which bulk messages are delivered as soon as they arrive,
   /// with the payload still arriving as a stream ([TalkMessage.bulk]),
@@ -212,10 +246,12 @@ class TalkAbortException extends SwitchboardException {
 /// delivered in its place. Frames the channel consumes itself (a final
 /// response completing a future, aborts, `EXTEND`, cancels, frames for ids
 /// it does not know or gave up on, requests it refuses, messages nobody
-/// will read) return their credit at once, and so does a reply relayed by
-/// [forwardMessage], whose far side's credit governs. A stream that is
-/// paused or not listened to therefore stalls its channel once the window
-/// is used up (see [messages]), and only that channel.
+/// will read) return their credit at once. What [forwardMessage] forwards
+/// (replies relayed back, and the message it forwards when called from the
+/// listener) returns its credit once the frame forwarded for it went out
+/// on the other channel. A stream that is paused or not listened to
+/// therefore stalls its channel once the window is used up (see
+/// [messages]), and only that channel.
 ///
 /// Bulk payloads (wiki page "Polyverse Switchboard Talk", "Bulk
 /// payloads"), over a mux channel: a message whose frame would exceed what
@@ -362,6 +398,10 @@ class TalkChannel {
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
 
+  /// The reassembly budget in use ([TalkOptions.maxInlinePayload]): the
+  /// payloads being reassembled for a listener, and those waiting for it.
+  int _assemblyBytes = 0;
+
   /// The order of [messages], kept while bulk payloads arrive.
   final _Lane _messagesLane = _Lane();
 
@@ -403,7 +443,8 @@ class TalkChannel {
   ///
   /// If the subscription is cancelled, buffered requests that were never
   /// delivered and every later request are answered with
-  /// `ABORT UNIMPLEMENTED`.
+  /// `ABORT UNIMPLEMENTED`, including requests whose bulk payloads are
+  /// still being reassembled; their transfers are cancelled too.
   late final Stream<TalkMessage> messages = _GuardedStream(
     _messages.stream,
     _undeliveredRequests,
@@ -624,8 +665,9 @@ class TalkChannel {
   /// restarts each time a chunk of the payload goes out (as it does for a
   /// stream item), and as the bulk payloads of stream items arrive; it
   /// stops when the final response arrives, and the transfer of a bulk
-  /// payload in that response is not timed (the connection's keep-alive
-  /// bounds a peer gone silent; [TalkRequest.cancel] stops it).
+  /// payload in that response is bounded by [TalkOptions.bulkIdleTimeout]
+  /// instead (a peer that stops sending it; [TalkRequest.cancel] stops it
+  /// too).
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
@@ -814,12 +856,21 @@ class TalkChannel {
   /// every frame after it, and is sized once the limit the peer announces
   /// is known: one sized against the 64 KiB assumed meanwhile could turn
   /// out too large for the window announced, and be lost. Its failures are
-  /// then reported to [onFailure] (logged without one) instead of thrown.
+  /// then reported to [onFailure] (logged without one) instead of thrown,
+  /// and so is the end of the channel before the frame went out.
+  ///
+  /// With [onAccepted] (forwarding), the frame goes through the awaitable
+  /// send of the mux channel, and [onAccepted] is called once the frame
+  /// (for a bulk payload: its `BULK` frame) was handed to the connection,
+  /// the channel's send window having taken it, or once it was discarded:
+  /// exactly once whenever this returns normally, never when it throws.
   void _sendFrame(
     TalkFrame frame, {
     _BulkSource? bulk,
     void Function(_BulkOut out)? onBulk,
+    void Function(_BulkOut? out)? onSent,
     void Function(SwitchboardException error)? onFailure,
+    void Function()? onAccepted,
   }) {
     if (_closing) {
       throw SwitchboardException.of(
@@ -828,29 +879,51 @@ class TalkChannel {
       );
     }
     if (_mustDefer()) {
-      _deferred.add(() {
-        try {
-          final out = _sendNow(frame, bulk);
+      final accepted = onAccepted == null ? null : _once(onAccepted);
+      void dropped(SwitchboardException error) {
+        accepted?.call();
+        onFailure?.call(error);
+      }
+
+      _deferred.add(
+        _Deferred(() {
+          final _BulkOut? out;
+          try {
+            out = _sendNow(frame, bulk, accepted);
+          } on Object catch (e) {
+            final error = e is SwitchboardException
+                ? e
+                : SwitchboardException.of(StatusCode.internal, '$e');
+            if (onFailure == null) {
+              _log.warning('$frame not sent: ${error.status}');
+            }
+            dropped(error);
+            return;
+          }
           if (out != null) {
             onBulk?.call(out);
           }
-        } on Object catch (e) {
-          final error = e is SwitchboardException
-              ? e
-              : SwitchboardException.of(StatusCode.internal, '$e');
-          if (onFailure != null) {
-            onFailure(error);
-          } else {
-            _log.warning('$frame not sent: ${error.status}');
-          }
-        }
-      });
+          onSent?.call(out);
+        }, dropped),
+      );
       return;
     }
-    final out = _sendNow(frame, bulk);
+    final out = _sendNow(frame, bulk, onAccepted);
     if (out != null) {
       onBulk?.call(out);
     }
+    onSent?.call(out);
+  }
+
+  /// [callback], called once however often the result is.
+  static void Function() _once(void Function() callback) {
+    var pending = true;
+    return () {
+      if (pending) {
+        pending = false;
+        callback();
+      }
+    };
   }
 
   /// Whether a frame sent now waits in [_deferred]: frames wait there
@@ -865,7 +938,8 @@ class TalkChannel {
     }
     final waiting = mux;
     waiting.limitsKnown.then((_) {
-      if (identical(_mux, waiting)) {
+      // Once the channel ended, they are dropped with it ([_peerEnded]).
+      if (identical(_mux, waiting) && !_rawEnded) {
         _flushDeferred();
       }
     });
@@ -875,16 +949,30 @@ class TalkChannel {
   /// Sends the frames that waited for the peer's LIMITS, in order.
   void _flushDeferred() {
     while (_deferred.isNotEmpty) {
-      _deferred.removeFirst()();
+      _deferred.removeFirst().send();
+    }
+  }
+
+  /// Drops the frames that waited for the peer's LIMITS, the channel
+  /// having ended, telling their senders.
+  void _dropDeferred(SwitchboardException error) {
+    final dropped = List.of(_deferred);
+    _deferred.clear();
+    for (final deferred in dropped) {
+      deferred.drop?.call(error);
     }
   }
 
   /// [_sendFrame] without the wait for LIMITS; throws its failures.
-  _BulkOut? _sendNow(TalkFrame frame, _BulkSource? bulk) {
+  _BulkOut? _sendNow(
+    TalkFrame frame,
+    _BulkSource? bulk, [
+    void Function()? onAccepted,
+  ]) {
     if (bulk == null) {
       final bytes = frame.encode();
       if (!_needsBulk(frame, bytes.length)) {
-        _sendRaw(bytes);
+        _sendRaw(bytes, onAccepted);
         return null;
       }
       bulk = _BulkSource.bytes(frame.payload);
@@ -902,6 +990,7 @@ class TalkChannel {
         frame
             .withBulk(TalkBulkReference(out.number, length: bulk.length))
             .encode(),
+        onAccepted,
       );
     } catch (_) {
       unawaited(
@@ -916,15 +1005,35 @@ class TalkChannel {
   }
 
   /// [_sendFrame] for frames that never carry a bulk payload.
-  void _sendChecked(TalkFrame frame) => _sendFrame(frame);
+  void _sendChecked(TalkFrame frame, {void Function()? onAccepted}) =>
+      _sendFrame(frame, onAccepted: onAccepted);
 
   /// Frames waiting for the peer's LIMITS (see [_sendFrame]).
-  final Queue<void Function()> _deferred = Queue<void Function()>();
+  final Queue<_Deferred> _deferred = Queue<_Deferred>();
 
-  void _sendRaw(Uint8List bytes) {
+  /// Hands [bytes] to the raw channel. With [onAccepted], through the
+  /// awaitable send of a mux channel (or of the slot channel carrying
+  /// one), calling it once the send window took them, or they were
+  /// discarded; as the sink drops a frame for a channel that can no
+  /// longer send, so does this, calling [onAccepted] at once.
+  void _sendRaw(Uint8List bytes, [void Function()? onAccepted]) {
+    final r = raw;
+    final Future<void> sent;
     try {
-      raw.sink.add(bytes);
-    } on SwitchboardException {
+      if (onAccepted != null && r is MuxChannel) {
+        sent = r.send(bytes);
+      } else if (onAccepted != null && r is MuxChannelCarrier) {
+        sent = (r as MuxChannelCarrier).send(bytes);
+      } else {
+        r.sink.add(bytes);
+        onAccepted?.call();
+        return;
+      }
+    } on SwitchboardException catch (e) {
+      if (onAccepted != null && e.code == StatusCode.failedPrecondition) {
+        onAccepted();
+        return;
+      }
       rethrow;
     } catch (e) {
       throw SwitchboardException.of(
@@ -932,6 +1041,9 @@ class TalkChannel {
         'channel closed: $e',
       );
     }
+    unawaited(
+      sent.then((_) => onAccepted(), onError: (Object _) => onAccepted()),
+    );
   }
 
   /// Whether [frame], [length] bytes encoded, goes as a bulk payload.
@@ -981,7 +1093,7 @@ class TalkChannel {
     }
 
     if (_mustDefer()) {
-      _deferred.add(send);
+      _deferred.add(_Deferred(send));
     } else {
       send();
     }
@@ -1007,6 +1119,7 @@ class TalkChannel {
     _ResponseSink? sink,
     bool ordered = false,
     _BulkSource? bulk,
+    void Function()? onAccepted,
   }) {
     if (_closing) {
       throw SwitchboardException.of(
@@ -1046,7 +1159,14 @@ class TalkChannel {
         frame,
         bulk: bulk,
         onBulk: (out) {
-          pending.bulkOuts.add(out);
+          final stopped = pending.bulkStopped;
+          if (stopped != null) {
+            // The frame waited for the peer's LIMITS, and the request was
+            // cancelled or failed locally meanwhile.
+            out.cancel(stopped);
+            return;
+          }
+          out.track(pending.bulkOuts);
           // The request's payload going out is progress: the requester
           // timeout restarts with each chunk the receiver takes.
           out.onProgress = () {
@@ -1062,6 +1182,7 @@ class TalkChannel {
           }
           pending.fail(error);
         },
+        onAccepted: onAccepted,
       );
     } catch (_) {
       if (identical(_outgoing[id], pending)) {
@@ -1211,6 +1332,9 @@ class TalkChannel {
         Status.of(StatusCode.unimplemented, 'no message listener'),
       );
     }
+    _messagesLane.dropIncoming(
+      Status.of(StatusCode.unimplemented, 'no message listener'),
+    );
     // Nothing is delivered any more: the waiting answers go at once.
     final outcomes = _orderedOutcomes.toList();
     _orderedOutcomes.clear();
@@ -1264,8 +1388,7 @@ class TalkChannel {
         _credit(wire);
         _onAbort(frame);
       case TalkKind.extend:
-        _credit(wire);
-        _onExtend(frame);
+        _onExtend(frame, wire);
     }
   }
 
@@ -1291,24 +1414,54 @@ class TalkChannel {
   /// Returns the credit of [message], once: it was handed to the
   /// application, or consumed by the channel.
   void _creditMessage(_Message message, [_Held? held]) {
+    final bytes = _uncount(message, held);
+    if (bytes != 0) {
+      _credit(bytes);
+    }
+  }
+
+  /// Takes [message] out of what [held] (if any) and the reassembly budget
+  /// count, and returns the credit of its frame still to be returned, once
+  /// (0 after, and when [held] returned it already).
+  int _uncount(_Message message, [_Held? held]) {
+    message._releaseAssembly();
+    held?.assembled.remove(message);
     if (held != null && message._heldBulk) {
       message._heldBulk = false;
       held.bulk.remove(message);
     }
     final bytes = message._creditBytes;
     if (bytes == 0) {
-      return;
+      return 0;
     }
     message._creditBytes = 0;
     if (held != null) {
       if (held.drained) {
         // Returned already with everything the controller held.
-        return;
+        return 0;
       }
       held.bytes -= bytes;
       held.frames--;
     }
-    _credit(bytes);
+    return bytes;
+  }
+
+  /// Hands [message] over with [deliver], returning its credit after,
+  /// unless [forwardMessage] took it over meanwhile
+  /// ([_Message._takeCredit]): then the credit goes back once what it
+  /// forwards went out, so that a forwarded frame is paced by the window
+  /// it is forwarded into, not queued here.
+  void _handOver(_Message message, _Held? held, void Function() deliver) {
+    message._deliveryCredit = _uncount(message, held);
+    try {
+      deliver();
+    } finally {
+      final bytes = message._deliveryCredit;
+      message._deliveryCredit = 0;
+      if (bytes != 0) {
+        _credit(bytes);
+      }
+    }
   }
 
   /// Returns the credit of everything [held] still holds: the controller
@@ -1328,6 +1481,12 @@ class TalkChannel {
   /// deliverable: nothing more will be added to its controller (the stream
   /// request ended), so it is bounded without the window.
   void _returnHeld(_Held held) {
+    // So does their share of the reassembly budget: what an ended stream
+    // holds is the application's, and stays so if it never listens.
+    for (final message in held.assembled) {
+      message._releaseAssembly();
+    }
+    held.assembled.clear();
     if (held.drained) {
       return;
     }
@@ -1436,11 +1595,7 @@ class TalkChannel {
       );
       return false;
     }
-    _bulkAwaited[number] = _Awaited(
-      message,
-      Timer(options.bulkOpenTimeout, () => _bulkNeverOpened(number)),
-    );
-    return true;
+    return _awaitBulk(number, message);
   }
 
   /// The bulk payload of [frame], a message dropped on arrival, is not
@@ -1463,10 +1618,21 @@ class TalkChannel {
       );
       return;
     }
+    _awaitBulk(number, null);
+  }
+
+  /// Dispatch may lag, but ignored responses must not buy unbounded
+  /// timers with the credit returned on arrival.
+  bool _awaitBulk(int number, _Message? message) {
+    if (_bulkAwaited.length >= options.maxUnclaimedBulk) {
+      _protocolError('too many BULK references waiting for their channels');
+      return false;
+    }
     _bulkAwaited[number] = _Awaited(
-      null,
+      message,
       Timer(options.bulkOpenTimeout, () => _bulkNeverOpened(number)),
     );
+    return true;
   }
 
   void _bulkNeverOpened(int number) {
@@ -1487,7 +1653,14 @@ class TalkChannel {
       ..length = message._bulkRef!.length
       ..onProgress = message._onBulkProgress;
     // Until its bytes were all read, or it was abandoned.
-    _bulkIns.add(b);
+    if (b._endStatus == null) {
+      _bulkIns.add(b);
+    }
+    final pending = _outgoing[message.responseId];
+    if (pending != null) {
+      pending.bulkIns.add(b);
+      unawaited(b.channel.done.then((_) => pending.bulkIns.remove(b)));
+    }
     var stream = message._forSink;
     final predicate = options.streamBulk;
     if (!stream && predicate != null) {
@@ -1497,12 +1670,27 @@ class TalkChannel {
         _log.warning('streamBulk failed; reassembling the payload', e, st);
       }
     }
-    if (stream) {
+    if (stream &&
+        !message._forSink &&
+        !message._reserveAssembly(_streamHold(b, message._bulkRef!.length))) {
+      // Until delivered, its bulk channel holds what its window lets the
+      // peer send, read by nobody: like a reassembly, a share of the
+      // budget of what waits behind a listener.
+      final status = Status.of(
+        StatusCode.resourceExhausted,
+        'bulk payloads waiting for the listener exceed the '
+        '${options.maxInlinePayload} byte budget',
+      );
+      b
+        ..close(status)
+        ..abandon();
+      message._bulkFailure = status;
+    } else if (stream) {
       message._streamBulk = true;
       message._startDeferredTimer();
     } else {
       b
-          .collect(options.maxInlinePayload)
+          .collect(options.maxInlinePayload, reserve: message._reserveAssembly)
           .then(
             (bytes) {
               message._assembled = bytes;
@@ -1510,6 +1698,7 @@ class TalkChannel {
               message._lane?.advance();
             },
             onError: (Object error) {
+              message._releaseAssembly();
               message._bulkFailure = error is SwitchboardException
                   ? error.status
                   : Status.of(StatusCode.internal, '$error');
@@ -1518,6 +1707,21 @@ class TalkChannel {
           );
     }
     message._lane?.advance();
+  }
+
+  /// What the bulk channel of [b], a payload of [length] bytes (null:
+  /// unknown), may hold while nobody reads it: what arrived, and what its
+  /// window still lets the peer send.
+  static int _streamHold(_BulkIn b, int? length) {
+    var hold = 0;
+    for (final chunk in b._buffer) {
+      hold += chunk.length;
+    }
+    final channel = b.channel;
+    if (channel.state != MuxChannelState.closed) {
+      hold += channel.receiveWindow + channel.bufferedBytes;
+    }
+    return length != null && length < hold ? length : hold;
   }
 
   /// Ends the bulk payloads in transfer in both directions: the channel
@@ -1552,6 +1756,18 @@ class TalkChannel {
 
   void _onMessage(TalkFrame frame, int wire) {
     if (!frame.hasResponse) {
+      if (_messagesCancelled) {
+        _credit(wire);
+        _discardBulk(frame);
+        if (frame.hasRequest) {
+          _incoming.remove(frame.requestId)?._abandon();
+          _rejectRequest(
+            frame.requestId,
+            Status.of(StatusCode.unimplemented, 'no message listener'),
+          );
+        }
+        return;
+      }
       final message = _Message(this, frame).._creditBytes = wire;
       if (frame.hasRequest && !_register(message)) {
         _creditMessage(message);
@@ -1585,7 +1801,11 @@ class TalkChannel {
       return;
     }
     pending.finalReceived = true;
-    final message = _Message(this, frame).._creditBytes = wire;
+    final message = _Message(this, frame)
+      .._creditBytes = wire
+      // An answer completing a future is taken by Talk itself, not held
+      // for a listener: no share of the reassembly budget.
+      .._budgeted = pending.ordered;
     pending.finalMessage = message;
     if (frame.hasRequest) {
       _register(message);
@@ -1645,8 +1865,7 @@ class TalkChannel {
     if (ordered) {
       _deliverOrdered(message, () => pending.complete(message));
     } else {
-      _creditMessage(message);
-      pending.complete(message);
+      _handOver(message, null, () => pending.complete(message));
     }
   }
 
@@ -1753,12 +1972,13 @@ class TalkChannel {
     }
   }
 
-  void _onExtend(TalkFrame frame) {
+  void _onExtend(TalkFrame frame, int wire) {
     final pending = _outgoing[frame.responseId];
     if (pending == null || pending.abandoned || pending.finalReceived) {
+      _credit(wire);
       return;
     }
-    pending.extended(frame);
+    pending.extended(frame, wire);
   }
 
   void _unknownResponse(TalkFrame frame) {
@@ -1792,7 +2012,6 @@ class TalkChannel {
 
   void _onDone() {
     _rawEnded = true;
-    _deferred.clear();
     if (_closing) {
       return;
     }
@@ -1815,7 +2034,11 @@ class TalkChannel {
     } else {
       r.sink.close().ignore();
     }
-    _terminate(SwitchboardException(status));
+    final error = SwitchboardException(status);
+    _terminate(error);
+    // What waited for the peer's LIMITS goes nowhere: after the requests
+    // it carries failed with the channel's status, its senders hear of it.
+    _dropDeferred(error);
     await _finish();
   }
 
@@ -1940,8 +2163,8 @@ abstract interface class _ResponseSink {
   /// The request failed, for any reason.
   void fail(SwitchboardException error);
 
-  /// The peer sent `EXTEND` carrying [payload].
-  void extended(Uint8List payload);
+  /// The peer sent [message], an `EXTEND`.
+  void extended(_Message message);
 }
 
 /// The timeout of one request, on either side: a gap restarted by every
@@ -2070,7 +2293,16 @@ class _Outgoing {
   final _Lane lane = _Lane();
 
   /// Bulk payloads of the request itself, being sent.
-  final List<_BulkOut> bulkOuts = [];
+  final Set<_BulkOut> bulkOuts = {};
+
+  /// Set once the request failed locally: the status its payload is
+  /// stopped with, also when it starts only after (its frame waited for
+  /// the peer's LIMITS).
+  Status? bulkStopped;
+
+  /// Reply payloads still in transfer, even after their streamed messages
+  /// were delivered. Local cancellation must not rely on the peer to stop.
+  final Set<_BulkIn> bulkIns = {};
 
   /// The final response or abort arrived; it may wait in [lane] (or, for
   /// an ordered request, in the lane of `messages`) for a bulk payload, and
@@ -2170,9 +2402,12 @@ class _Outgoing {
   void addItem(_Message message) {
     final sink = this.sink;
     if (sink != null) {
-      // Forwarded: the far side's credit governs.
-      channel._creditMessage(message);
-      _guard(() => sink.item(message), 'forwarding an item');
+      // Its credit goes back once the item forwarded went out.
+      channel._handOver(
+        message,
+        null,
+        () => _guard(() => sink.item(message), 'forwarding an item'),
+      );
       return;
     }
     if (items!.isClosed) {
@@ -2207,21 +2442,23 @@ class _Outgoing {
     }
     _failed = true;
     lane.drop();
-    // A final waiting in the lane of `messages` (an ordered request): its
-    // payload is not wanted any more; it is dropped when its turn comes.
-    final last = finalMessage;
-    if (last != null && last._bulk != null) {
-      last._bulk!
+    for (final bulk in List.of(bulkIns)) {
+      bulk
         ..close(Status.of(StatusCode.cancelled, 'request ended'))
         ..abandon();
     }
+    bulkIns.clear();
+    // An ordered answer can still be waiting for dispatch in the messages
+    // lane. Drop its reference now, so it cannot hold later messages up.
+    finalMessage?._drop();
     if (error is! TalkAbortException || error.isChannelAbort) {
       // A local failure: the payload of the request is not wanted any
       // more. After the peer's abort response, its receiver decides.
+      final stopped = bulkStopped = error.status.isOk
+          ? Status.of(StatusCode.cancelled)
+          : error.status;
       for (final out in bulkOuts) {
-        out.cancel(
-          error.status.isOk ? Status.of(StatusCode.cancelled) : error.status,
-        );
+        out.cancel(stopped);
       }
     }
     final sink = this.sink;
@@ -2240,8 +2477,8 @@ class _Outgoing {
     channel._returnHeld(itemsHeld);
   }
 
-  /// The peer sent [frame], an `EXTEND`.
-  void extended(TalkFrame frame) {
+  /// The peer sent [frame], an `EXTEND` [wire] bytes long.
+  void extended(TalkFrame frame, int wire) {
     final (:deadline, :renew) = frame.extension;
     final now = monotonicNow();
     if (frame.payload.isEmpty) {
@@ -2252,14 +2489,20 @@ class _Outgoing {
     _arm();
     final sink = this.sink;
     if (sink != null) {
-      // In order with the items relayed before it.
-      final payload = frame.payload;
+      // In order with the items relayed before it, its credit returned
+      // once it went out (or when the lane drops it).
+      final message = _Message(channel, frame).._creditBytes = wire;
       lane.add(
-        null,
-        () => _guard(() => sink.extended(payload), 'forwarding EXTEND'),
+        message,
+        () => channel._handOver(
+          message,
+          null,
+          () => _guard(() => sink.extended(message), 'forwarding EXTEND'),
+        ),
       );
       return;
     }
+    channel._credit(wire);
     final callback = onExtend;
     if (callback != null) {
       _guard(
@@ -2359,6 +2602,25 @@ class _Message extends TalkMessage {
   /// of a channel that is not flow controlled.
   int _creditBytes = 0;
 
+  /// That credit while the message is being handed over
+  /// ([TalkChannel._handOver]), returned after unless taken over.
+  int _deliveryCredit = 0;
+
+  /// Takes over the credit of this message's frame, while it is being
+  /// handed over, for forwarding: the function returned gives it back,
+  /// once, however often it is called. Nothing to give back when the
+  /// message was handed over before (its credit went back then).
+  void Function() _takeCredit() {
+    final bytes = _deliveryCredit;
+    if (bytes == 0) {
+      return _noCredit;
+    }
+    _deliveryCredit = 0;
+    return TalkChannel._once(() => channel._credit(bytes));
+  }
+
+  static void _noCredit() {}
+
   // Bulk payload: the reference, the bulk channel once claimed, and how
   // it is delivered.
   TalkBulkReference? _bulkRef;
@@ -2368,6 +2630,34 @@ class _Message extends TalkMessage {
   Uint8List? _assembled;
   Status? _bulkFailure;
 
+  /// Bytes charged to the channel until this message is delivered.
+  int _assemblyBytes = 0;
+  bool _dropped = false;
+
+  /// Its reassembly counts toward the channel's budget: it is held for a
+  /// listener (see [TalkOptions.maxInlinePayload]).
+  bool _budgeted = true;
+
+  bool _reserveAssembly(int bytes) {
+    if (_dropped) {
+      return false;
+    }
+    if (!_budgeted) {
+      return true;
+    }
+    if (channel._assemblyBytes + bytes > channel.options.maxInlinePayload) {
+      return false;
+    }
+    _assemblyBytes += bytes;
+    channel._assemblyBytes += bytes;
+    return true;
+  }
+
+  void _releaseAssembly() {
+    channel._assemblyBytes -= _assemblyBytes;
+    _assemblyBytes = 0;
+  }
+
   /// Held in a controller with its bulk payload unread ([_Held.bulk]).
   bool _heldBulk = false;
 
@@ -2375,7 +2665,7 @@ class _Message extends TalkMessage {
   _Lane? _lane;
 
   /// Bulk payloads of the replies to this request, being sent.
-  final List<_BulkOut> _bulkOuts = [];
+  final Set<_BulkOut> _bulkOuts = {};
 
   /// Called as the bulk payload of this message is read: restarts the
   /// timeouts that its transfer counts as progress for.
@@ -2407,6 +2697,11 @@ class _Message extends TalkMessage {
   /// The message will not be delivered: its credit goes back, its bulk
   /// payload is not wanted, a request is answered `CANCELLED`.
   void _drop() {
+    if (_dropped) {
+      return;
+    }
+    _dropped = true;
+    _bulkFailure ??= Status.of(StatusCode.cancelled, 'message dropped');
     channel._creditMessage(this);
     final b = _bulk;
     if (b != null) {
@@ -2420,6 +2715,7 @@ class _Message extends TalkMessage {
       }
     }
     _abortQuietly(Status.of(StatusCode.cancelled, 'message dropped'));
+    _lane?.advance();
   }
 
   @override
@@ -2668,6 +2964,7 @@ class _Message extends TalkMessage {
     _BulkSource? bulk,
     void Function(_BulkOut out)? onBulk,
     void Function(SwitchboardException error)? onFailure,
+    void Function()? onAccepted,
   }) {
     _check();
     _sendReply(
@@ -2680,10 +2977,11 @@ class _Message extends TalkMessage {
         ),
         bulk: bulk,
         onBulk: (out) {
-          _bulkOuts.add(out);
+          out.track(_bulkOuts);
           onBulk?.call(out);
         },
         onFailure: onFailure,
+        onAccepted: onAccepted,
       ),
       isFinal: true,
     );
@@ -2744,6 +3042,7 @@ class _Message extends TalkMessage {
     void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     _BulkSource? bulk,
+    void Function()? onAccepted,
   }) {
     _check();
     return _sendReply(
@@ -2753,6 +3052,7 @@ class _Message extends TalkMessage {
         onExtend: onExtend,
         sink: sink,
         bulk: bulk,
+        onAccepted: onAccepted,
         build: (id) => TalkFrame(
           kind: TalkKind.message,
           procedure: procedure,
@@ -2795,6 +3095,7 @@ class _Message extends TalkMessage {
     _BulkSource? bulk,
     void Function(_BulkOut out)? onBulk,
     void Function(SwitchboardException error)? onFailure,
+    void Function()? onAccepted,
   }) {
     _check(item: true);
     _sendReply(
@@ -2807,12 +3108,13 @@ class _Message extends TalkMessage {
         ),
         bulk: bulk,
         onBulk: (out) {
-          _bulkOuts.add(out);
+          out.track(_bulkOuts);
           // An item's payload going out is progress, as the item was.
           out.onProgress = _replied;
           onBulk?.call(out);
         },
         onFailure: onFailure,
+        onAccepted: onAccepted,
       ),
     );
     _replied();
@@ -2873,6 +3175,7 @@ class _Message extends TalkMessage {
     void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     _BulkSource? bulk,
+    void Function()? onAccepted,
   }) {
     _check(item: true);
     final pending = _sendReply(
@@ -2882,6 +3185,7 @@ class _Message extends TalkMessage {
         onExtend: onExtend,
         sink: sink,
         bulk: bulk,
+        onAccepted: onAccepted,
         build: (id) => TalkFrame(
           kind: TalkKind.streamItem,
           procedure: procedure,
@@ -2966,14 +3270,14 @@ class _Message extends TalkMessage {
 
   /// Sends an `EXTEND` with [payload] as received from the far responder,
   /// for forwarding: buffers already on the wire stay as they are.
-  void _extendRaw(Uint8List payload) {
+  void _extendRaw(Uint8List payload, {void Function()? onAccepted}) {
     _check();
     final frame = TalkFrame(
       kind: TalkKind.extend,
       responseId: requestId,
       payload: payload,
     );
-    _sendReply(() => channel._sendChecked(frame));
+    _sendReply(() => channel._sendChecked(frame, onAccepted: onAccepted));
     final expiry = _expiry;
     if (expiry == null || _finished) {
       return;
@@ -3108,6 +3412,9 @@ class _Message extends TalkMessage {
     final cancelled = Status.of(StatusCode.cancelled, 'request cancelled');
     _bulk?.close(cancelled);
     _bulk?.abandon();
+    if (!_ready) {
+      _drop();
+    }
     for (final out in _bulkOuts) {
       out.cancel(cancelled);
     }
@@ -3174,36 +3481,50 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
   void onData(void Function(TalkMessage data)? handleData) {
     super.onData((message) {
       if (message is _Message) {
-        message.channel._creditMessage(message, _held);
-      }
-      if (message is _Message && message._outcome != null) {
-        // The answer to an ordered request, in its place among the
-        // messages; never shown to the listener.
-        final outcomes = message.channel._orderedOutcomes;
-        if (outcomes.isNotEmpty && identical(outcomes.first, message)) {
-          outcomes.removeFirst();
-        } else {
-          outcomes.remove(message);
-        }
-        message._runOutcome();
-        return;
-      }
-      // Requests are queued, and delivered, in arrival order.
-      if (_undelivered.isNotEmpty && identical(_undelivered.first, message)) {
-        _undelivered.removeFirst();
-      }
-      if (handleData == null) {
-        return;
-      }
-      try {
-        handleData(message);
-      } catch (e, st) {
-        _log.severe('message handler threw on ${message.procedureName}', e, st);
-        if (message is _Message) {
-          message._handlerFailed();
-        }
+        // The credit goes back once the listener took the message, or once
+        // a forwardMessage of it, called by the listener, sent it on.
+        message.channel._handOver(
+          message,
+          _held,
+          () => _deliver(message, handleData),
+        );
+      } else {
+        _deliver(message, handleData);
       }
     });
+  }
+
+  void _deliver(
+    TalkMessage message,
+    void Function(TalkMessage data)? handleData,
+  ) {
+    if (message is _Message && message._outcome != null) {
+      // The answer to an ordered request, in its place among the
+      // messages; never shown to the listener.
+      final outcomes = message.channel._orderedOutcomes;
+      if (outcomes.isNotEmpty && identical(outcomes.first, message)) {
+        outcomes.removeFirst();
+      } else {
+        outcomes.remove(message);
+      }
+      message._runOutcome();
+      return;
+    }
+    // Requests are queued, and delivered, in arrival order.
+    if (_undelivered.isNotEmpty && identical(_undelivered.first, message)) {
+      _undelivered.removeFirst();
+    }
+    if (handleData == null) {
+      return;
+    }
+    try {
+      handleData(message);
+    } catch (e, st) {
+      _log.severe('message handler threw on ${message.procedureName}', e, st);
+      if (message is _Message) {
+        message._handlerFailed();
+      }
+    }
   }
 
   @override
@@ -3227,9 +3548,17 @@ class _Held {
   /// The messages held whose bulk payload is a stream nobody read yet.
   final List<_Message> bulk = [];
 
+  /// The held messages whose reassembled payload has a share of the
+  /// channel's budget, released as each is delivered, or all of them with
+  /// the credit ([TalkChannel._returnHeld]).
+  final Set<_Message> assembled = {};
+
   /// Counts the credit of [message], added to the controller, and, with
   /// [trackBulk], its streamed bulk payload.
   void hold(_Message message, {bool trackBulk = true}) {
+    if (message._assemblyBytes > 0) {
+      assembled.add(message);
+    }
     if (message._creditBytes != 0) {
       bytes += message._creditBytes;
       frames++;
@@ -3242,6 +3571,16 @@ class _Held {
 
   /// The controller delivers nothing more; its credit went back.
   bool drained = false;
+}
+
+/// A frame waiting for the peer's LIMITS ([TalkChannel._sendFrame]): sent
+/// in order once the limit is known, or dropped with the channel, which
+/// [drop] (if any) hears of.
+class _Deferred {
+  _Deferred(this.send, [this.drop]);
+
+  final void Function() send;
+  final void Function(SwitchboardException error)? drop;
 }
 
 /// How a bulk reply ended, for [TalkMessage.replyBulk]: the transfer's own

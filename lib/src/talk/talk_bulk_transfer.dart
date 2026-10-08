@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 part of 'talk_channel.dart';
@@ -79,6 +80,15 @@ class _BulkOut {
   final Completer<void> _done = Completer<void>()..future.ignore();
   bool _stopped = false;
   StreamIterator<List<int>>? _iterator;
+  Set<_BulkOut>? _owner;
+
+  /// The request keeps active sends for cancellation, not its history.
+  void track(Set<_BulkOut> owner) {
+    if (!_done.isCompleted) {
+      _owner = owner;
+      owner.add(this);
+    }
+  }
 
   /// Called each time a chunk was handed to the bulk channel (its window
   /// took it): the transfer progresses.
@@ -162,6 +172,8 @@ class _BulkOut {
 
   void _channelDone(Status status) {
     talk._bulkOuts.remove(this);
+    _owner?.remove(this);
+    _owner = null;
     if (!_stopped) {
       // The receiver closed it (it does not want the rest), or the
       // connection ended.
@@ -298,6 +310,8 @@ class _BulkOut {
     _from = from;
     from._grant();
     var received = 0;
+    // The last send: they complete in order.
+    var sending = Future<void>.value();
     from._attach(
       (data) {
         final length = data.length;
@@ -318,7 +332,7 @@ class _BulkOut {
           return;
         }
         try {
-          channel
+          sending = channel
               .send(data)
               .then(
                 (_) => from._consume(length),
@@ -341,7 +355,11 @@ class _BulkOut {
             ),
           );
         } else {
-          _finish(null);
+          // The CLOSE would wait behind what still waits for credit, but
+          // its confirmation is timed from now: a reader slower than that
+          // would see the payload cut. Closed once the window took it all,
+          // as a payload sent from a source is.
+          unawaited(sending.then((_) => _finish(null)));
         }
       },
     );
@@ -361,6 +379,11 @@ class _BulkIn {
     // Never paused nor cancelled: it ends with the bulk channel, and what
     // arrives for nobody is dropped (and consumed) here.
     channel.stream.listen(_onChunk, onDone: _onEnd);
+    final timeout = talk.options.bulkIdleTimeout;
+    if (timeout > Duration.zero) {
+      _lastProgress = monotonicNow();
+      _armIdle(timeout);
+    }
   }
 
   final TalkChannel talk;
@@ -398,8 +421,70 @@ class _BulkIn {
   /// Called each time the reader took a chunk: the transfer progresses.
   void Function()? onProgress;
 
+  // The idle timeout ([TalkOptions.bulkIdleTimeout]): one timer while the
+  // channel is open and read, checking the last progress when it fires.
+  Timer? _idleTimer;
+  Duration _lastProgress = Duration.zero;
+
+  /// Why the transfer failed on this side (it went idle), for a reader
+  /// that attaches later.
+  Status? _failed;
+
+  void _armIdle(Duration delay) {
+    _idleTimer = Timer(
+      delay > _maxTimerDelay ? _maxTimerDelay : delay,
+      _checkIdle,
+    );
+  }
+
+  void _stopIdle() {
+    _idleTimer?.cancel();
+    _idleTimer = null;
+  }
+
+  /// A chunk arrived or was consumed: the idle timeout restarts.
+  void _progressed() {
+    if (_idleTimer != null) {
+      _lastProgress = monotonicNow();
+    }
+  }
+
+  void _checkIdle() {
+    _idleTimer = null;
+    if (_dropping || channel.state != MuxChannelState.open) {
+      return;
+    }
+    final timeout = talk.options.bulkIdleTimeout;
+    final now = monotonicNow();
+    if (channel.heldBytes > 0 || channel.bufferedBytes > 0) {
+      // What arrived waits to be consumed here: the peer may be waiting
+      // for this side's credit.
+      _lastProgress = now;
+    }
+    final idle = now - _lastProgress;
+    if (idle < timeout) {
+      _armIdle(timeout - idle);
+      return;
+    }
+    final status = Status.of(
+      StatusCode.deadlineExceeded,
+      'no byte of bulk payload $number within $timeout',
+    );
+    _log.fine('bulk channel ${channel.id} went idle: $status');
+    _failed = status;
+    close(status);
+    final onDone = _onDone;
+    if (onDone != null) {
+      // The reader learns of it now, not once the peer confirmed the
+      // CLOSE; what still arrives is dropped.
+      _detach();
+      onDone(status);
+    }
+  }
+
   void _onChunk(Uint8List data) {
-    if (_dropping) {
+    _progressed();
+    if (_dropping || _failed != null) {
       _consume(data.length);
       return;
     }
@@ -412,10 +497,11 @@ class _BulkIn {
   }
 
   void _onEnd() {
-    talk._bulkIns.remove(this);
+    _stopIdle();
     unawaited(
       channel.done.then((status) {
         _endStatus = status;
+        talk._bulkIns.remove(this);
         if (!_dropping) {
           _onDone?.call(status);
         }
@@ -430,6 +516,13 @@ class _BulkIn {
     void Function(Status status) onDone,
   ) {
     _read = true;
+    final failed = _failed;
+    if (failed != null) {
+      // Went idle before it was read.
+      _detach();
+      onDone(failed);
+      return;
+    }
     _onData = onData;
     _onDone = onDone;
     while (_buffer.isNotEmpty && identical(_onData, onData)) {
@@ -443,6 +536,7 @@ class _BulkIn {
 
   /// The reader went away: what arrives from now on is dropped.
   void _detach() {
+    _stopIdle();
     _dropping = true;
     _onData = null;
     _onDone = null;
@@ -470,6 +564,7 @@ class _BulkIn {
   /// to ended.
   void close(Status status) {
     if (channel.state == MuxChannelState.open) {
+      _stopIdle();
       unawaited(channel.close(_bulkCloseStatus(status)));
     }
   }
@@ -586,6 +681,7 @@ class _BulkIn {
   }
 
   void _consume(int length) {
+    _progressed();
     try {
       channel.consumed(length);
     } on StateError catch (e) {
@@ -608,7 +704,7 @@ class _BulkIn {
 
   /// Reads the whole payload, at most [max] bytes: beyond, the bulk channel
   /// is closed `RESOURCE_EXHAUSTED` and the future fails with it.
-  Future<Uint8List> collect(int max) {
+  Future<Uint8List> collect(int max, {bool Function(int bytes)? reserve}) {
     final completer = Completer<Uint8List>()..future.ignore();
     final declared = length;
     if (declared != null && declared > max) {
@@ -630,10 +726,11 @@ class _BulkIn {
         if (completer.isCompleted) {
           return;
         }
-        if (builder.length + data.length > max) {
+        if (builder.length + data.length > max ||
+            (reserve != null && !reserve(data.length))) {
           final status = Status.of(
             StatusCode.resourceExhausted,
-            'bulk payload of more than $max bytes',
+            'bulk reassembly exceeds the $max byte budget',
           );
           close(status);
           subscription.cancel().ignore();
@@ -780,5 +877,22 @@ class _Lane {
     for (final (message, _) in entries) {
       message?._drop();
     }
+  }
+
+  /// Nobody will read incoming messages. Keep ordered answers, which
+  /// still belong to their requests, but refuse and drop everything else.
+  void dropIncoming(Status status) {
+    final entries = List.of(_queue);
+    _queue.clear();
+    for (final entry in entries) {
+      final message = entry.$1;
+      if (message != null && !message.frame.hasResponse) {
+        message._abortQuietly(status);
+        message._drop();
+      } else {
+        _queue.add(entry);
+      }
+    }
+    advance();
   }
 }
