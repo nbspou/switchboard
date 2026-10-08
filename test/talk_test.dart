@@ -2822,6 +2822,47 @@ void main() {
       await third;
       await talk.close();
     });
+
+    for (final abort in [false, true]) {
+      test(
+        'closing releases a queued ordered ${abort ? 'abort' : 'answer'}',
+        () {
+          fakeAsync((async) {
+            final (talk, peer) = syncLink();
+            final seen = <TalkMessage>[];
+            final sub = talk.messages.listen(seen.add)..pause();
+            final response = Outcome(
+              talk.request('Q', Uint8List(0), ordered: true),
+            );
+            peer.add(
+              abort
+                  ? TalkFrame(
+                      kind: TalkKind.abort,
+                      responseId: 1,
+                      payload: Status.of(StatusCode.notFound).encode(),
+                    ).encode()
+                  : answer(1),
+            );
+            async.flushMicrotasks();
+            expect(response.isDone, isFalse);
+            expect(talk.outgoingRequestCount, 0);
+            final closed = Outcome(
+              talk.close(Status.of(StatusCode.unavailable)),
+            );
+            async.flushMicrotasks();
+            expect(closed.isDone, isTrue);
+            expect(response.isDone, isTrue);
+            expect(response.error, isStatus(StatusCode.unavailable));
+          sub.resume();
+          async.flushMicrotasks();
+          expect(seen, isEmpty, reason: 'outcome markers stay internal');
+          sub.cancel();
+          async.flushMicrotasks();
+          expect(async.pendingTimers, isEmpty);
+          });
+        },
+      );
+    }
   });
 
   group('subscriptions', () {
