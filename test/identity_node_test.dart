@@ -736,6 +736,40 @@ void main() {
       expect(toB.localIdentity, 'npc-7');
     });
 
+    test('updateCredential while the node is identifying on a connection: '
+        'the renewed credential is presented there once done', () async {
+      final (b, uri) = await server('mem');
+      final accepted = <MuxConnection>[];
+      b.connections.listen(accepted.add);
+      final renewed = await issue('npc-7', npcKey, [
+        Scope.of(Right.open, 'npc'),
+        Scope.of(Right.open, 'chat'),
+      ]);
+      // A new pooled connection: connect identifies on it before
+      // returning it.
+      final a = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+      );
+      final connecting = a.connect(uri);
+      await a.updateCredential(renewed);
+      await connecting.timeout(limit);
+      expect(accepted.single.peerIdentity!.credential, renewed);
+      // identifyOn.
+      final quiet = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        identifyFor: (_) => false,
+      );
+      final connection = await quiet.connect(uri);
+      await until(() => accepted.length == 2);
+      expect(accepted.last.peerIdentity, isNull);
+      final identifying = quiet.identifyOn(connection);
+      await quiet.updateCredential(renewed);
+      await identifying.timeout(limit);
+      expect(accepted.last.peerIdentity!.credential, renewed);
+    });
+
     test('PeerSet connections identify', () async {
       final b = await node();
       final seen = Completer<String?>();

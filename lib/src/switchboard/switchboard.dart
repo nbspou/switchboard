@@ -200,7 +200,10 @@ class Switchboard {
   /// Replaces [credential] with [credential] (a renewed one, typically)
   /// and presents it again, with `IDENT`, on every open connection this
   /// node has identified on, with the intent and receiver of the last
-  /// identification there; the peers replace the identity they had.
+  /// identification there; the peers replace the identity they had. A
+  /// connection the node is identifying on meanwhile (being established,
+  /// brokered, or in [identifyOn]) gets it once that identification
+  /// completes, before the connection is handed out.
   /// Completes once every such identification has completed or failed
   /// (failures are logged: a peer that refuses the credential ends its
   /// connection). Throws [ArgumentError] like the [credential] setter.
@@ -228,6 +231,20 @@ class Switchboard {
       );
     } on Object catch (e) {
       _log.info('identifying again on ${_remotes[connection]} failed: $e');
+    }
+  }
+
+  /// After an identification on [connection] with [used]: when the
+  /// credential was replaced meanwhile, [updateCredential] skipped the
+  /// connection (not identified yet), so the current one is presented
+  /// there now, as [updateCredential] would have.
+  Future<void> _presentCurrent(
+    MuxConnection connection,
+    Credential used,
+  ) async {
+    final current = _identity;
+    if (current != null && !identical(current, used) && connection.isOpen) {
+      await _reidentify(connection, current);
     }
   }
 
@@ -1272,6 +1289,7 @@ class Switchboard {
           timeout: identityTimeout,
         );
         _identified[connection] = _Identification(intent, named);
+        await _presentCurrent(connection, credential);
       } on Object catch (e) {
         _log.info('identification to $endpoint failed: $e');
         unawaited(connection.goAway());
@@ -1390,7 +1408,10 @@ class Switchboard {
           receiver: named,
           timeout: identityTimeout,
         )
-        .then((_) => _identified[connection] = _Identification(intent, named));
+        .then((_) {
+          _identified[connection] = _Identification(intent, named);
+          return _presentCurrent(connection, credential);
+        });
   }
 
   /// What [endpointPolicy] says for [endpoint]; a hook that throws refuses
@@ -1649,6 +1670,7 @@ class Switchboard {
           );
         }
         _identified[connection] = _Identification(null, identity);
+        await _presentCurrent(connection, credential);
       }
       _log.fine('$address dialled back from ${_remotes[connection]}');
       return connection;
