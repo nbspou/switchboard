@@ -377,6 +377,45 @@ void main() {
     });
   });
 
+  test('messages sent before the peer\'s LIMITS are sized against the '
+      'window it announces', () async {
+    // The server grants 256 bytes: frames of at most 112 bytes. The client
+    // talks at once, before that LIMITS arrived.
+    final (a, b) = MemoryTransport.pair();
+    final client = MuxConnection(a, isInitiator: true, options: quiet);
+    final server = MuxConnection(
+      b,
+      isInitiator: false,
+      options: quiet.copyWith(initialWindow: 256),
+    );
+    addTearDown(client.close);
+    addTearDown(server.close);
+    final received = <String>[];
+    final all = Completer<void>();
+    server.incoming.listen((channel) {
+      if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+        TalkChannel.adoptBulk(channel);
+        return;
+      }
+      TalkChannel(channel).messages.listen((m) {
+        received.add('${m.procedureName} ${m.payload.length} ${m.isBulk}');
+        if (received.length == 3) {
+          all.complete();
+        }
+      });
+    });
+    client.incoming.listen(TalkChannel.adoptBulk);
+    final raw = client.open(Uint8List(0));
+    expect(raw.maxSubframeLength, 32752);
+    TalkChannel(raw)
+      ..send('SMALL', pattern(50))
+      ..send('BIG', pattern(200))
+      ..send('AFTER', pattern(10));
+    await all.future.timeout(const Duration(seconds: 2));
+    expect(raw.maxSubframeLength, 112);
+    expect(received, ['SMALL 50 false', 'BIG 200 true', 'AFTER 10 false']);
+  });
+
   test('a lower bulkThreshold sends bulk earlier', () async {
     final peers = await Peers.connect();
     final (talk, server) = await peers.open(

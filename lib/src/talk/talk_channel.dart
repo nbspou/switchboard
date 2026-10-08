@@ -726,6 +726,11 @@ class TalkChannel {
       _closeFuture ??= _close(status);
 
   Future<void> _close(Status status) async {
+    // What waited for the peer's LIMITS goes before the end, sized against
+    // the limit assumed meanwhile; the mux holds it until the LIMITS.
+    if (!_rawEnded) {
+      _flushDeferred();
+    }
     final peerEnded = _peerEndedFuture;
     if (peerEnded != null) {
       // The raw stream ended first; its end status is what outstanding
@@ -801,14 +806,81 @@ class TalkChannel {
   /// Sends [frame]: inline, or with its payload on a bulk channel when
   /// [bulk] is given or the frame is too large inline (a `MESSAGE` or
   /// `STREAM_ITEM` over the channel's limit, see
-  /// [TalkOptions.bulkThreshold]). Returns the bulk transfer, if any.
-  _BulkOut? _sendFrame(TalkFrame frame, {_BulkSource? bulk}) {
+  /// [TalkOptions.bulkThreshold]); [onBulk] gets the bulk transfer, if
+  /// any.
+  ///
+  /// While the mux channel waits for the peer's LIMITS (see
+  /// `MuxOptions.awaitPeerLimits`), the frame waits here, in order with
+  /// every frame after it, and is sized once the limit the peer announces
+  /// is known: one sized against the 64 KiB assumed meanwhile could turn
+  /// out too large for the window announced, and be lost. Its failures are
+  /// then reported to [onFailure] (logged without one) instead of thrown.
+  void _sendFrame(
+    TalkFrame frame, {
+    _BulkSource? bulk,
+    void Function(_BulkOut out)? onBulk,
+    void Function(SwitchboardException error)? onFailure,
+  }) {
     if (_closing) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'channel closed',
       );
     }
+    if (_mustDefer()) {
+      _deferred.add(() {
+        try {
+          final out = _sendNow(frame, bulk);
+          if (out != null) {
+            onBulk?.call(out);
+          }
+        } on Object catch (e) {
+          final error = e is SwitchboardException
+              ? e
+              : SwitchboardException.of(StatusCode.internal, '$e');
+          if (onFailure != null) {
+            onFailure(error);
+          } else {
+            _log.warning('$frame not sent: ${error.status}');
+          }
+        }
+      });
+      return;
+    }
+    final out = _sendNow(frame, bulk);
+    if (out != null) {
+      onBulk?.call(out);
+    }
+  }
+
+  /// Whether a frame sent now waits in [_deferred]: frames wait there
+  /// already, or the mux channel waits for the peer's LIMITS.
+  bool _mustDefer() {
+    if (_deferred.isNotEmpty) {
+      return true;
+    }
+    final mux = _mux;
+    if (mux == null || !mux.awaitingLimits) {
+      return false;
+    }
+    final waiting = mux;
+    waiting.limitsKnown.then((_) {
+      if (identical(_mux, waiting)) {
+        _flushDeferred();
+      }
+    });
+    return true;
+  }
+
+  /// Sends the frames that waited for the peer's LIMITS, in order.
+  void _flushDeferred() {
+    while (_deferred.isNotEmpty) {
+      _deferred.removeFirst()();
+    }
+  }
+
+  /// [_sendFrame] without the wait for LIMITS; throws its failures.
+  _BulkOut? _sendNow(TalkFrame frame, _BulkSource? bulk) {
     if (bulk == null) {
       final bytes = frame.encode();
       if (!_needsBulk(frame, bytes.length)) {
@@ -845,6 +917,9 @@ class TalkChannel {
 
   /// [_sendFrame] for frames that never carry a bulk payload.
   void _sendChecked(TalkFrame frame) => _sendFrame(frame);
+
+  /// Frames waiting for the peer's LIMITS (see [_sendFrame]).
+  final Queue<void Function()> _deferred = Queue<void Function()>();
 
   void _sendRaw(Uint8List bytes) {
     try {
@@ -897,10 +972,18 @@ class TalkChannel {
     if (_closing) {
       return;
     }
-    try {
-      raw.sink.add(frame.encode());
-    } catch (e, st) {
-      _log.fine('failed to send $frame', e, st);
+    void send() {
+      try {
+        raw.sink.add(frame.encode());
+      } catch (e, st) {
+        _log.fine('failed to send $frame', e, st);
+      }
+    }
+
+    if (_mustDefer()) {
+      _deferred.add(send);
+    } else {
+      send();
     }
   }
 
@@ -959,17 +1042,27 @@ class TalkChannel {
     _nextRequestId = id >= TalkFrame.maxId ? 1 : id + 1;
     pending.startTimer();
     try {
-      final out = _sendFrame(frame, bulk: bulk);
-      if (out != null) {
-        pending.bulkOuts.add(out);
-        // The request's payload going out is progress: the requester
-        // timeout restarts with each chunk the receiver takes.
-        out.onProgress = () {
-          if (!pending.ended && !pending.finalReceived) {
-            pending.replied();
+      _sendFrame(
+        frame,
+        bulk: bulk,
+        onBulk: (out) {
+          pending.bulkOuts.add(out);
+          // The request's payload going out is progress: the requester
+          // timeout restarts with each chunk the receiver takes.
+          out.onProgress = () {
+            if (!pending.ended && !pending.finalReceived) {
+              pending.replied();
+            }
+          };
+        },
+        // Only when the frame waited for the peer's LIMITS.
+        onFailure: (error) {
+          if (identical(_outgoing[id], pending)) {
+            _outgoing.remove(id);
           }
-        };
-      }
+          pending.fail(error);
+        },
+      );
     } catch (_) {
       if (identical(_outgoing[id], pending)) {
         _outgoing.remove(id);
@@ -1688,6 +1781,7 @@ class TalkChannel {
 
   void _onDone() {
     _rawEnded = true;
+    _deferred.clear();
     if (_closing) {
       return;
     }
@@ -2542,35 +2636,42 @@ class _Message extends TalkMessage {
     Name? name,
   }) {
     final source = TalkChannel._bulkSource(Uint8List(0), bytes, length)!;
-    return _reply(Uint8List(0), _name(procedure, name), bulk: source)?.done ??
-        Future<void>.value();
+    final sent = _Sent();
+    _reply(
+      Uint8List(0),
+      _name(procedure, name),
+      bulk: source,
+      onBulk: sent.started,
+      onFailure: sent.failed,
+    );
+    return sent.done;
   }
 
-  _BulkOut? _reply(Uint8List payload, Name? procedure, {_BulkSource? bulk}) {
+  void _reply(
+    Uint8List payload,
+    Name? procedure, {
+    _BulkSource? bulk,
+    void Function(_BulkOut out)? onBulk,
+    void Function(SwitchboardException error)? onFailure,
+  }) {
     _check();
-    return _sendReply(
-      () => _keep(
-        channel._sendFrame(
-          TalkFrame(
-            kind: TalkKind.message,
-            procedure: procedure,
-            responseId: requestId,
-            payload: payload,
-          ),
-          bulk: bulk,
+    _sendReply(
+      () => channel._sendFrame(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: procedure,
+          responseId: requestId,
+          payload: payload,
         ),
+        bulk: bulk,
+        onBulk: (out) {
+          _bulkOuts.add(out);
+          onBulk?.call(out);
+        },
+        onFailure: onFailure,
       ),
       isFinal: true,
     );
-  }
-
-  /// Remembers [out], the bulk payload of a reply, so that a cancel of
-  /// this request stops it.
-  _BulkOut? _keep(_BulkOut? out) {
-    if (out != null) {
-      _bulkOuts.add(out);
-    }
-    return out;
   }
 
   @override
@@ -2662,37 +2763,44 @@ class _Message extends TalkMessage {
     Name? name,
   }) {
     final source = TalkChannel._bulkSource(Uint8List(0), bytes, length)!;
-    return _replyItem(
-          Uint8List(0),
-          _name(procedure, name),
-          bulk: source,
-        )?.done ??
-        Future<void>.value();
+    final sent = _Sent();
+    _replyItem(
+      Uint8List(0),
+      _name(procedure, name),
+      bulk: source,
+      onBulk: sent.started,
+      onFailure: sent.failed,
+    );
+    return sent.done;
   }
 
-  _BulkOut? _replyItem(
+  void _replyItem(
     Uint8List payload,
     Name? procedure, {
     _BulkSource? bulk,
+    void Function(_BulkOut out)? onBulk,
+    void Function(SwitchboardException error)? onFailure,
   }) {
     _check(item: true);
-    final out = _sendReply(
-      () => _keep(
-        channel._sendFrame(
-          TalkFrame(
-            kind: TalkKind.streamItem,
-            procedure: procedure,
-            responseId: requestId,
-            payload: payload,
-          ),
-          bulk: bulk,
+    _sendReply(
+      () => channel._sendFrame(
+        TalkFrame(
+          kind: TalkKind.streamItem,
+          procedure: procedure,
+          responseId: requestId,
+          payload: payload,
         ),
+        bulk: bulk,
+        onBulk: (out) {
+          _bulkOuts.add(out);
+          // An item's payload going out is progress, as the item was.
+          out.onProgress = _replied;
+          onBulk?.call(out);
+        },
+        onFailure: onFailure,
       ),
     );
-    // An item's payload going out is progress, as the item was.
-    out?.onProgress = _replied;
     _replied();
-    return out;
   }
 
   @override
@@ -3119,4 +3227,25 @@ class _Held {
 
   /// The controller delivers nothing more; its credit went back.
   bool drained = false;
+}
+
+/// How a bulk reply ended, for [TalkMessage.replyBulk]: the transfer's own
+/// end once it started, or the failure of a frame that waited for the
+/// peer's LIMITS.
+class _Sent {
+  final Completer<void> _done = Completer<void>()..future.ignore();
+
+  Future<void> get done => _done.future;
+
+  void started(_BulkOut out) {
+    if (!_done.isCompleted) {
+      _done.complete(out.done);
+    }
+  }
+
+  void failed(SwitchboardException error) {
+    if (!_done.isCompleted) {
+      _done.completeError(error);
+    }
+  }
 }

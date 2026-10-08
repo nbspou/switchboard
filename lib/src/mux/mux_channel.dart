@@ -214,6 +214,24 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   @internal
   bool get hasListener => _incoming.hasListener;
 
+  /// Whether DATA waits for the peer's LIMITS (see [sendWindow]): until
+  /// then [maxSubframeLength] reflects the 64 KiB assumed without one.
+  @internal
+  bool get awaitingLimits =>
+      _awaitingLimits && _state != MuxChannelState.closed;
+
+  /// Completes once the wait for the peer's LIMITS ended, or the channel
+  /// ended first.
+  @internal
+  Future<void> get limitsKnown {
+    if (!awaitingLimits) {
+      return Future<void>.value();
+    }
+    return (_limitsKnownCompleter ??= Completer<void>()).future;
+  }
+
+  Completer<void>? _limitsKnownCompleter;
+
   /// Bytes of cost (a subframe's length plus 16) the peer may still send on
   /// the channel before this side returns credit.
   ///
@@ -698,6 +716,9 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     if (_state != MuxChannelState.closed) {
       _admitPending();
     }
+    final known = _limitsKnownCompleter;
+    _limitsKnownCompleter = null;
+    known?.complete();
   }
 
   /// Applies the peer's CREDIT of [bytes]. Ignored once the channel can
@@ -907,6 +928,9 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   void _complete() {
     _state = MuxChannelState.closed;
+    final known = _limitsKnownCompleter;
+    _limitsKnownCompleter = null;
+    known?.complete();
     _confirmTimer?.cancel();
     _confirmTimer = null;
     _pendingClose = null;
