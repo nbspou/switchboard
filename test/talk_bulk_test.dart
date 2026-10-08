@@ -248,6 +248,43 @@ void main() {
     });
   }
 
+  test('a message keeps its place while its payload is reassembled', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    final seen = <String>[];
+    final all = Completer<void>();
+    server.messages.listen((m) {
+      seen.add('${m.procedureName} ${m.payload.length}');
+      if (seen.length == 4) {
+        all.complete();
+      }
+    });
+    talk
+      ..send('A', Uint8List(1))
+      ..send('B', Uint8List(0), bulk: generated(500000, piece: 1000))
+      ..send('C', Uint8List(2))
+      ..send('D', pattern(100000));
+    await all.future;
+    expect(seen, ['A 1', 'B 500000', 'C 2', 'D 100000']);
+  });
+
+  test('an ordered answer with a bulk payload keeps its place among the '
+      'messages', () async {
+    final peers = await Peers.connect();
+    final (talk, server) = await peers.open();
+    server.messages.listen((m) {
+      server.send('EVENT', Uint8List.fromList([1]));
+      m.reply(pattern(200000));
+      server.send('EVENT', Uint8List.fromList([2]));
+    });
+    final log = <String>[];
+    talk.messages.listen((m) => log.add('event ${m.payload.single}'));
+    final answer = await talk.request('SUB', Uint8List(0), ordered: true);
+    log.add('answer ${answer.payload.length}');
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    expect(log, ['event 1', 'answer 200000', 'event 2']);
+  });
+
   test('a lower bulkThreshold sends bulk earlier', () async {
     final peers = await Peers.connect();
     final (talk, server) = await peers.open(

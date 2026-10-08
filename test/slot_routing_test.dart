@@ -509,6 +509,20 @@ void main() {
       await talk.close();
     });
 
+    test('Talk: bulk payloads both ways on the retried slot channel', () async {
+      a
+        ..mode = Mode.moved
+        ..moved = MovedStatus(owner: 2, epoch: 2);
+      b.mode = Mode.talk;
+      final talk = await router.openTalkToSlot(svc, 1);
+      await talk.messages.first.timeout(limit);
+      final big = 'k' * 100000;
+      final answer = await talk.request('GET', bytes(big)).timeout(limit);
+      expect(answer.isBulk, isTrue);
+      expect(text(answer.payload), 'B:$big');
+      await talk.close();
+    });
+
     test(
       'through a resolver without slot tables: the same address once more',
       () async {
