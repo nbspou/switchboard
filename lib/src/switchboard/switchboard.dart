@@ -479,6 +479,9 @@ class Switchboard {
   // attempts in progress, the opens waiting for their instance to dial
   // back (by intent), and the intents given up on lately.
   final Map<ServiceAddress, MuxConnection> _brokeredPool = {};
+  // The identity each brokered connection was checked to carry: the pool
+  // reuses one only while its peer still carries it.
+  final Expando<String> _brokeredAs = Expando<String>('brokered as');
   final Map<ServiceAddress, Future<MuxConnection>> _brokering = {};
   final Map<String, Completer<MuxConnection>> _brokerWaits = {};
   final LinkedHashSet<String> _abandoned = LinkedHashSet<String>();
@@ -1555,11 +1558,21 @@ class Switchboard {
   }
 
   /// A pooled brokered connection to [address], brokered through [r] if
-  /// there is none; concurrent calls share one attempt.
+  /// there is none; concurrent calls share one attempt. A pooled connection
+  /// whose peer no longer carries the identity it was brokered as (expired,
+  /// or replaced by another) is not reused: it is sent GOAWAY and the
+  /// instance brokered again.
   Future<MuxConnection> _brokeredPooled(ServiceAddress address, Resolver r) {
     final pooled = _brokeredPool[address];
     if (pooled != null && pooled.isOpen && !pooled.peerGoingAway) {
-      return Future.value(pooled);
+      if (pooled.peerIdentity?.identity == _brokeredAs[pooled]) {
+        return Future.value(pooled);
+      }
+      // Its peer identity expired (a credential not renewed: revoked) or
+      // changed: the connection no longer shows that the peer is the
+      // instance. It is brokered again, and this one goes.
+      _log.fine('brokered connection to $address no longer identified');
+      unawaited(pooled.goAway());
     }
     _brokeredPool.remove(address);
     final existing = _brokering[address];
@@ -1672,6 +1685,7 @@ class Switchboard {
         _identified[connection] = _Identification(null, identity);
         await _presentCurrent(connection, credential);
       }
+      _brokeredAs[connection] = identity;
       _log.fine('$address dialled back from ${_remotes[connection]}');
       return connection;
     } catch (e) {

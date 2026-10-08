@@ -18,6 +18,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
@@ -194,6 +195,59 @@ void main() {
     npcKey = await HolderKey.generate();
     gateKey = await HolderKey.generate();
     workerKey = await HolderKey.generate();
+  });
+
+  test('a pooled brokered connection is reused only while its peer carries '
+      'the identity it was brokered as', () async {
+    var now = DateTime.now().toUtc();
+    await withClock(Clock(() => now), () async {
+      Future<Credential> credential() => authority.issue(
+        kind: CredentialKind.node,
+        identity: 'worker-a1',
+        scopes: [Scope.of(Right.register, 'worker-*')],
+        holderKey: workerKey.publicKey,
+        lifetime: const Duration(minutes: 1),
+      );
+      final worker = await node(
+        credential: await credential(),
+        holderKey: workerKey,
+      );
+      worker.registerService(npc, answer, instance: 1);
+      final dialled = <MuxConnection>[];
+      var asked = 0;
+      final resolver = _BrokerResolver((endpoint, intent) async {
+        asked++;
+        dialled.add(await worker.dial(endpoint, intent: intent));
+        return 'worker-a1';
+      })..add(ServiceRecord(ServiceAddress(npc, 1)));
+      addTearDown(resolver.close);
+      final consumer = await node(resolver: resolver);
+      await consumer.listenMemory();
+      Future<String> openNpc() async =>
+          answerOf(await consumer.openChannel(ServiceAddress(npc, 1)));
+      expect(await openNpc(), 'npc for nobody');
+      expect(dialled, hasLength(1));
+      // Renewed in time: the connection is reused past the first expiry.
+      now = now.add(const Duration(seconds: 40));
+      await worker.updateCredential(await credential());
+      now = now.add(const Duration(seconds: 40));
+      expect(await openNpc(), 'npc for nobody');
+      expect(dialled, hasLength(1));
+      // Not renewed (revoked): not reused. The instance is brokered again
+      // (its dial-back fails, its credential having expired), and the
+      // connection it had is sent GOAWAY.
+      now = now.add(const Duration(minutes: 2));
+      await expectLater(
+        consumer.openChannel(ServiceAddress(npc, 1)),
+        throwsA(isA<SwitchboardException>()),
+      );
+      expect(dialled, hasLength(1));
+      expect(asked, 2);
+      expect(
+        await dialled.single.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+    });
   });
 
   test('a dial-back arriving before CONNECT fails is sent GOAWAY', () async {
