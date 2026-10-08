@@ -245,7 +245,12 @@ void main() {
   group('WebSocket binding', () {
     test('the mux frame limit reaches both ends', () async {
       const limit = 4 * 1024 * 1024;
-      final options = fast.copyWith(maxFrameSize: limit);
+      // A window of 8 MiB, so that a subframe of 3 MiB (at most half the
+      // window) can be sent.
+      final options = fast.copyWith(
+        maxFrameSize: limit,
+        initialWindow: 2 * limit,
+      );
       final server = Switchboard(muxOptions: options);
       addTearDown(server.close);
       server.registerService(Name('echo'), (incoming) {
@@ -272,7 +277,7 @@ void main() {
         uri,
         ChannelAddress(type: Name('echo')),
       );
-      echo.send(big);
+      unawaited(echo.send(big));
       expect(await echo.stream.first, big);
       await echo.close();
     });
@@ -786,7 +791,7 @@ void main() {
       expect(channel.connection, isNot(same(first)));
       expect(await tagOf(channel), 'svc');
       // The held channel still works on the old connection.
-      serverSide.channel.send(bytes('still here'));
+      unawaited(serverSide.channel.send(bytes('still here')));
       expect(await held.stream.first, bytes('still here'));
       await held.close();
       await goingAway;

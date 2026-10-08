@@ -293,7 +293,7 @@ void main() {
         throwsCode(StatusCode.unavailable),
       );
       // The held channel still works on the old connection.
-      atServer.channel.send(bytes('still here'));
+      unawaited(atServer.channel.send(bytes('still here')));
       expect(await channel.stream.first, bytes('still here'));
       await channel.close();
       await closing;

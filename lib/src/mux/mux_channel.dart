@@ -57,7 +57,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     this.id,
     this.isLocallyOpened,
     this.openPayload,
-  ) {
+    this._initialSendWindow,
+  ) : _sendWindow = _initialSendWindow {
     // Synchronous, fed from [_queue] only while the listener is active, so
     // that every buffered byte is in [_queue] and accounted for.
     _incoming = StreamController<Uint8List>(
@@ -100,9 +101,24 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   final Completer<Status> _done = Completer<Status>();
   MuxChannelState _state = MuxChannelState.open;
   Status _endStatus = Status.ok;
+  // Whether we decided to close: close() was called or the peer's CLOSE
+  // was confirmed. Our CLOSE may still wait behind subframes waiting for
+  // credit ([_pendingClose]).
   bool _closeSent = false;
   bool _closeReceived = false;
   Timer? _confirmTimer;
+
+  // Flow control, sending side: the window the peer granted, the
+  // subframes waiting for it (in order), and our CLOSE waiting behind
+  // them.
+  final int _initialSendWindow;
+  int _sendWindow;
+  final Queue<_PendingSend> _pendingSends = Queue<_PendingSend>();
+  Status? _pendingClose;
+  bool _closeQueued = false;
+
+  /// A completed future, returned by [send] for a subframe sent at once.
+  static final Future<void> _sentAtOnce = Future<void>.value();
 
   /// Current state.
   MuxChannelState get state => _state;
@@ -152,30 +168,204 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   @override
   Future<Status> get done => _done.future;
 
+  /// Bytes of cost (a subframe's length plus 16, [MuxCredit.costOf]) this
+  /// side may still send on the channel before the peer returns credit.
+  ///
+  /// Starts at the initial window the peer announced in LIMITS before the
+  /// channel was opened (64 KiB if none had arrived), grows with every
+  /// CREDIT the peer sends for the channel and shrinks with every DATA
+  /// frame sent on it. See the wiki page "Polyverse Switchboard Mux",
+  /// section "Flow control".
+  int get sendWindow => _sendWindow;
+
+  /// The largest subframe [send] takes on this channel, in bytes, or a
+  /// negative number when not even an empty one fits.
+  ///
+  /// A DATA frame's cost is kept to half the channel's initial window (the
+  /// one [sendWindow] started at), so that a peer returning credit in
+  /// batches of up to half its window can never leave a subframe waiting
+  /// for ever; with the default window of 64 KiB that is 32752 bytes. The
+  /// frame must also fit the frame limit the peer announced with LIMITS
+  /// (its 3 or 7 byte header included). Larger payloads go on a channel
+  /// whose [priority] is [MuxPriority.bulk], which splits them.
+  int get maxSubframeLength {
+    var max = _frameCostLimit - MuxCredit.frameOverhead;
+    final peerMax = _link.host.peerMaxFrameSize;
+    if (peerMax > 0) {
+      final fits = peerMax - MuxFrame.headerSizeFor(id);
+      if (fits < max) {
+        max = fits;
+      }
+    }
+    return max;
+  }
+
+  /// The largest cost of one DATA frame: half the initial window, but at
+  /// least an empty subframe's when the window takes one.
+  int get _frameCostLimit {
+    final half = _initialSendWindow ~/ 2;
+    if (half >= MuxCredit.frameOverhead) {
+      return half;
+    }
+    return _initialSendWindow < MuxCredit.frameOverhead
+        ? _initialSendWindow
+        : MuxCredit.frameOverhead;
+  }
+
   /// Sends one DATA subframe, which may be empty.
   ///
+  /// Flow control: the subframe costs its length plus 16 bytes of
+  /// [sendWindow]. When the window takes it, and no earlier subframe is
+  /// still waiting, it is handed to the connection at once and the
+  /// returned future is already complete. Otherwise it waits, in order
+  /// behind the subframes before it, until the peer returns enough credit,
+  /// and the future completes when it has been handed to the connection.
+  /// The connection writes it when the transport takes it (see
+  /// "Output scheduling" in the design record).
+  ///
+  /// So what this side holds for a channel is bounded: a sender that awaits
+  /// each future has at most one window handed over and not written yet,
+  /// plus the one subframe it waits for. A sender that does not await
+  /// (as [sink]'s `add` does not) queues every subframe here until the
+  /// window takes it; what the peer receives is bounded by the window
+  /// either way.
+  ///
+  /// The future fails with a [SwitchboardException]
+  /// ([StatusCode.failedPrecondition]) if the channel can no longer send
+  /// before the subframe goes out: the peer closed it, the connection
+  /// ended, or [close]'s confirmation timed out. Such a failure is never
+  /// reported as unhandled. A [close] called meanwhile waits for the
+  /// subframes before it.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
-  /// [canSend] is false, and with [StatusCode.frameTooLarge] if the frame
-  /// would exceed the limit the peer announced with LIMITS.
-  void send(Uint8List subframe) {
+  /// [canSend] is false, and with [StatusCode.frameTooLarge] if the
+  /// subframe is longer than [maxSubframeLength].
+  Future<void> send(Uint8List subframe) {
     if (!canSend) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'channel $id is ${_state.name}',
       );
     }
+    _checkSize(subframe.length);
+    final cost = MuxCredit.costOf(subframe.length);
+    if (_pendingSends.isEmpty && cost <= _sendWindow) {
+      _sendWindow -= cost;
+      _link.host.sendFrame(MuxFrame.data(id, subframe));
+      return _sentAtOnce;
+    }
+    final pending = _PendingSend(subframe);
+    _pendingSends.add(pending);
+    return pending.completer.future;
+  }
+
+  void _checkSize(int length) {
     final max = _link.host.peerMaxFrameSize;
-    final size = MuxFrame.headerSizeFor(id) + subframe.length;
+    final size = MuxFrame.headerSizeFor(id) + length;
     if (max > 0 && size > max) {
       throw SwitchboardException.of(
         StatusCode.frameTooLarge,
         'frame of $size bytes exceeds the peer limit of $max',
       );
     }
-    _link.host.sendFrame(MuxFrame.data(id, subframe));
+    final cost = MuxCredit.costOf(length);
+    final limit = _frameCostLimit;
+    if (cost > limit) {
+      throw SwitchboardException.of(
+        StatusCode.frameTooLarge,
+        'subframe of $length bytes costs $cost, more than $limit, half the '
+        'initial window of channel $id',
+      );
+    }
+  }
+
+  /// Hands the waiting subframes the window now takes to the connection,
+  /// in order, then our CLOSE if it waited behind them.
+  void _admitPending() {
+    while (_pendingSends.isNotEmpty) {
+      final head = _pendingSends.first;
+      final cost = MuxCredit.costOf(head.subframe.length);
+      if (cost > _sendWindow) {
+        break;
+      }
+      _pendingSends.removeFirst();
+      try {
+        // The peer may have lowered its frame limit meanwhile.
+        _checkSize(head.subframe.length);
+      } on SwitchboardException catch (e) {
+        head.completer.completeError(e);
+        continue;
+      }
+      _sendWindow -= cost;
+      _link.host.sendFrame(MuxFrame.data(id, head.subframe));
+      head.completer.complete();
+    }
+    final close = _pendingClose;
+    if (_pendingSends.isEmpty && close != null) {
+      _pendingClose = null;
+      _queueClose(close);
+    }
+  }
+
+  /// Fails every subframe still waiting for credit.
+  void _failPendingSends() {
+    if (_pendingSends.isEmpty) {
+      return;
+    }
+    final error = SwitchboardException.of(
+      StatusCode.failedPrecondition,
+      'channel $id closed before the subframe was sent',
+    );
+    final pending = List.of(_pendingSends);
+    _pendingSends.clear();
+    for (final send in pending) {
+      send.completer.completeError(error);
+    }
+  }
+
+  /// Applies the peer's CREDIT of [bytes]. Ignored once the channel can
+  /// send no more DATA. Throws [ProtocolException] if the window would
+  /// exceed `2^32 - 1`.
+  void _receiveCredit(int bytes) {
+    if (_closeReceived || _closeQueued || _state == MuxChannelState.closed) {
+      return;
+    }
+    final window = _sendWindow + bytes;
+    if (window > MuxLimits.maxWindow) {
+      throw ProtocolException(
+        'CREDIT of $bytes takes the window of channel $id to $window, '
+        'above 2^32 - 1',
+      );
+    }
+    _sendWindow = window;
+    _admitPending();
+  }
+
+  /// Sends our CLOSE carrying [status].
+  void _queueClose(Status status) {
+    _closeQueued = true;
+    _link.host.sendFrame(_closeFrame(status));
+  }
+
+  /// Sends our CLOSE now if it waits behind subframes waiting for credit,
+  /// failing them.
+  void _flushPendingClose() {
+    final close = _pendingClose;
+    if (close == null) {
+      return;
+    }
+    _pendingClose = null;
+    _failPendingSends();
+    _queueClose(close);
   }
 
   /// Sends CLOSE carrying [status] unless already sent.
+  ///
+  /// Subframes still waiting for credit ([send]) go first: the CLOSE
+  /// follows them, so that what was sent before it arrives before it. If
+  /// they are still waiting when the confirmation times out
+  /// ([MuxOptions.closeConfirmTimeout]), or the peer closes meanwhile, they
+  /// are dropped (their futures fail) and the CLOSE goes at once.
   ///
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the frame fits the peer's announced frame limit and
@@ -200,7 +390,11 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       // A synchronous transport can confirm during sendFrame; install
       // the timer first so that completion cancels it.
       _link._startConfirmTimer();
-      _link.host.sendFrame(_closeFrame(status));
+      if (_pendingSends.isEmpty) {
+        _queueClose(status);
+      } else {
+        _pendingClose = status;
+      }
     }
     return _done.future;
   }
@@ -288,6 +482,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _state = MuxChannelState.closed;
     _confirmTimer?.cancel();
     _confirmTimer = null;
+    _pendingClose = null;
+    _failPendingSends();
     _endRequested = true;
     _scheduleDrain();
     if (!_done.isCompleted) {
@@ -336,8 +532,16 @@ class MuxChannelLink {
     int id, {
     required bool isLocallyOpened,
     required Uint8List openPayload,
+    required int sendWindow,
   }) {
-    channel = MuxChannel._(this, connection, id, isLocallyOpened, openPayload);
+    channel = MuxChannel._(
+      this,
+      connection,
+      id,
+      isLocallyOpened,
+      openPayload,
+      sendWindow,
+    );
   }
 
   /// The owning connection's hooks.
@@ -360,20 +564,31 @@ class MuxChannelLink {
   /// CLOSE has not been received.
   void receiveData(Uint8List payload) => channel._receive(payload);
 
+  /// Applies the peer's CREDIT of [bytes] for this channel. Throws
+  /// [ProtocolException] if the window would exceed `2^32 - 1`.
+  void receiveCredit(int bytes) => channel._receiveCredit(bytes);
+
   /// Handles the peer's CLOSE: frees the id, sends the confirming CLOSE if
-  /// we have not sent ours, and completes the channel.
+  /// we have not sent ours (or ours if it still waited behind subframes,
+  /// which are dropped), and completes the channel.
   void receiveClose(Status status) {
     final c = channel;
     c._closeReceived = true;
     c._noteStatus(status);
     final confirm = !c._closeSent;
+    final ours = c._pendingClose;
+    c._pendingClose = null;
+    c._failPendingSends();
     c._closeSent = true;
     c._state = MuxChannelState.closed;
     // Free the id before sending the confirmation so that a peer reacting
     // to it synchronously may reuse the id.
     host.release(this);
     if (confirm) {
+      c._closeQueued = true;
       host.sendFrame(MuxFrame.close(c.id));
+    } else if (ours != null) {
+      c._queueClose(ours);
     }
     c._complete();
   }
@@ -408,6 +623,7 @@ class MuxChannelLink {
     c._confirmTimer = Timer(timeout, () {
       c._confirmTimer = null;
       if (c._state == MuxChannelState.halfClosedLocal) {
+        c._flushPendingClose();
         host.abandon(this);
       }
     });
@@ -426,7 +642,8 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
       throw StateError('channel ${_channel.id} sink is closed');
     }
     if (_channel.canSend) {
-      _channel.send(event);
+      // Waits for credit inside the channel if it must; see send.
+      _channel.send(event).ignore();
     }
   }
 
@@ -445,6 +662,10 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
     unawaited(_channel.close(status));
   }
 
+  /// Sends every subframe of [stream], waiting for each to be handed to
+  /// the connection before taking the next, so that the stream is paused
+  /// while the channel waits for credit. Subframes are dropped once the
+  /// channel can no longer send.
   @override
   Future<void> addStream(Stream<Uint8List> stream) async {
     await for (final subframe in stream) {
@@ -452,7 +673,11 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
         break;
       }
       if (_channel.canSend) {
-        _channel.send(subframe);
+        try {
+          await _channel.send(subframe);
+        } on SwitchboardException {
+          // Closed while waiting: dropped, as add drops it.
+        }
       }
     }
   }
@@ -465,4 +690,16 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
 
   @override
   Future<void> get done => _channel.done;
+}
+
+/// A subframe waiting for flow-control credit.
+class _PendingSend {
+  _PendingSend(this.subframe) {
+    // A failure is reported to whoever awaits the future, never as an
+    // unhandled error.
+    completer.future.ignore();
+  }
+
+  final Uint8List subframe;
+  final Completer<void> completer = Completer<void>();
 }

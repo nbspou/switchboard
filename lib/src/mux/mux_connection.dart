@@ -730,6 +730,7 @@ class MuxConnection {
       id,
       isLocallyOpened: true,
       openPayload: payload,
+      sendWindow: _peerInitialWindow,
     );
     _links[id] = link;
     _openCount++;
@@ -926,6 +927,11 @@ class MuxConnection {
 
   int get _peerMaxFrameSize => _peerLimits?.maxFrameSize ?? 0;
 
+  /// The send window of a channel opened now: the initial window of the
+  /// peer's last LIMITS, 64 KiB before any.
+  int get _peerInitialWindow =>
+      _peerLimits?.initialWindow ?? MuxLimits.defaultInitialWindow;
+
   Uint8List _nextPingPayload() {
     final n = _pingCounter;
     _pingCounter = (n + 1) & 0x7FFFFFFF;
@@ -1054,6 +1060,7 @@ class MuxConnection {
       id,
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
+      sendWindow: _peerInitialWindow,
     )..incomingPending = true;
     _links[id] = link;
     _openCount++;
@@ -1140,9 +1147,10 @@ class MuxConnection {
     }
   }
 
-  /// Flow-control credit from the peer.
+  /// Flow-control credit from the peer: ignored for a channel that is not
+  /// open here (it raced a CLOSE).
   void _onCredit(MuxCredit credit) {
-    _log.finest('$this: credit $credit');
+    _links[credit.channelId]?.receiveCredit(credit.bytes);
   }
 
   // Identity ------------------------------------------------------------

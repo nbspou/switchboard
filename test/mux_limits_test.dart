@@ -274,7 +274,7 @@ void main() {
       final c1 = a.open(empty);
       final c2 = a.open(empty);
       final c3 = a.open(empty);
-      c2.send(hexBytes('01 02 03'));
+      unawaited(c2.send(hexBytes('01 02 03')));
       await a.ping();
       expect(b.openChannelCount, 3);
       expect(b.bufferedBytes, greaterThan(0));
@@ -600,9 +600,10 @@ void main() {
         keepAliveTimeout: const Duration(milliseconds: 20),
       ),
     );
-    final channel = mux.open(empty);
+    // OPEN frames are not flow controlled, so they fill the transport's
+    // output where DATA would wait for credit.
     for (var i = 0; i < 2000; i++) {
-      channel.send(Uint8List(1000));
+      mux.open(Uint8List(1000));
     }
     expect(transport.isInputThrottled, isTrue);
     // Nothing arrives, but the peer reads a chunk every 10 ms: longer than
@@ -949,7 +950,7 @@ void main() {
       expect(b.isReceivePaused, isFalse);
       // Unread data on top of them pauses it, and reading that data
       // resumes it although the payloads are still held.
-      second.send(Uint8List(120));
+      unawaited(second.send(Uint8List(120)));
       await pumpEventQueue();
       expect(b.isReceivePaused, isTrue);
       await held.stream.first;

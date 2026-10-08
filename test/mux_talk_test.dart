@@ -8,6 +8,8 @@ Authors:
   Claude Opus 5.5 <noreply@anthropic.com>
 */
 
+import 'dart:async';
+
 import 'dart:typed_data';
 
 import 'package:switchboard/core.dart';
@@ -73,7 +75,7 @@ void main() {
     final good = TalkChannel(client.open(Uint8List(0)));
     final sibling = TalkChannel(client.open(Uint8List(0)));
     // Reserved flag bit 0x40: a channel protocol error.
-    bad.send(hexBytes('41 48 45 4C 4C 4F 00 00 00'));
+    unawaited(bad.send(hexBytes('41 48 45 4C 4C 4F 00 00 00')));
     expect((await bad.done).known, StatusCode.protocolError);
     expect((await serverTalks.first.done).known, StatusCode.protocolError);
     expect((await good.request('X', Uint8List(0))).payload, [1]);

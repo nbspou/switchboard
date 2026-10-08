@@ -347,7 +347,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     try {
       for (final subframe in pending) {
         _sent = true;
-        next.send(subframe);
+        unawaited(next.send(subframe));
       }
     } on SwitchboardException catch (e) {
       _log.fine('$type/$slot: held subframes not sent: ${e.status}');

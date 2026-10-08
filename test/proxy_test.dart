@@ -61,15 +61,18 @@ class RacingSwitchboard extends Switchboard {
 }
 
 /// Two mux connections over an in-memory transport, closed after the test.
-(MuxConnection, MuxConnection) muxPair({MuxOptions acceptor = fast}) {
+(MuxConnection, MuxConnection) muxPair({
+  MuxOptions initiator = fast,
+  MuxOptions acceptor = fast,
+}) {
   final (a, b) = MemoryTransport.pair();
-  final initiator = MuxConnection(a, isInitiator: true, options: fast);
+  final initiating = MuxConnection(a, isInitiator: true, options: initiator);
   final accepting = MuxConnection(b, isInitiator: false, options: acceptor);
   addTearDown(() async {
-    await initiator.close();
+    await initiating.close();
     await accepting.close();
   });
-  return (initiator, accepting);
+  return (initiating, accepting);
 }
 
 /// client ⇄ (proxyIn | pipe | proxyOut) ⇄ backend.
@@ -85,13 +88,23 @@ class Piped {
 /// proxy attaches the pipe.
 Future<Piped> piped({
   void Function(MuxChannel client)? early,
-  MuxOptions backendOptions = fast,
+  MuxOptions options = fast,
+  MuxOptions? backendOptions,
 }) async {
   final p = Piped();
-  final (clientConnection, proxyIn) = muxPair();
-  final (proxyOut, backendConnection) = muxPair(acceptor: backendOptions);
+  final (clientConnection, proxyIn) = muxPair(
+    initiator: options,
+    acceptor: options,
+  );
+  final (proxyOut, backendConnection) = muxPair(
+    initiator: options,
+    acceptor: backendOptions ?? options,
+  );
   p.clientConnection = clientConnection;
   p.backendConnection = backendConnection;
+  // The LIMITS of each side have arrived: they set the windows.
+  await clientConnection.ping();
+  await proxyOut.ping();
   final atProxy = StreamQueue(proxyIn.incoming);
   final atBackend = StreamQueue(backendConnection.incoming);
   p.client = clientConnection.open(bytes('header'));
@@ -114,8 +127,8 @@ void main() {
       final atBackend = p.backend.stream.take(100).toList();
       final atClient = p.client.stream.take(100).toList();
       for (var i = 0; i < 100; i++) {
-        p.client.send(toBackend[i]);
-        p.backend.send(toClient[i]);
+        unawaited(p.client.send(toBackend[i]));
+        unawaited(p.backend.send(toClient[i]));
       }
       expect(await atBackend, toBackend);
       expect(await atClient, toClient);
@@ -124,13 +137,17 @@ void main() {
     });
 
     test('forwards large subframes', () async {
-      final p = await piped();
+      // Windows of 2 MiB on every connection: a subframe costs at most half
+      // the window.
+      final p = await piped(
+        options: fast.copyWith(initialWindow: 2 * 1024 * 1024),
+      );
       final big = pattern(900 * 1024, 7);
       final atBackend = p.backend.stream.first;
-      p.client.send(big);
+      unawaited(p.client.send(big));
       expect(await atBackend, big);
       final atClient = p.client.stream.first;
-      p.backend.send(big);
+      unawaited(p.backend.send(big));
       expect(await atClient, big);
       await p.backend.close();
       await p.pipe;
@@ -139,7 +156,7 @@ void main() {
     test('client close status reaches the backend', () async {
       final p = await piped();
       final atBackend = p.backend.stream.toList();
-      p.client.send(bytes('last'));
+      unawaited(p.client.send(bytes('last')));
       await p.client.close(Status.of(StatusCode.cancelled, 'bye'));
       expect(await atBackend, [bytes('last')]);
       expect(await p.backend.done, Status.of(StatusCode.cancelled, 'bye'));
@@ -150,7 +167,7 @@ void main() {
     test('backend close status reaches the client', () async {
       final p = await piped();
       final atClient = p.client.stream.toList();
-      p.backend.send(bytes('result'));
+      unawaited(p.backend.send(bytes('result')));
       await p.backend.close(Status.of(StatusCode.aborted, 'conflict'));
       expect(await atClient, [bytes('result')]);
       expect(await p.client.done, Status.of(StatusCode.aborted, 'conflict'));
@@ -223,7 +240,7 @@ void main() {
 
     test('a subframe over the receiving peer limit closes both', () async {
       final p = await piped(backendOptions: fast.copyWith(maxFrameSize: 1000));
-      p.client.send(pattern(2000));
+      unawaited(p.client.send(pattern(2000)));
       expect(await p.client.done, hasCode(StatusCode.frameTooLarge));
       expect(await p.backend.done, hasCode(StatusCode.frameTooLarge));
       await p.pipe;
@@ -249,7 +266,7 @@ void main() {
       await p.backend.stream.listen(null).cancel();
       var finished = false;
       unawaited(p.pipe.then((_) => finished = true));
-      p.client.send(bytes('dropped'));
+      unawaited(p.client.send(bytes('dropped')));
       await p.clientConnection.ping();
       await p.backendConnection.ping();
       await pumpEventQueue();
@@ -257,7 +274,7 @@ void main() {
       expect(p.client.state, MuxChannelState.open);
       expect(p.backend.state, MuxChannelState.open);
       // The other direction still flows.
-      p.backend.send(bytes('still'));
+      unawaited(p.backend.send(bytes('still')));
       expect(await p.client.stream.first, bytes('still'));
       await p.backend.close();
       await p.pipe;
@@ -677,7 +694,7 @@ void main() {
       while (held.length < 4) {
         await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      held.last.channel.send(bytes('served'));
+      unawaited(held.last.channel.send(bytes('served')));
       expect(await channel.stream.first, bytes('served'));
       // A channel of the greedy client that ends frees its allowance, once
       // the proxy has closed both sides of it.
@@ -695,7 +712,7 @@ void main() {
       while (held.length < 5) {
         await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      held.last.channel.send(bytes('again'));
+      unawaited(held.last.channel.send(bytes('again')));
       expect(await more.stream.first, bytes('again'));
     });
 
@@ -1028,7 +1045,7 @@ void main() {
       final channel = await open(4);
       final answers = StreamQueue(channel.stream);
       expect(await answers.next, bytes('2 4'));
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(await answers.next, bytes('2:x'));
       expect(opened[1], hasLength(1));
       // The open payload is sent again, the instance set to the new owner.
@@ -1056,7 +1073,7 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'movedAfter:2:2';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.moved));
       expect(MovedStatus.fromStatus(status), MovedStatus.unknown);
@@ -1075,7 +1092,7 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.relocated));
       expect(status.encode(), MovedStatus.unknown.encode(relocated: true));
@@ -1093,7 +1110,7 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(
         (await channel.done).encode(),
         MovedStatus(
@@ -1103,7 +1120,7 @@ void main() {
       );
       modes[1] = 'movedAfter:2:2';
       final moved = await open(4);
-      moved.send(bytes('x'));
+      unawaited(moved.send(bytes('x')));
       final status = await moved.done;
       expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
     });
@@ -1195,7 +1212,7 @@ void main() {
       // Each subframe counts its length plus 32: the fourth goes beyond.
       var sent = 0;
       while (channel.canSend && sent < 10) {
-        channel.send(pattern(300, sent++));
+        unawaited(channel.send(pattern(300, sent++)));
         await Future<void>.delayed(Duration.zero);
       }
       final status = await channel.done;
