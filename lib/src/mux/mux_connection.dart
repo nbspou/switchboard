@@ -1140,6 +1140,9 @@ class MuxConnection {
     var queue = _outQueues[id];
     if (queue == null) {
       if (!isData || (_heldOutputFrames == 0 && _outputReady)) {
+        if (isData) {
+          link.dataWritten(MuxCredit.costOf(frame.payload.length));
+        }
         _writeOpening(frame.encode(), opens);
         return;
       }
@@ -1233,6 +1236,11 @@ class MuxConnection {
       _outQueues.remove(queue.id);
     } else {
       _takeTurn(queue);
+    }
+    if (frame.isData) {
+      _links[queue.id]?.dataWritten(
+        MuxCredit.costOf(frame.bytes.length - MuxFrame.headerSizeFor(queue.id)),
+      );
     }
     _writeOpening(frame.bytes, frame.opens);
   }

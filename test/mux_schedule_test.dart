@@ -16,11 +16,13 @@ import 'dart:mirrors';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/transport/memory_transport.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
 
@@ -88,6 +90,39 @@ class RateSink implements StreamSink<List<int>> {
 
 void main() {
   group('output scheduler', () {
+    test('CREDIT cannot replace credit reserved by unwritten DATA', () async {
+      final (local, remote) = MemoryTransport.pair();
+      final gate = GatedTransport(local);
+      final a = MuxConnection(gate, isInitiator: true, options: rawOptions);
+      final raw = RawPeer(remote);
+      addTearDown(a.close);
+      raw.send(
+        hexString(
+          MuxControlMessage.limits(
+            const MuxLimits(
+              maxFrameSize: 0,
+              maxChannels: 0,
+              initialWindow: MuxLimits.maxWindow,
+            ),
+          ).toFrame().encode(),
+        ),
+      );
+      raw.send('02 00 00 01 5E');
+      await raw.nextControl(MuxControlType.pong);
+      final channel = a.open(empty);
+      await channel.send(Uint8List(1));
+      expect(a.heldOutputBytes, greaterThan(0));
+      // Nothing was written, so none of the initial window was consumed.
+      raw.send(
+        hexString(
+          MuxControlMessage.credit(MuxCredit(channel.id, 1)).toFrame().encode(),
+        ),
+      );
+      await pumpEventQueue();
+      expect(a.isOpen, isFalse);
+      expect(await a.done, hasCode(StatusCode.protocolError));
+    });
+
     test(
       'a priority change moves already queued frames to the new tier',
       () async {
@@ -489,6 +524,33 @@ void main() {
   });
 
   group('openAfter', () {
+    test(
+      'a synchronous peer may refuse a child during its OPEN write',
+      () async {
+        final transport = StreamChannelController<Uint8List>(sync: true);
+        final peer = transport.foreign.stream.listen((bytes) {
+          final frame = MuxFrame.decode(bytes);
+          if (frame.command == MuxCommand.open && frame.payload.isNotEmpty) {
+            transport.foreign.sink.add(
+              MuxFrame.close(frame.channelId).encode(),
+            );
+          }
+        });
+        addTearDown(peer.cancel);
+        final mux = MuxConnection(
+          transport.local,
+          isInitiator: true,
+          options: rawOptions,
+        );
+        addTearDown(mux.close);
+        final parent = mux.open(empty);
+        final child = parent.openAfter(Uint8List.fromList([9]));
+        expect(await child.done, Status.ok);
+        expect(mux.isOpen, isTrue);
+        expect(mux.openChannelCount, 1);
+      },
+    );
+
     for (final command in [MuxCommand.data, MuxCommand.close]) {
       test(
         '${command.name} before the child OPEN is a protocol error',

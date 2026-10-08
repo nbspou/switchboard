@@ -150,6 +150,9 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   // initial window the 64 KiB assumed without LIMITS.
   int _initialSendWindow;
   int _sendWindow;
+  // Credit reserved for DATA handed to the scheduler but not written yet.
+  // The peer cannot have consumed it: it still counts toward the u32 cap.
+  int _reservedSendCost = 0;
   bool _awaitingLimits;
   final Queue<_PendingSend> _pendingSends = Queue<_PendingSend>();
   Status? _pendingClose;
@@ -384,6 +387,9 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// opened before the peer's LIMITS arrived it is 0 until then, so that
   /// DATA waits for it (see [MuxOptions.awaitPeerLimits]); it then starts
   /// at the window announced, or at 64 KiB if the wait ended without one.
+  /// Credit reserved by DATA waiting in the output scheduler is excluded
+  /// here, but still counts toward the `2^32 - 1` cap on peer grants until
+  /// that DATA is written to the transport.
   /// See the wiki page "Polyverse Switchboard Mux", section "Flow
   /// control".
   int get sendWindow => _sendWindow;
@@ -486,6 +492,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     final cost = MuxCredit.costOf(subframe.length);
     if (_pendingSends.isEmpty && cost <= _sendWindow) {
       _sendWindow -= cost;
+      _reservedSendCost += cost;
       _link.host.sendChannelFrame(_link, MuxFrame.data(id, subframe));
       return _sentAtOnce;
     }
@@ -600,6 +607,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       final start = pending.offset;
       // Accounted before the write, which could come back here.
       _sendWindow -= MuxCredit.costOf(n);
+      _reservedSendCost += MuxCredit.costOf(n);
       pending.offset += n;
       _link.host.sendChannelFrame(
         _link,
@@ -667,6 +675,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
               break;
             }
             _sendWindow -= cost;
+            _reservedSendCost += cost;
             _pendingSends.removeFirst();
             _link.host.sendChannelFrame(
               _link,
@@ -742,10 +751,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       return;
     }
     final window = _sendWindow + bytes;
-    if (window > MuxLimits.maxWindow) {
+    if (window + _reservedSendCost > MuxLimits.maxWindow) {
       throw ProtocolException(
         'CREDIT of $bytes takes the window of channel $id to $window, '
-        'above 2^32 - 1',
+        'plus $_reservedSendCost reserved for unwritten DATA, above 2^32 - 1',
       );
     }
     _sendWindow = window;
@@ -948,6 +957,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _pendingClose = null;
     _failPendingSends();
     _link.preOpen = const [];
+    _reservedSendCost = 0;
     _released = true;
     _held = 0;
     _endRequested = true;
@@ -1090,6 +1100,14 @@ class MuxChannelLink {
   /// Applies the peer's CREDIT of [bytes] for this channel. Throws
   /// [ProtocolException] if the window would exceed `2^32 - 1`.
   void receiveCredit(int bytes) => channel._receiveCredit(bytes);
+
+  /// DATA of [cost] bytes of credit is going to the transport now: its
+  /// reservation ends. After local completion no reservation remains.
+  void dataWritten(int cost) {
+    if (channel._state != MuxChannelState.closed) {
+      channel._reservedSendCost -= cost;
+    }
+  }
 
   /// The wait for the peer's LIMITS ended; [window] is the initial window
   /// of a channel opened before it.
