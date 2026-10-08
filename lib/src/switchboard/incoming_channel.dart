@@ -57,7 +57,9 @@ class IncomingChannel {
 
   /// A description of the remote side of the connection, for logs: the
   /// remote socket address of an accepted connection or the endpoint URI
-  /// of an initiated one. Null when unknown.
+  /// of an initiated one; `local` on the accepted side of a connection the
+  /// node made to one of its own listeners (`Switchboard.localConnections`).
+  /// Null when unknown.
   final String? remote;
 
   /// Default options for [talk]; null means the [TalkOptions] defaults.
