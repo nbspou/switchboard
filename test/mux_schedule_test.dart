@@ -559,6 +559,43 @@ void main() {
       expect((await raw.next()).channelId, next.id);
     });
 
+    test('a close of a channel whose OPEN still waits is not timed until '
+        'the OPEN goes out; nothing leaks when it never does', () async {
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(
+          closeConfirmTimeout: const Duration(milliseconds: 30),
+        ),
+      );
+      addTearDown(mux.close);
+      raw.send(
+        hexString(
+          MuxControlMessage.limits(
+            const MuxLimits(maxFrameSize: 0, maxChannels: 0, initialWindow: 64),
+          ).toFrame().encode(),
+        ),
+      );
+      raw.send('02 00 00 01 5E');
+      await raw.nextControl(MuxControlType.pong);
+      final parent = mux.open(empty);
+      await raw.next();
+      await parent.send(Uint8List(16));
+      await parent.send(Uint8List(16));
+      unawaited(parent.send(Uint8List(16)).catchError((Object _) {}));
+      final child = parent.openAfter(empty);
+      await child.send(Uint8List(5));
+      unawaited(child.close());
+      await raw.next();
+      await raw.next();
+      // Longer than the confirmation timeout: the child is not abandoned.
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(child.state, MuxChannelState.halfClosedLocal);
+      expect(mux.unconfirmedCloseCount, 0);
+      raw.send('22 02 00');
+      expect((await child.done).known, StatusCode.cancelled);
+      expect(mux.unconfirmedCloseCount, 0);
+      expect(mux.openChannelCount, 0);
+    });
+
     test('refused once the parent can no longer send', () async {
       final (a, b) = muxPair();
       addTearDown(a.close);

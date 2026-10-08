@@ -1223,9 +1223,15 @@ class MuxConnection {
   /// channel sent meanwhile follows it.
   void _openWritten(MuxChannelLink link) {
     link.openWritten = true;
+    link.openWrittenAfterClose();
     final frames = link.preOpen;
     link.preOpen = const [];
     for (final (frame, opens) in frames) {
+      if (link.closeReceived && frame.command == MuxCommand.data) {
+        // The peer refused the channel while its OPEN was being written
+        // (a synchronous transport): DATA would land on an unknown id.
+        continue;
+      }
       _sendChannelFrame(link, frame, opens: opens);
     }
   }

@@ -779,8 +779,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       _state = MuxChannelState.halfClosedLocal;
       _noteStatus(status);
       // A synchronous transport can confirm during sendFrame; install
-      // the timer first so that completion cancels it.
-      _link._startConfirmTimer();
+      // the timer first so that completion cancels it. A channel whose
+      // OPEN waits behind its parent's frames ([openAfter]) arms it when
+      // the OPEN goes out: the peer cannot confirm a channel it does not
+      // know.
+      if (_link.openWritten) {
+        _link._startConfirmTimer();
+      }
       if (_pendingSends.isEmpty) {
         _queueClose(status);
       } else {
@@ -1097,6 +1102,15 @@ class MuxChannelLink {
     final c = channel;
     c._noteStatus(status);
     c._complete();
+  }
+
+  /// Arms the close confirmation timer of a channel whose CLOSE was
+  /// requested before its OPEN went out.
+  void openWrittenAfterClose() {
+    if (channel._closeSent &&
+        channel._state == MuxChannelState.halfClosedLocal) {
+      _startConfirmTimer();
+    }
   }
 
   void _startConfirmTimer() {
