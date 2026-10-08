@@ -734,6 +734,62 @@ void main() {
       await p.proxy.close();
     });
 
+    for (final code in [StatusCode.moved, StatusCode.relocated]) {
+      test(
+        '${code.name} abort fields and reason pass through byte for byte',
+        () async {
+          final p = RawProxy();
+          p.fromClient(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('Q'),
+              requestId: 7,
+            ),
+          );
+          await pumpEventQueue();
+          // The owner bytes and malformed UTF-8 reason must survive status
+          // decoding. Rebuilding the status from its reason would corrupt it.
+          final payload = bytes([
+            code.code,
+            0,
+            0xFF,
+            0xEE,
+            0xDD,
+            0xCC,
+            0xBB,
+            0xAA,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            0xFF,
+            0x80,
+          ]);
+          p.fromBackend(
+            TalkFrame(
+              kind: TalkKind.abort,
+              responseId: p.atBackend.single.requestId,
+              payload: payload,
+            ),
+          );
+          await Future.wait(p.proxy.forwards);
+          await pumpEventQueue();
+          final response = p.atClient.single;
+          expect(response.kind, TalkKind.abort);
+          expect(response.responseId, 7);
+          expect(response.payload, payload);
+          expect(
+            p.atBackend,
+            hasLength(1),
+            reason: 'neither status is retried',
+          );
+          expect(p.proxy.front.incomingRequestCount, 0);
+          expect(p.proxy.back.outgoingRequestCount, 0);
+          await p.proxy.close();
+        },
+      );
+    }
+
     test('a chained request from the backend gets its own id toward the '
         'client', () async {
       final p = RawProxy();
