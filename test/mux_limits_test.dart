@@ -237,6 +237,35 @@ void main() {
       },
     );
 
+    test('a paused listener holds at most maxChannels of them', () async {
+      final (mux, raw) = rawPair(options: rawOptions.copyWith(maxChannels: 2));
+      addTearDown(mux.close);
+      final received = <MuxChannel>[];
+      final subscription = mux.incoming.listen(received.add)..pause();
+      addTearDown(subscription.cancel);
+      for (var i = 0; i < 2; i++) {
+        raw.send(openHex(3, 10));
+        raw.send('02 03 00 AA');
+        raw.send('22 03 00');
+        expect(closeStatus(await raw.next()), Status.ok);
+      }
+      // Its CLOSE confirms the rejection.
+      raw.send(openHex(3, 10));
+      raw.send('22 03 00');
+      expect(closeStatus(await raw.next()).known, StatusCode.resourceExhausted);
+      expect(mux.openPayloadBytes, 20);
+      expect(received, isEmpty);
+      subscription.resume();
+      await pumpEventQueue();
+      expect(received, hasLength(2));
+      expect(mux.openPayloadBytes, 0);
+      for (final channel in received) {
+        expect(channel.state, MuxChannelState.closed);
+        expect((await channel.stream.toList()).map(hexString), ['AA']);
+      }
+      expect(mux.bufferedBytes, 0);
+    });
+
     test('cancelling incoming closes them with UNAVAILABLE', () async {
       final (a, b) = muxPair(
         acceptor: quiet.copyWith(goAwayGrace: const Duration(seconds: 5)),
