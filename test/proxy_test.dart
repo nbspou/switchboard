@@ -127,6 +127,55 @@ Future<Piped> piped({
 
 void main() {
   group('pipeChannels', () {
+    test('a send rejected by delayed LIMITS closes both pipe ends', () async {
+      final (clientConnection, proxyIn) = muxPair();
+      final (outTransport, peerTransport) = MemoryTransport.pair();
+      final proxyOut = MuxConnection(
+        outTransport,
+        isInitiator: true,
+        options: fast,
+      );
+      addTearDown(proxyOut.close);
+      final wire = StreamQueue(peerTransport.stream);
+      final incoming = StreamQueue(proxyIn.incoming);
+      final client = clientConnection.open(Uint8List(0));
+      final inbound = await incoming.next;
+      final outbound = proxyOut.open(Uint8List(0));
+      pipeChannels(inbound, outbound).ignore();
+      await client.send(Uint8List(1000));
+      await pumpEventQueue();
+      expect(inbound.heldBytes, 1016);
+      peerTransport.sink.add(
+        MuxControlMessage.limits(
+          const MuxLimits(
+            maxFrameSize: 256,
+            maxChannels: 4,
+            initialWindow: 256,
+          ),
+        ).toFrame().encode(),
+      );
+      await pumpEventQueue();
+      expect(outbound.canSend, isFalse);
+      expect(await client.done, hasCode(StatusCode.frameTooLarge));
+      final sent = <MuxFrame>[];
+      await proxyOut.close();
+      while (await wire.hasNext) {
+        sent.add(MuxFrame.decode(await wire.next));
+      }
+      expect(
+        Status.decode(
+          sent
+              .where(
+                (f) =>
+                    f.channelId == outbound.id && f.command == MuxCommand.close,
+              )
+              .single
+              .payload,
+        ),
+        hasCode(StatusCode.frameTooLarge),
+      );
+    });
+
     test('forwards subframes both ways, in order', () async {
       final p = await piped();
       final toBackend = [for (var i = 0; i < 100; i++) pattern(i, i)];

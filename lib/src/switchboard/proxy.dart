@@ -52,7 +52,8 @@ final Logger _log = Logger('Switchboard.Router');
 /// `UNKNOWN`. A subframe that cannot be forwarded (it exceeds the frame
 /// limit the receiving peer announced, or costs more than half the window
 /// it grants: [MuxChannel.maxSubframeLength]) closes both sides with that
-/// error. Subframes are forwarded whole, so a proxy should not grant its
+/// error, including when LIMITS arrives after the send began waiting.
+/// Subframes are forwarded whole, so a proxy should not grant its
 /// clients more (window, frame size) than its backends grant it; a side
 /// whose [MuxChannel.priority] is [MuxPriority.bulk] splits what it sends
 /// instead, which suits a byte stream (a Talk bulk payload).
@@ -281,6 +282,23 @@ void _forward(
 }) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
+  void failed(Object error, int length) {
+    _consumed(from, length);
+    if (error is SwitchboardException &&
+        error.code == StatusCode.failedPrecondition) {
+      // The destination ended while waiting; its end closes from too.
+      return;
+    }
+    _log.warning(
+      'proxy: cannot forward $length bytes from channel '
+      '${from.id} to channel ${to.id}: $error',
+    );
+    final code = error is SwitchboardException ? error.code : null;
+    final status = genericStatus(code ?? StatusCode.internal);
+    unawaited(to.close(status));
+    unawaited(from.close(status));
+  }
+
   from.stream.listen(
     (subframe) {
       final length = subframe.length;
@@ -294,21 +312,10 @@ void _forward(
             .send(subframe)
             .then(
               (_) => _consumed(from, length),
-              // [to] ended while the subframe waited: its end closes
-              // [from] too.
-              onError: (Object _) => _consumed(from, length),
+              onError: (Object error) => failed(error, length),
             );
       } on SwitchboardException catch (e) {
-        _consumed(from, length);
-        _log.warning(
-          'proxy: cannot forward ${subframe.length} bytes from channel '
-          '${from.id} to channel ${to.id}: ${e.status}',
-        );
-        final status = e.code == null
-            ? Status.of(StatusCode.internal)
-            : genericStatus(e.code!);
-        unawaited(to.close(status));
-        unawaited(from.close(status));
+        failed(e, length);
       }
     },
     onError: (Object e) => _log.fine('proxy: channel ${from.id} failed: $e'),
