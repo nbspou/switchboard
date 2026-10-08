@@ -964,6 +964,41 @@ void main() {
   });
 
   group('timing (fake_async)', () {
+    for (final hook in ['onConnect', 'onOpen']) {
+      test('$hook closing the set leaves no hook timeout behind', () {
+        fakeAsync((async) {
+          final resolver = StaticResolver();
+          final consumer = Switchboard(muxOptions: fast);
+          final w = Worker(1);
+          unawaited(w.start());
+          async.flushMicrotasks();
+          resolver.add(w.record());
+          late PeerSet set;
+          Future<void> closeInHook() {
+            unawaited(set.close());
+            return Completer<void>().future;
+          }
+
+          set = PeerSet.watch(
+            consumer,
+            gpu,
+            resolver: resolver,
+            connectTimeout: const Duration(seconds: 10),
+            onConnect: hook == 'onConnect' ? (_) => closeInHook() : null,
+            channel: hook == 'onOpen' ? ChannelAddress(type: gpu) : null,
+            onOpen: hook == 'onOpen' ? (_, _) => closeInHook() : null,
+          );
+          async.elapse(const Duration(seconds: 1));
+          expect(set.isClosed, isTrue);
+          unawaited(w.stop());
+          unawaited(consumer.close());
+          unawaited(resolver.close());
+          async.elapse(const Duration(seconds: 1));
+          expect(async.pendingTimers, isEmpty);
+        });
+      });
+    }
+
     test('the backoff schedule, a lasting connection resets it, close '
         'leaves no timer', () {
       fakeAsync((async) {

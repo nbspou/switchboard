@@ -204,7 +204,8 @@ class PeerEvent {
 /// (with any status), fail the attempt: the set leaves the connection with
 /// GOAWAY and the peer is offline (with [StatusCode.internal] for a hook,
 /// the channel's close status for the channel) until the next attempt
-/// after the backoff. The hooks run again after every reconnect.
+/// after the backoff. The hooks run again after every reconnect. A hook
+/// may close the set synchronously; its timeout is cancelled with the connection.
 ///
 /// The per-peer channel behaves like a `PersistentChannel` of a
 /// `ReconnectingClient`: when it ends while the connection stays up, the
@@ -1314,15 +1315,6 @@ class Peer {
       return Status.of(code, '$name failed');
     }
 
-    final FutureOr<Object?> result;
-    try {
-      result = hook();
-    } on Object catch (e, st) {
-      return failed(e, st);
-    }
-    if (result is! Future<Object?>) {
-      return null;
-    }
     final wait = Completer<Status?>();
     _hookWait = wait;
     final timeout = _set.connectTimeout;
@@ -1336,23 +1328,41 @@ class Peer {
         }
       });
     }
-    result
-        .then<void>(
-          (_) {
-            if (!wait.isCompleted) {
-              wait.complete(null);
-            }
-          },
-          onError: (Object e, StackTrace st) {
-            if (wait.isCompleted) {
-              // Left, or timed out, already.
-              _log.fine('$this: $name failed late: $e');
-              return;
-            }
-            wait.complete(failed(e, st));
-          },
-        )
-        .ignore();
+    final FutureOr<Object?> result;
+    try {
+      result = hook();
+    } on Object catch (e, st) {
+      if (!wait.isCompleted) {
+        wait.complete(failed(e, st));
+      }
+      if (identical(_hookWait, wait)) {
+        _endHook();
+      }
+      return wait.future;
+    }
+    if (result is! Future<Object?>) {
+      if (!wait.isCompleted) {
+        wait.complete(null);
+      }
+    } else {
+      result
+          .then<void>(
+            (_) {
+              if (!wait.isCompleted) {
+                wait.complete(null);
+              }
+            },
+            onError: (Object e, StackTrace st) {
+              if (wait.isCompleted) {
+                // Left, or timed out, already.
+                _log.fine('$this: $name failed late: $e');
+                return;
+              }
+              wait.complete(failed(e, st));
+            },
+          )
+          .ignore();
+    }
     final outcome = await wait.future;
     if (identical(_hookWait, wait)) {
       _endHook();
