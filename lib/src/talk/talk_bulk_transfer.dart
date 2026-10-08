@@ -608,7 +608,7 @@ class _BulkIn {
 
   /// Reads the whole payload, at most [max] bytes: beyond, the bulk channel
   /// is closed `RESOURCE_EXHAUSTED` and the future fails with it.
-  Future<Uint8List> collect(int max) {
+  Future<Uint8List> collect(int max, {bool Function(int bytes)? reserve}) {
     final completer = Completer<Uint8List>()..future.ignore();
     final declared = length;
     if (declared != null && declared > max) {
@@ -630,10 +630,11 @@ class _BulkIn {
         if (completer.isCompleted) {
           return;
         }
-        if (builder.length + data.length > max) {
+        if (builder.length + data.length > max ||
+            (reserve != null && !reserve(data.length))) {
           final status = Status.of(
             StatusCode.resourceExhausted,
-            'bulk payload of more than $max bytes',
+            'bulk reassembly exceeds the $max byte budget',
           );
           close(status);
           subscription.cancel().ignore();

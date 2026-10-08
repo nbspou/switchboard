@@ -150,6 +150,74 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  test('failed reassembly releases its partial memory budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkChunkSize: 100),
+    );
+    server.messages.listen((message) => message.reply(Uint8List(0)));
+    await expectLater(
+      talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1100))),
+      throwsStatus(StatusCode.resourceExhausted),
+    );
+    await talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1000)));
+  });
+
+  test(
+    'completed streams keep unread items within the reassembly budget',
+    () async {
+      final peers = await Peers.connect(
+        serverOptions: const TalkOptions(bulkThreshold: 100),
+      );
+      final (talk, server) = await peers.open(
+        options: const TalkOptions(maxInlinePayload: 1000),
+      );
+      server.messages.listen((message) {
+        message.replyItem(pattern(1000));
+        message.reply(Uint8List(0));
+      });
+      final first = talk.streamRequest('LIST', Uint8List(0));
+      await first.done;
+      final second = talk.streamRequest('LIST', Uint8List(0));
+      second.items.listen((_) => fail('over-budget item delivered'));
+      await expectLater(
+        second.done,
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      expect((await first.items.toList()).single.payload, pattern(1000));
+      final third = talk.streamRequest('LIST', Uint8List(0));
+      expect((await third.items.toList()).single.payload, pattern(1000));
+      await third.done;
+    },
+  );
+
+  test('unread reassemblies share a channel memory budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkThreshold: 100),
+    );
+    final subscription = server.messages.listen((message) {
+      expect(message.payload, pattern(1000));
+      message.reply(Uint8List(0));
+    })..pause();
+    final first = talk.request('PUT', pattern(1000));
+    await pumpEventQueue();
+    final second = talk.request('PUT', pattern(1000));
+    await expectLater(
+      second.timeout(const Duration(seconds: 1)),
+      throwsStatus(StatusCode.resourceExhausted),
+    );
+    subscription.resume();
+    await first;
+    // Delivery releases the budget; subsequent large requests still work.
+    await talk.request('PUT', pattern(1000));
+    await subscription.cancel();
+  });
+
   test('cancelling a stream request closes a delivered item bulk channel '
       'without relying on the peer', () async {
     final peers = await Peers.connect();

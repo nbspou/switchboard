@@ -136,6 +136,9 @@ class TalkOptions {
   /// with `RESOURCE_EXHAUSTED`, toward the sender (its bulk channel is
   /// closed with it, a request is answered with it) and the receiver.
   /// Default 16 MiB.
+  /// Also caps the total reassembled bytes still held by this channel for
+  /// delivery to the application. Exceeding that budget fails the payload
+  /// with `RESOURCE_EXHAUSTED`; delivery or discard releases its budget.
   final int maxInlinePayload;
 
   /// Receiving: the window granted to a bulk channel being read whose
@@ -363,6 +366,9 @@ class TalkChannel {
   final Map<int, _Awaited> _bulkAwaited = {};
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
+
+  /// Reassembly in progress and completed payloads not delivered yet.
+  int _assemblyBytes = 0;
 
   /// The order of [messages], kept while bulk payloads arrive.
   final _Lane _messagesLane = _Lane();
@@ -1300,6 +1306,8 @@ class TalkChannel {
   /// Returns the credit of [message], once: it was handed to the
   /// application, or consumed by the channel.
   void _creditMessage(_Message message, [_Held? held]) {
+    message._releaseAssembly();
+    held?.assembled.remove(message);
     if (held != null && message._heldBulk) {
       message._heldBulk = false;
       held.bulk.remove(message);
@@ -1324,6 +1332,10 @@ class TalkChannel {
   /// it counts for will deliver nothing more.
   void _drainHeld(_Held held) {
     _returnHeld(held);
+    for (final message in held.assembled) {
+      message._releaseAssembly();
+    }
+    held.assembled.clear();
     // Bulk payloads of the dropped messages will not be read.
     final bulk = List.of(held.bulk);
     held.bulk.clear();
@@ -1523,7 +1535,7 @@ class TalkChannel {
       message._startDeferredTimer();
     } else {
       b
-          .collect(options.maxInlinePayload)
+          .collect(options.maxInlinePayload, reserve: message._reserveAssembly)
           .then(
             (bytes) {
               message._assembled = bytes;
@@ -1531,6 +1543,7 @@ class TalkChannel {
               message._lane?.advance();
             },
             onError: (Object error) {
+              message._releaseAssembly();
               message._bulkFailure = error is SwitchboardException
                   ? error.status
                   : Status.of(StatusCode.internal, '$error');
@@ -2411,6 +2424,25 @@ class _Message extends TalkMessage {
   Uint8List? _assembled;
   Status? _bulkFailure;
 
+  /// Bytes charged to the channel until this message is delivered.
+  int _assemblyBytes = 0;
+  bool _dropped = false;
+
+  bool _reserveAssembly(int bytes) {
+    if (_dropped ||
+        channel._assemblyBytes + bytes > channel.options.maxInlinePayload) {
+      return false;
+    }
+    _assemblyBytes += bytes;
+    channel._assemblyBytes += bytes;
+    return true;
+  }
+
+  void _releaseAssembly() {
+    channel._assemblyBytes -= _assemblyBytes;
+    _assemblyBytes = 0;
+  }
+
   /// Held in a controller with its bulk payload unread ([_Held.bulk]).
   bool _heldBulk = false;
 
@@ -2450,6 +2482,7 @@ class _Message extends TalkMessage {
   /// The message will not be delivered: its credit goes back, its bulk
   /// payload is not wanted, a request is answered `CANCELLED`.
   void _drop() {
+    _dropped = true;
     channel._creditMessage(this);
     final b = _bulk;
     if (b != null) {
@@ -3270,9 +3303,16 @@ class _Held {
   /// The messages held whose bulk payload is a stream nobody read yet.
   final List<_Message> bulk = [];
 
+  /// Reassembled payloads whose memory budget lasts until delivery, even
+  /// after a stream request ends and returns its parent-frame credit.
+  final Set<_Message> assembled = {};
+
   /// Counts the credit of [message], added to the controller, and, with
   /// [trackBulk], its streamed bulk payload.
   void hold(_Message message, {bool trackBulk = true}) {
+    if (message._assemblyBytes > 0) {
+      assembled.add(message);
+    }
     if (message._creditBytes != 0) {
       bytes += message._creditBytes;
       frames++;
