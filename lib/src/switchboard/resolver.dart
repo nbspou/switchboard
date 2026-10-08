@@ -15,6 +15,7 @@ import '../address/service_address.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
+import '../status.dart';
 
 /// How `Switchboard.selectAndConnect` picks among the candidate instances
 /// of a type when the caller gives no shard slot (with a shard slot the
@@ -118,6 +119,8 @@ abstract interface class BrokeringResolver implements Resolver {
 /// It can also carry configured slot tables ([defineSlots], [setSlot]),
 /// for routing shard slots without a naming service; [locateSlot] then
 /// answers from the configured table, as there is no authority to ask.
+/// After [close], resolution and changes fail with
+/// [StatusCode.failedPrecondition]; the last table remains readable.
 class StaticResolver implements SlotResolver {
   /// Creates a resolver pre-populated with [records].
   StaticResolver([Iterable<ServiceRecord> records = const []]) {
@@ -132,18 +135,30 @@ class StaticResolver implements SlotResolver {
   final Map<Name, _StaticSlots> _slots = {};
   final StreamController<SlotEvent> _slotEvents =
       StreamController<SlotEvent>.broadcast();
+  bool _closed = false;
+
+  void _checkOpen() {
+    if (_closed) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'static resolver closed',
+      );
+    }
+  }
 
   /// Read-only view of the table.
   Map<ServiceAddress, ServiceRecord> get table => Map.unmodifiable(_table);
 
   /// Adds or replaces [record] and emits an up event.
   void add(ServiceRecord record) {
+    _checkOpen();
     _table[record.address] = record;
     _events.add(ServiceEvent(up: true, record: record));
   }
 
   /// Removes the record for [address] if present and emits a down event.
   void remove(ServiceAddress address) {
+    _checkOpen();
     final removed = _table.remove(address);
     if (removed != null) {
       _events.add(
@@ -156,10 +171,13 @@ class StaticResolver implements SlotResolver {
   }
 
   @override
-  Future<List<ServiceRecord>> resolve(Name type) async => [
-    for (final r in _table.values)
-      if (r.address.type == type) r,
-  ];
+  Future<List<ServiceRecord>> resolve(Name type) async {
+    _checkOpen();
+    return [
+      for (final r in _table.values)
+        if (r.address.type == type) r,
+    ];
+  }
 
   @override
   Stream<ServiceEvent> get events => _events.stream;
@@ -171,6 +189,7 @@ class StaticResolver implements SlotResolver {
   /// slot free. Slots of a previous definition are reported gone on
   /// [slotEvents].
   void defineSlots(SlotSpace space) {
+    _checkOpen();
     final previous = _slots[space.type];
     if (previous != null) {
       for (final slot in previous.entries.keys.toList()) {
@@ -183,6 +202,7 @@ class StaticResolver implements SlotResolver {
   /// Removes the slot space of [type]; its channels are routed by the
   /// plain rule again.
   void removeSlots(Name type) {
+    _checkOpen();
     final previous = _slots.remove(type);
     if (previous != null) {
       for (final slot in previous.entries.keys.toList()) {
@@ -195,6 +215,7 @@ class StaticResolver implements SlotResolver {
   /// Throws [StateError] without a slot space for [type] ([defineSlots])
   /// and [RangeError] for a slot outside it.
   void setSlot(Name type, int slot, SlotEntry entry) {
+    _checkOpen();
     final slots = _slots[type];
     if (slots == null) {
       throw StateError('no slot space for $type');
@@ -233,11 +254,14 @@ class StaticResolver implements SlotResolver {
   /// The configured entry ([slotOwner]): a static table has no authority
   /// to ask.
   @override
-  Future<SlotEntry?> locateSlot(Name type, int slot) async =>
-      slotOwner(type, slot);
+  Future<SlotEntry?> locateSlot(Name type, int slot) async {
+    _checkOpen();
+    return slotOwner(type, slot);
+  }
 
   @override
   Future<void> close() async {
+    _closed = true;
     await _events.close();
     await _slotEvents.close();
   }
@@ -264,11 +288,22 @@ class EndpointResolver implements Resolver {
 
   /// The endpoint every address resolves to.
   final Uri endpoint;
+  bool _closed = false;
 
+  /// Resolves to [endpoint], or fails with [StatusCode.failedPrecondition]
+  /// after [close].
   @override
-  Future<List<ServiceRecord>> resolve(Name type) async => [
-    ServiceRecord(ServiceAddress(type), endpoints: [endpoint]),
-  ];
+  Future<List<ServiceRecord>> resolve(Name type) async {
+    if (_closed) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'endpoint resolver closed',
+      );
+    }
+    return [
+      ServiceRecord(ServiceAddress(type), endpoints: [endpoint]),
+    ];
+  }
 
   @override
   Stream<ServiceEvent> get events => const Stream.empty();
@@ -277,5 +312,7 @@ class EndpointResolver implements Resolver {
   Future<void> get ready => Future.value();
 
   @override
-  Future<void> close() async {}
+  Future<void> close() async {
+    _closed = true;
+  }
 }
