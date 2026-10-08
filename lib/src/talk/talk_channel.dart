@@ -1821,12 +1821,12 @@ class _Message extends TalkMessage {
 
   /// Answers with an abort on the channel's behalf, if still unanswered.
   /// Never while the final reply is being sent: that is the one final.
+  /// Guards this send too, since a synchronous peer may cancel during it.
   void _abortQuietly(Status status) {
     if (_finished || _finalizing || !expectsReply) {
       return;
     }
-    channel._rejectRequest(requestId, status);
-    _finish();
+    _sendReply(() => channel._rejectRequest(requestId, status), isFinal: true);
   }
 
   /// The peer cancelled the request: answer it with the final the protocol

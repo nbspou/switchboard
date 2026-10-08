@@ -2575,6 +2575,22 @@ void main() {
       });
     });
 
+    test('a cancel during an automatic timeout abort gets no second final', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal);
+        async.elapse(const Duration(seconds: 10));
+        async.flushMicrotasks();
+        expect(r.finals, hasLength(1));
+        expect(r.finals.single.status.known, StatusCode.deadlineExceeded);
+        expect(r.request.canReply, isFalse);
+        expect(r.request.isCancelled, isTrue);
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
     test('a cancel during a chained reply leaves the chained request as '
         'the final', () {
       fakeAsync((async) {
