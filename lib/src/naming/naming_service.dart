@@ -923,6 +923,7 @@ class NamingService {
       return;
     }
     session.wasIdentified = true;
+    session.identityByConnection = session.connection?.peerIdentity != null;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
     final expires = credential.expiresAtTime;
@@ -947,8 +948,7 @@ class NamingService {
       return;
     }
     final connection = session.connection;
-    final byConnection =
-        connection != null && session.payloadCredential == null;
+    final byConnection = session.identityByConnection;
     _log.info(
       'naming channel ${byConnection ? 'and connection ' : ''}ended: the '
       'credential expired',
@@ -956,7 +956,7 @@ class NamingService {
     final status = Status.of(StatusCode.unauthenticated, 'credential expired');
     _drop(session);
     unawaited(session.channel.close(status));
-    if (byConnection && connection.isOpen) {
+    if (byConnection && connection != null && connection.isOpen) {
       unawaited(connection.goAway(status));
     }
   }
@@ -1462,8 +1462,6 @@ class NamingService {
       return;
     }
     session.active = false;
-    unawaited(session.identitySubscription?.cancel());
-    session.identitySubscription = null;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
     _held.removeWhere((h) => identical(h.session, session));
@@ -1527,6 +1525,10 @@ class _Session {
   /// ends it, rather than leaving it unidentified.
   bool wasIdentified = false;
 
+  /// The source of the identity whose expiry the timer tracks. A payload
+  /// credential can coexist with it, but does not suppress its GOAWAY.
+  bool identityByConnection = false;
+
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
 
@@ -1556,8 +1558,10 @@ class _Session {
     }
   }
 
-  /// Stops listening to the channel.
+  /// Stops listening to the channel and its connection's identity.
   void cancel() {
+    identitySubscription?.cancel().ignore();
+    identitySubscription = null;
     subscription?.cancel().ignore();
     subscription = null;
   }

@@ -629,6 +629,54 @@ void main() {
   });
 
   group('expiry and RENEW', () {
+    test('connection expiry sends GOAWAY even with an expired payload', () {
+      fakeAsync((async) {
+        late Mesh mesh;
+        late Switchboard client;
+        late TalkChannel channel;
+        Status? ended;
+        Status? goAway;
+        Future<void> setUp() async {
+          mesh = await Mesh.start(close: false);
+          client = await node(
+            credential: await issue(
+              'worker-a1',
+              workerScopes,
+              lifetime: const Duration(minutes: 2),
+            ),
+            close: false,
+          );
+          final payload = await issue(
+            'worker-a1',
+            workerScopes,
+            bearer: true,
+            lifetime: const Duration(minutes: 1),
+          );
+          final connection = await client.connect(mesh.uri);
+          unawaited(connection.peerGoAwayStatus.then((s) => goAway = s));
+          channel = TalkChannel(
+            connection.open(
+              ChannelAddress(type: naming, payload: payload.encode()).encode(),
+            ),
+          );
+          unawaited(channel.done.then((s) => ended = s));
+          await channel.request('REGISTER', registerPayload(workerType));
+        }
+
+        unawaited(setUp());
+        async.elapse(const Duration(seconds: 1));
+        expect(mesh.service.table, hasLength(1));
+        async.elapse(const Duration(minutes: 2));
+        expect(ended, hasCode(StatusCode.unauthenticated));
+        expect(goAway, hasCode(StatusCode.unauthenticated));
+        expect(mesh.service.table, isEmpty);
+        unawaited(client.close());
+        unawaited(mesh.close());
+        async.elapse(const Duration(seconds: 30));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     for (final initiallyIdentified in [false, true]) {
       test('an idle session follows IDENT expiry '
           '(initially identified: $initiallyIdentified)', () {
