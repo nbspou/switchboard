@@ -202,6 +202,15 @@ void main() {
       unawaited(b.sink.close());
     });
 
+    test('maxFrameSize zero means no limit', () async {
+      final (a, b) = MemoryTransport.pair(maxFrameSize: 0);
+      addTearDown(a.sink.close);
+      final received = b.stream.first;
+      a.sink.add(hexBytes('02 02 00 AA'));
+      expect(await received, hexBytes('02 02 00 AA'));
+      expect((b as FrameLimited).maxFrameSize, 0);
+    });
+
     test('addError closes the pair and fails done', () async {
       final (a, b) = MemoryTransport.pair();
       a.sink.addError(StateError('boom'));

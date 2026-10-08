@@ -25,14 +25,14 @@ abstract final class MemoryTransport {
   ///
   /// Frames are copied on [StreamSink.add], so the caller may reuse its
   /// buffer. With [delay], every frame (and the close) is delivered that
-  /// much later, in order. With [maxFrameSize], a frame longer than that
-  /// fails the receiving side's stream with a [SwitchboardException]
+  /// much later, in order. With a positive [maxFrameSize], a frame longer
+  /// than that fails the receiving side's stream with a [SwitchboardException]
   /// carrying [StatusCode.frameTooLarge] and ends it, mimicking what the
   /// stream binding does: the receiving side's sink stays writable until
   /// it is closed, or until its listener has seen the error and the end
   /// of the stream, so a mux layer can still send GOAWAY to the sender.
   /// Frames sent to the failed side are dropped. Both transports then
-  /// implement [FrameLimited].
+  /// implement [FrameLimited]. Null or 0 means no frame size limit.
   ///
   /// Closing one side's sink ends both streams. Errors added to a sink
   /// close the pair and complete that sink's `done` with the error.
@@ -130,7 +130,7 @@ class _MemoryEndpoint
       if (peer._incoming.isClosed) {
         return;
       }
-      if (max != null && copy.length > max) {
+      if (max != null && max > 0 && copy.length > max) {
         _log.warning(
           'memory transport $label: frame of ${copy.length} bytes exceeds '
           '$max',

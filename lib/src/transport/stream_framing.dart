@@ -71,7 +71,7 @@ class StreamFrameDecoder {
   /// Creates a decoder that first expects the peer preamble.
   StreamFrameDecoder({this.maxFrameSize = StreamFraming.defaultMaxFrameSize});
 
-  /// Largest accepted frame body.
+  /// Largest accepted frame body; 0 means no limit.
   final int maxFrameSize;
 
   Uint8List _buf = Uint8List(0);
@@ -128,7 +128,7 @@ class StreamFrameDecoder {
         if (length == 0) {
           throw ProtocolException('zero length frame');
         }
-        if (length > maxFrameSize) {
+        if (maxFrameSize > 0 && length > maxFrameSize) {
           throw SwitchboardException.of(
             StatusCode.frameTooLarge,
             'frame of $length bytes exceeds limit of $maxFrameSize',

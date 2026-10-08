@@ -196,6 +196,8 @@ final class WebSocketServerChannel implements StreamChannel<Uint8List>, FrameLim
 
 `IOWebSocketTransport` is a separate class rather than a static `WebSocketTransport.upgrade` because Dart has no static extension members and `WebSocketTransport` must stay free of `dart:io`. The transport limits (`maxFrameSize` of the stream and WebSocket transports) and `MuxOptions.maxFrameSize` should agree; with the defaults they are all 1 MiB.
 
+An explicit `maxFrameSize: 0` disables the size limit in the stream decoder and memory transport, as it does in the WebSocket transports and the `FrameLimited` capability. Stream frames still require a nonzero length. Omitting the memory transport's nullable limit also leaves it unlimited.
+
 ## Mux
 
 ```dart
