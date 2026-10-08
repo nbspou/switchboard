@@ -629,6 +629,25 @@ void main() {
   });
 
   group('expiry and RENEW', () {
+    test(
+      'renewing another credential does not replace the payload identity',
+      () async {
+        final mesh = await Mesh.start();
+        final client = await node();
+        final bearer = await issue('consumer-2', consumerScopes, bearer: true);
+        final channel = await channelTo(client, mesh, payload: bearer.encode());
+        // This credential can be copied off the wire, but only its holder
+        // may exercise its rights. Sharing an identity is not possession.
+        final privileged = await issue('consumer-2', adminScopes);
+        final response = await channel.request('RENEW', privileged.encode());
+        expect(Credential.decode(response.payload).holderKey, key.publicKey);
+        expect(
+          await call(channel, Procedures.register, registerPayload(workerType)),
+          StatusCode.permissionDenied,
+        );
+      },
+    );
+
     test('RENEW re-issues the channel\'s credential', () async {
       final mesh = await Mesh.start();
       final original = await issue(
