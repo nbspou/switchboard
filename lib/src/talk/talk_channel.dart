@@ -544,6 +544,64 @@ class TalkChannel {
   /// Number of the peer's requests waiting for our final reply.
   int get incomingRequestCount => _incoming.length;
 
+  /// Whether a message sent now would go to the connection at once: the
+  /// channel is open and its raw channel [MuxChannel.isWritable] (room in
+  /// the peer's window for a frame of [MuxChannel.maxSubframeLength], and
+  /// nothing of the channel waiting for credit). Over a slot channel, for
+  /// its current mux channel (false while a replacement is opened); over
+  /// a `StreamChannel` that is not a mux channel, always true while open.
+  ///
+  /// It reflects the receiver's window and the channel's backlog, not the
+  /// connection's output scheduler: a message sent while writable is
+  /// handed to the scheduler at once and written within its tier's turn.
+  /// The future of [send] is the way to follow one message; this is for
+  /// deciding whether to produce the next.
+  bool get isWritable {
+    if (_closing) {
+      return false;
+    }
+    final r = raw;
+    if (r is MuxChannel) {
+      return r.isWritable;
+    }
+    if (r is MuxChannelCarrier) {
+      return (r as MuxChannelCarrier).isWritable;
+    }
+    return true;
+  }
+
+  /// Completes once the channel [isWritable]: at once when it is, else
+  /// when the peer's credit makes room (see [MuxChannel.whenWritable]).
+  /// Fails with [StatusCode.failedPrecondition] when the channel can no
+  /// longer send: at once if it is closing, else when its raw channel
+  /// stops sending. Never reports an unhandled error. Over a
+  /// `StreamChannel` that is not a mux channel it completes at once.
+  ///
+  /// The way to pace what the request API sends, which does not wait for
+  /// the window ([startRequest]), and a publisher that would rather not
+  /// produce a message before it can go: `await talk.whenWritable;` then
+  /// send.
+  Future<void> get whenWritable {
+    if (_closing) {
+      final closed = Completer<void>()..future.ignore();
+      closed.completeError(
+        SwitchboardException.of(
+          StatusCode.failedPrecondition,
+          'channel closed',
+        ),
+      );
+      return closed.future;
+    }
+    final r = raw;
+    if (r is MuxChannel) {
+      return r.whenWritable;
+    }
+    if (r is MuxChannelCarrier) {
+      return (r as MuxChannelCarrier).whenWritable;
+    }
+    return Future<void>.value();
+  }
+
   /// The id the next request will try first. Ids still in use are skipped.
   @visibleForTesting
   int get nextRequestId => _nextRequestId;
@@ -674,7 +732,8 @@ class TalkChannel {
   /// so it may be dropped.
   ///
   /// Throws synchronously like [startRequest]. [name] and [ordered] as for
-  /// [startRequest].
+  /// [startRequest]. Its frame is sent without waiting for the window (see
+  /// [startRequest], "Pacing").
   Future<TalkMessage> request(
     String procedure,
     Uint8List payload, {
@@ -749,6 +808,15 @@ class TalkChannel {
   /// instead (a peer that stops sending it; [TalkRequest.cancel] stops it
   /// too).
   ///
+  /// Pacing: the request's frame is handed to the channel without waiting
+  /// for the peer's window, which the futures of the request API do not
+  /// report (they are for the answer): what the window does not take
+  /// waits in the channel, in order, and a frame the channel can no longer
+  /// send fails the request when the channel ends. To pace a run of
+  /// requests, await [whenWritable] before starting each one (a bulk
+  /// payload's own transfer waits for its bulk channel's window either
+  /// way).
+  ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
   /// reached, with [StatusCode.failedPrecondition] if the channel is
@@ -784,9 +852,9 @@ class TalkChannel {
   }
 
   /// Sends a stream request. Items and the final response arrive through
-  /// the returned [TalkStream]. Takes and throws like [startRequest]; the
-  /// requester timeout is also restarted by every item (and, once the peer
-  /// declared a renewal, renewed by every item).
+  /// the returned [TalkStream]. Takes, throws and paces like
+  /// [startRequest]; the requester timeout is also restarted by every item
+  /// (and, once the peer declared a renewal, renewed by every item).
   TalkStream streamRequest(
     String procedure,
     Uint8List payload, {

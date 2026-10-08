@@ -79,6 +79,14 @@ abstract interface class MuxChannelCarrier {
   /// replacement it waits for, so that a layer forwarding what it reads
   /// can return the credit of what it forwards once it went out.
   Future<void> send(Uint8List subframe);
+
+  /// As [MuxChannel.isWritable], for the current channel; false while a
+  /// replacement is awaited.
+  bool get isWritable;
+
+  /// As [MuxChannel.whenWritable], for the current channel, or the
+  /// replacement it waits for.
+  Future<void> get whenWritable;
 }
 
 /// One channel of a [MuxConnection].
@@ -164,6 +172,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   Status? _pendingClose;
   bool _closeQueued = false;
   bool _admitting = false;
+
+  /// [whenWritable] futures waiting for the window, each made in its
+  /// caller's zone.
+  final List<Completer<void>> _writableWaiters = [];
 
   /// A completed future, returned by [send] for a subframe sent at once.
   /// Made in the caller's zone each time: one shared future would run the
@@ -507,6 +519,85 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     return pending.future;
   }
 
+  /// Whether a subframe as large as [send] takes on this channel
+  /// ([maxSubframeLength]) would go to the connection at once: the channel
+  /// can send ([canSend]), no subframe of it waits for credit, and the
+  /// send window ([sendWindow], which leaves out the credit of what the
+  /// output scheduler holds) has room for that subframe's cost. False
+  /// while the peer's LIMITS is awaited (see [sendWindow]).
+  ///
+  /// Readiness reflects the receiver's window and this channel's own
+  /// backlog, not the connection's output scheduler: a subframe sent while
+  /// writable is handed to the scheduler at once, and written within its
+  /// tier's turn ([priority]) when the transport takes it. The future of
+  /// [send] is the way to follow a subframe; this is for deciding whether
+  /// to produce one: a publisher that sends only while writable never
+  /// queues here, and a slow receiver stalls it at the window.
+  bool get isWritable =>
+      canSend && _pendingSends.isEmpty && _sendWindow >= _writableCost;
+
+  /// The cost of the largest subframe [send] takes on this channel.
+  int get _writableCost {
+    final max = maxSubframeLength;
+    return MuxCredit.costOf(max < 0 ? 0 : max);
+  }
+
+  /// Completes once the channel [isWritable]: at once when it is, else
+  /// when the peer's credit (or LIMITS) makes room for a subframe of
+  /// [maxSubframeLength] and nothing of this channel waits for credit any
+  /// more. Fails with a [SwitchboardException]
+  /// ([StatusCode.failedPrecondition]) when the channel can no longer
+  /// send: at once if [canSend] is false, else when it closes, the peer
+  /// closes it, or the connection ends. Never reports an unhandled error.
+  ///
+  /// As [isWritable], it reflects the receiver's window and this channel's
+  /// backlog, not the output scheduler.
+  Future<void> get whenWritable {
+    if (!canSend) {
+      return _notWritable();
+    }
+    if (isWritable) {
+      return Future<void>.value();
+    }
+    final waiter = Completer<void>()..future.ignore();
+    _writableWaiters.add(waiter);
+    return waiter.future;
+  }
+
+  Future<void> _notWritable() {
+    final waiter = Completer<void>()..future.ignore();
+    waiter.completeError(
+      SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'channel $id is ${_state.name}',
+      ),
+    );
+    return waiter.future;
+  }
+
+  /// Completes the [whenWritable] futures once the channel is writable,
+  /// or fails them once it can no longer send.
+  void _wakeWritable() {
+    if (_writableWaiters.isEmpty || (canSend && !isWritable)) {
+      return;
+    }
+    final waiters = List.of(_writableWaiters);
+    _writableWaiters.clear();
+    final error = canSend
+        ? null
+        : SwitchboardException.of(
+            StatusCode.failedPrecondition,
+            'channel $id is ${_state.name}',
+          );
+    for (final waiter in waiters) {
+      if (error == null) {
+        waiter.complete();
+      } else {
+        waiter.completeError(error);
+      }
+    }
+  }
+
   /// Opens a channel on the same connection, as [MuxConnection.open] does,
   /// whose OPEN keeps its place among the frames of this channel: it goes
   /// out after the subframes handed to [send] before the call (those
@@ -703,6 +794,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       _pendingClose = null;
       _queueClose(close);
     }
+    _wakeWritable();
   }
 
   /// Fails every subframe still waiting for credit; a channel whose OPEN
@@ -747,6 +839,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     final known = _limitsKnownCompleter;
     _limitsKnownCompleter = null;
     known?.complete();
+    _wakeWritable();
   }
 
   /// Applies the peer's CREDIT of [bytes]. Ignored once the channel can
@@ -840,6 +933,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       } else {
         _pendingClose = status;
       }
+      // Nothing more is sent: what waits for room fails.
+      _wakeWritable();
     }
     return _done.future;
   }
@@ -973,6 +1068,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _released = true;
     _held = 0;
     _endRequested = true;
+    _wakeWritable();
     _scheduleDrain();
     if (!_done.isCompleted) {
       _done.complete(_endStatus);

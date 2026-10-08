@@ -310,6 +310,40 @@ void main() {
       expect(resolver.located, isEmpty);
     });
 
+    test('whenWritable waits for the replacement and follows it', () async {
+      a
+        ..mode = Mode.moved
+        ..moved = MovedStatus(owner: 2, epoch: 2);
+      final channel = await router.openChannelToSlot(svc, 1);
+      final first = channel.channel;
+      await first.done;
+      // Rejected with nothing sent: a replacement is on its way.
+      expect(channel.isWritable, isFalse);
+      await channel.whenWritable.timeout(limit);
+      expect(channel.retried, isTrue);
+      expect(channel.channel, isNot(same(first)));
+      expect(channel.isWritable, isTrue);
+      expect(await greeting(channel), 'B 1');
+      await channel.close();
+      expect(channel.isWritable, isFalse);
+      await expectLater(
+        channel.whenWritable,
+        throwsCode(StatusCode.failedPrecondition),
+      );
+    });
+
+    test('whenWritable fails when no replacement comes', () async {
+      a.mode = Mode.moved;
+      resolver.answer = (_) => const SlotEntry.owned(1, epoch: 1);
+      final channel = await router.openChannelToSlot(svc, 1);
+      await channel.channel.done;
+      await expectLater(
+        channel.whenWritable.timeout(limit),
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      expect(await channel.done, hasCode(StatusCode.moved));
+    });
+
     test('the open payload is sent again', () async {
       a
         ..mode = Mode.moved

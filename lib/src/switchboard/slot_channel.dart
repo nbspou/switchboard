@@ -191,6 +191,63 @@ class SlotChannel
     return _current.send(subframe);
   }
 
+  /// As [MuxChannel.isWritable], for the current channel: false while a
+  /// replacement is being opened (subframes sent meanwhile are held, see
+  /// [send]) and once the channel is closing.
+  @override
+  bool get isWritable =>
+      _closeRequested == null && !_holding && _current.isWritable;
+
+  /// As [MuxChannel.whenWritable], for the current channel: while a
+  /// replacement is being opened, or the first channel was rejected with
+  /// nothing sent, it waits for the replacement and completes when that
+  /// one is writable. Fails with [StatusCode.failedPrecondition] once the
+  /// slot channel can no longer send (closed, or ended without a
+  /// replacement). Never reports an unhandled error.
+  @override
+  Future<void> get whenWritable => _whenWritable()..ignore();
+
+  Future<void> _whenWritable() async {
+    while (true) {
+      if (_closeRequested != null || _final) {
+        throw SwitchboardException.of(
+          StatusCode.failedPrecondition,
+          'slot channel is ${_final ? 'closed' : 'closing'}',
+        );
+      }
+      if (_holding) {
+        final settled = Completer<void>();
+        _settled.add(settled);
+        await settled.future;
+        continue;
+      }
+      final channel = _current;
+      try {
+        await channel.whenWritable;
+        return;
+      } on SwitchboardException {
+        // The channel stopped sending: a rejection that is retried waits
+        // for the replacement, any other end fails.
+        if (!identical(channel, _current) || _holding) {
+          continue;
+        }
+        rethrow;
+      }
+    }
+  }
+
+  /// Completed when a replacement took over or the channel ended, for
+  /// [whenWritable] waiting meanwhile (each made in its caller's zone).
+  final List<Completer<void>> _settled = [];
+
+  void _settle() {
+    final settled = List.of(_settled);
+    _settled.clear();
+    for (final waiter in settled) {
+      waiter.complete();
+    }
+  }
+
   /// As [MuxChannel.manualCredit], for the current channel and a
   /// replacement.
   bool get manualCredit => _manualCredit;
@@ -332,6 +389,7 @@ class SlotChannel
 
   void _finish(Status status) {
     _final = true;
+    _settle();
     _dropPending();
     if (!_done.isCompleted) {
       _done.complete(status);
@@ -381,6 +439,7 @@ class SlotChannel
     // Bulk channels the new owner opens go where the first one's would.
     BulkRoutes.follow(_current, next);
     _current = next;
+    _settle();
     _watch(next);
     if (_incoming.hasListener) {
       _subscribe(next);

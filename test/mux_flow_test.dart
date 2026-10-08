@@ -318,6 +318,124 @@ void main() {
     });
   });
 
+  group('readiness', () {
+    test('whenWritable waits while the window has no room for the largest '
+        'subframe, completes on CREDIT, and at once with room', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(limitsHex(100));
+      await settle(raw);
+      final channel = mux.open(empty);
+      expect(await raw.nextHex(), '12 02 00');
+      // The largest subframe is 34 bytes, costing 50.
+      expect(channel.maxSubframeLength, 34);
+      expect(channel.isWritable, isTrue);
+      await channel.whenWritable;
+      await channel.send(Uint8List(34));
+      expect(channel.isWritable, isTrue);
+      await channel.send(Uint8List(10));
+      expect(channel.sendWindow, 24);
+      expect(channel.isWritable, isFalse);
+      var ready = false;
+      final writable = channel.whenWritable.then((_) => ready = true);
+      // Not enough yet.
+      raw.send(creditHex(channel.id, 20));
+      await settle(raw);
+      await pumpEventQueue();
+      expect(ready, isFalse);
+      expect(channel.isWritable, isFalse);
+      raw.send(creditHex(channel.id, 6));
+      await settle(raw);
+      await writable;
+      expect(channel.sendWindow, 50);
+      expect(channel.isWritable, isTrue);
+      await channel.whenWritable;
+    });
+
+    test('a subframe waiting for credit keeps the channel not writable '
+        'until it went', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(limitsHex(100));
+      await settle(raw);
+      final channel = mux.open(empty);
+      await channel.send(Uint8List(34));
+      await channel.send(Uint8List(34));
+      final queued = channel.send(Uint8List(34));
+      var ready = false;
+      final writable = channel.whenWritable.then((_) => ready = true);
+      // Room for the waiting one only: it goes, and nothing is left.
+      raw.send(creditHex(channel.id, 50));
+      await settle(raw);
+      await queued;
+      await pumpEventQueue();
+      expect(ready, isFalse);
+      raw.send(creditHex(channel.id, 50));
+      await settle(raw);
+      await writable;
+      expect(channel.isWritable, isTrue);
+    });
+
+    test('whenWritable fails when the channel stops sending, by either '
+        'side', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(limitsHex(100));
+      await settle(raw);
+      final ours = mux.open(empty);
+      final theirs = mux.open(empty);
+      for (var i = 0; i < 2; i++) {
+        await ours.send(Uint8List(34));
+        await theirs.send(Uint8List(34));
+      }
+      expect(ours.isWritable, isFalse);
+      final oursWaiting = ours.whenWritable;
+      final theirsWaiting = theirs.whenWritable;
+      unawaited(ours.close());
+      await expectLater(
+        oursWaiting,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      raw.send(hexString(MuxFrame.close(theirs.id).encode()));
+      await expectLater(
+        theirsWaiting,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      expect(ours.isWritable, isFalse);
+      expect(theirs.isWritable, isFalse);
+      await expectLater(
+        ours.whenWritable,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      // Never unhandled when nobody waits.
+      ours.whenWritable.ignore();
+      final dropped = mux.open(empty);
+      await dropped.send(Uint8List(34));
+      await dropped.send(Uint8List(34));
+      unawaited(dropped.whenWritable);
+      await mux.close();
+      await pumpEventQueue();
+    });
+
+    test('a channel opened before the peer LIMITS becomes writable when it '
+        'arrives', () async {
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(awaitPeerLimits: true),
+      );
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      expect(channel.isWritable, isFalse);
+      var ready = false;
+      final writable = channel.whenWritable.then((_) => ready = true);
+      await pumpEventQueue();
+      expect(ready, isFalse);
+      raw.send(limitsHex(1000));
+      await writable;
+      expect(channel.isWritable, isTrue);
+      expect(channel.sendWindow, 1000);
+    });
+  });
+
   group('DATA waits for the peer LIMITS', () {
     final waiting = rawOptions.copyWith(awaitPeerLimits: true);
 

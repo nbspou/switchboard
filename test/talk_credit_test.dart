@@ -490,4 +490,72 @@ void main() {
       await talk.close();
     });
   });
+
+  group('readiness', () {
+    test('a publisher gating on whenWritable never queues in the channel, '
+        'and a stalled subscriber stops it', () async {
+      final (talk, serverTalk, raw, serverRaw) = await talkPair(client, server);
+      final received = <TalkMessage>[];
+      final subscription = serverTalk.messages.listen(received.add)..pause();
+      const count = 300;
+      var sent = 0;
+      var waiting = 0;
+      final publisher = () async {
+        for (var i = 0; i < count; i++) {
+          await talk.whenWritable;
+          final handed = talk.send('EVENT', Uint8List(1000));
+          // The window had room: it went at once.
+          var done = false;
+          unawaited(handed.then((_) => done = true));
+          await Future<void>.value();
+          if (!done) {
+            waiting++;
+          }
+          sent++;
+        }
+      }();
+      await settle();
+      // Writable while the window has room for the largest frame (half of
+      // it): the publisher stopped with the window half spent.
+      expect(talk.isWritable, isFalse);
+      expect(waiting, 0);
+      expect(raw.sendWindow, greaterThan(0));
+      expect(raw.sendWindow, lessThan(raw.maxSubframeLength + 16));
+      expect(sent, lessThan(40));
+      expect(serverRaw.heldBytes, lessThan(MuxOptions.defaultInitialWindow));
+      await settle();
+      expect(sent, lessThan(40));
+      subscription.resume();
+      await publisher;
+      await settle();
+      expect(received, hasLength(count));
+      expect(waiting, 0);
+      await subscription.cancel();
+      // A closed channel is not writable.
+      await talk.close();
+      expect(talk.isWritable, isFalse);
+      await expectLater(
+        talk.whenWritable,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+    });
+
+    test('whenWritable over a raw stream channel completes at once', () async {
+      final a = StreamController<Uint8List>();
+      final b = StreamController<Uint8List>();
+      final talk = TalkChannel(StreamChannel(a.stream, b.sink));
+      expect(talk.isWritable, isTrue);
+      await talk.whenWritable;
+      await talk.close();
+      expect(talk.isWritable, isFalse);
+      await expectLater(
+        talk.whenWritable,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      // Nothing listens to either end any more: their done events would
+      // never be delivered.
+      unawaited(a.close());
+      unawaited(b.close());
+    });
+  });
 }
