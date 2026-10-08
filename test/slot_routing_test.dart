@@ -334,6 +334,25 @@ void main() {
       expect(await greeting(channel), 'B 1');
     });
 
+    test(
+      'a newer table pointing back to the rejecting owner wins too',
+      () async {
+        a
+          ..mode = Mode.moved
+          ..moved = MovedStatus(owner: 2, epoch: 2);
+        final channel = await router.openChannelToSlot(svc, 1);
+        resolver.setSlot(svc, 1, const SlotEntry.owned(1, epoch: 3));
+        // The slot has already returned to A. Do not follow its stale MOVED
+        // to B, which no longer owns the slot.
+        b.mode = Mode.moved;
+        b.moved = MovedStatus(owner: 1, epoch: 3);
+        expect(await channel.done.timeout(limit), hasCode(StatusCode.moved));
+        expect(MovedStatus.fromStatus(await channel.done), a.moved);
+        expect(b.opened, isEmpty);
+        expect(resolver.located, isEmpty);
+      },
+    );
+
     test('nowhere else to go: MOVED is surfaced', () async {
       a.mode = Mode.moved;
       resolver.answer = (_) => const SlotEntry.owned(1, epoch: 1);

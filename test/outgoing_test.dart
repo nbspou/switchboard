@@ -641,9 +641,12 @@ void main() {
       final owner1 = node();
       final owner2 = node();
       final seen = <String>[];
+      var movedEpoch = 2;
       owner1.registerService(svc, (incoming) {
         seen.add('1 ${text(incoming.address.payload)}');
-        unawaited(incoming.reject(MovedStatus(owner: 2, epoch: 2).toStatus()));
+        unawaited(
+          incoming.reject(MovedStatus(owner: 2, epoch: movedEpoch).toStatus()),
+        );
       }, instance: 1);
       owner2.registerService(svc, (incoming) {
         seen.add('2 ${text(incoming.address.payload)}');
@@ -672,6 +675,8 @@ void main() {
       // With a payload, both get it.
       seen.clear();
       resolver.setSlot(svc, 1, const SlotEntry.owned(1, epoch: 3));
+      // The next hand-over must be newer than the table's return to 1.
+      movedEpoch = 4;
       final given = await client.openChannelToSlot(
         svc,
         1,
