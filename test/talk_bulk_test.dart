@@ -127,6 +127,17 @@ class Peers {
   }
 }
 
+/// Polls [condition] until it holds, at most 2 s.
+Future<void> until(bool Function() condition) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 2));
+  while (!condition()) {
+    if (DateTime.now().isAfter(deadline)) {
+      fail('condition not met');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+}
+
 /// Collects a stream of byte chunks into one list.
 Future<Uint8List> collect(Stream<List<int>> stream) async {
   final builder = BytesBuilder(copy: false);
@@ -733,6 +744,60 @@ void main() {
       await raw.close();
       expect((await bulks.first.done).known, StatusCode.cancelled);
     });
+
+    test('a bulk channel no message references in time is closed', () async {
+      final peers = await Peers.connect(
+        serverOptions: const TalkOptions(
+          bulkOpenTimeout: Duration(milliseconds: 50),
+        ),
+      );
+      final raw = peers.client.open(Uint8List(0));
+      final server = await peers.accepted.next;
+      server.messages.listen((_) {});
+      final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+      await bulk.send(Uint8List(1000));
+      expect((await bulk.done).known, StatusCode.cancelled);
+      // A late reference to it is a protocol error.
+      await raw.send(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('PUT'),
+          bulk: true,
+          payload: TalkBulkReference(1).encode(),
+        ).encode(),
+      );
+      expect((await raw.done).known, StatusCode.protocolError);
+    });
+
+    test(
+      'bulk payloads nobody reads yet do not pause the connection',
+      () async {
+        // A small receive mark: 20 unread payloads, a window each, are well
+        // beyond it.
+        final peers = await Peers.connect(
+          options: quiet.copyWith(receiveHighWaterMarkBytes: 1024 * 1024),
+          serverOptions: TalkOptions(streamBulk: (_) => true),
+        );
+        final (talk, server) = await peers.open();
+        final (other, otherServer) = await peers.open();
+        otherServer.messages.listen((m) => m.reply(m.payload));
+        final unread = <TalkMessage>[];
+        server.messages.listen(unread.add);
+        for (var i = 0; i < 20; i++) {
+          talk.send('PUT', pattern(200000));
+        }
+        await until(() => unread.length == 20);
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        expect(peers.server.isReceivePaused, isFalse);
+        expect(peers.server.bufferedBytes, lessThan(64 * 1024));
+        final echo = await other
+            .request('ECHO', Uint8List.fromList([5]))
+            .timeout(const Duration(seconds: 2));
+        expect(echo.payload, [5]);
+        // Read one of them whole: what waited is there.
+        expect(await collect(unread.first.bulk), pattern(200000));
+      },
+    );
 
     test('a reference to a bulk number never opened is a channel protocol '
         'error', () async {

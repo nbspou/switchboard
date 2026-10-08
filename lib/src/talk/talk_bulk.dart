@@ -216,6 +216,12 @@ abstract final class BulkRoutes {
   /// which a `_bulk` OPEN is closed `RESOURCE_EXHAUSTED`.
   static const int maxHeld = 16;
 
+  /// How long a bulk channel is held for a parent that no target took
+  /// yet; then it is closed `FAILED_PRECONDITION`. Held channels are not
+  /// read, so what they buffer counts toward the connection's receive
+  /// high-water mark meanwhile.
+  static const Duration heldTimeout = Duration(seconds: 10);
+
   /// Marks [channel] as a bulk channel, which no bulk channel may name as
   /// its parent.
   static void markBulk(MuxChannel channel) => _bulk[channel] = true;
@@ -235,7 +241,8 @@ abstract final class BulkRoutes {
     route.target = target;
     final held = route.held;
     route.held = [];
-    for (final (bulk, number) in held) {
+    for (final (bulk, number, timer) in held) {
+      timer.cancel();
       target(bulk, number);
     }
   }
@@ -299,7 +306,21 @@ abstract final class BulkRoutes {
       );
       return;
     }
-    route.held.add((bulk, open.number));
+    late final Timer timer;
+    timer = Timer(heldTimeout, () {
+      final before = route.held.length;
+      route.held.removeWhere((entry) => identical(entry.$3, timer));
+      if (route.held.length != before) {
+        _refuse(
+          bulk,
+          Status.of(
+            StatusCode.failedPrecondition,
+            'the parent channel took no bulk payloads in time',
+          ),
+        );
+      }
+    });
+    route.held.add((bulk, open.number, timer));
   }
 
   static void _refuse(MuxChannel bulk, Status status) {
@@ -323,7 +344,8 @@ abstract final class BulkRoutes {
         route
           ..held = []
           ..target = null;
-        for (final (bulk, _) in held) {
+        for (final (bulk, _, timer) in held) {
+          timer.cancel();
           unawaited(
             bulk.close(
               Status.of(StatusCode.cancelled, 'parent channel closed'),
@@ -341,5 +363,5 @@ class _Route {
 
   final MuxChannel parent;
   BulkTarget? target;
-  List<(MuxChannel, int)> held = [];
+  List<(MuxChannel, int, Timer)> held = [];
 }

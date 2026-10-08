@@ -73,6 +73,8 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
       target._send(procedure, payload, bulk: bulk);
     } on SwitchboardException catch (e) {
       _log.fine('forwarded ${incoming.frame} dropped: $e');
+      // Its payload, if streamed, will not be read either.
+      incoming._bulk?.abandon();
     }
     return Future<void>.value();
   }

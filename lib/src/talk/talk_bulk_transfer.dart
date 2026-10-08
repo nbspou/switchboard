@@ -96,7 +96,6 @@ class _BulkOut {
   }
 
   _BulkIn? _from;
-  StreamSubscription<Uint8List>? _pipe;
 
   /// Completes once the payload was sent whole and the bulk channel
   /// closed; fails with the status the transfer ended with otherwise.
@@ -141,8 +140,7 @@ class _BulkOut {
             _log.fine('cancelling a bulk source failed', e, st),
       );
     }
-    _pipe?.cancel().ignore();
-    _pipe = null;
+    _from?._detach();
   }
 
   /// The payload went whole ([failure] null) or failed: closes the bulk
@@ -298,24 +296,15 @@ class _BulkOut {
   /// consumed once this channel's send took it.
   void _pipeFrom(_BulkIn from) {
     _from = from;
-    from._read = true;
     from._grant();
     var received = 0;
-    void consumed(int length) {
-      try {
-        from.channel.consumed(length);
-      } on StateError catch (e) {
-        _log.warning('bulk forwarding credit: $e');
-      }
-    }
-
-    _pipe = from.channel.stream.listen(
+    from._attach(
       (data) {
         final length = data.length;
         received += length;
         final declared = from.length;
         if (declared != null && received > declared) {
-          consumed(length);
+          from._consume(length);
           _finish(
             Status.of(
               StatusCode.protocolError,
@@ -325,41 +314,35 @@ class _BulkOut {
           return;
         }
         if (_stopped || !channel.canSend) {
-          consumed(length);
+          from._consume(length);
           return;
         }
         try {
           channel
               .send(data)
               .then(
-                (_) => consumed(length),
-                onError: (Object _) => consumed(length),
+                (_) => from._consume(length),
+                onError: (Object _) => from._consume(length),
               );
         } on SwitchboardException catch (e) {
-          consumed(length);
+          from._consume(length);
           _finish(e.status);
         }
       },
-      onDone: () {
-        from._ended = true;
-        from.talk._bulkIns.remove(from);
-        unawaited(
-          from.channel.done.then((status) {
-            final declared = from.length;
-            if (!status.isOk) {
-              _finish(status);
-            } else if (declared != null && received != declared) {
-              _finish(
-                Status.of(
-                  StatusCode.protocolError,
-                  'bulk payload of $received bytes, $declared declared',
-                ),
-              );
-            } else {
-              _finish(null);
-            }
-          }),
-        );
+      (status) {
+        final declared = from.length;
+        if (!status.isOk) {
+          _finish(status);
+        } else if (declared != null && received != declared) {
+          _finish(
+            Status.of(
+              StatusCode.protocolError,
+              'bulk payload of $received bytes, $declared declared',
+            ),
+          );
+        } else {
+          _finish(null);
+        }
       },
     );
   }
@@ -368,13 +351,22 @@ class _BulkOut {
 /// One bulk payload the peer sends this side: the bulk channel it arrived
 /// on, adopted for a parent channel and claimed by the message that
 /// references it.
+///
+/// Read from adoption on, in manual credit: what arrives before a reader
+/// takes it waits here, bounded by the bulk channel's window and, like
+/// everything Talk holds, left out of the connection's receive high-water
+/// mark, so that payloads nobody reads yet cannot pause the connection.
 class _BulkIn {
-  _BulkIn(this.talk, this.channel, this.number);
+  _BulkIn(this.talk, this.channel, this.number) {
+    // Never paused nor cancelled: it ends with the bulk channel, and what
+    // arrives for nobody is dropped (and consumed) here.
+    channel.stream.listen(_onChunk, onDone: _onEnd);
+  }
 
   final TalkChannel talk;
 
-  /// The bulk channel; in manual credit, its subframes consumed as the
-  /// reader takes them.
+  /// The bulk channel, in manual credit: its subframes are consumed as
+  /// the reader takes them.
   final MuxChannel channel;
 
   /// The bulk number of its OPEN.
@@ -383,16 +375,95 @@ class _BulkIn {
   /// The declared length, once claimed; null when unknown.
   int? length;
 
-  /// Whether something reads it: the application's stream, the
-  /// reassembly, or a forwarding pipe.
+  /// What arrived before a reader was attached.
+  final Queue<Uint8List> _buffer = Queue<Uint8List>();
+
+  /// The attached reader, if any.
+  void Function(Uint8List data)? _onData;
+  void Function(Status status)? _onDone;
+
+  /// Whether something reads it (the application's stream, the
+  /// reassembly, a forwarding pipe), or it was abandoned.
   bool _read = false;
+
+  /// Abandoned, or its reader gone: what arrives is dropped.
+  bool _dropping = false;
+
+  /// The bulk channel's end status, once known.
+  Status? _endStatus;
+
+  /// Bounds the wait of an unclaimed bulk channel for its message.
+  Timer? unclaimedTimer;
 
   /// Called each time the reader took a chunk: the transfer progresses.
   void Function()? onProgress;
 
-  /// Whether its bytes have all been delivered (the channel's stream
-  /// ended).
-  bool _ended = false;
+  void _onChunk(Uint8List data) {
+    if (_dropping) {
+      _consume(data.length);
+      return;
+    }
+    final onData = _onData;
+    if (onData == null) {
+      _buffer.add(data);
+      return;
+    }
+    onData(data);
+  }
+
+  void _onEnd() {
+    talk._bulkIns.remove(this);
+    unawaited(
+      channel.done.then((status) {
+        _endStatus = status;
+        if (!_dropping) {
+          _onDone?.call(status);
+        }
+      }),
+    );
+  }
+
+  /// Attaches the reader: [onData] gets what arrived so far and every
+  /// later chunk, [onDone] the bulk channel's end status after the last.
+  void _attach(
+    void Function(Uint8List data) onData,
+    void Function(Status status) onDone,
+  ) {
+    _read = true;
+    _onData = onData;
+    _onDone = onDone;
+    while (_buffer.isNotEmpty && identical(_onData, onData)) {
+      onData(_buffer.removeFirst());
+    }
+    final status = _endStatus;
+    if (status != null && identical(_onDone, onDone) && !_dropping) {
+      onDone(status);
+    }
+  }
+
+  /// The reader went away: what arrives from now on is dropped.
+  void _detach() {
+    _dropping = true;
+    _onData = null;
+    _onDone = null;
+    _dropBuffer();
+  }
+
+  void _dropBuffer() {
+    var bytes = 0;
+    final frames = _buffer.length;
+    for (final chunk in _buffer) {
+      bytes += chunk.length;
+    }
+    _buffer.clear();
+    if (frames > 0) {
+      try {
+        channel.consumed(bytes, subframes: frames);
+      } on StateError catch (e) {
+        _log.warning('bulk credit accounting: $e');
+      }
+    }
+  }
 
   /// Closes the bulk channel with [status] if it is still open: the
   /// receiver does not want the rest, or the message or channel it belongs
@@ -404,16 +475,17 @@ class _BulkIn {
   }
 
   /// Nobody will read it: closes it `CANCELLED` if it is still in transfer
-  /// and drops what it buffered.
+  /// and drops what it holds.
   void abandon() {
+    unclaimedTimer?.cancel();
+    unclaimedTimer = null;
     if (_read) {
       return;
     }
     _read = true;
     talk._bulkIns.remove(this);
     close(Status.of(StatusCode.cancelled, 'bulk payload not read'));
-    // Dropping a stream's buffer takes a listener that cancels.
-    channel.stream.listen(null).cancel().ignore();
+    _detach();
   }
 
   /// Raises the window to the declared length, up to
@@ -446,24 +518,24 @@ class _BulkIn {
       throw StateError('the bulk payload is read already');
     }
     _read = true;
-    StreamSubscription<Uint8List>? subscription;
     var received = 0;
+    var finished = false;
     late final StreamController<Uint8List> controller;
     void fail(Status status) {
+      finished = true;
       close(status);
+      _detach();
       if (!controller.isClosed) {
         controller
           ..addError(SwitchboardException(status))
           ..close().ignore();
       }
-      subscription?.cancel().ignore();
-      subscription = null;
     }
 
     controller = StreamController<Uint8List>(
       onListen: () {
         _grant();
-        subscription = channel.stream.listen(
+        _attach(
           (data) {
             if (controller.isClosed) {
               _consume(data.length);
@@ -483,40 +555,31 @@ class _BulkIn {
             }
             controller.add(data);
           },
-          onDone: () {
-            _ended = true;
-            talk._bulkIns.remove(this);
-            unawaited(
-              channel.done.then((status) {
-                if (controller.isClosed) {
-                  return;
-                }
-                final declared = length;
-                if (!status.isOk) {
-                  controller.addError(SwitchboardException(status));
-                } else if (declared != null && received != declared) {
-                  controller.addError(
-                    SwitchboardException.of(
-                      StatusCode.protocolError,
-                      'bulk payload of $received bytes, $declared declared',
-                    ),
-                  );
-                }
-                controller.close().ignore();
-              }),
-            );
+          (status) {
+            finished = true;
+            if (controller.isClosed) {
+              return;
+            }
+            final declared = length;
+            if (!status.isOk) {
+              controller.addError(SwitchboardException(status));
+            } else if (declared != null && received != declared) {
+              controller.addError(
+                SwitchboardException.of(
+                  StatusCode.protocolError,
+                  'bulk payload of $received bytes, $declared declared',
+                ),
+              );
+            }
+            controller.close().ignore();
           },
         );
       },
       onCancel: () {
-        if (!_ended) {
+        if (!finished) {
           close(Status.of(StatusCode.cancelled, 'bulk payload not wanted'));
+          _detach();
         }
-        // Not returned: the cancel of an ended mux stream is a future of
-        // the root zone, which would deliver this stream's end outside the
-        // listener's zone (and outside fake_async's control).
-        subscription?.cancel().ignore();
-        subscription = null;
       },
     );
     return _BulkStream(controller.stream, this);
@@ -549,13 +612,14 @@ class _BulkIn {
     final completer = Completer<Uint8List>()..future.ignore();
     final declared = length;
     if (declared != null && declared > max) {
-      _read = true;
       final status = Status.of(
         StatusCode.resourceExhausted,
         'bulk payload of $declared bytes, more than $max',
       );
+      _read = true;
+      talk._bulkIns.remove(this);
       close(status);
-      channel.stream.listen(null).cancel().ignore();
+      _detach();
       completer.completeError(SwitchboardException(status));
       return completer.future;
     }

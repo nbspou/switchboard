@@ -1094,6 +1094,7 @@ class TalkChannel {
     if (_messagesCancelled) {
       _log.fine('no message listener, dropping ${message.frame}');
       _creditMessage(message);
+      message._bulk?.abandon();
       message._abortQuietly(
         Status.of(StatusCode.unimplemented, 'no message listener'),
       );
@@ -1285,6 +1286,17 @@ class TalkChannel {
       return;
     }
     _bulkUnclaimed[number] = b;
+    // A bulk channel no message references in time is not waited for.
+    b.unclaimedTimer = Timer(options.bulkOpenTimeout, () {
+      b.unclaimedTimer = null;
+      if (identical(_bulkUnclaimed[number], b)) {
+        _bulkUnclaimed.remove(number);
+        _log.fine('bulk channel $number not referenced in time');
+        b
+          ..close(Status.of(StatusCode.cancelled, 'not referenced in time'))
+          ..abandon();
+      }
+    });
   }
 
   /// Claims the bulk channel [message] references, if it is a bulk
@@ -1364,6 +1376,8 @@ class TalkChannel {
   /// [b] carries the payload of [message]: delivered as a stream, or
   /// reassembled first (see [TalkOptions.streamBulk]).
   void _attachBulk(_Message message, _BulkIn b) {
+    b.unclaimedTimer?.cancel();
+    b.unclaimedTimer = null;
     message._bulk = b;
     b
       ..length = message._bulkRef!.length
@@ -1468,6 +1482,7 @@ class TalkChannel {
     }
     pending.finalReceived = true;
     final message = _Message(this, frame).._creditBytes = wire;
+    pending.finalMessage = message;
     if (frame.hasRequest) {
       _register(message);
     }
@@ -1952,10 +1967,13 @@ class _Outgoing {
   /// Bulk payloads of the request itself, being sent.
   final List<_BulkOut> bulkOuts = [];
 
-  /// The final response or abort arrived; it may wait in [lane] for a bulk
-  /// payload, and the request stays in the channel's table until it is
-  /// delivered.
+  /// The final response or abort arrived; it may wait in [lane] (or, for
+  /// an ordered request, in the lane of `messages`) for a bulk payload, and
+  /// the request stays in the channel's table until it is delivered.
   bool finalReceived = false;
+
+  /// The final response, once it arrived.
+  _Message? finalMessage;
   final Completer<TalkMessage> completer = Completer<TalkMessage>();
   Timer? timer;
 
@@ -2081,6 +2099,14 @@ class _Outgoing {
     }
     _failed = true;
     lane.drop();
+    // A final waiting in the lane of `messages` (an ordered request): its
+    // payload is not wanted any more; it is dropped when its turn comes.
+    final last = finalMessage;
+    if (last != null && last._bulk != null) {
+      last._bulk!
+        ..close(Status.of(StatusCode.cancelled, 'request ended'))
+        ..abandon();
+    }
     if (error is! TalkAbortException || error.isChannelAbort) {
       // A local failure: the payload of the request is not wanted any
       // more. After the peer's abort response, its receiver decides.
