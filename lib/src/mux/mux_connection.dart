@@ -1120,8 +1120,13 @@ class MuxConnection {
     }
     if (!link.openWritten) {
       // The channel's own OPEN waits behind its parent's frames.
+      // send has handed the payload over: the caller may reuse it now.
       (link.preOpen = link.preOpen.isEmpty ? [] : link.preOpen).add((
-        frame,
+        MuxFrame(
+          frame.command,
+          frame.channelId,
+          Uint8List.fromList(frame.payload),
+        ),
         opens,
       ));
       return;

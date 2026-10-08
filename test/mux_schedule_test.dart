@@ -520,6 +520,27 @@ void main() {
       ]);
     });
 
+    for (final priority in MuxPriority.values) {
+      test(
+        'a ${priority.name} send before OPEN copies the caller buffer',
+        () async {
+          final (a, b, gate) = gatedPair();
+          addTearDown(a.close);
+          await a.ping();
+          final parent = a.open(empty);
+          await parent.send(Uint8List(1));
+          final child = parent.openAfter(empty)..priority = priority;
+          final payload = Uint8List.fromList([1, 2, 3]);
+          await child.send(payload);
+          payload.fillRange(0, payload.length, 9);
+          gate.allow(10);
+          await pumpEventQueue();
+          expect(gate.on(child.id).where(isData).single.payload, [1, 2, 3]);
+          expect(b.isOpen, isTrue);
+        },
+      );
+    }
+
     test('a parent closed before the OPEN went out ends the new channel '
         'unopened, its id free', () async {
       final (mux, raw) = rawPair();

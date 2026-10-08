@@ -1055,7 +1055,8 @@ class MuxChannelLink {
 
   /// Frames of this channel handed to the connection before its OPEN was
   /// written, in order, each with the channel it opens if it is an OPEN
-  /// ordered behind this channel's frames.
+  /// ordered behind this channel's frames. Payloads are owned copies,
+  /// since handing them over completes their send futures.
   List<(MuxFrame, MuxChannelLink?)> preOpen = const [];
 
   /// Ends a channel whose OPEN never went out, with [status].
