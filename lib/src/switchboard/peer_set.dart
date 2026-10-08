@@ -278,7 +278,8 @@ class PeerSet {
   /// backoff schedule of each peer, as for `ReconnectingClient`.
   /// [connectTimeout] bounds each connection attempt (dialling the
   /// endpoints one after the other) and each step of the set-up (each
-  /// hook, the PING round trip); [Duration.zero] waits for ever.
+  /// hook, credential selection, the PING round trip); [Duration.zero]
+  /// waits for ever.
   /// [removalHoldDown] is how long a peer whose record left the resolver
   /// is kept ([PeerState.held]) before it is removed; [Duration.zero]
   /// removes it at once. [policy] is the policy of the set's connections,
@@ -1477,20 +1478,18 @@ class Peer {
     final template = _set.channel!;
     var payload = template.payload;
     if (payload.isEmpty) {
-      try {
+      final failure = await _bounded('credential', () async {
         payload = await _set.switchboard.payloadFor(
           connection,
           record: _record,
         );
-      } on Object catch (e, st) {
-        _log.warning('$this: no payload for the channel', e, st);
-        _failConnection(
-          connection,
-          Status.of(StatusCode.internal, 'credential failed'),
-        );
+        return null;
+      });
+      if (!identical(_connection, connection) || _channel != null) {
         return false;
       }
-      if (!identical(_connection, connection) || _channel != null) {
+      if (failure != null) {
+        _failConnection(connection, failure);
         return false;
       }
     }

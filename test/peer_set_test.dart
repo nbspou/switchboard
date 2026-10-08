@@ -964,6 +964,47 @@ void main() {
   });
 
   group('timing (fake_async)', () {
+    test('a hanging credential fails setup within connectTimeout', () {
+      fakeAsync((async) {
+        final resolver = StaticResolver();
+        final credential = Completer<Uint8List?>();
+        final consumer = Switchboard(
+          muxOptions: fast,
+          credentialFor: (_, _) => credential.future,
+        );
+        final w = Worker(1);
+        unawaited(w.start());
+        async.flushMicrotasks();
+        resolver.add(w.record());
+        final set = PeerSet.watch(
+          consumer,
+          gpu,
+          resolver: resolver,
+          channel: ChannelAddress(type: gpu),
+          connectTimeout: ms(300),
+          initialBackoff: ms(500),
+          jitter: 0,
+        );
+        async.elapse(ms(299));
+        final peer = set.peers[1]!;
+        expect(peer.state, PeerState.connecting);
+        async.elapse(ms(2));
+        expect(peer.state, PeerState.offline);
+        expect(peer.lastStatus, hasCode(StatusCode.internal));
+        expect(peer.connection, isNull);
+        // A credential delivered after its bound cannot open a channel.
+        credential.complete(bytes('late'));
+        async.flushMicrotasks();
+        expect(w.raw, isEmpty);
+        unawaited(set.close());
+        unawaited(w.stop());
+        unawaited(consumer.close());
+        unawaited(resolver.close());
+        async.elapse(const Duration(seconds: 1));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     for (final hook in ['onConnect', 'onOpen']) {
       test('$hook closing the set leaves no hook timeout behind', () {
         fakeAsync((async) {
