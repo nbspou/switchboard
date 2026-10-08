@@ -396,6 +396,13 @@ class NamingService {
   /// Number of channels currently served.
   int get channelCount => _sessions.length;
 
+  /// Number of requests kept while they wait for something slow: an
+  /// `ASSIGN` or a migration in progress, the assignment hold, a brokered
+  /// `CONNECT`. A request its requester cancels while it waits for an
+  /// operation in progress is forgotten at once.
+  @visibleForTesting
+  int get waitingRequestCount => _slots.waitingCount;
+
   /// True while `REGISTER` requests for any id are held; see
   /// [assignmentHold].
   bool get isHoldingAssignments => _holdTimer != null;
