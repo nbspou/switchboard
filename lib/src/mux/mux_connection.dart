@@ -51,6 +51,7 @@ class MuxOptions {
     this.identityVerifier,
     this.identityTimeout = const Duration(seconds: 10),
     this.requireNamedIdent = false,
+    this.initialWindow = defaultInitialWindow,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -70,6 +71,10 @@ class MuxOptions {
 
   /// Default [maxOpenPayloadBytes]: 16 MiB.
   static const int defaultMaxOpenPayloadBytes = 16 * 1024 * 1024;
+
+  /// Default [initialWindow]: 64 KiB, the window a peer assumes before our
+  /// LIMITS arrives ([MuxLimits.defaultInitialWindow]).
+  static const int defaultInitialWindow = MuxLimits.defaultInitialWindow;
 
   /// Largest incoming mux frame, header included, that we accept; a larger
   /// one ends the connection with GOAWAY `FRAME_TOO_LARGE`. Announced with
@@ -191,6 +196,15 @@ class MuxOptions {
   /// node's identification can be relayed to it.
   final bool requireNamedIdent;
 
+  /// The flow-control window, in bytes of cost (a subframe's length plus
+  /// 16), this side announces in LIMITS and grants every channel in the
+  /// peer's direction: what the peer may send on a channel before this side
+  /// returns credit. 1 to `2^32 - 1`; default 64 KiB.
+  ///
+  /// Only announced with [announceLimits]; without LIMITS the peer assumes
+  /// 64 KiB, which is then what this side grants too.
+  final int initialWindow;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -210,6 +224,7 @@ class MuxOptions {
     CredentialVerifier? identityVerifier,
     Duration? identityTimeout,
     bool? requireNamedIdent,
+    int? initialWindow,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -229,6 +244,7 @@ class MuxOptions {
     identityVerifier: identityVerifier ?? this.identityVerifier,
     identityTimeout: identityTimeout ?? this.identityTimeout,
     requireNamedIdent: requireNamedIdent ?? this.requireNamedIdent,
+    initialWindow: initialWindow ?? this.initialWindow,
   );
 }
 
@@ -244,7 +260,8 @@ class MuxConnection {
   /// Sends LIMITS at once if [MuxOptions.announceLimits] is set. If the
   /// transport implements [FrameLimited] with a limit below
   /// [MuxOptions.maxFrameSize], logs a warning and announces the
-  /// transport's limit.
+  /// transport's limit. Throws [ArgumentError] if
+  /// [MuxOptions.initialWindow] is not 1 to `2^32 - 1`.
   MuxConnection(
     StreamChannel<Uint8List> transport, {
     required this.isInitiator,
@@ -252,6 +269,14 @@ class MuxConnection {
   }) : _transport = transport,
        _firstId = isInitiator ? 2 : 3,
        _firstLongId = MuxFrame.maxShortId + (isInitiator ? 1 : 2) {
+    if (options.initialWindow < 1 ||
+        options.initialWindow > MuxLimits.maxWindow) {
+      throw ArgumentError.value(
+        options.initialWindow,
+        'options.initialWindow',
+        'must be 1 to ${MuxLimits.maxWindow}',
+      );
+    }
     _nextShortId = _firstId;
     _nextLongId = _firstLongId;
     var shortIds = (MuxFrame.maxShortId - _firstId) ~/ 2 + 1;
@@ -294,6 +319,7 @@ class MuxConnection {
           MuxLimits(
             maxFrameSize: _clampU32(receiveLimit),
             maxChannels: _clampU32(options.maxChannels),
+            initialWindow: options.initialWindow,
           ),
         ).toFrame(),
       );
@@ -1107,9 +1133,16 @@ class MuxConnection {
         _onPeerNonce(message.payload);
       case MuxControlType.ident:
         _onIdent(message.payload);
+      case MuxControlType.credit:
+        _onCredit(MuxCredit.decode(message.payload));
       case null:
         _log.fine('$this: ignoring control type ${message.type}');
     }
+  }
+
+  /// Flow-control credit from the peer.
+  void _onCredit(MuxCredit credit) {
+    _log.finest('$this: credit $credit');
   }
 
   // Identity ------------------------------------------------------------

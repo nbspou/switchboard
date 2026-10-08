@@ -96,11 +96,20 @@ void main() {
       '02 00 00 03 21 00',
     );
     vector(
-      'Control LIMITS, 1024 bytes, 4 channels',
+      'Control LIMITS, 1024 bytes, 4 channels, 64 KiB window',
       MuxControlMessage.limits(
-        const MuxLimits(maxFrameSize: 1024, maxChannels: 4),
+        const MuxLimits(
+          maxFrameSize: 1024,
+          maxChannels: 4,
+          initialWindow: 65536,
+        ),
       ).toFrame(),
-      '02 00 00 04 00 04 00 00 04 00 00 00',
+      '02 00 00 04 00 04 00 00 04 00 00 00 00 00 01 00',
+    );
+    vector(
+      'Control CREDIT, channel 2, 32768 bytes',
+      MuxControlMessage.credit(const MuxCredit(2, 32768)).toFrame(),
+      '02 00 00 07 02 00 00 00 00 00 00 80 00 00',
     );
 
     test('CLOSE payloads decode to their status', () {
@@ -131,19 +140,67 @@ void main() {
       final goAway = control('02 00 00 03 21 00');
       expect(goAway.knownType, MuxControlType.goAway);
       expect(goAway.goAwayStatus, Status.of(StatusCode.goingAway));
-      final limits = control('02 00 00 04 00 04 00 00 04 00 00 00');
+      final limits = control('02 00 00 04 00 04 00 00 04 00 00 00 00 00 01 00');
       expect(limits.knownType, MuxControlType.limits);
       expect(
         MuxLimits.decode(limits.payload),
-        const MuxLimits(maxFrameSize: 1024, maxChannels: 4),
+        const MuxLimits(
+          maxFrameSize: 1024,
+          maxChannels: 4,
+          initialWindow: 65536,
+        ),
       );
+      final credit = control('02 00 00 07 02 00 00 00 00 00 00 80 00 00');
+      expect(credit.knownType, MuxControlType.credit);
+      expect(MuxCredit.decode(credit.payload), const MuxCredit(2, 32768));
     });
 
     test('LIMITS ignores trailing fields', () {
       expect(
-        MuxLimits.decode(hexBytes('00 04 00 00 04 00 00 00 99 99')),
-        const MuxLimits(maxFrameSize: 1024, maxChannels: 4),
+        MuxLimits.decode(hexBytes('00 04 00 00 04 00 00 00 00 00 01 00 99 99')),
+        const MuxLimits(
+          maxFrameSize: 1024,
+          maxChannels: 4,
+          initialWindow: 65536,
+        ),
       );
+    });
+
+    test('LIMITS and CREDIT carry full u32 and u48 values', () {
+      // Bitwise operations are 32-bit when compiled to JavaScript.
+      const limits = MuxLimits(
+        maxFrameSize: 0xFFFFFFFF,
+        maxChannels: 0x80000000,
+        initialWindow: 0xFFFFFFFF,
+      );
+      expect(hexString(limits.encode()), 'FF FF FF FF 00 00 00 80 FF FF FF FF');
+      expect(MuxLimits.decode(limits.encode()), limits);
+      const credit = MuxCredit(0xFFFFFFFFFFFE, 0xFFFFFFFF);
+      expect(hexString(credit.encode()), 'FE FF FF FF FF FF FF FF FF FF');
+      expect(MuxCredit.decode(credit.encode()), credit);
+      const high = MuxCredit(0x100000002, 0x80000000);
+      expect(MuxCredit.decode(high.encode()).channelId, 0x100000002);
+      expect(MuxCredit.decode(high.encode()).bytes, 0x80000000);
+    });
+
+    test('LIMITS and CREDIT refuse values that do not fit', () {
+      for (final limits in const [
+        MuxLimits(maxFrameSize: 0, maxChannels: 0, initialWindow: 0),
+        MuxLimits(maxFrameSize: 0, maxChannels: 0, initialWindow: 0x100000000),
+        MuxLimits(maxFrameSize: -1, maxChannels: 0),
+      ]) {
+        expect(limits.encode, throwsArgumentError, reason: '$limits');
+      }
+      for (final credit in const [
+        MuxCredit(-1, 0),
+        MuxCredit(0x1000000000000, 0),
+        MuxCredit(2, -1),
+        MuxCredit(2, 0x100000000),
+      ]) {
+        expect(credit.encode, throwsArgumentError, reason: '$credit');
+      }
+      expect(MuxCredit.costOf(0), 16);
+      expect(MuxCredit.costOf(100), 116);
     });
 
     test('unknown control types decode', () {
@@ -260,6 +317,35 @@ void main() {
         throwsA(isA<ProtocolException>()),
       );
     });
+
+    // Control payloads that are protocol errors (after the type byte).
+    for (final (name, hex, decode)
+        in <(String, String, Object Function(Uint8List))>[
+          (
+            'LIMITS shorter than 12 bytes',
+            '00 04 00 00 04 00 00 00',
+            MuxLimits.decode,
+          ),
+          (
+            'LIMITS with a zero window',
+            '00 04 00 00 04 00 00 00 00 00 00 00',
+            MuxLimits.decode,
+          ),
+          (
+            'CREDIT that is not 10 bytes',
+            '02 00 00 00 00 00 00 80',
+            MuxCredit.decode,
+          ),
+          (
+            'CREDIT of 11 bytes',
+            '02 00 00 00 00 00 00 80 00 00 00',
+            MuxCredit.decode,
+          ),
+        ]) {
+      test(name, () {
+        expect(() => decode(hexBytes(hex)), throwsA(isA<ProtocolException>()));
+      });
+    }
   });
 
   group('mux negative vectors, connection', () {
@@ -286,6 +372,56 @@ void main() {
         expect(mux.isOpen, isFalse);
       });
     }
+
+    for (final (name, hex) in const [
+      ('LIMITS shorter than 12 bytes', '02 00 00 04 00 04 00 00 04 00 00 00'),
+      (
+        'LIMITS with a zero window',
+        '02 00 00 04 00 04 00 00 04 00 00 00 00 00 00 00',
+      ),
+      ('CREDIT that is not 10 bytes', '02 00 00 07 02 00 00 00 00 00 00 80'),
+    ]) {
+      test('$name: GOAWAY PROTOCOL_ERROR and close', () async {
+        final (local, remote) = MemoryTransport.pair();
+        final mux = MuxConnection(
+          local,
+          isInitiator: true,
+          options: const MuxOptions(
+            keepAliveInterval: null,
+            announceLimits: false,
+          ),
+        );
+        final queue = StreamQueue(remote.stream);
+        remote.sink.add(hexBytes(hex));
+        final frame = MuxFrame.decode(await queue.next);
+        final control = MuxControlMessage.decode(frame.payload);
+        expect(control.knownType, MuxControlType.goAway);
+        expect(control.goAwayStatus.known, StatusCode.protocolError);
+        expect(await queue.hasNext, isFalse);
+        expect((await mux.done).known, StatusCode.protocolError);
+      });
+    }
+
+    test('CREDIT for a channel that is not open is ignored', () async {
+      final (local, remote) = MemoryTransport.pair();
+      final mux = MuxConnection(
+        local,
+        isInitiator: true,
+        options: const MuxOptions(
+          keepAliveInterval: null,
+          announceLimits: false,
+        ),
+      );
+      final queue = StreamQueue(remote.stream);
+      remote.sink
+        ..add(hexBytes('02 00 00 07 02 00 00 00 00 00 00 80 00 00'))
+        ..add(hexBytes('02 00 00 07 FE FF FF FF FF FF FF FF FF FF'))
+        ..add(hexBytes('02 00 00 01 AA'));
+      expect(hexString(await queue.next), '02 00 00 02 AA');
+      expect(mux.isOpen, isTrue);
+      await mux.close();
+      await queue.cancel();
+    });
 
     test('a long id above 32 bits addresses its own channel', () async {
       final (local, remote) = MemoryTransport.pair();

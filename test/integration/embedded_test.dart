@@ -83,8 +83,8 @@ void main() {
     }
     expect(await read(8), preamble);
     var frame = await readFrame();
-    // LIMITS on the control channel: 02 00 00 | 04 | u32 | u32.
-    expect(frame, startsWith('0C 00 00 00 02 00 00 04'));
+    // LIMITS on the control channel: 02 00 00 | 04 | u32 | u32 | u32.
+    expect(frame, startsWith('10 00 00 00 02 00 00 04'));
     frame = await readFrame();
     expect(frame, reply);
     await socket.close();

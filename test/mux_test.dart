@@ -383,7 +383,10 @@ void main() {
           maxChannels: 7,
         ),
       );
-      expect(await raw.nextHex(), '02 00 00 04 00 10 00 00 07 00 00 00');
+      expect(
+        await raw.nextHex(),
+        '02 00 00 04 00 10 00 00 07 00 00 00 00 00 01 00',
+      );
       await mux.close();
     });
 

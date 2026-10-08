@@ -226,7 +226,10 @@ enum MuxControlType {
 
   /// The sender's credential and proof of possession; payload is
   /// [MuxIdent].
-  ident(6);
+  ident(6),
+
+  /// Flow-control credit for one channel; payload is [MuxCredit].
+  credit(7);
 
   const MuxControlType(this.code);
 
@@ -298,6 +301,11 @@ class MuxControlMessage {
   /// IDENT carrying [ident]. Throws [ArgumentError] like [MuxIdent.encode].
   MuxControlMessage.ident(MuxIdent ident)
     : this(MuxControlType.ident.code, ident.encode());
+
+  /// CREDIT carrying [credit]. Throws [ArgumentError] like
+  /// [MuxCredit.encode].
+  MuxControlMessage.credit(MuxCredit credit)
+    : this(MuxControlType.credit.code, credit.encode());
 
   /// Largest PING payload a sender may use.
   static const int maxPingPayload = 125;
@@ -609,12 +617,28 @@ class MuxIdent {
       'proof of ${proof.length} bytes)';
 }
 
-/// Advisory limits announced with the LIMITS control message.
+/// What a peer announces with the LIMITS control message: the largest frame
+/// and the number of channels it accepts (advisory, 0 meaning "no stated
+/// limit"), and the initial flow-control window of the channels opened
+/// after the message is received.
 ///
-/// A value of 0 means "no stated limit".
+/// See the wiki page "Polyverse Switchboard Mux", sections "Control channel"
+/// and "Flow control".
 class MuxLimits {
-  /// Creates limits.
-  const MuxLimits({required this.maxFrameSize, required this.maxChannels});
+  /// Creates limits. [initialWindow] defaults to [defaultInitialWindow],
+  /// the window a sender assumes before any LIMITS arrives.
+  const MuxLimits({
+    required this.maxFrameSize,
+    required this.maxChannels,
+    this.initialWindow = defaultInitialWindow,
+  });
+
+  /// The initial window of every channel until the peer's LIMITS has been
+  /// received: 64 KiB.
+  static const int defaultInitialWindow = 64 * 1024;
+
+  /// Largest window: a window above `2^32 - 1` is a protocol error.
+  static const int maxWindow = 0xFFFFFFFF;
 
   /// Largest mux frame, header included, the sender accepts.
   final int maxFrameSize;
@@ -622,52 +646,148 @@ class MuxLimits {
   /// Largest number of simultaneously open channels the sender accepts.
   final int maxChannels;
 
-  /// Encoded size of the fields this implementation understands.
-  static const int encodedLength = 8;
+  /// The flow-control window, in bytes of cost (see [MuxCredit.costOf]),
+  /// that the sender of the LIMITS grants every channel opened after the
+  /// message was received, in each channel's direction towards it. Never 0.
+  final int initialWindow;
 
-  /// Encodes as `u32 maxFrameSize`, `u32 maxChannels`.
+  /// Encoded size of the fields this implementation understands, and the
+  /// smallest LIMITS payload it accepts.
+  static const int encodedLength = 12;
+
+  /// Encodes as `u32 maxFrameSize`, `u32 maxChannels`, `u32 initialWindow`.
   ///
-  /// Throws [ArgumentError] if a value does not fit in a `u32`.
+  /// Throws [ArgumentError] if a value does not fit in a `u32`, or if
+  /// [initialWindow] is 0.
   Uint8List encode() {
     for (final (name, value) in [
       ('maxFrameSize', maxFrameSize),
       ('maxChannels', maxChannels),
+      ('initialWindow', initialWindow),
     ]) {
       if (value < 0 || value > 0xFFFFFFFF) {
         throw ArgumentError.value(value, name, 'must fit in u32');
       }
     }
+    if (initialWindow == 0) {
+      throw ArgumentError.value(
+        initialWindow,
+        'initialWindow',
+        'must not be 0',
+      );
+    }
     return (ByteWriter(encodedLength)
           ..u32(maxFrameSize)
-          ..u32(maxChannels))
+          ..u32(maxChannels)
+          ..u32(initialWindow))
         .toBytes();
   }
 
-  /// Decodes a LIMITS payload. Fields beyond the first two are ignored.
+  /// Decodes a LIMITS payload. Fields beyond the first three are ignored.
   ///
-  /// Throws [ProtocolException] if the payload is shorter than 8 bytes.
+  /// Throws [ProtocolException] if the payload is shorter than
+  /// [encodedLength] bytes or the initial window is 0.
   static MuxLimits decode(Uint8List bytes) {
-    final reader = ByteReader(bytes);
-    try {
-      return MuxLimits(
-        maxFrameSize: reader.u32('max frame size'),
-        maxChannels: reader.u32('max channels'),
+    if (bytes.length < encodedLength) {
+      throw ProtocolException(
+        'LIMITS of ${bytes.length} bytes, at least $encodedLength expected',
       );
-    } on FormatException catch (e) {
-      throw ProtocolException('malformed LIMITS: ${e.message}');
     }
+    final reader = ByteReader(bytes);
+    final limits = MuxLimits(
+      maxFrameSize: reader.u32('max frame size'),
+      maxChannels: reader.u32('max channels'),
+      initialWindow: reader.u32('initial window'),
+    );
+    if (limits.initialWindow == 0) {
+      throw ProtocolException('LIMITS with an initial window of 0');
+    }
+    return limits;
   }
 
   @override
   bool operator ==(Object other) =>
       other is MuxLimits &&
       other.maxFrameSize == maxFrameSize &&
-      other.maxChannels == maxChannels;
+      other.maxChannels == maxChannels &&
+      other.initialWindow == initialWindow;
 
   @override
-  int get hashCode => Object.hash(maxFrameSize, maxChannels);
+  int get hashCode => Object.hash(maxFrameSize, maxChannels, initialWindow);
 
   @override
   String toString() =>
-      'MuxLimits(maxFrameSize: $maxFrameSize, maxChannels: $maxChannels)';
+      'MuxLimits(maxFrameSize: $maxFrameSize, maxChannels: $maxChannels, '
+      'initialWindow: $initialWindow)';
+}
+
+/// The payload of a CREDIT control message: `u48` channel id, `u32` bytes.
+///
+/// The sender has consumed [bytes] of cost on [channelId] (or grants that
+/// much more), and the receiver may send as many more bytes of cost on it.
+/// See the wiki page "Polyverse Switchboard Mux", section "Flow control".
+class MuxCredit {
+  /// Credit of [bytes] for [channelId].
+  const MuxCredit(this.channelId, this.bytes);
+
+  /// What a DATA frame costs beyond its payload, so that a flood of empty
+  /// subframes is bounded too: 16 bytes.
+  static const int frameOverhead = 16;
+
+  /// The flow-control cost of a DATA frame carrying a subframe of
+  /// [subframeLength] bytes: the length plus [frameOverhead].
+  static int costOf(int subframeLength) => subframeLength + frameOverhead;
+
+  /// Encoded size: exactly 10 bytes.
+  static const int encodedLength = 10;
+
+  /// The channel the credit is for, from the receiver's point of view the
+  /// same id as on the wire.
+  final int channelId;
+
+  /// Bytes of cost returned or granted, 0 to `2^32 - 1`.
+  final int bytes;
+
+  /// Encodes as `u48 channelId`, `u32 bytes`.
+  ///
+  /// Throws [ArgumentError] if [channelId] does not fit in a `u48` or
+  /// [bytes] in a `u32`.
+  Uint8List encode() {
+    if (channelId < 0 || channelId > MuxFrame.maxId) {
+      throw ArgumentError.value(channelId, 'channelId', 'must fit in u48');
+    }
+    if (bytes < 0 || bytes > 0xFFFFFFFF) {
+      throw ArgumentError.value(bytes, 'bytes', 'must fit in u32');
+    }
+    return (ByteWriter(encodedLength)
+          ..u48(channelId)
+          ..u32(bytes))
+        .toBytes();
+  }
+
+  /// Decodes a CREDIT payload.
+  ///
+  /// Throws [ProtocolException] unless the payload is exactly
+  /// [encodedLength] bytes.
+  static MuxCredit decode(Uint8List bytes) {
+    if (bytes.length != encodedLength) {
+      throw ProtocolException(
+        'CREDIT of ${bytes.length} bytes, $encodedLength expected',
+      );
+    }
+    final reader = ByteReader(bytes);
+    return MuxCredit(reader.u48('channel id'), reader.u32('bytes'));
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is MuxCredit &&
+      other.channelId == channelId &&
+      other.bytes == bytes;
+
+  @override
+  int get hashCode => Object.hash(channelId, bytes);
+
+  @override
+  String toString() => 'MuxCredit($channelId, $bytes)';
 }

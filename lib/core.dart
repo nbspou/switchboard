@@ -36,6 +36,7 @@ export 'src/mux/mux_frame.dart'
         MuxCommand,
         MuxControlMessage,
         MuxControlType,
+        MuxCredit,
         MuxFrame,
         MuxIdent,
         MuxLimits;
