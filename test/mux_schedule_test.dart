@@ -551,6 +551,54 @@ void main() {
       },
     );
 
+    /// A mux over a gated transport whose raw peer answers synchronously:
+    /// [reply] sees every frame the mux writes, as the mux writes it, and
+    /// what it returns reaches the mux before that write returns.
+    (MuxConnection, GatedTransport) syncPeer(
+      List<MuxFrame> Function(MuxFrame frame) reply,
+    ) {
+      final transport = StreamChannelController<Uint8List>(sync: true);
+      final peer = transport.foreign.stream.listen((bytes) {
+        for (final frame in reply(MuxFrame.decode(bytes))) {
+          transport.foreign.sink.add(frame.encode());
+        }
+      });
+      addTearDown(peer.cancel);
+      final gate = GatedTransport(transport.local);
+      final mux = MuxConnection(gate, isInitiator: true, options: rawOptions);
+      addTearDown(mux.close);
+      return (mux, gate);
+    }
+
+    test('a child refused during its OPEN write from the scheduler still '
+        'sends its CLOSE and the OPENs behind it', () async {
+      final (mux, gate) = syncPeer(
+        (frame) => [
+          if (frame.command == MuxCommand.open && frame.payload.isNotEmpty)
+            MuxFrame.close(frame.channelId),
+        ],
+      );
+      final parent = mux.open(empty);
+      await parent.send(Uint8List(1));
+      final child = parent.openAfter(Uint8List.fromList([9]));
+      final grandchild = child.openAfter(Uint8List.fromList([8]));
+      final closed = child.close();
+      // The OPEN goes from the scheduler, not from a frame the mux reads.
+      gate.allow(10);
+      await closed;
+      await pumpEventQueue();
+      List<MuxCommand> on(MuxChannel channel) => [
+        for (final frame in gate.on(channel.id)) frame.command,
+      ];
+      // Our CLOSE confirms the peer's: without it the peer would keep the
+      // id half closed, and refuse its reuse.
+      expect(on(child), [MuxCommand.open, MuxCommand.close]);
+      expect(on(grandchild), [MuxCommand.open, MuxCommand.close]);
+      expect(grandchild.state, MuxChannelState.closed);
+      expect(mux.openChannelCount, 1);
+      expect(mux.isOpen, isTrue);
+    });
+
     for (final command in [MuxCommand.data, MuxCommand.close]) {
       test(
         '${command.name} before the child OPEN is a protocol error',

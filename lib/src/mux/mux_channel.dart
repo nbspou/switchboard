@@ -956,7 +956,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _confirmTimer = null;
     _pendingClose = null;
     _failPendingSends();
-    _link.preOpen = const [];
+    if (!_link.openWritten) {
+      // The OPEN never goes out: neither does what waited for it. A
+      // channel the peer closes while its OPEN is being written (a
+      // synchronous transport) still sends what waited behind the OPEN:
+      // our CLOSE, and the OPENs of the channels opened after it.
+      _link.preOpen = const [];
+    }
     _reservedSendCost = 0;
     _released = true;
     _held = 0;
