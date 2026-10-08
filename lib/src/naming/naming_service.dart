@@ -475,6 +475,9 @@ class NamingService {
     );
     _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
+    session.identitySubscription = connection?.identityChanges.listen(
+      (_) => _watchIdentity(session),
+    );
     if (credential != null && credential.isNotEmpty && verifier != null) {
       // Requests wait until the credential is checked.
       session.subscription!.pause();
@@ -912,7 +915,8 @@ class NamingService {
   }
 
   /// Notes that [session] is identified, if it is, and ends it when its
-  /// identity expires without being renewed.
+  /// identity expires without being renewed. Called on every valid IDENT
+  /// too, so an idle session follows a newly established or earlier expiry.
   void _watchIdentity(_Session session) {
     final credential = _identityOf(session);
     if (credential == null || !session.active) {
@@ -1458,6 +1462,8 @@ class NamingService {
       return;
     }
     session.active = false;
+    unawaited(session.identitySubscription?.cancel());
+    session.identitySubscription = null;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
     _held.removeWhere((h) => identical(h.session, session));
@@ -1523,6 +1529,9 @@ class _Session {
 
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
+
+  /// Tracks IDENT changes even when no naming request arrives.
+  StreamSubscription<void>? identitySubscription;
 
   final Set<_Registration> owned = {};
 

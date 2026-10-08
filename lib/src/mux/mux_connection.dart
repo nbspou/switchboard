@@ -345,6 +345,8 @@ class MuxConnection {
   PeerIdentity? _peerIdentity;
   final Completer<PeerIdentity> _peerIdentified = Completer<PeerIdentity>();
   Completer<void>? _identityEvent;
+  final StreamController<void> _identityChanges =
+      StreamController<void>.broadcast();
   // Frames that arrived while an IDENT was being verified; handled after
   // it, in order, so that they see its outcome.
   final Queue<Uint8List> _heldFrames = Queue<Uint8List>();
@@ -488,6 +490,12 @@ class MuxConnection {
   @internal
   Future<void> get identityChanged =>
       (_identityEvent ??= Completer<void>()).future;
+
+  /// Each valid `IDENT` of the peer. Ends with the connection. Subscribers
+  /// can cancel when a naming session ends without retaining that session
+  /// until the peer identifies again.
+  @internal
+  Stream<void> get identityChanges => _identityChanges.stream;
 
   /// Identifies this side to the peer with [credential] (wiki page
   /// "Switchboard Identity and Credentials", section "Connection
@@ -1218,6 +1226,7 @@ class MuxConnection {
       _peerIdentified.complete(identity);
     }
     _signalIdentity();
+    _identityChanges.add(null);
     while (_heldFrames.isNotEmpty && !_verifyingIdent && !_closing) {
       _processFrame(_heldFrames.removeFirst());
     }
@@ -1557,6 +1566,7 @@ class MuxConnection {
     _peerNonceWaiter = null;
     nonceWaiter?.completeError(SwitchboardException(status));
     _signalIdentity();
+    unawaited(_identityChanges.close());
     final idle = _idle;
     _idle = null;
     if (idle != null && !idle.isCompleted) {

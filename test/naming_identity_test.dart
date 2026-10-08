@@ -629,6 +629,62 @@ void main() {
   });
 
   group('expiry and RENEW', () {
+    for (final initiallyIdentified in [false, true]) {
+      test('an idle session follows IDENT expiry '
+          '(initially identified: $initiallyIdentified)', () {
+        fakeAsync((async) {
+          late Mesh mesh;
+          late Switchboard client;
+          late MuxConnection connection;
+          late TalkChannel channel;
+          Status? ended;
+          Status? goAway;
+          var identified = false;
+          Future<void> setUp() async {
+            mesh = await Mesh.start(requireCredential: false, close: false);
+            client = await node(
+              credential: initiallyIdentified
+                  ? await issue('worker-a1', workerScopes)
+                  : null,
+              close: false,
+            );
+            connection = await client.connect(mesh.uri);
+            unawaited(connection.peerGoAwayStatus.then((s) => goAway = s));
+            channel = TalkChannel(
+              connection.open(ChannelAddress(type: naming).encode()),
+            );
+            unawaited(channel.done.then((s) => ended = s));
+            await channel.request('REGISTER', registerPayload(workerType));
+            await connection.identify(
+              await issue(
+                'worker-a1',
+                workerScopes,
+                lifetime: const Duration(minutes: 1),
+              ),
+              holderKey: key,
+            );
+            identified = true;
+          }
+
+          unawaited(setUp());
+          async.elapse(const Duration(seconds: 1));
+          expect(identified, isTrue);
+          expect(mesh.service.table, hasLength(1));
+          // No further request: expiry must follow the new IDENT even
+          // when the session was anonymous, or had a later deadline.
+          async.elapse(const Duration(minutes: 1));
+          expect(mesh.service.table, isEmpty);
+          expect(ended, hasCode(StatusCode.unauthenticated));
+          expect(goAway, hasCode(StatusCode.unauthenticated));
+          unawaited(channel.close());
+          unawaited(client.close());
+          unawaited(mesh.close());
+          async.elapse(const Duration(seconds: 30));
+          expect(async.pendingTimers, isEmpty);
+        });
+      });
+    }
+
     test(
       'renewing another credential does not replace the payload identity',
       () async {
