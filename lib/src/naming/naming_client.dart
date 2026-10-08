@@ -36,9 +36,10 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// client's channel: dial [DialBackRequest.endpoint], identify there with
 /// [DialBackRequest.intent] naming [DialBackRequest.requester] as the
 /// receiver, and complete once that identification is confirmed. A
-/// failure is answered `ABORT` (with the status of a
-/// [SwitchboardException], else `UNAVAILABLE`). `MeshNode` installs one
-/// (see [NamingClient.connectHandler]).
+/// failure, whatever it is, is answered `ABORT UNAVAILABLE` (wiki page
+/// "Switchboard Identity and Credentials", "Reverse connections"); its
+/// cause goes to the log. `MeshNode` installs one (see
+/// [NamingClient.connectHandler]).
 typedef ConnectHandler = Future<void> Function(DialBackRequest request);
 
 /// A client of the naming service: registers this process's services and
@@ -344,15 +345,15 @@ class NamingClient {
     try {
       await handler(request);
     } on Object catch (e, st) {
-      final status = e is SwitchboardException
-          ? e.status
-          : Status.of(StatusCode.unavailable, 'dial back failed');
       if (e is! SwitchboardException) {
         _log.warning('CONNECT handler failed', e, st);
       } else {
-        _log.info('CONNECT to ${request.endpoint} failed: $status');
+        _log.info('CONNECT to ${request.endpoint} failed: ${e.status}');
       }
-      _abortRequest(message, status);
+      _abortRequest(
+        message,
+        Status.of(StatusCode.unavailable, 'dial back failed'),
+      );
       return;
     }
     if (message.canReply) {

@@ -1462,6 +1462,41 @@ void main() {
       expect(assigned, [1]);
     });
 
+    test(
+      'a relayed CONNECT whose dial-back fails is answered UNAVAILABLE',
+      () async {
+        final scripted = ScriptedConnector((m) {});
+        addTearDown(scripted.close);
+        final client = NamingClient(
+          scripted.call,
+          reconnectDelay: reconnectDelay,
+        );
+        clients.add(client);
+        final failures = <Object>[
+          SwitchboardException.of(StatusCode.failedPrecondition, 'left mesh'),
+          SwitchboardException.of(StatusCode.deadlineExceeded, 'no answer'),
+          SwitchboardException.of(StatusCode.unauthenticated, 'refused'),
+          StateError('bug'),
+        ];
+        var calls = 0;
+        client.connectHandler = (request) async => throw failures[calls++];
+        await client.start();
+        await client.synced.timeout(timeout);
+        final server = scripted.servers.single;
+        for (var i = 0; i < failures.length; i++) {
+          await expectLater(
+            server.request(
+              'CONNECT',
+              DialBackRequest('consumer', uriA).encode(),
+              name: Procedures.connect,
+            ),
+            throwsStatus(StatusCode.unavailable),
+          );
+        }
+        expect(calls, failures.length);
+      },
+    );
+
     test('a refused UNREGSTR drops the channel', () async {
       final registered = <String>[];
       final scripted = ScriptedConnector((m) {

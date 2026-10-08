@@ -888,7 +888,7 @@ class NamingClient {
   Future<Credential> renew({Credential? current});  // RENEW: current's bytes, or empty for the channel's own
   Future<String> connectTo(Name type, int instance, Uri endpoint, Uint8List intent, {Duration? timeout});   // CONNECT; the identity the instance presents; timeout cancels the request
   ConnectHandler? connectHandler;                   // serves the CONNECT the naming service relays; null: UNIMPLEMENTED
-  // typedef ConnectHandler = Future<void> Function(DialBackRequest request);   // complete once the dial-back identified; a failure is the abort status (non-Switchboard: UNAVAILABLE)
+  // typedef ConnectHandler = Future<void> Function(DialBackRequest request);   // complete once the dial-back identified; any failure is answered ABORT UNAVAILABLE (wiki), the cause logged
 
   // Sharding (constructor also takes Duration slotHandlerMaxDuration, default 10 min:
   // then ABORT DEADLINE_EXCEEDED, 0 = none; declared deadlines are lowered to what is left of it)
