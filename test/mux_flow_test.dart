@@ -12,12 +12,16 @@ Authors:
 // credit is returned.
 
 import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:async/async.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
+import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
 
 import 'mux_harness.dart';
@@ -33,6 +37,10 @@ String limitsHex(int window) => hexString(
 String creditHex(int id, int bytes) => hexString(
   MuxControlMessage.credit(MuxCredit(id, bytes)).toFrame().encode(),
 );
+
+/// A DATA frame on [id] with [length] payload bytes, as hex.
+String dataHex(int id, int length) =>
+    hexString(MuxFrame.data(id, Uint8List(length)).encode());
 
 /// Sends PING and waits for its PONG: frames sent before it were handled.
 Future<void> settle(RawPeer raw) async {
@@ -270,5 +278,333 @@ void main() {
         expect((await raw.next()).payload[0], i);
       }
     });
+  });
+
+  group('receive window', () {
+    /// A channel the mux opened over [raw], after the mux's LIMITS of
+    /// [window].
+    Future<(MuxConnection, RawPeer, MuxChannel)> opened(
+      int window, {
+      bool manual = false,
+    }) async {
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(
+          announceLimits: true,
+          initialWindow: window,
+        ),
+      );
+      addTearDown(mux.close);
+      await raw.nextControl(MuxControlType.limits);
+      final channel = mux.open(empty)..manualCredit = manual;
+      expect(await raw.nextHex(), '12 02 00');
+      return (mux, raw, channel);
+    }
+
+    String data(int length) => dataHex(2, length);
+
+    test('automatic credit: returned once half the window is taken; a '
+        'paused subscription takes nothing', () async {
+      final (mux, raw, channel) = await opened(1000);
+      final taken = <int>[];
+      final sub = channel.stream.listen((d) => taken.add(d.length))..pause();
+      // 6 subframes of cost 100: nothing taken while paused.
+      for (var i = 0; i < 6; i++) {
+        raw.send(data(84));
+      }
+      await settle(raw);
+      expect(channel.receiveWindow, 400);
+      expect(channel.bufferedBytes, 600);
+      expect(mux.bufferedBytes, 600);
+      sub.resume();
+      final credit = await raw.nextControl(MuxControlType.credit);
+      expect(MuxCredit.decode(credit.payload), const MuxCredit(2, 600));
+      expect(taken, hasLength(6));
+      expect(channel.receiveWindow, 1000);
+      expect(mux.bufferedBytes, 0);
+      // Under half: kept until more is taken.
+      raw.send(data(84));
+      raw.send(data(84));
+      await settle(raw);
+      expect(channel.receiveWindow, 800);
+      for (var i = 0; i < 3; i++) {
+        raw.send(data(84));
+      }
+      expect(
+        MuxCredit.decode(
+          (await raw.nextControl(MuxControlType.credit)).payload,
+        ),
+        const MuxCredit(2, 500),
+      );
+      await sub.cancel();
+    });
+
+    test('manual credit: returned as the layer reports consumption', () async {
+      final (mux, raw, channel) = await opened(1000, manual: true);
+      final taken = <Uint8List>[];
+      channel.stream.listen(taken.add);
+      for (var i = 0; i < 6; i++) {
+        raw.send(data(84));
+      }
+      await settle(raw);
+      // Taken, not consumed: held, still counted by the connection.
+      expect(taken, hasLength(6));
+      expect(channel.bufferedBytes, 0);
+      expect(mux.bufferedBytes, 600);
+      expect(channel.receiveWindow, 400);
+      channel.consumed(84);
+      channel.consumed(168, subframes: 2);
+      await settle(raw);
+      expect(channel.receiveWindow, 400);
+      expect(mux.bufferedBytes, 300);
+      // Half the window: returned.
+      channel.consumed(taken[3].length);
+      channel.consumed(taken[4].length);
+      expect(
+        MuxCredit.decode(
+          (await raw.nextControl(MuxControlType.credit)).payload,
+        ),
+        const MuxCredit(2, 500),
+      );
+      expect(channel.receiveWindow, 900);
+      // More than delivered and not consumed: a bug of the layer.
+      expect(() => channel.consumed(200), throwsStateError);
+      expect(() => channel.consumed(-1), throwsArgumentError);
+      // Back to automatic: what is held counts as consumed (100 bytes),
+      // and delivery is consumption again.
+      channel.manualCredit = false;
+      expect(mux.bufferedBytes, 0);
+      raw.send(data(384));
+      expect(
+        MuxCredit.decode(
+          (await raw.nextControl(MuxControlType.credit)).payload,
+        ),
+        const MuxCredit(2, 500),
+      );
+      expect(channel.receiveWindow, 1000);
+      expect(() => channel.consumed(0), throwsStateError);
+    });
+
+    test(
+      'grant raises the window at once, with the credit not returned yet',
+      () async {
+        final (mux, raw, channel) = await opened(1000);
+        final sub = channel.stream.listen((_) {});
+        raw.send(data(84));
+        await settle(raw);
+        expect(channel.receiveWindow, 900);
+        sub.pause();
+        // With the 100 bytes consumed and not returned yet.
+        channel.grant(10000);
+        expect(
+          MuxCredit.decode(
+            (await raw.nextControl(MuxControlType.credit)).payload,
+          ),
+          const MuxCredit(2, 10100),
+        );
+        expect(channel.receiveWindow, 11000);
+        // The peer may use all of it.
+        for (var i = 0; i < 10; i++) {
+          raw.send(data(984));
+        }
+        await settle(raw);
+        expect(channel.receiveWindow, 1000);
+        // Credit now comes in batches of half the raised window, 5500.
+        sub.resume();
+        expect(
+          MuxCredit.decode(
+            (await raw.nextControl(MuxControlType.credit)).payload,
+          ),
+          const MuxCredit(2, 10000),
+        );
+        expect(channel.receiveWindow, 11000);
+        await sub.cancel();
+        expect(() => channel.grant(0), throwsArgumentError);
+        expect(() => channel.grant(MuxLimits.maxWindow), throwsArgumentError);
+        expect(mux.isOpen, isTrue);
+      },
+    );
+
+    test('no credit once our CLOSE is out or the peer\'s came', () async {
+      final (_, raw, channel) = await opened(1000);
+      final sub = channel.stream.listen((_) {})..pause();
+      raw.send(data(484));
+      await settle(raw);
+      unawaited(channel.close());
+      expect(await raw.nextHex(), '22 02 00');
+      sub.resume();
+      channel.grant(100);
+      // In flight before the peer saw the CLOSE: still within the window.
+      raw.send(data(484));
+      raw.send('22 02 00');
+      await channel.done;
+      await settle(raw);
+      expect(channel.receiveWindow, 0);
+      await sub.cancel();
+    });
+
+    test('a frame beyond the window is a protocol error, logged with its '
+        'channel', () async {
+      final (mux, raw, channel) = await opened(100);
+      raw.send(data(84));
+      raw.send(data(0));
+      final goAway = await raw.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus.known, StatusCode.protocolError);
+      expect(
+        goAway.goAwayStatus.reason,
+        'DATA costing 16 bytes on channel 2, beyond the window of 0 granted',
+      );
+      expect((await mux.done).known, StatusCode.protocolError);
+      expect(await channel.done, hasCode(StatusCode.connectionLost));
+    });
+  });
+
+  group('between two connections', () {
+    Future<void> exchange(MuxConnection a, MuxConnection b) async {
+      await a.ping();
+      await b.ping();
+      final atB = StreamQueue(b.incoming);
+      final ca = a.open(empty);
+      final cb = await atB.next;
+      final sizes = [for (var i = 0; i < 200; i++) (i * 997) % 30000];
+      Future<void> sendAll(MuxChannel channel) async {
+        for (final size in sizes) {
+          await channel.send(Uint8List(size)..fillRange(0, size, size & 0xFF));
+        }
+      }
+
+      Future<void> receiveAll(MuxChannel channel) async {
+        final received = await channel.stream.take(sizes.length).toList();
+        expect(received.map((d) => d.length), sizes);
+        for (final d in received) {
+          expect(d.every((b) => b == d.length & 0xFF), isTrue);
+        }
+      }
+
+      await Future.wait([
+        sendAll(ca),
+        sendAll(cb),
+        receiveAll(ca),
+        receiveAll(cb),
+      ]);
+      await a.ping();
+      await b.ping();
+      // Nothing in flight: each side's view of each window agrees.
+      expect(ca.sendWindow, cb.receiveWindow);
+      expect(cb.sendWindow, ca.receiveWindow);
+      expect(ca.sendWindow, greaterThan(32768));
+      expect(cb.sendWindow, greaterThan(32768));
+      await ca.close();
+      await atB.cancel();
+    }
+
+    test('window accounting both ways over memory', () async {
+      final (a, b) = muxPair();
+      await exchange(a, b);
+      await a.close();
+    });
+
+    test('window accounting both ways over TCP', () async {
+      final listener = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final accepted = listener.first;
+      final a = MuxConnection(
+        await StreamTransport.connectTcp('127.0.0.1', listener.port),
+        isInitiator: true,
+        options: quiet,
+      );
+      final b = MuxConnection(
+        StreamTransport.fromSocket(await accepted),
+        isInitiator: false,
+        options: quiet,
+      );
+      await listener.close();
+      await exchange(a, b);
+      await a.close();
+      await b.done;
+    });
+
+    test('a slow consumer stalls its own channel, another one flows', () async {
+      final (a, b) = muxPair();
+      await a.ping();
+      final atB = StreamQueue(b.incoming);
+      final slow = a.open(empty);
+      final fast = a.open(empty);
+      final slowAtB = await atB.next;
+      final fastAtB = await atB.next;
+      final paused = slowAtB.stream.listen((_) {})..pause();
+      final fastReceived = fastAtB.stream.fold<int>(0, (n, d) => n + d.length);
+      var slowSent = 0;
+      final slowDone = () async {
+        for (var i = 0; i < 100; i++) {
+          await slow.send(Uint8List(16000));
+          slowSent++;
+        }
+      }();
+      for (var i = 0; i < 100; i++) {
+        await fast.send(Uint8List(16000));
+      }
+      await a.ping();
+      // The paused channel holds its window, 4 subframes of 16016; the
+      // fifth waits for credit.
+      expect(slowSent, 4);
+      expect(slowAtB.bufferedBytes, 4 * 16016);
+      expect(b.bufferedBytes, 4 * 16016);
+      await fast.close();
+      expect(await fastReceived, 100 * 16000);
+      paused.resume();
+      await slowDone;
+      await slow.close();
+      await a.close();
+      await paused.cancel();
+      await atB.cancel();
+    });
+
+    test(
+      'the connection backstop pauses reading for all channels together',
+      () async {
+        final (a, b) = muxPair(
+          acceptor: quiet.copyWith(receiveHighWaterMarkBytes: 100000),
+        );
+        await a.ping();
+        final atB = StreamQueue(b.incoming);
+        final channels = [for (var i = 0; i < 3; i++) a.open(empty)];
+        final subs = <StreamSubscription<Uint8List>>[];
+        for (var i = 0; i < 3; i++) {
+          final channel = await atB.next;
+          // One held by a layer with manual credit, two not read at all.
+          channel.manualCredit = i == 0;
+          subs.add(channel.stream.listen((_) {}));
+          if (i > 0) {
+            subs.last.pause();
+          }
+        }
+        for (final channel in channels) {
+          for (var i = 0; i < 4; i++) {
+            unawaited(channel.send(Uint8List(16000)));
+          }
+        }
+        await pumpEventQueue();
+        // Each channel holds its window, 64064 bytes, and the third pushes
+        // the total over the mark.
+        expect(b.bufferedBytes, greaterThan(100000));
+        expect(b.isReceivePaused, isTrue);
+        // A ping is not answered while reading is paused.
+        var answered = false;
+        unawaited(a.ping().then((_) => answered = true));
+        await pumpEventQueue();
+        expect(answered, isFalse);
+        // The layer consumes what it holds: reading resumes below half.
+        final layer = b.channels.firstWhere((c) => c.manualCredit);
+        layer.consumed(4 * 16000, subframes: 4);
+        subs[1].resume();
+        await pumpEventQueue();
+        expect(b.isReceivePaused, isFalse);
+        expect(answered, isTrue);
+        for (final sub in subs) {
+          await sub.cancel();
+        }
+        await a.close();
+        await atB.cancel();
+      },
+    );
   });
 }

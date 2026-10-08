@@ -41,8 +41,8 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// refreshing the slot) with the same open payload, and takes over
 /// transparently. Subframes the caller sends while the replacement is
 /// being opened are sent on it, in order. At most [maxHeldBytes] are held
-/// meanwhile (each subframe counted as its length plus 32 bytes, as
-/// [MuxOptions.maxChannelBufferBytes] counts): a subframe beyond that is
+/// meanwhile (each subframe counted at its flow-control cost, its length
+/// plus 16 bytes, as the mux counts it): a subframe beyond that is
 /// dropped, the channel is closed with `RESOURCE_EXHAUSTED`, which [done]
 /// reports at once, and a replacement opened after all is closed with it
 /// too. Through `proxyHandler` the caller is a remote client, whose
@@ -68,14 +68,15 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// Wraps [channel], the first channel opened for [slot] of [type];
   /// [reopen] opens the replacement. Created by
   /// `Switchboard.openChannelToSlot` and `proxyHandler`, with the node's
-  /// [MuxOptions.maxChannelBufferBytes] as [maxHeldBytes].
+  /// [MuxOptions.initialWindow] as [maxHeldBytes]: one window, what a
+  /// client of the proxy can send before it needs credit.
   @internal
   SlotChannel(
     this.type,
     this.slot,
     MuxChannel channel,
     this._reopen, {
-    this.maxHeldBytes = MuxOptions.defaultMaxChannelBufferBytes,
+    this.maxHeldBytes = MuxOptions.defaultInitialWindow,
   }) : _current = channel {
     _sink = _SlotChannelSink(this);
     _incoming = StreamController<Uint8List>(
@@ -99,14 +100,10 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   final int slot;
 
   /// Largest number of bytes held while the replacement is being opened,
-  /// each subframe counted as its length plus 32; beyond, the channel is
-  /// closed with `RESOURCE_EXHAUSTED`. 0 (or less) means no limit, as for
-  /// [MuxOptions.maxChannelBufferBytes].
+  /// each subframe counted at its flow-control cost (its length plus 16);
+  /// beyond, the channel is closed with `RESOURCE_EXHAUSTED`. 0 (or less)
+  /// means no limit.
   final int maxHeldBytes;
-
-  /// Accounting overhead of one held subframe, as the mux counts its
-  /// receive buffers, so that floods of empty subframes are bounded too.
-  static const int _subframeOverhead = 32;
 
   final SlotReopen _reopen;
   MuxChannel _current;
@@ -170,7 +167,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       );
     }
     if (_holding) {
-      final size = subframe.length + _subframeOverhead;
+      final size = MuxCredit.costOf(subframe.length);
       if (maxHeldBytes > 0 && _pendingBytes + size > maxHeldBytes) {
         _overflowed();
         return;

@@ -421,11 +421,11 @@ void main() {
       late Completer<SlotEntry?> answer;
 
       setUp(() {
-        // Channels of this node buffer at most 1000 bytes, each subframe
-        // counted as its length plus 32.
+        // A window of 1000 bytes: a slot channel of this node holds at most
+        // that much, each subframe counted as its length plus 16.
         small = Switchboard(
           resolver: resolver,
-          muxOptions: fast.copyWith(maxChannelBufferBytes: 1000),
+          muxOptions: fast.copyWith(initialWindow: 1000),
           slotRefreshTimeout: limit,
         );
         addTearDown(small.close);
@@ -475,7 +475,7 @@ void main() {
           channel.send(bytes('x' * 300));
         }
         expect(channel.canSend, isTrue);
-        // A fourth would hold 1328 bytes.
+        // A fourth would hold 1264 bytes.
         channel.send(bytes('x' * 300));
         expect(channel.canSend, isFalse);
         // Before the LOCATE has answered.

@@ -1191,7 +1191,7 @@ void main() {
       // the next is sent: the client leg's own receive buffer, with the
       // same limit, never fills up.
       await startProxy(
-        options: fast.copyWith(maxChannelBufferBytes: 1000),
+        options: fast.copyWith(initialWindow: 1000),
         memory: true,
       );
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
@@ -1209,7 +1209,7 @@ void main() {
       };
       final channel = await open(4);
       await asked.future;
-      // Each subframe counts its length plus 32: the fourth goes beyond.
+      // Each subframe counts its length plus 16: the fourth goes beyond.
       var sent = 0;
       while (channel.canSend && sent < 10) {
         unawaited(channel.send(pattern(300, sent++)));

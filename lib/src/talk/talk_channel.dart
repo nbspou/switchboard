@@ -194,9 +194,9 @@ class TalkChannel {
   /// while the subscription is paused.
   ///
   /// That buffer has no byte bound. The channel reads its raw channel as
-  /// frames arrive, so the receive buffer cap of a mux channel
-  /// (`MuxOptions.maxChannelBufferBytes`) and the connection's receive
-  /// high-water mark count nothing held here. Only the peer's unanswered
+  /// frames arrive, so a mux channel counts them consumed when they are
+  /// read: its flow-control window and the connection's receive high-water
+  /// mark count nothing held here. Only the peer's unanswered
   /// requests among it are bounded, by number
   /// ([TalkOptions.maxIncomingRequests]); plain messages are not, nor are
   /// requests answered while they wait (by the responder timeout or a

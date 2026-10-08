@@ -2555,8 +2555,8 @@ class Switchboard {
   /// [SlotChannel] for why a `MOVED` after the first subframe is not
   /// retried (the caller may open again and resend: nothing was
   /// processed) and why a `RELOCATED` never is. Subframes sent while the
-  /// replacement is being opened are held, at most
-  /// [MuxOptions.maxChannelBufferBytes] of [muxOptions]
+  /// replacement is being opened are held, at most one window,
+  /// [MuxOptions.initialWindow] of [muxOptions]
   /// ([SlotChannel.maxHeldBytes]); beyond, the channel is closed with
   /// `RESOURCE_EXHAUSTED`.
   ///
@@ -2599,7 +2599,7 @@ class Switchboard {
         implicitPayload: payload == null,
         mayRelay: true,
       ),
-      maxHeldBytes: muxOptions.maxChannelBufferBytes,
+      maxHeldBytes: muxOptions.initialWindow,
     );
   }
 

@@ -58,6 +58,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     this.isLocallyOpened,
     this.openPayload,
     this._initialSendWindow,
+    this._receiveWindow,
+    this._creditWindow,
   ) : _sendWindow = _initialSendWindow {
     // Synchronous, fed from [_queue] only while the listener is active, so
     // that every buffered byte is in [_queue] and accounted for.
@@ -69,10 +71,6 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     );
     _sink = _MuxChannelSink(this);
   }
-
-  /// Accounting overhead of one buffered subframe, so that floods of empty
-  /// subframes are bounded by [MuxOptions.maxChannelBufferBytes] too.
-  static const int _subframeOverhead = 32;
 
   final MuxChannelLink _link;
 
@@ -120,6 +118,21 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// A completed future, returned by [send] for a subframe sent at once.
   static final Future<void> _sentAtOnce = Future<void>.value();
 
+  // Flow control, receiving side: what the peer may still send, the
+  // window credit is returned against (half of it is the batch), what was
+  // consumed and not returned yet, and, with manual credit, what was
+  // delivered and not reported consumed. Every byte of cost the peer may
+  // send is in exactly one of these: the receive window, [_queuedBytes],
+  // [_held] or [_unreturned].
+  int _receiveWindow;
+  int _creditWindow;
+  int _unreturned = 0;
+  int _held = 0;
+  bool _manualCredit = false;
+  // Set when the channel completes: what is held no longer counts toward
+  // the connection's buffers, and nothing is returned any more.
+  bool _released = false;
+
   /// Current state.
   MuxChannelState get state => _state;
 
@@ -127,22 +140,130 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   bool get canSend => _state == MuxChannelState.open;
 
   /// Bytes received and not yet delivered to the [stream]'s listener,
-  /// because nobody listens yet or the subscription is paused. Each
-  /// subframe counts as its length plus a small fixed overhead. Bounded by
-  /// [MuxOptions.maxChannelBufferBytes].
+  /// because nobody listens yet or the subscription is paused, each
+  /// subframe counted at its flow-control cost (its length plus 16).
+  /// Bounded by the window this side granted (see [receiveWindow]).
   int get bufferedBytes => _queuedBytes;
 
   /// Incoming DATA subframes, single subscription, buffered until
   /// listened to. Ends when the peer's CLOSE arrives or the connection
   /// drops; read [done] for the reason.
   ///
-  /// At most [MuxOptions.maxChannelBufferBytes] are buffered while nobody
-  /// listens or the subscription is paused. Beyond that the channel is
-  /// closed with `RESOURCE_EXHAUSTED`, the buffered subframes are dropped
-  /// and the stream ends without them. Cancelling the subscription drops
-  /// further DATA; it does not close the channel.
+  /// Flow control: what the peer may send is bounded by the window this
+  /// side grants ([receiveWindow]), and credit is returned as subframes
+  /// are consumed. Without [manualCredit] a subframe counts as consumed
+  /// once the listener has taken it: delivered, not merely buffered, so a
+  /// paused subscription (or none yet) consumes nothing and stalls the
+  /// channel, and only it, once the window is used up. Cancelling the
+  /// subscription drops further DATA, which counts as consumed; it does
+  /// not close the channel.
   @override
   Stream<Uint8List> get stream => _incoming.stream;
+
+  /// Bytes of cost (a subframe's length plus 16) the peer may still send on
+  /// the channel before this side returns credit.
+  ///
+  /// Starts at [MuxOptions.initialWindow] as announced in LIMITS (64 KiB
+  /// without LIMITS); for a channel the peer opened, which it may have
+  /// opened before our LIMITS reached it and so with 64 KiB, at the larger
+  /// of the two. Shrinks with every DATA frame received and grows with
+  /// every CREDIT sent. A DATA frame beyond it is a protocol error that
+  /// ends the connection with GOAWAY `PROTOCOL_ERROR`.
+  ///
+  /// Credit is sent once the consumed and unreturned cost reaches half the
+  /// window credit is returned against: the initial window (the smaller of
+  /// the two for a channel the peer opened) plus what [grant] added. There
+  /// is no timer; a peer that sends a frame costing more than half that
+  /// window may wait for ever, which is why [send] refuses such frames.
+  int get receiveWindow => _receiveWindow;
+
+  /// Whether a layer that reads the channel on the application's behalf
+  /// returns credit itself with [consumed]; false by default.
+  ///
+  /// While true, a subframe the [stream]'s listener takes does not count
+  /// as consumed: it stays held, counted toward the connection's buffered
+  /// bytes (see [MuxConnection.bufferedBytes]), until [consumed] reports
+  /// it, typically when the application has taken the message it belongs
+  /// to. Set it before listening. Setting it back to false counts what is
+  /// held as consumed.
+  bool get manualCredit => _manualCredit;
+
+  set manualCredit(bool value) {
+    if (value == _manualCredit) {
+      return;
+    }
+    _manualCredit = value;
+    if (!value && _held > 0) {
+      final cost = _held;
+      _held = 0;
+      if (!_released) {
+        _link.host.noteBuffered(-cost);
+      }
+      _consume(cost);
+    }
+  }
+
+  /// With [manualCredit]: reports that [subframes] subframes delivered by
+  /// [stream], [bytes] bytes long together, have been consumed, so that
+  /// their cost ([bytes] plus 16 per subframe) can be returned to the peer.
+  /// For one subframe: `consumed(subframe.length)`.
+  ///
+  /// Credit goes out in batches, once half the window is consumed and
+  /// unreturned (see [receiveWindow]). Does nothing once the channel is
+  /// closed. Throws [ArgumentError] for negative values and [StateError]
+  /// when more is reported than was delivered and not yet reported (always
+  /// the case without [manualCredit], where delivery is consumption).
+  void consumed(int bytes, {int subframes = 1}) {
+    if (bytes < 0 || subframes < 0) {
+      throw ArgumentError('negative bytes ($bytes) or subframes ($subframes)');
+    }
+    if (_released) {
+      return;
+    }
+    final cost = bytes + MuxCredit.frameOverhead * subframes;
+    if (cost > _held) {
+      throw StateError(
+        'channel $id: $cost bytes of cost reported consumed, $_held '
+        'delivered and not consumed',
+      );
+    }
+    _held -= cost;
+    _link.host.noteBuffered(-cost);
+    _consume(cost);
+  }
+
+  /// Raises the window the peer may use on this channel by [bytes] at once,
+  /// for a transfer this side expects to be large: sends CREDIT for them
+  /// (with the credit consumed and not returned yet), and returns credit
+  /// against the larger window from then on. What this side may have to
+  /// hold for the channel grows by as much.
+  ///
+  /// Does nothing once this side can no longer receive DATA on the channel
+  /// that it would want more of (its CLOSE went out, or the peer's came).
+  /// Throws [ArgumentError] if [bytes] is not positive, or if the window
+  /// would exceed `2^32 - 1`.
+  void grant(int bytes) {
+    if (bytes <= 0) {
+      throw ArgumentError.value(bytes, 'bytes', 'must be positive');
+    }
+    final credit = bytes + _unreturned;
+    if (_receiveWindow + credit > MuxLimits.maxWindow) {
+      throw ArgumentError.value(
+        bytes,
+        'bytes',
+        'the window of channel $id would exceed 2^32 - 1',
+      );
+    }
+    if (!_mayReturnCredit) {
+      return;
+    }
+    _creditWindow += bytes;
+    _unreturned = 0;
+    _receiveWindow += credit;
+    _link.host.sendFrame(
+      MuxControlMessage.credit(MuxCredit(id, credit)).toFrame(),
+    );
+  }
 
   /// Sink for outgoing subframes.
   ///
@@ -418,40 +539,61 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   // Receive buffer --------------------------------------------------------
 
+  /// Takes a DATA payload. Throws [ProtocolException] if it goes beyond
+  /// the window granted to the peer.
   void _receive(Uint8List payload) {
+    final cost = MuxCredit.costOf(payload.length);
+    if (cost > _receiveWindow) {
+      throw ProtocolException(
+        'DATA costing $cost bytes on channel $id, beyond the window of '
+        '$_receiveWindow granted',
+      );
+    }
+    _receiveWindow -= cost;
     if (_discarding || _endRequested) {
+      // Dropped: as good as consumed.
+      _consume(cost);
       return;
     }
-    final size = payload.length + _subframeOverhead;
     _queue.add(payload);
-    _queuedBytes += size;
-    _link.host.noteBuffered(size);
-    final cap = _link.host.options.maxChannelBufferBytes;
-    if (cap > 0 && _queuedBytes > cap) {
-      _discard();
-      if (_state == MuxChannelState.open) {
-        unawaited(
-          close(
-            Status.of(
-              StatusCode.resourceExhausted,
-              'receive buffer of $cap bytes exceeded',
-            ),
-          ),
-        );
-      }
-      return;
-    }
+    _queuedBytes += cost;
+    _link.host.noteBuffered(cost);
     _scheduleDrain();
   }
 
-  /// Drops buffered subframes and every later one.
+  /// Drops buffered subframes and every later one; they count as consumed.
   void _discard() {
     _discarding = true;
-    if (_queuedBytes != 0) {
-      _link.host.noteBuffered(-_queuedBytes);
-    }
+    final cost = _queuedBytes;
     _queue.clear();
     _queuedBytes = 0;
+    if (cost != 0) {
+      _link.host.noteBuffered(-cost);
+      _consume(cost);
+    }
+  }
+
+  /// Whether credit may still go to the peer: it may still send DATA, and
+  /// our CLOSE (which tells it to stop) has not gone out.
+  bool get _mayReturnCredit => !_released && !_closeReceived && !_closeQueued;
+
+  /// Counts [cost] as consumed and returns credit once half the window is
+  /// consumed and unreturned.
+  void _consume(int cost) {
+    _unreturned += cost;
+    if (_unreturned == 0 || !_mayReturnCredit) {
+      return;
+    }
+    final half = _creditWindow ~/ 2;
+    if (_unreturned < (half < 1 ? 1 : half)) {
+      return;
+    }
+    final credit = _unreturned;
+    _unreturned = 0;
+    _receiveWindow += credit;
+    _link.host.sendFrame(
+      MuxControlMessage.credit(MuxCredit(id, credit)).toFrame(),
+    );
   }
 
   void _onCancel() => _discard();
@@ -466,12 +608,22 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   void _drain() {
     _drainScheduled = false;
+    var consumed = 0;
     while (_queue.isNotEmpty && _incoming.hasListener && !_incoming.isPaused) {
       final payload = _queue.removeFirst();
-      final size = payload.length + _subframeOverhead;
-      _queuedBytes -= size;
-      _link.host.noteBuffered(-size);
+      final cost = MuxCredit.costOf(payload.length);
+      _queuedBytes -= cost;
+      if (_manualCredit && !_released) {
+        // Held by the listener until it reports it consumed.
+        _held += cost;
+      } else {
+        _link.host.noteBuffered(-cost);
+        consumed += cost;
+      }
       _incoming.add(payload);
+    }
+    if (consumed != 0) {
+      _consume(consumed);
     }
     if (_endRequested && _queue.isEmpty && !_incoming.isClosed) {
       unawaited(_incoming.close());
@@ -484,6 +636,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _confirmTimer = null;
     _pendingClose = null;
     _failPendingSends();
+    if (!_released) {
+      _released = true;
+      if (_held != 0) {
+        _link.host.noteBuffered(-_held);
+        _held = 0;
+      }
+    }
     _endRequested = true;
     _scheduleDrain();
     if (!_done.isCompleted) {
@@ -533,6 +692,8 @@ class MuxChannelLink {
     required bool isLocallyOpened,
     required Uint8List openPayload,
     required int sendWindow,
+    required int receiveWindow,
+    required int creditWindow,
   }) {
     channel = MuxChannel._(
       this,
@@ -541,6 +702,8 @@ class MuxChannelLink {
       isLocallyOpened,
       openPayload,
       sendWindow,
+      receiveWindow,
+      creditWindow,
     );
   }
 
@@ -561,7 +724,8 @@ class MuxChannelLink {
   bool get closeReceived => channel._closeReceived;
 
   /// Delivers a DATA payload. The caller has checked that the peer's
-  /// CLOSE has not been received.
+  /// CLOSE has not been received. Throws [ProtocolException] if the
+  /// payload goes beyond the window granted to the peer.
   void receiveData(Uint8List payload) => channel._receive(payload);
 
   /// Applies the peer's CREDIT of [bytes] for this channel. Throws

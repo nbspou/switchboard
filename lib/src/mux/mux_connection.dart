@@ -44,7 +44,6 @@ class MuxOptions {
     this.goAwayGrace = const Duration(seconds: 10),
     this.announceLimits = true,
     this.maxPendingRejections = defaultMaxPendingRejections,
-    this.maxChannelBufferBytes = defaultMaxChannelBufferBytes,
     this.receiveHighWaterMarkBytes = defaultReceiveHighWaterMarkBytes,
     this.closeConfirmTimeout = const Duration(seconds: 30),
     this.maxOpenPayloadBytes = defaultMaxOpenPayloadBytes,
@@ -62,9 +61,6 @@ class MuxOptions {
 
   /// Default [maxPendingRejections].
   static const int defaultMaxPendingRejections = 1024;
-
-  /// Default [maxChannelBufferBytes]: 4 MiB.
-  static const int defaultMaxChannelBufferBytes = 4 * 1024 * 1024;
 
   /// Default [receiveHighWaterMarkBytes]: 16 MiB.
   static const int defaultReceiveHighWaterMarkBytes = 16 * 1024 * 1024;
@@ -129,19 +125,16 @@ class MuxOptions {
   /// unlimited.
   final int maxPendingRejections;
 
-  /// Largest number of bytes buffered for one channel while nobody listens
-  /// to its stream or the subscription is paused. Each subframe counts as
-  /// its length plus 32 bytes. Beyond it the channel is closed with CLOSE
-  /// `RESOURCE_EXHAUSTED` and its buffer dropped; the connection is not
-  /// affected. 0 means unlimited.
-  final int maxChannelBufferBytes;
-
-  /// Bytes buffered over all channels (counted as for
-  /// [maxChannelBufferBytes]) above which the connection stops reading the
-  /// transport, which pushes back on the peer through the transport's own
-  /// flow control. Reading resumes once the buffers drain to half of it.
-  /// Keep-alive does not probe while reading is paused. 0 means never
-  /// pause.
+  /// Bytes buffered over all channels (see [MuxConnection.bufferedBytes],
+  /// each subframe counted at its flow-control cost, its length plus 16)
+  /// above which the connection stops reading the transport, which pushes
+  /// back on the peer through the transport's own flow control. Reading
+  /// resumes once the buffers drain to half of it. Keep-alive does not
+  /// probe while reading is paused. 0 means never pause.
+  ///
+  /// The window of each channel ([initialWindow]) bounds what a peer can
+  /// make one channel hold; this mark is the backstop for all of them
+  /// together. Default 16 MiB.
   final int receiveHighWaterMarkBytes;
 
   /// How long [MuxChannel.close] waits for the peer's confirming CLOSE.
@@ -217,7 +210,6 @@ class MuxOptions {
     Duration? goAwayGrace,
     bool? announceLimits,
     int? maxPendingRejections,
-    int? maxChannelBufferBytes,
     int? receiveHighWaterMarkBytes,
     Duration? closeConfirmTimeout,
     int? maxOpenPayloadBytes,
@@ -236,7 +228,6 @@ class MuxOptions {
     goAwayGrace: goAwayGrace ?? this.goAwayGrace,
     announceLimits: announceLimits ?? this.announceLimits,
     maxPendingRejections: maxPendingRejections ?? this.maxPendingRejections,
-    maxChannelBufferBytes: maxChannelBufferBytes ?? this.maxChannelBufferBytes,
     receiveHighWaterMarkBytes:
         receiveHighWaterMarkBytes ?? this.receiveHighWaterMarkBytes,
     closeConfirmTimeout: closeConfirmTimeout ?? this.closeConfirmTimeout,
@@ -457,10 +448,13 @@ class MuxConnection {
     for (final link in _links.values) link.channel,
   ];
 
-  /// Bytes buffered in the receive queues of all channels, counted as for
-  /// [MuxOptions.maxChannelBufferBytes], plus the OPEN payloads held for
-  /// the channels the peer opened until they are closed and delivered (see
-  /// [MuxOptions.maxOpenPayloadBytes]).
+  /// Bytes received and not consumed yet over all channels, at their
+  /// flow-control cost (a subframe's length plus 16): buffered for a
+  /// stream's listener, or held by one with [MuxChannel.manualCredit]
+  /// until it reports them consumed; plus the OPEN payloads held for the
+  /// channels the peer opened until they are closed and delivered (see
+  /// [MuxOptions.maxOpenPayloadBytes]). Compared against
+  /// [MuxOptions.receiveHighWaterMarkBytes].
   int get bufferedBytes => _bufferedBytes;
 
   /// Bytes of OPEN payloads held for the channels the peer opened that are
@@ -731,6 +725,9 @@ class MuxConnection {
       isLocallyOpened: true,
       openPayload: payload,
       sendWindow: _peerInitialWindow,
+      // The peer learns of the channel after our LIMITS.
+      receiveWindow: _localInitialWindow,
+      creditWindow: _localInitialWindow,
     );
     _links[id] = link;
     _openCount++;
@@ -932,6 +929,12 @@ class MuxConnection {
   int get _peerInitialWindow =>
       _peerLimits?.initialWindow ?? MuxLimits.defaultInitialWindow;
 
+  /// The window this side grants: the one announced in LIMITS, or the
+  /// 64 KiB the peer assumes without it.
+  int get _localInitialWindow => options.announceLimits
+      ? options.initialWindow
+      : MuxLimits.defaultInitialWindow;
+
   Uint8List _nextPingPayload() {
     final n = _pingCounter;
     _pingCounter = (n + 1) & 0x7FFFFFFF;
@@ -1061,6 +1064,16 @@ class MuxConnection {
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
       sendWindow: _peerInitialWindow,
+      // The peer may have opened it before our LIMITS reached it, with the
+      // 64 KiB it assumes until then: accept the larger of the two, and
+      // return credit against the smaller, so that a sender holding either
+      // window never waits for credit we would not send.
+      receiveWindow: _localInitialWindow > MuxLimits.defaultInitialWindow
+          ? _localInitialWindow
+          : MuxLimits.defaultInitialWindow,
+      creditWindow: _localInitialWindow < MuxLimits.defaultInitialWindow
+          ? _localInitialWindow
+          : MuxLimits.defaultInitialWindow,
     )..incomingPending = true;
     _links[id] = link;
     _openCount++;

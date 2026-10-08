@@ -252,11 +252,11 @@ Status _closeStatusFor(Status status) {
 ///    entry, or found with [SlotResolver.locateSlot] within
 ///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
 ///    instance set to the new owner's, and the client does not notice.
-///    What the client sends meanwhile is held, at most
-///    [MuxOptions.maxChannelBufferBytes] of the node's
-///    [Switchboard.muxOptions] ([SlotChannel.maxHeldBytes]); beyond, the
-///    channel is closed with `RESOURCE_EXHAUSTED` (nothing was processed:
-///    the client may open it again).
+///    What the client sends meanwhile is held, at most one window,
+///    [MuxOptions.initialWindow] of the node's [Switchboard.muxOptions]
+///    ([SlotChannel.maxHeldBytes]); beyond, the channel is closed with
+///    `RESOURCE_EXHAUSTED` (nothing was processed: the client may open it
+///    again).
 ///    After the first subframe, or when no other owner is found, the
 ///    `MOVED` is forwarded to the client, which may open the channel again
 ///    and resend, since `MOVED` means nothing was processed (see
@@ -448,7 +448,7 @@ ChannelHandler proxyHandler(
             excludeOwnEndpoints: true,
             mayLocate: () => locates.take(client),
           ),
-          maxHeldBytes: switchboard.muxOptions.maxChannelBufferBytes,
+          maxHeldBytes: switchboard.muxOptions.initialWindow,
         );
         await _pipe(
           _MuxEnd(incoming.channel),
