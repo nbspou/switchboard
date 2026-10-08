@@ -541,6 +541,71 @@ void main() {
       );
     });
 
+    test('an expectedIdentityFor that throws fails that relay: the next is '
+        'tried', () async {
+      final mesh = await startMesh();
+      final relays = [
+        await Relay.start(mesh),
+        await Relay.start(mesh, identity: 'relay-2'),
+      ];
+      final worker = await Worker.start(mesh);
+      Future<Switchboard> consumerWith(ExpectedIdentity hook) async {
+        final c = await newNode(
+          credential: await issue('consumer-1', consumerScopes),
+          relay: RelayConfig(),
+          expectedIdentityFor: hook,
+        );
+        final joined = MeshNode.join(c, mesh);
+        addTearDown(joined.leave);
+        await joined.synced.timeout(limit);
+        return c;
+      }
+
+      // The first relay asked about fails, the other one carries the open.
+      final asked = <Uri>[];
+      final c = await consumerWith((endpoint, record) {
+        if (record?.address.type != relayType) {
+          return null;
+        }
+        asked.add(endpoint);
+        if (asked.length == 1) {
+          throw StateError('vault sealed');
+        }
+        return null;
+      });
+      final answer = await run(c, worker.address, 'x');
+      expect(asked, hasLength(2));
+      expect(asked.toSet(), hasLength(2));
+      final used = relays.singleWhere((r) => r.uri == asked.last);
+      expect(
+        answer,
+        contains('for ${used == relays.first ? 'relay-1' : 'relay-2'}'),
+      );
+      // Every relay failing: the destination is unavailable, never reached
+      // through an IDENT naming nobody.
+      final failing = await consumerWith(
+        (endpoint, record) => record?.address.type == relayType
+            ? throw StateError('vault sealed')
+            : null,
+      );
+      await expectLater(
+        failing.openChannel(worker.address),
+        throwsA(
+          isA<SwitchboardException>()
+              .having((e) => e.code, 'code', StatusCode.unavailable)
+              .having(
+                (e) => e.status.reason,
+                'reason',
+                allOf(
+                  contains('expectedIdentityFor'),
+                  isNot(contains('vault sealed')),
+                ),
+              ),
+        ),
+      );
+      expect(worker.seen, hasLength(1));
+    });
+
     test('RelayConfig: the relay type must be reserved', () async {
       expect(RelayConfig().type, relayType);
       expect(RelayConfig(type: Name('_relay2')).type, Name('_relay2'));

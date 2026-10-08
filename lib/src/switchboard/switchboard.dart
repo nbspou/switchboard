@@ -290,7 +290,9 @@ class Switchboard {
   /// on every identification on an initiated connection that is not given
   /// a receiver. Null (the default), or a null answer, names nobody,
   /// except on a connection to a relay, which is named by the identity
-  /// its record carries (see [relay]). See [ExpectedIdentity].
+  /// its record carries (see [relay]). A hook that throws fails the
+  /// connection (GOAWAY, [StatusCode.internal]) rather than naming nobody.
+  /// See [ExpectedIdentity].
   final ExpectedIdentity? expectedIdentityFor;
 
   /// Resolves service types for [openChannel] and [openTalk]. May be
@@ -1006,7 +1008,10 @@ class Switchboard {
   /// [StatusCode.unimplemented] for an unsupported scheme, with
   /// [StatusCode.invalidArgument] for a `tcp` URI without host or port or
   /// a `mem` URI without id, and with [StatusCode.failedPrecondition]
-  /// after [close].
+  /// after [close]. When the node identifies on a new connection: with
+  /// [StatusCode.unauthenticated] when the identification fails, and with
+  /// [StatusCode.internal] when [expectedIdentityFor] throws; either way
+  /// the connection is sent GOAWAY.
   ///
   /// [record] is the resolver's record the connection is established for,
   /// if the caller has one: it reaches [expectedIdentityFor] (and names a
@@ -1247,10 +1252,17 @@ class Switchboard {
     final normalised = _normalised(endpoint);
     if (credential != null &&
         (intent != null || receiver != null || _identifiesTo(normalised))) {
-      final named =
-          receiver ??
-          _expectedIdentity(normalised, record) ??
-          _relayIdentity(record);
+      final String? named;
+      try {
+        named =
+            receiver ??
+            _expectedIdentity(normalised, record) ??
+            _relayIdentity(record);
+      } on SwitchboardException {
+        // The hook failed: no IDENT that names nobody instead.
+        unawaited(connection.goAway());
+        rethrow;
+      }
       try {
         await connection.identify(
           credential,
@@ -1314,7 +1326,10 @@ class Switchboard {
   }
 
   /// What [expectedIdentityFor] says for [endpoint] (normalised) and
-  /// [record]; a hook that throws names nobody.
+  /// [record]. A hook that throws fails closed: the error is logged and
+  /// this throws [SwitchboardException] [StatusCode.internal] naming the
+  /// hook (not the error, which a proxy or relay could pass on), so that
+  /// the node never sends an `IDENT` naming nobody in its place.
   String? _expectedIdentity(Uri endpoint, ServiceRecord? record) {
     final hook = expectedIdentityFor;
     if (hook == null) {
@@ -1324,7 +1339,10 @@ class Switchboard {
       return hook(endpoint, record);
     } on Object catch (e, st) {
       _log.warning('expectedIdentityFor failed for $endpoint', e, st);
-      return null;
+      throw SwitchboardException.of(
+        StatusCode.internal,
+        'expectedIdentityFor failed for $endpoint',
+      );
     }
   }
 
@@ -1339,8 +1357,10 @@ class Switchboard {
   /// for a connection the node initiated, what [expectedIdentityFor] gives
   /// for its endpoint, else nobody.
   ///
-  /// Fails like [MuxConnection.identify]. Throws [StateError] when the
-  /// node has no credential.
+  /// Fails like [MuxConnection.identify], and with [StatusCode.internal]
+  /// when [expectedIdentityFor] throws (no `IDENT` is sent; the connection
+  /// is left as it is). Throws [StateError] when the node has no
+  /// credential.
   Future<void> identifyOn(
     MuxConnection connection, {
     Uint8List? intent,
@@ -1351,12 +1371,17 @@ class Switchboard {
       throw StateError('the node has no credential');
     }
     final dialled = _dialled[connection];
-    final named =
-        receiver ??
-        _identified[connection]?.receiver ??
-        (dialled == null
-            ? null
-            : _expectedIdentity(_normalised(dialled), null));
+    final String? named;
+    try {
+      named =
+          receiver ??
+          _identified[connection]?.receiver ??
+          (dialled == null
+              ? null
+              : _expectedIdentity(_normalised(dialled), null));
+    } on SwitchboardException catch (e) {
+      return Future.error(e);
+    }
     return connection
         .identify(
           credential,

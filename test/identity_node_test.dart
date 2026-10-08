@@ -18,6 +18,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
@@ -607,15 +608,85 @@ void main() {
       final explicit = await client('other');
       final connection = await explicit.dial(uri, receiver: 'gate');
       expect(connection.isOpen, isTrue);
+      // A hook that throws fails the connection (see below).
       final failing = await node(
         credential: await npcCredential(),
         holderKey: npcKey,
         expectedIdentityFor: (endpoint, record) => throw StateError('no'),
       );
-      await expectLater(
-        failing.connect(uri),
-        throwsCode(StatusCode.unauthenticated),
+      await expectLater(failing.connect(uri), throwsCode(StatusCode.internal));
+    });
+
+    test('an expectedIdentityFor that throws fails closed', () async {
+      // A host that accepts an IDENT naming nobody: the hook's failure must
+      // not fall back to one.
+      final (lenient, uri) = await server(
+        'mem',
+        credential: await issue('gate', gateKey, const []),
+        holderKey: gateKey,
       );
+      final accepted = <MuxConnection>[];
+      lenient.connections.listen(accepted.add);
+      final warnings = <LogRecord>[];
+      final logs = Logger.root.onRecord.listen((r) {
+        if (r.level >= Level.WARNING) {
+          warnings.add(r);
+        }
+      });
+      addTearDown(logs.cancel);
+      final failing = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        expectedIdentityFor: (endpoint, record) =>
+            throw StateError('vault sealed'),
+      );
+      final failure = throwsA(
+        isA<SwitchboardException>()
+            .having((e) => e.code, 'code', StatusCode.internal)
+            .having(
+              (e) => e.status.reason,
+              'reason',
+              allOf(
+                contains('expectedIdentityFor'),
+                isNot(contains('vault sealed')),
+              ),
+            ),
+      );
+      await expectLater(failing.connect(uri), failure);
+      await expectLater(failing.dial(uri), failure);
+      await expectLater(
+        failing.openChannelAt(uri, ChannelAddress(type: npc)),
+        failure,
+      );
+      await until(() => accepted.length == 3);
+      for (final connection in accepted) {
+        expect(
+          await connection.done.timeout(limit),
+          hasCode(StatusCode.goingAway),
+        );
+        expect(connection.peerIdentity, isNull);
+      }
+      final hook = warnings.where(
+        (r) => r.message.contains('expectedIdentityFor'),
+      );
+      expect(hook, hasLength(3));
+      expect(hook.map((r) => r.error), everyElement(isA<StateError>()));
+      // An explicit receiver does not ask the hook.
+      final explicit = await failing.dial(uri, receiver: 'gate');
+      expect(explicit.isOpen, isTrue);
+      // identifyOn fails the same way, without an IDENT, and leaves the
+      // connection as it is.
+      final quiet = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        identifyFor: (_) => false,
+        expectedIdentityFor: (endpoint, record) =>
+            throw StateError('vault sealed'),
+      );
+      final connection = await quiet.connect(uri);
+      await expectLater(quiet.identifyOn(connection), failure);
+      expect(connection.isOpen, isTrue);
+      expect(await open(quiet, uri, npc), 'npc for nobody');
     });
 
     test('dial with an intent and a receiver; updateCredential presents '
@@ -701,6 +772,62 @@ void main() {
           .timeout(limit);
       // The PeerSet tells the hook which record it dials.
       expect(records.single?.address, ServiceAddress(npc, 5));
+    });
+
+    test('PeerSet: an expectedIdentityFor that throws fails the attempt, '
+        'which is retried after the backoff', () async {
+      final b = await node();
+      final held = <IncomingChannel>[];
+      b.registerService(npc, held.add, acceptAnyInstance: true);
+      final accepted = <MuxConnection>[];
+      b.connections.listen(accepted.add);
+      final uri = await b.listenMemory();
+      var calls = 0;
+      final consumer = await node(
+        credential: await npcCredential(),
+        holderKey: npcKey,
+        outgoingPolicy: ChannelPolicies.denyAll,
+        resolver: StaticResolver([
+          ServiceRecord(ServiceAddress(npc, 5), endpoints: [uri]),
+        ]),
+        expectedIdentityFor: (endpoint, record) {
+          if (calls++ < 2) {
+            throw StateError('vault sealed');
+          }
+          return null;
+        },
+      );
+      final set = PeerSet.watch(
+        consumer,
+        npc,
+        channel: ChannelAddress(type: npc),
+        initialBackoff: const Duration(milliseconds: 10),
+        maxBackoff: const Duration(milliseconds: 80),
+        jitter: 0,
+      );
+      addTearDown(set.close);
+      final events = <PeerEvent>[];
+      set.events.listen(events.add);
+      await until(() => set.peers[5]?.isOnline ?? false);
+      expect(calls, 3);
+      expect(events.map((e) => e.type), [
+        PeerEventType.added,
+        PeerEventType.offline,
+        PeerEventType.online,
+      ]);
+      expect(events[1].status, hasCode(StatusCode.internal));
+      expect(events[1].status!.reason, contains('expectedIdentityFor'));
+      // The two failed attempts were connections of their own, left with
+      // GOAWAY before any IDENT.
+      expect(accepted, hasLength(3));
+      for (final connection in accepted.take(2)) {
+        expect(
+          await connection.done.timeout(limit),
+          hasCode(StatusCode.goingAway),
+        );
+        expect(connection.peerIdentity, isNull);
+      }
+      expect(accepted.last.peerIdentity?.identity, 'npc-7');
     });
 
     test('an open through the resolver tells the hook its record', () async {
