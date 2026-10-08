@@ -1119,12 +1119,14 @@ class MuxConnection {
     );
   }
 
-  void _dropQueuedData(MuxChannelLink link) {
-    final queue = _outQueues[link.id];
+  /// Drops the DATA queued for [id], whose CLOSE the peer sent, and writes
+  /// what follows it (our CLOSE) at once, so that nothing stays queued for
+  /// an id that is about to be free.
+  void _dropQueuedData(int id) {
+    final queue = _outQueues.remove(id);
     if (queue == null) {
       return;
     }
-    _outQueues.remove(link.id);
     final rest = <Uint8List>[];
     for (final frame in queue.frames) {
       _heldOutputFrames--;
@@ -1252,7 +1254,10 @@ class MuxConnection {
           link.receiveClose(status);
         } else if (link == null && _awaitingClose.remove(id)) {
           // The confirmation of a CLOSE we sent without a channel: the id
-          // is mutually closed and free again.
+          // is mutually closed and free again. A channel whose close
+          // confirmation timed out may still have DATA queued, and the
+          // CLOSE behind it, if the peer's CLOSE crossed ours.
+          _dropQueuedData(id);
           if (_isOwnShortId(id)) {
             _shortIdsInUse--;
           }
@@ -1915,7 +1920,8 @@ class _Host implements MuxChannelHost {
       _connection._sendChannelFrame(link, frame);
 
   @override
-  void dropQueuedData(MuxChannelLink link) => _connection._dropQueuedData(link);
+  void dropQueuedData(MuxChannelLink link) =>
+      _connection._dropQueuedData(link.id);
 
   @override
   void release(MuxChannelLink link) => _connection._release(link);

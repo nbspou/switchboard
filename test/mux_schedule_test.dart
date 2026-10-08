@@ -226,6 +226,37 @@ void main() {
       expect(order(gate), isEmpty);
     });
 
+    test('a channel whose close was not confirmed keeps its queue until the '
+        'peer\'s CLOSE, which drops the DATA and lets the CLOSE go', () async {
+      final (a, b, gate) = gatedPair(
+        initiator: quiet.copyWith(
+          closeConfirmTimeout: const Duration(milliseconds: 20),
+        ),
+      );
+      addTearDown(a.close);
+      final channel = a.open(empty);
+      final atB = await b.incoming.first;
+      for (var n = 0; n < 3; n++) {
+        await channel.send(tagged(channel, n));
+      }
+      // Nothing written: the CLOSE waits behind the DATA, and the
+      // confirmation times out.
+      await channel.close();
+      expect(a.unconfirmedCloseCount, 1);
+      expect(a.heldOutputBytes, greaterThan(0));
+      expect(gate.on(2).map((f) => f.command), [MuxCommand.open]);
+      // The peer closes too: its CLOSE crosses ours.
+      unawaited(atB.close());
+      await pumpEventQueue();
+      expect(a.unconfirmedCloseCount, 0);
+      expect(a.heldOutputBytes, 0);
+      expect(gate.on(2).map((f) => f.command), [
+        MuxCommand.open,
+        MuxCommand.close,
+      ]);
+      expect(await atB.done, Status.ok);
+    });
+
     test('closing the connection writes the GOAWAY first, then what was '
         'held', () async {
       final (a, b, gate) = gatedPair();
