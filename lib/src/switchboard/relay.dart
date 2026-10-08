@@ -58,7 +58,9 @@ final Logger _log = Logger('Switchboard.Relay');
 ///    to the instance is being opened (steps 4 to 7) is checked again
 ///    under its new identity: if that may not open the type, the channel
 ///    to the instance is closed (`CANCELLED`) and the consumer's refused
-///    with `PERMISSION_DENIED`. An identity that arrives once the two
+///    with `PERMISSION_DENIED`. If a required identity expires meanwhile,
+///    the consumer is refused with `UNAUTHENTICATED` and the channel to
+///    the instance is closed. An identity that arrives once the two
 ///    channels are piped does not affect them.
 /// 4. Bounds the channels it relays per consumer connection to
 ///    [maxChannelsPerConnection] (0: no bound): `RESOURCE_EXHAUSTED`
@@ -274,8 +276,13 @@ class RelayService {
       final channel = target.channel;
       // The consumer may have identified (again) while the channel to the
       // instance was being opened: the identity it has now is the one held
-      // to its scopes.
+      // to its scopes. A required identity can also have expired meanwhile.
       final now = connection.peerIdentity;
+      if (requireIdentity && now == null) {
+        unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+        await incoming.reject(genericStatus(StatusCode.unauthenticated));
+        return;
+      }
       if (now != null &&
           !identical(now, identity) &&
           !now.allows(Right.open, type)) {

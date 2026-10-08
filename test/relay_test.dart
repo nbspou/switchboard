@@ -23,6 +23,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
@@ -689,6 +690,59 @@ void main() {
   });
 
   group('refusals', () {
+    test(
+      'a credential expiring while resolving cannot start a relay',
+      () async {
+        var now = DateTime.now();
+        await withClock(Clock(() => now), () async {
+          final worker = await newNode();
+          final endpoint = await worker.listenMemory();
+          worker.registerService(workerType, (incoming) {
+            incoming.channel.send(bytes('private response'));
+            unawaited(incoming.channel.close());
+          }, instance: 1);
+          final resolver = GatedResolver([
+            ServiceRecord(ServiceAddress(workerType, 1), endpoints: [endpoint]),
+          ]);
+          final relay = await newNode(
+            credential: await issue('relay-1', relayScopes),
+            requireNamedIdent: true,
+          );
+          final service = RelayService(
+            relay,
+            allowEndpoints: true,
+            resolver: resolver,
+          );
+          relay.registerService(relayType, service.handler);
+          final uri = await relay.listenMemory();
+          final consumer = await newNode(
+            credential: await authority.issue(
+              kind: CredentialKind.node,
+              identity: 'consumer-1',
+              scopes: consumerScopes,
+              holderKey: key.publicKey,
+              lifetime: const Duration(minutes: 1),
+            ),
+          );
+          final connection = await relayConnection(consumer, uri);
+          final channel = openRelayed(
+            connection,
+            ChannelAddress(type: workerType, instance: 1).encode(),
+          );
+          final received = <Uint8List>[];
+          channel.stream.listen(received.add);
+          await resolver.asked.timeout(limit);
+          now = now.add(const Duration(minutes: 2));
+          resolver.release();
+          expect(
+            await channel.done.timeout(limit),
+            hasCode(StatusCode.unauthenticated),
+          );
+          expect(received, isEmpty);
+        });
+      },
+    );
+
     test('an unidentified consumer: UNAUTHENTICATED, after the hold; one '
         'whose OPEN overtakes its IDENT is held, then admitted', () async {
       final mesh = await startMesh();
