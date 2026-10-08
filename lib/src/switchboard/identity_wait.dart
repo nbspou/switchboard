@@ -4,7 +4,7 @@ Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
-  GPT-6 Astra <noreply@openai.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 /// Bounded identity holds shared by node dispatch and the relay.

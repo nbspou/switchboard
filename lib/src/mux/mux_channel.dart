@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -139,8 +140,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   /// Completes with the channel's end status once it is closed: the first
   /// non-OK status sent or received, else OK. If the connection ended
-  /// first, [StatusCode.connectionLost], or [StatusCode.goingAway] if the
-  /// peer had sent GOAWAY. Never completes with an error.
+  /// first: [StatusCode.goingAway] if the peer had sent GOAWAY (the peer's
+  /// status in the reason when it was another), else the status of our own
+  /// `goAway` if we had called it, else [StatusCode.connectionLost]. Never
+  /// completes with an error.
   ///
   /// Application codes (256 and above) received from a peer, which must
   /// not be sent in CLOSE, are reported as [StatusCode.unknown] with the

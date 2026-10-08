@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -96,7 +97,8 @@ class MuxOptions {
   final Duration? keepAliveInterval;
 
   /// How long to wait for any frame after a keep-alive PING before the
-  /// connection is closed with `CONNECTION_LOST`. Also bounds how long
+  /// connection ends (`CONNECTION_LOST`, or the GOAWAY status if one was
+  /// sent or received first). Also bounds how long
   /// [MuxConnection.close] waits for the transport to close; after that
   /// the transport is aborted if it implements [AbortableTransport].
   /// A reply or connection close cancels the probe timer even when the
@@ -380,7 +382,11 @@ class MuxConnection {
   /// (`PROTOCOL_ERROR`, `FRAME_TOO_LARGE` or `UNSUPPORTED`), left too
   /// many CLOSEs unconfirmed (`RESOURCE_EXHAUSTED`, see
   /// [MuxOptions.maxPendingRejections]) or sent an `IDENT` that failed
-  /// verification (`UNAUTHENTICATED`); otherwise `CONNECTION_LOST`.
+  /// verification (`UNAUTHENTICATED`); else the status of our own
+  /// [goAway] if we called it (`GOING_AWAY` by default); otherwise
+  /// `CONNECTION_LOST`. The channels still open end with the same status,
+  /// except that a protocol failure of the peer ends them as the loss of
+  /// the connection would.
   Future<Status> get done => _done.future;
 
   /// Whether the transport is open and no local close (including
