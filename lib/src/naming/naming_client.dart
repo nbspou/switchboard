@@ -612,8 +612,10 @@ class NamingClient {
   /// endpoints and metadata (publishing `UP` if either changed), only the
   /// newest registration is remembered, and the earlier call's future
   /// completes (or fails) like this one.
-  /// If the replacement is refused, the client drops the channel so that
-  /// the superseded record cannot remain published without being tracked.
+  /// If the replacement is refused while the earlier registration may be
+  /// published on the channel (it was made, or was in flight, on it), the
+  /// client drops the channel, so that the record it no longer tracks
+  /// goes away with it.
   ///
   /// [onAssigned], if given, is called synchronously with the instance id
   /// whenever the registration gets an id different from the one it had:
@@ -705,7 +707,9 @@ class NamingClient {
   /// Removes the registration of `type/instance` made through this client
   /// and stops re-registering it. A [register] of it still in flight fails
   /// with [StatusCode.cancelled]; if the naming service registers it anyway,
-  /// the client unregisters it as soon as the answer arrives.
+  /// the client unregisters it as soon as the answer arrives, and if one
+  /// that replaced a registration on the channel is refused, the client
+  /// drops the channel, which takes the replaced record with it.
   ///
   /// While disconnected it completes immediately: the naming service already
   /// dropped the record with the channel. Fails with [StatusCode.notFound]
@@ -1037,6 +1041,8 @@ class NamingClient {
     ]) {
       _supersede(older, entry);
     }
+    // Whatever it replaced, it replaced.
+    entry.replacesOn = null;
     _log.fine('registered ${ServiceAddress(entry.type, assigned)}');
     if (changed) {
       _notifyAssigned(entry, assigned);
@@ -1068,12 +1074,18 @@ class NamingClient {
     final indeterminate = _isIndeterminate(error);
     if (!_entries.contains(entry)) {
       // Unregistered while the request was in flight. If the naming service
-      // may have registered it after all, the record must not outlive the
-      // channel unnoticed.
+      // may have registered it after all, or still publishes the record it
+      // was to replace, the record must not outlive the channel unnoticed.
       if (indeterminate) {
         session.lose(
           Status.of(StatusCode.aborted, 'REGISTER outcome unknown'),
           'REGISTER $address has no clear outcome ($error)',
+        );
+      } else if (identical(entry.replacesOn, session)) {
+        session.lose(
+          Status.of(StatusCode.aborted, 'replacement REGISTER failed'),
+          'replacement REGISTER $address failed after unregister; dropping '
+          'the old record',
         );
       }
       return;
@@ -1125,7 +1137,7 @@ class NamingClient {
     }
     _entries.remove(entry);
     entry.completer.completeError(error, stackTrace);
-    if (entry.replacesRegistration) {
+    if (identical(entry.replacesOn, session)) {
       session.lose(
         Status.of(StatusCode.aborted, 'replacement REGISTER failed'),
         'replacement REGISTER $address failed; dropping the old record',
@@ -1147,7 +1159,13 @@ class NamingClient {
   void _supersede(_Entry older, _Entry newer) {
     _entries.remove(older);
     older.superseded = true;
-    newer.replacesRegistration = true;
+    final live = _session;
+    if (live != null &&
+        (identical(older.session, live) ||
+            identical(older.pending, live) ||
+            identical(older.replacesOn, live))) {
+      newer.replacesOn = live;
+    }
     if (!older.completer.isCompleted) {
       newer.completer.future.then(
         older.completer.complete,
@@ -1361,8 +1379,10 @@ class _Entry {
   /// Replaced by a newer registration of the same address.
   bool superseded = false;
 
-  /// Supersedes an entry whose record may still exist on the channel.
-  bool replacesRegistration = false;
+  /// The session on which a registration this entry superseded may still
+  /// be published (registered, or in flight, there): if this entry is
+  /// refused on it, the channel is dropped. Null once registered.
+  _Session? replacesOn;
 
   /// Refusals of re-registration in a row.
   int refusals = 0;

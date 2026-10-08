@@ -1639,6 +1639,74 @@ void main() {
       expect(h.service.table, isEmpty);
     });
 
+    test('a refused replacement of a registration never made keeps the '
+        'channel', () async {
+      final other = h.link().$1;
+      expect(await register(other, 'npc', instance: 5), 5);
+      final client = newClient(connector);
+      connector.down = true;
+      unawaited(client.start());
+      await until(() => connector.calls >= 2);
+      // Neither is sent before the next connect.
+      final first = client.register(Name('npc'), [uriA], instance: 5);
+      final firstFailed = expectLater(
+        first,
+        throwsStatus(StatusCode.alreadyExists),
+      );
+      final replacement = client.register(Name('npc'), [uriB], instance: 5);
+      final failedCalls = connector.calls;
+      connector.down = false;
+      await expectLater(replacement, throwsStatus(StatusCode.alreadyExists));
+      await firstFailed;
+      await client.synced.timeout(timeout);
+      // Nothing of this client's was published: the channel stays.
+      await Future<void>.delayed(reconnectDelay * 5);
+      expect(connector.calls, failedCalls + 1);
+      expect(client.isSynced, isTrue);
+    });
+
+    test('a replacement unregistered in flight, then refused, drops the '
+        'old record', () async {
+      final h = Harness(assignmentHold: const Duration(seconds: 1));
+      addTearDown(h.close);
+      // On the first channel, the naming service takes one request at a
+      // time from this client.
+      var calls = 0;
+      final client = NamingClient(() async {
+        calls++;
+        final link = StreamChannelController<Uint8List>();
+        h.service.serve(
+          TalkChannel(
+            link.local,
+            options: calls == 1
+                ? const TalkOptions(
+                    replyTimeout: Duration(milliseconds: 200),
+                    maxIncomingRequests: 1,
+                  )
+                : serverOptions,
+          ),
+        );
+        return TalkChannel(link.foreign, options: clientOptions);
+      }, reconnectDelay: reconnectDelay);
+      clients.add(client);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      await client.register(type, [uriA], instance: 1);
+      // Held until the assignment hold ends: the service refuses what
+      // follows on the channel meanwhile.
+      final held = client.register(Name('api'), [uriA]);
+      await pump();
+      final replacement = client.register(type, [uriB], instance: 1);
+      await client.unregister(type, 1);
+      await expectLater(replacement, throwsStatus(StatusCode.cancelled));
+      await until(() => !h.service.table.containsKey(ServiceAddress(type, 1)));
+      // The held registration is made again on the next channel.
+      await held.timeout(const Duration(seconds: 3));
+      expect(calls, 2);
+      expect(h.service.table.keys.map((a) => a.type), [Name('api')]);
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();
