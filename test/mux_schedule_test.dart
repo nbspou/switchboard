@@ -12,6 +12,7 @@ Authors:
 // order it goes; bulk channels and their chunks.
 
 import 'dart:async';
+import 'dart:mirrors';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -37,6 +38,16 @@ List<(int, int)> order(GatedTransport gate) => [
   for (final frame in gate.written)
     if (isData(frame)) (frame.channelId, frame.payload[1]),
 ];
+
+// Retention checks need to count the scheduler's otherwise invisible
+// turn entries: empty entries hold memory without affecting wire output.
+dynamic field(Object object, String name) {
+  final mirror = reflect(object);
+  final symbol = mirror.type.declarations.keys.singleWhere(
+    (symbol) => MirrorSystem.getName(symbol) == name,
+  );
+  return mirror.getField(symbol).reflectee;
+}
 
 /// An output that takes one chunk, hands it to [target], and takes the
 /// next only after [delay]: a socket whose peer reads at a fixed rate.
@@ -77,6 +88,42 @@ class RateSink implements StreamSink<List<int>> {
 
 void main() {
   group('output scheduler', () {
+    test(
+      'closed channels leave no scheduler turns while output is blocked',
+      () async {
+        final (a, b, gate) = gatedPair();
+        addTearDown(a.close);
+        final incoming = StreamQueue(b.incoming);
+        for (var i = 0; i < 40; i++) {
+          final channel = a.open(empty);
+          final peer = await incoming.next;
+          await channel.send(Uint8List(1));
+          await peer.close();
+        }
+        expect(a.heldOutputBytes, 0);
+        expect(field(a, '_ordinaryTurns'), isEmpty);
+        expect(field(a, '_bulkTurns'), isEmpty);
+        expect(gate.isOutputReady, isFalse);
+      },
+    );
+
+    test('connection loss releases scheduled and pre-OPEN output', () async {
+      final (a, b, _) = gatedPair();
+      addTearDown(a.close);
+      await a.ping();
+      final parent = a.open(empty);
+      await parent.send(Uint8List(1));
+      final child = parent.openAfter(empty);
+      await child.send(Uint8List(1));
+      expect(a.heldOutputBytes, greaterThan(0));
+      await b.close();
+      await a.done;
+      expect(a.heldOutputBytes, 0);
+      expect(field(field(child, '_link') as Object, 'preOpen'), isEmpty);
+      expect(field(a, '_ordinaryTurns'), isEmpty);
+      expect(field(a, '_bulkTurns'), isEmpty);
+    });
+
     test('frames go straight out while the transport is ready', () async {
       final (a, b, gate) = gatedPair();
       addTearDown(a.close);

@@ -1090,8 +1090,10 @@ class MuxConnection {
   // a new OPEN never overtakes an old CLOSE.
 
   final Map<int, _OutQueue> _outQueues = {};
-  final Queue<_OutQueue> _ordinaryTurns = Queue<_OutQueue>();
-  final Queue<_OutQueue> _bulkTurns = Queue<_OutQueue>();
+  // Ordered sets allow a closed channel's turn to be removed at once,
+  // even while the transport never becomes ready to drain the lists.
+  final LinkedHashSet<_OutQueue> _ordinaryTurns = LinkedHashSet<_OutQueue>();
+  final LinkedHashSet<_OutQueue> _bulkTurns = LinkedHashSet<_OutQueue>();
   int _ordinarySinceBulk = 0;
   int _heldOutputFrames = 0;
   int _heldOutputBytes = 0;
@@ -1169,12 +1171,14 @@ class MuxConnection {
       final _OutQueue queue;
       if (_ordinaryTurns.isNotEmpty &&
           (!bulkWaiting || _ordinarySinceBulk < options.bulkZipper)) {
-        queue = _ordinaryTurns.removeFirst();
+        queue = _ordinaryTurns.first;
+        _ordinaryTurns.remove(queue);
         if (bulkWaiting) {
           _ordinarySinceBulk++;
         }
       } else if (bulkWaiting) {
-        queue = _bulkTurns.removeFirst();
+        queue = _bulkTurns.first;
+        _bulkTurns.remove(queue);
         _ordinarySinceBulk = 0;
       } else {
         return null;
@@ -1182,7 +1186,6 @@ class MuxConnection {
       if (queue.frames.isNotEmpty) {
         return queue;
       }
-      // Emptied by dropQueuedData.
       queue.listed = false;
     }
   }
@@ -1286,7 +1289,9 @@ class MuxConnection {
         rest.add(frame);
       }
     }
-    // Left in its turn list, skipped once empty.
+    _ordinaryTurns.remove(queue);
+    _bulkTurns.remove(queue);
+    queue.listed = false;
     queue.frames.clear();
     for (final frame in rest) {
       _writeOpening(frame.bytes, frame.opens);
@@ -2049,6 +2054,11 @@ class MuxConnection {
   }
 
   void _finish(Status status, Status channelStatus) {
+    _outQueues.clear();
+    _ordinaryTurns.clear();
+    _bulkTurns.clear();
+    _heldOutputFrames = 0;
+    _heldOutputBytes = 0;
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;
     _limitsTimer?.cancel();

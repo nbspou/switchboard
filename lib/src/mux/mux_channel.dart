@@ -941,6 +941,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _confirmTimer = null;
     _pendingClose = null;
     _failPendingSends();
+    _link.preOpen = const [];
     _released = true;
     _held = 0;
     _endRequested = true;
