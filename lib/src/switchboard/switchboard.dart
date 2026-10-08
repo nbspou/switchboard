@@ -35,6 +35,7 @@ import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
 import '../status.dart';
+import '../talk/talk_bulk.dart';
 import '../talk/talk_channel.dart';
 import '../transport/memory_transport.dart';
 import '../transport/stream_transport.dart';
@@ -61,7 +62,12 @@ final Logger _log = Logger('Switchboard.Router');
 /// and Dispatch". Dispatch is symmetric: channels the peer opens on a
 /// connection this node initiated are dispatched exactly like channels on
 /// accepted connections, under that connection's policy
-/// ([outgoingPolicy]).
+/// ([outgoingPolicy]). Bulk channels (the reserved type `_bulk`, wiki page
+/// "Polyverse Switchboard Talk", "Bulk payloads") are not dispatched to
+/// services: each goes to the Talk layer of the channel it names on the
+/// same connection ([TalkChannel.adoptBulk]), or the pipe forwarding that
+/// channel, without any policy, and is refused `FAILED_PRECONDITION` when
+/// no such channel is open.
 ///
 /// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`,
 /// `tcp://host:port` and, within one isolate, `mem://id` (see
@@ -1813,6 +1819,12 @@ class Switchboard {
     } on ProtocolException catch (e) {
       _log.warning('channel ${channel.id} from $remote: ${e.status}');
       unawaited(channel.close(e.status));
+      return;
+    }
+    if (TalkBulkOpen.isBulk(address)) {
+      // A bulk channel belongs to a channel of this connection that was
+      // admitted already: routed to its Talk layer, no policy consulted.
+      TalkChannel.routeBulk(channel, address);
       return;
     }
     final policy = _policies[connection];
