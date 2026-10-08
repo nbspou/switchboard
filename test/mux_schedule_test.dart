@@ -425,6 +425,43 @@ void main() {
   });
 
   group('openAfter', () {
+    for (final command in [MuxCommand.data, MuxCommand.close]) {
+      test(
+        '${command.name} before the child OPEN is a protocol error',
+        () async {
+          final (mux, raw) = rawPair();
+          addTearDown(mux.close);
+          final parent = mux.open(empty);
+          await parent.send(Uint8List(32752));
+          await parent.send(Uint8List(32752));
+          parent.send(empty).ignore();
+          final child = parent.openAfter(empty);
+          raw.send(hexString(MuxFrame(command, child.id, empty).encode()));
+          await pumpEventQueue();
+          expect(mux.isOpen, isFalse);
+          expect(await mux.done, hasCode(StatusCode.protocolError));
+        },
+      );
+    }
+
+    test('CREDIT for a child whose OPEN has not gone out is ignored', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      final parent = mux.open(empty);
+      await parent.send(Uint8List(32752));
+      await parent.send(Uint8List(32752));
+      parent.send(empty).ignore();
+      final child = parent.openAfter(empty);
+      raw.send(
+        hexString(
+          MuxControlMessage.credit(MuxCredit(child.id, 100)).toFrame().encode(),
+        ),
+      );
+      await pumpEventQueue();
+      expect(child.sendWindow, MuxLimits.defaultInitialWindow);
+      expect(mux.isOpen, isTrue);
+    });
+
     /// (command, channel id) of every frame written but control messages.
     List<(MuxCommand, int)> commands(GatedTransport gate) => [
       for (final frame in gate.written)

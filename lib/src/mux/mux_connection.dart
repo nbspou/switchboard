@@ -1136,10 +1136,7 @@ class MuxConnection {
     var queue = _outQueues[id];
     if (queue == null) {
       if (!isData || (_heldOutputFrames == 0 && _outputReady)) {
-        _write(frame.encode());
-        if (opens != null) {
-          _openWritten(opens);
-        }
+        _writeOpening(frame.encode(), opens);
         return;
       }
       queue = _outQueues[id] = _OutQueue(id);
@@ -1224,8 +1221,17 @@ class MuxConnection {
     } else {
       _takeTurn(queue);
     }
-    _write(frame.bytes);
-    final opens = frame.opens;
+    _writeOpening(frame.bytes, frame.opens);
+  }
+
+  /// Makes an OPEN visible before writing it: a synchronous peer may
+  /// respond during the write. Until this point its id is only reserved
+  /// locally, and DATA or CLOSE from the peer must be refused.
+  void _writeOpening(Uint8List bytes, MuxChannelLink? opens) {
+    if (opens != null) {
+      opens.openWritten = true;
+    }
+    _write(bytes);
     if (opens != null) {
       _openWritten(opens);
     }
@@ -1283,11 +1289,7 @@ class MuxConnection {
     // Left in its turn list, skipped once empty.
     queue.frames.clear();
     for (final frame in rest) {
-      _write(frame.bytes);
-      final opens = frame.opens;
-      if (opens != null) {
-        _openWritten(opens);
-      }
+      _writeOpening(frame.bytes, frame.opens);
     }
   }
 
@@ -1396,7 +1398,7 @@ class MuxConnection {
         _handleOpen(id, frame.payload);
       case MuxCommand.data:
         final link = _links[id];
-        if (link != null && !link.closeReceived) {
+        if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveData(frame.payload);
         } else if (link == null && _awaitingClose.contains(id)) {
           // In flight before the peer saw our CLOSE: dropped.
@@ -1408,7 +1410,7 @@ class MuxConnection {
           decodeStatusPayload(frame.payload, 'CLOSE'),
         );
         final link = _links[id];
-        if (link != null && !link.closeReceived) {
+        if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveClose(status);
         } else if (link == null && _awaitingClose.remove(id)) {
           // The confirmation of a CLOSE we sent without a channel: the id
@@ -1584,7 +1586,10 @@ class MuxConnection {
   /// Flow-control credit from the peer: ignored for a channel that is not
   /// open here (it raced a CLOSE).
   void _onCredit(MuxCredit credit) {
-    _links[credit.channelId]?.receiveCredit(credit.bytes);
+    final link = _links[credit.channelId];
+    if (link != null && link.openWritten) {
+      link.receiveCredit(credit.bytes);
+    }
   }
 
   // Identity ------------------------------------------------------------
