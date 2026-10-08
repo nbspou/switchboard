@@ -620,7 +620,12 @@ class TalkChannel {
   /// locally (timeout, the channel closing), stops the transfer with
   /// `CANCELLED`; the receiver can stop it too, by closing the bulk
   /// channel. Needs a mux channel: over any other `StreamChannel` a bulk
-  /// payload throws [StatusCode.unimplemented].
+  /// payload throws [StatusCode.unimplemented]. The requester timeout
+  /// restarts each time a chunk of the payload goes out (as it does for a
+  /// stream item), and as the bulk payloads of stream items arrive; it
+  /// stops when the final response arrives, and the transfer of a bulk
+  /// payload in that response is not timed (the connection's keep-alive
+  /// bounds a peer gone silent; [TalkRequest.cancel] stops it).
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
@@ -957,6 +962,13 @@ class TalkChannel {
       final out = _sendFrame(frame, bulk: bulk);
       if (out != null) {
         pending.bulkOuts.add(out);
+        // The request's payload going out is progress: the requester
+        // timeout restarts with each chunk the receiver takes.
+        out.onProgress = () {
+          if (!pending.ended && !pending.finalReceived) {
+            pending.replied();
+          }
+        };
       }
     } catch (_) {
       if (identical(_outgoing[id], pending)) {
@@ -1062,7 +1074,13 @@ class TalkChannel {
       return false;
     }
     _incoming[id] = message;
-    message._startTimer();
+    if (message.frame.bulk) {
+      // Started once the request is delivered: its application cannot
+      // answer before (see [_attachBulk]).
+      message._timerDeferred = true;
+    } else {
+      message._startTimer();
+    }
     return true;
   }
 
@@ -1347,7 +1365,9 @@ class TalkChannel {
   /// reassembled first (see [TalkOptions.streamBulk]).
   void _attachBulk(_Message message, _BulkIn b) {
     message._bulk = b;
-    b.length = message._bulkRef!.length;
+    b
+      ..length = message._bulkRef!.length
+      ..onProgress = message._onBulkProgress;
     _bulkIns.add(b);
     unawaited(
       b.channel.done.then((_) {
@@ -1367,12 +1387,14 @@ class TalkChannel {
     }
     if (stream) {
       message._streamBulk = true;
+      message._startDeferredTimer();
     } else {
       b
           .collect(options.maxInlinePayload)
           .then(
             (bytes) {
               message._assembled = bytes;
+              message._startDeferredTimer();
               message._lane?.advance();
             },
             onError: (Object error) {
@@ -1544,6 +1566,13 @@ class TalkChannel {
     if (frame.hasRequest) {
       _register(message);
     }
+    // The payload of an item arriving is progress of the request, as the
+    // item was.
+    message._onBulkProgress = () {
+      if (!pending.ended && !pending.finalReceived) {
+        pending.replied();
+      }
+    };
     if (!_claimBulk(message, forSink: pending.sink != null)) {
       return;
     }
@@ -2219,6 +2248,25 @@ class _Message extends TalkMessage {
   /// Bulk payloads of the replies to this request, being sent.
   final List<_BulkOut> _bulkOuts = [];
 
+  /// Called as the bulk payload of this message is read: restarts the
+  /// timeouts that its transfer counts as progress for.
+  void Function()? _onBulkProgress;
+
+  /// The responder timeout waits for the request to be delivered (a bulk
+  /// payload being reassembled or not dispatched yet).
+  bool _timerDeferred = false;
+
+  /// Starts the responder timeout deferred by [TalkChannel._register].
+  void _startDeferredTimer() {
+    if (!_timerDeferred) {
+      return;
+    }
+    _timerDeferred = false;
+    if (!_finished && expectsReply) {
+      _startTimer();
+    }
+  }
+
   /// Whether the message can be delivered: inline, or its bulk payload is
   /// reassembled, failed, or delivered as a stream.
   bool get _ready =>
@@ -2621,6 +2669,8 @@ class _Message extends TalkMessage {
         ),
       ),
     );
+    // An item's payload going out is progress, as the item was.
+    out?.onProgress = _replied;
     _replied();
     return out;
   }

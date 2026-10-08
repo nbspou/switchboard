@@ -285,6 +285,87 @@ void main() {
     expect(log, ['event 1', 'answer 200000', 'event 2']);
   });
 
+  group('timeouts', () {
+    const short = TalkOptions(
+      requestTimeout: Duration(milliseconds: 200),
+      replyTimeout: Duration(milliseconds: 150),
+    );
+
+    /// [count] pieces of [size] bytes, one every [every].
+    Stream<List<int>> slow(int count, int size, Duration every) async* {
+      for (var i = 0; i < count; i++) {
+        await Future<void>.delayed(every);
+        yield pattern(size, i * size);
+      }
+    }
+
+    test('an upload longer than both timeouts succeeds while it progresses '
+        '(reassembled)', () async {
+      final peers = await Peers.connect(serverOptions: short);
+      final (talk, server) = await peers.open(options: short);
+      server.messages.listen((m) => m.reply(Uint8List.fromList([1])));
+      // 12 pieces, 50 ms apart: 600 ms, three times the requester timeout.
+      final answer = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: slow(12, 70000, const Duration(milliseconds: 50)),
+      );
+      expect(answer.payload, [1]);
+    });
+
+    test('a streamed upload read for longer than both timeouts, declared '
+        'with EXTEND', () async {
+      final peers = await Peers.connect(
+        serverOptions: TalkOptions(
+          requestTimeout: short.requestTimeout,
+          replyTimeout: short.replyTimeout,
+          streamBulk: (_) => true,
+        ),
+      );
+      final (talk, server) = await peers.open(options: short);
+      server.messages.listen((m) async {
+        // A long read is declared, as any long work on a request is.
+        m.extend(deadline: const Duration(seconds: 5));
+        var n = 0;
+        await for (final chunk in m.bulk) {
+          n += chunk.length;
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+        }
+        m.reply(Uint8List.fromList([n ~/ 100000]));
+      });
+      final answer = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: generated(1000000, piece: 65536),
+        bulkLength: 1000000,
+      );
+      expect(answer.payload, [10]);
+    });
+
+    test('a stalled upload times out and is cancelled', () async {
+      final peers = await Peers.connect(serverOptions: short);
+      final (talk, server) = await peers.open(options: short);
+      final served = <TalkMessage>[];
+      server.messages.listen(served.add);
+      final source = StreamController<List<int>>();
+      source.add(pattern(100000));
+      await expectLater(
+        talk.request('PUT', Uint8List(0), bulk: source.stream),
+        throwsA(
+          isA<SwitchboardException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.deadlineExceeded,
+          ),
+        ),
+      );
+      await pumpEventQueue();
+      expect(source.hasListener, isFalse);
+      expect(served, isEmpty);
+      await source.close();
+    });
+  });
+
   test('a lower bulkThreshold sends bulk earlier', () async {
     final peers = await Peers.connect();
     final (talk, server) = await peers.open(

@@ -79,6 +79,22 @@ class _BulkOut {
   final Completer<void> _done = Completer<void>()..future.ignore();
   bool _stopped = false;
   StreamIterator<List<int>>? _iterator;
+
+  /// Called each time a chunk was handed to the bulk channel (its window
+  /// took it): the transfer progresses.
+  void Function()? onProgress;
+
+  void _progress() {
+    final callback = onProgress;
+    if (callback != null) {
+      try {
+        callback();
+      } catch (e, st) {
+        _log.severe('bulk progress callback failed', e, st);
+      }
+    }
+  }
+
   _BulkIn? _from;
   StreamSubscription<Uint8List>? _pipe;
 
@@ -94,7 +110,7 @@ class _BulkOut {
     final bytes = source._bytes;
     final stream = source._stream;
     if (bytes != null) {
-      _sendBytes(bytes);
+      unawaited(_pumpStream(_pieces(bytes)));
     } else if (stream != null) {
       unawaited(_pumpStream(stream));
     } else {
@@ -162,13 +178,13 @@ class _BulkOut {
     }
   }
 
-  void _sendBytes(Uint8List bytes) {
-    try {
-      channel
-          .send(bytes)
-          .then((_) => _finish(null), onError: (Object _) => _finish(null));
-    } on SwitchboardException catch (e) {
-      _finish(e.status);
+  /// [bytes] as views of [TalkOptions.bulkChunkSize] bytes, without a
+  /// copy.
+  Stream<List<int>> _pieces(Uint8List bytes) async* {
+    final chunk = talk.options.bulkChunkSize;
+    for (var offset = 0; offset < bytes.length; offset += chunk) {
+      final end = offset + chunk < bytes.length ? offset + chunk : bytes.length;
+      yield Uint8List.sublistView(bytes, offset, end);
     }
   }
 
@@ -203,6 +219,7 @@ class _BulkOut {
           final piece = _take(parts, chunk);
           held -= piece.length;
           await channel.send(piece);
+          _progress();
         }
       }
       if (!_stopped && failure == null) {
@@ -217,6 +234,7 @@ class _BulkOut {
             final piece = _take(parts, held < chunk ? held : chunk);
             held -= piece.length;
             await channel.send(piece);
+            _progress();
           }
         }
       }
@@ -364,6 +382,9 @@ class _BulkIn {
   /// reassembly, or a forwarding pipe.
   bool _read = false;
 
+  /// Called each time the reader took a chunk: the transfer progresses.
+  void Function()? onProgress;
+
   /// Whether its bytes have all been delivered (the channel's stream
   /// ended).
   bool _ended = false;
@@ -502,6 +523,19 @@ class _BulkIn {
     }
   }
 
+  /// The reader took a chunk.
+  void _taken(int length) {
+    _consume(length);
+    final callback = onProgress;
+    if (callback != null) {
+      try {
+        callback();
+      } catch (e, st) {
+        _log.severe('bulk progress callback failed', e, st);
+      }
+    }
+  }
+
   /// Reads the whole payload, at most [max] bytes: beyond, the bulk channel
   /// is closed `RESOURCE_EXHAUSTED` and the future fails with it.
   Future<Uint8List> collect(int max) {
@@ -592,7 +626,7 @@ class _BulkSubscription extends DelegatingStreamSubscription<Uint8List> {
   @override
   void onData(void Function(Uint8List data)? handleData) {
     super.onData((data) {
-      _bulk._consume(data.length);
+      _bulk._taken(data.length);
       handleData?.call(data);
     });
   }

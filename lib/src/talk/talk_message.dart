@@ -88,6 +88,12 @@ abstract class TalkMessage {
   /// a second call throws [StateError], as does one after [payloadBytes].
   /// A payload nobody reads is cancelled once the request it belongs to
   /// is answered, or when the channel closes.
+  ///
+  /// The responder timeout of a request with a bulk payload starts when
+  /// the request is delivered: once its payload is reassembled, or at once
+  /// when it is streamed. Reading a streamed payload for longer than
+  /// [TalkOptions.replyTimeout] is long work like any other: declare it
+  /// with [extend] (or [setReplyTimeout]), so that the requester waits too.
   Stream<Uint8List> get bulk;
 
   /// The whole payload, at most [maxLength] bytes (default
