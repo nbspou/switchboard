@@ -817,6 +817,9 @@ class SlotGate implements SlotHandler {
   /// [SlotLifecycle.load], which receives [context]. Refused with
   /// `UNAVAILABLE` after [close], or while an earlier load or unload of
   /// this slot is still running, even if it has already been revoked.
+  /// A cancelled [context] never admits queued work: a load that finishes
+  /// after cancellation is unloaded, its queue refused with `MOVED`, and
+  /// the assignment fails with `CANCELLED`.
   @override
   Future<AssignResult> onAssign(
     AssignRequest request, [
@@ -848,6 +851,9 @@ class SlotGate implements SlotHandler {
         StatusCode.unavailable,
         '$type gate closed',
       );
+    }
+    if (context?.isCancelled ?? false) {
+      throw SwitchboardException.of(StatusCode.cancelled, 'ASSIGN cancelled');
     }
     final existing = _slots[slot];
     switch (existing?.state) {
@@ -883,6 +889,11 @@ class SlotGate implements SlotHandler {
         );
       }
     }
+    if (context?.isCancelled ?? false) {
+      _slots.remove(slot);
+      _refuseQueue(s, movedStatus(slot));
+      throw SwitchboardException.of(StatusCode.cancelled, 'ASSIGN cancelled');
+    }
     final AssignResult result;
     try {
       result = await lifecycle.load(
@@ -899,11 +910,17 @@ class SlotGate implements SlotHandler {
       }
       rethrow;
     }
-    if (!identical(_slots[slot], s)) {
-      // Stopped while loading (closed or revoked).
+    final cancelled = context?.isCancelled ?? false;
+    if (!identical(_slots[slot], s) || cancelled) {
+      // Stopped while loading (closed, revoked or cancelled). Do not
+      // release the queue before the naming client notices cancellation.
+      if (identical(_slots[slot], s)) {
+        _slots.remove(slot);
+        _refuseQueue(s, movedStatus(slot));
+      }
       await _unload(slot);
       throw SwitchboardException.of(
-        StatusCode.unavailable,
+        cancelled ? StatusCode.cancelled : StatusCode.unavailable,
         'slot $type/$slot stopped while loading',
       );
     }

@@ -167,12 +167,13 @@ class RecordingContext implements SlotRequestContext {
   final int epoch;
 
   final List<(Duration?, Duration?)> declared = [];
+  final Completer<void> cancelled = Completer<void>();
 
   @override
-  bool get isCancelled => false;
+  bool get isCancelled => cancelled.isCompleted;
 
   @override
-  Future<void> get onCancel => Completer<void>().future;
+  Future<void> get onCancel => cancelled.future;
 
   @override
   void extend({Duration? deadline, Duration? renew}) =>
@@ -436,6 +437,26 @@ void main() {
       await expectLater(loading, throwsCode(StatusCode.unavailable));
       expect(lifecycle.log, ['load 1 e1 h0', 'unload 1']);
     });
+
+    test(
+      'a cancelled ASSIGN cannot serve its queue when load completes',
+      () async {
+        newGate();
+        final context = RecordingContext(kv, 1, 1);
+        final hold = lifecycle.loadGate = Completer<void>();
+        final loading = gate.onAssign(assign(1), context);
+        loading.ignore();
+        final queued = peer.open(shard: 1);
+        await settle();
+        context.cancelled.complete();
+        hold.complete();
+        await expectLater(loading, throwsCode(StatusCode.cancelled));
+        expect(await queued.done.timeout(limit), isMoved());
+        expect(lifecycle.served, isEmpty);
+        expect(gate.serves(1), isFalse);
+        expect(lifecycle.log, ['load 1 e1 h0', 'unload 1']);
+      },
+    );
 
     test('a failed load refuses the queue and fails ASSIGN', () async {
       newGate();
