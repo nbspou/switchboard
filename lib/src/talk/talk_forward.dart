@@ -36,7 +36,8 @@ part of 'talk_channel.dart';
 ///   `CONNECTION_LOST` or `DEADLINE_EXCEEDED`, are never presented as the
 ///   far peer's answer;
 /// * a cancel of [incoming], or the loss of its channel, cancels the
-///   forwarded request.
+///   forwarded request. A reply that cannot be delivered also cancels it,
+///   including a synchronous reply received while forwarding the request.
 ///
 /// Procedure names and payloads pass through byte for byte, including
 /// names that are not valid UTF-8; an absent procedure field on a response
@@ -107,8 +108,8 @@ class _Relay implements _ResponseSink {
   /// The forwarded request, once sent.
   _Outgoing? _out;
 
-  /// [incoming] was cancelled while the forwarded request was being sent.
-  bool _cancelWhenSent = false;
+  /// Cancellation requested while the forwarded request was being sent.
+  Status? _cancelWhenSent;
 
   /// The forwarded request ended.
   bool _ended = false;
@@ -152,8 +153,9 @@ class _Relay implements _ResponseSink {
       relay._end();
       return relay._done.future;
     }
-    if (relay._cancelWhenSent) {
-      relay._onIncomingCancelled();
+    final cancel = relay._cancelWhenSent;
+    if (cancel != null) {
+      relay._cancelOutgoing(cancel);
     }
     return relay._done.future;
   }
@@ -187,16 +189,17 @@ class _Relay implements _ResponseSink {
     }
   }
 
-  void _onIncomingCancelled() {
+  void _onIncomingCancelled() => _cancelOutgoing(
+    incoming._cancelStatus ?? Status.of(StatusCode.cancelled),
+  );
+
+  void _cancelOutgoing(Status status) {
     final out = _out;
     if (out == null) {
-      _cancelWhenSent = true;
+      _cancelWhenSent ??= status;
       return;
     }
-    out.channel._cancelOutgoing(
-      out,
-      incoming._cancelStatus ?? Status.of(StatusCode.cancelled),
-    );
+    out.channel._cancelOutgoing(out, status);
   }
 
   void _abortIncoming(Status status) {
@@ -221,13 +224,7 @@ class _Relay implements _ResponseSink {
     } on SwitchboardException catch (e) {
       _log.fine('response to request ${incoming.requestId} not sent: $e');
       _abortIncoming(_localFailure(e.status));
-      final out = _out;
-      if (out != null) {
-        out.channel._cancelOutgoing(
-          out,
-          Status.of(StatusCode.cancelled, 'requester unreachable'),
-        );
-      }
+      _cancelOutgoing(Status.of(StatusCode.cancelled, 'requester unreachable'));
     }
   }
 

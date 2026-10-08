@@ -165,6 +165,19 @@ class RawProxy {
 
 class _ForeignMessage extends Fake implements TalkMessage {}
 
+/// A frontend sink whose frame limit refuses a large streamed reply.
+class _LimitedSink extends DelegatingStreamSink<Uint8List> {
+  _LimitedSink(super.sink);
+
+  @override
+  void add(Uint8List data) {
+    if (data.length > 64) {
+      throw SwitchboardException.of(StatusCode.frameTooLarge);
+    }
+    super.add(data);
+  }
+}
+
 void main() {
   for (final sync in [false, true]) {
     for (final hops in [1, 2]) {
@@ -562,6 +575,71 @@ void main() {
   group('frame level', () {
     final odd = Name.fromBytes([0xFF, 0x41, 0, 0, 0, 0, 0, 0]);
     final odd2 = Name.fromBytes([0xC3, 0x28, 0x80, 0, 0, 0, 0, 0]);
+
+    test('an undeliverable synchronous item cancels the forwarded request', () {
+      fakeAsync((async) {
+        final toClient = StreamChannelController<Uint8List>(sync: true);
+        final toBackend = StreamChannelController<Uint8List>(sync: true);
+        final proxy = Proxy(
+          TalkChannel(
+            StreamChannel(
+              toClient.local.stream,
+              _LimitedSink(toClient.local.sink),
+            ),
+          ),
+          TalkChannel(toBackend.local),
+        );
+        final atClient = <TalkFrame>[];
+        final atBackend = <TalkFrame>[];
+        toClient.foreign.stream.listen(
+          (d) => atClient.add(TalkFrame.decode(d)),
+        );
+        toBackend.foreign.stream.listen((data) {
+          final frame = TalkFrame.decode(data);
+          atBackend.add(frame);
+          if (frame.kind == TalkKind.message) {
+            // Respond inside the proxy's send, before it has the handle.
+            toBackend.foreign.sink.add(
+              TalkFrame(
+                kind: TalkKind.streamItem,
+                responseId: frame.requestId,
+                payload: Uint8List(100),
+              ).encode(),
+            );
+          } else if (frame.kind == TalkKind.abort && frame.hasRequest) {
+            toBackend.foreign.sink.add(
+              TalkFrame(
+                kind: TalkKind.abort,
+                responseId: frame.requestId,
+                payload: Status.of(StatusCode.cancelled).encode(),
+              ).encode(),
+            );
+          }
+        });
+        toClient.foreign.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('LIST'),
+            requestId: 7,
+            stream: true,
+          ).encode(),
+        );
+        async.flushMicrotasks();
+        expect(atClient.single.status.known, StatusCode.unavailable);
+        expect(atBackend.map((f) => f.kind), [
+          TalkKind.message,
+          TalkKind.abort,
+        ]);
+        expect(proxy.front.incomingRequestCount, 0);
+        expect(proxy.back.outgoingRequestCount, 0);
+        final forwarded = Outcome(proxy.forwards.single);
+        async.flushMicrotasks();
+        expect(forwarded.isDone, isTrue);
+        proxy.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
 
     test('non-UTF-8 procedure names pass through byte for byte', () async {
       final p = RawProxy();
