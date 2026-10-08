@@ -343,6 +343,56 @@ void main() {
     expect(MemoryEndpoints.ids, isEmpty, reason: 'a memory listener leaked');
   });
 
+  test('publishSharded handles both SLOTS and HOLDING failures', () async {
+    final host = newNode();
+    final service = NamingService(
+      maxSlotCount: 1,
+      assignmentHold: Duration.zero,
+    );
+    addTearDown(service.close);
+    host.registerService(Services.naming, service.handler);
+    final endpoint = await host.listenMemory();
+    final node = newNode();
+    final mesh = MeshNode.join(node, endpoint, watch: false);
+    addTearDown(mesh.leave);
+
+    // SLOTS is too large; HOLDING then has no space. Both errors must be
+    // handled even though publishSharded reports only the first one.
+    await expectLater(
+      mesh.publishSharded(npc, _UnusedLifecycle(), count: 2, holding: [0]),
+      throwsCode(StatusCode.outOfRange),
+    );
+    expect(mesh.published, isEmpty);
+    expect(mesh.gates[npc], isNull);
+    expect(service.table, isEmpty);
+  });
+
+  test('publishSharded handles an immediate HOLDING failure', () async {
+    final host = newNode();
+    final service = NamingService(assignmentHold: Duration.zero);
+    addTearDown(service.close);
+    host.registerService(Services.naming, service.handler);
+    final endpoint = await host.listenMemory();
+    final node = newNode();
+    final mesh = MeshNode.join(node, endpoint, watch: false);
+    addTearDown(mesh.leave);
+
+    // Local validation fails before SLOTS completes its round trip.
+    await expectLater(
+      mesh.publishSharded(
+        npc,
+        _UnusedLifecycle(),
+        count: 2,
+        mode: SlotMode.static,
+        holding: [-1],
+      ),
+      throwsRangeError,
+    );
+    expect(mesh.published, isEmpty);
+    expect(mesh.gates[npc], isNull);
+    expect(service.table, isEmpty);
+  });
+
   for (final scheme in ['tcp', 'ws', 'mem']) {
     group('over $scheme', () {
       late NamingNode naming;
@@ -895,4 +945,18 @@ void main() {
       expect(naming.service.watchCount, 1);
     });
   });
+}
+
+class _UnusedLifecycle extends SlotLifecycle {
+  @override
+  Future<AssignResult> load(
+    int slot, {
+    required int epoch,
+    required int holder,
+    required bool shared,
+    SlotRequestContext? context,
+  }) async => AssignResult.notHolding;
+
+  @override
+  void serve(IncomingChannel channel, int slot) {}
 }

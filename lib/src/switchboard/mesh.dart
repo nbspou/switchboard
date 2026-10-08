@@ -323,7 +323,8 @@ class MeshNode {
   /// [NamingClient.defineSlots] (for example
   /// [StatusCode.failedPrecondition] when the space is defined
   /// differently) and [NamingClient.declareHolding]. On failure the type is
-  /// unregistered again.
+  /// unregistered again. Both requests' errors are handled even if one
+  /// fails before the other finishes.
   Future<SlotGate> publishSharded(
     Name type,
     SlotLifecycle lifecycle, {
@@ -391,6 +392,7 @@ class MeshNode {
       );
       // Start SLOTS and HOLDING back to back, so that the naming service
       // sees them in one burst and no round trip separates them.
+      final held = holding.toList();
       final defined = client.defineSlots(
         type,
         count: count,
@@ -399,14 +401,15 @@ class MeshNode {
         shared: shared,
         capacity: capacity,
       );
-      final held = holding.toList();
       final declared = held.isNotEmpty
           ? client.declareHolding(type, held)
           : Future<List<int>>.value(const []);
-      await defined;
-      _spaces[type] = space;
       // The slots to discard reach lifecycle.discard through the gate.
-      await declared;
+      await Future.wait<void>([
+        defined,
+        declared.then<void>((_) {}),
+      ], eagerError: true);
+      _spaces[type] = space;
       return gate;
     } catch (_) {
       gates.remove(type);
