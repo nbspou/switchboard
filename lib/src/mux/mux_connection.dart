@@ -1436,7 +1436,9 @@ class MuxConnection {
 
   void _startKeepAlive() {
     final interval = options.keepAliveInterval;
-    if (interval == null) {
+    // A synchronous transport can end the connection while the constructor
+    // sends LIMITS, before the first timer is armed.
+    if (interval == null || _closing) {
       return;
     }
     _keepAliveTimer = Timer(interval, _onKeepAliveTimer);

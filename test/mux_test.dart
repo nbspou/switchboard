@@ -1201,6 +1201,28 @@ void main() {
       await a.close();
       await b.done;
     });
+
+    test('a connection that ends while it starts arms no keep-alive', () {
+      fakeAsync((async) {
+        final transport = StreamChannelController<Uint8List>(sync: true);
+        // A peer that hangs up on the LIMITS sent from the constructor.
+        transport.foreign.stream.listen((_) {
+          unawaited(transport.foreign.sink.close());
+        });
+        final mux = MuxConnection(
+          transport.local,
+          isInitiator: true,
+          options: const MuxOptions(
+            keepAliveInterval: Duration(seconds: 5),
+            keepAliveTimeout: Duration(seconds: 1),
+          ),
+        );
+        expect(mux.isOpen, isFalse);
+        // Past the bound of the close on the transport.
+        async.elapse(const Duration(seconds: 2));
+        expect(async.nonPeriodicTimerCount, 0);
+      });
+    });
   });
 
   group('connection end', () {
