@@ -133,9 +133,10 @@ class MuxOptions {
   /// a channel and still wait for the peer's CLOSE: peer OPENs we rejected
   /// (beyond [maxChannels], after GOAWAY, or with nobody listening to
   /// [MuxConnection.incoming]) and channels whose close confirmation timed
-  /// out ([closeConfirmTimeout]). Each costs its id and remaining receive window; beyond the cap
-  /// the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. 0 means
-  /// unlimited.
+  /// out ([closeConfirmTimeout]). Each costs its id and the receive window
+  /// the peer may still use, against which its late DATA, dropped, is
+  /// still checked; beyond the cap the connection ends with GOAWAY
+  /// `RESOURCE_EXHAUSTED`. 0 means unlimited.
   final int maxPendingRejections;
 
   /// Bytes buffered over all channels (see [MuxConnection.bufferedBytes],
@@ -154,7 +155,9 @@ class MuxOptions {
   ///
   /// On expiry the channel is considered closed locally: [MuxChannel.done]
   /// completes with the first status sent or received and the channel no
-  /// longer counts as open. Nothing is sent. The id stays reserved until
+  /// longer counts as open. Nothing is sent but our CLOSE, if it still
+  /// waited behind subframes waiting for credit: they are dropped, and an
+  /// `OK` close becomes `DEADLINE_EXCEEDED`. The id stays reserved until
   /// the peer's CLOSE arrives after all, or until the connection ends,
   /// because reusing it while the peer may still consider the channel open
   /// would let the peer's late frames for the old channel land on a new
@@ -1643,7 +1646,8 @@ class MuxConnection {
   }
 
   /// Flow-control credit from the peer: ignored for a channel that is not
-  /// open here (it raced a CLOSE).
+  /// open here (it raced a CLOSE), and for an id whose OPEN we have not
+  /// written yet ([MuxChannel.openAfter]), which the peer cannot know.
   void _onCredit(MuxCredit credit) {
     final link = _links[credit.channelId];
     if (link != null && link.openWritten) {
