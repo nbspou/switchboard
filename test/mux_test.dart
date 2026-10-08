@@ -1481,8 +1481,19 @@ void main() {
       unawaited(channel.send(big));
       expect(hexString(await replies.next), '01 02');
       expect(await replies.next, big);
-      final back = server.open(hexBytes('BB'));
+      // A bulk payload of 1 MB, in chunks, paced by the window.
+      final back = server.open(hexBytes('BB'))..priority = MuxPriority.bulk;
       expect(back.id, 3);
+      final backAtClient = await StreamQueue(client.incoming).next;
+      final bulk = Uint8List.fromList(
+        List.generate(1000000, (i) => i * 13 & 0xFF),
+      );
+      final received = backAtClient.stream
+          .expand((d) => d)
+          .take(bulk.length)
+          .toList();
+      await back.send(bulk);
+      expect(await received, bulk);
       await channel.close(Status.of(StatusCode.cancelled));
       expect(await accepted.done, hasCode(StatusCode.cancelled));
       await echo.cancel();

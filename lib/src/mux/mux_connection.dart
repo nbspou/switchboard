@@ -51,6 +51,8 @@ class MuxOptions {
     this.identityTimeout = const Duration(seconds: 10),
     this.requireNamedIdent = false,
     this.initialWindow = defaultInitialWindow,
+    this.bulkZipper = defaultBulkZipper,
+    this.bulkChunkSize = defaultBulkChunkSize,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -71,6 +73,12 @@ class MuxOptions {
   /// Default [initialWindow]: 64 KiB, the window a peer assumes before our
   /// LIMITS arrives ([MuxLimits.defaultInitialWindow]).
   static const int defaultInitialWindow = MuxLimits.defaultInitialWindow;
+
+  /// Default [bulkZipper]: one bulk frame after 4 ordinary ones.
+  static const int defaultBulkZipper = 4;
+
+  /// Default [bulkChunkSize]: 64 KiB.
+  static const int defaultBulkChunkSize = 64 * 1024;
 
   /// Largest incoming mux frame, header included, that we accept; a larger
   /// one ends the connection with GOAWAY `FRAME_TOO_LARGE`. Announced with
@@ -198,6 +206,20 @@ class MuxOptions {
   /// 64 KiB, which is then what this side grants too.
   final int initialWindow;
 
+  /// The output scheduler's zipper between ordinary and bulk channels
+  /// ([MuxChannel.priority]): while frames of bulk channels wait for the
+  /// transport, one of them goes after this many ordinary frames, so that
+  /// sustained ordinary traffic cannot starve a transfer. At least 1;
+  /// default 4.
+  final int bulkZipper;
+
+  /// The largest chunk, in payload bytes, that [MuxChannel.send] cuts a
+  /// payload into on a bulk channel (also bounded by the peer's frame
+  /// limit and the window), so that a frame of another channel waits at
+  /// most one chunk's serialization time behind a transfer. At least 1;
+  /// default 64 KiB.
+  final int bulkChunkSize;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -217,6 +239,8 @@ class MuxOptions {
     Duration? identityTimeout,
     bool? requireNamedIdent,
     int? initialWindow,
+    int? bulkZipper,
+    int? bulkChunkSize,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -236,6 +260,8 @@ class MuxOptions {
     identityTimeout: identityTimeout ?? this.identityTimeout,
     requireNamedIdent: requireNamedIdent ?? this.requireNamedIdent,
     initialWindow: initialWindow ?? this.initialWindow,
+    bulkZipper: bulkZipper ?? this.bulkZipper,
+    bulkChunkSize: bulkChunkSize ?? this.bulkChunkSize,
   );
 }
 
@@ -252,7 +278,18 @@ class MuxConnection {
   /// transport implements [FrameLimited] with a limit below
   /// [MuxOptions.maxFrameSize], logs a warning and announces the
   /// transport's limit. Throws [ArgumentError] if
-  /// [MuxOptions.initialWindow] is not 1 to `2^32 - 1`.
+  /// [MuxOptions.initialWindow] is not 1 to `2^32 - 1`, or if
+  /// [MuxOptions.bulkZipper] or [MuxOptions.bulkChunkSize] is below 1.
+  ///
+  /// Frames go to the transport as the application produces them; when the
+  /// transport implements [OutputReadyTransport] and is not ready, DATA
+  /// frames wait in per-channel queues and an output scheduler picks the
+  /// order in which they go once it is: control messages first (they are
+  /// never held), then ordinary channels, one frame per channel in turn,
+  /// then bulk channels ([MuxChannel.priority]), with one bulk frame after
+  /// [MuxOptions.bulkZipper] ordinary ones while bulk frames wait. The
+  /// order within a channel never changes. See the wiki page "Polyverse
+  /// Switchboard Mux", section "Output scheduling".
   MuxConnection(
     StreamChannel<Uint8List> transport, {
     required this.isInitiator,
@@ -266,6 +303,20 @@ class MuxConnection {
         options.initialWindow,
         'options.initialWindow',
         'must be 1 to ${MuxLimits.maxWindow}',
+      );
+    }
+    if (options.bulkZipper < 1) {
+      throw ArgumentError.value(
+        options.bulkZipper,
+        'options.bulkZipper',
+        'must be at least 1',
+      );
+    }
+    if (options.bulkChunkSize < 1) {
+      throw ArgumentError.value(
+        options.bulkChunkSize,
+        'options.bulkChunkSize',
+        'must be at least 1',
       );
     }
     _nextShortId = _firstId;
@@ -900,17 +951,202 @@ class MuxConnection {
 
   // Sending -------------------------------------------------------------
 
+  /// Writes [frame] to the transport now, whatever is held: control
+  /// messages, OPEN, and CLOSE frames with nothing queued before them.
   void _sendFrame(MuxFrame frame) {
     if (!_writable) {
       return;
     }
+    _write(frame.encode());
+  }
+
+  void _write(Uint8List bytes) {
+    if (!_writable) {
+      return;
+    }
     try {
-      final bytes = frame.encode();
       _transport.sink.add(bytes);
       _sentBytes += bytes.length;
     } on Object catch (e) {
       _log.fine('$this: transport write failed: $e');
       _writable = false;
+    }
+  }
+
+  // Output scheduling ----------------------------------------------------
+  //
+  // DATA waits here, in one queue per channel id, while the transport is
+  // not ready (OutputReadyTransport); a CLOSE waits behind the DATA queued
+  // before it, so the order within a channel is kept. Control messages and
+  // the other frames go straight to the transport. Queues take turns: the
+  // ordinary ones first, one frame each, then the bulk ones, with a bulk
+  // turn after bulkZipper ordinary frames while bulk frames wait. Queues
+  // are keyed by id and an id is reused only once its CLOSE went out, so
+  // a new OPEN never overtakes an old CLOSE.
+
+  final Map<int, _OutQueue> _outQueues = {};
+  final Queue<_OutQueue> _ordinaryTurns = Queue<_OutQueue>();
+  final Queue<_OutQueue> _bulkTurns = Queue<_OutQueue>();
+  int _ordinarySinceBulk = 0;
+  int _heldOutputFrames = 0;
+  int _heldOutputBytes = 0;
+  bool _awaitingOutput = false;
+  bool _pumping = false;
+
+  /// Bytes of the frames the output scheduler holds because the transport
+  /// was not ready to take them (see [OutputReadyTransport]): at most the
+  /// windows of the channels with something to send, plus one subframe
+  /// each.
+  int get heldOutputBytes => _heldOutputBytes;
+
+  bool get _outputReady {
+    final transport = _transport;
+    return transport is! OutputReadyTransport ||
+        (transport as OutputReadyTransport).isOutputReady;
+  }
+
+  void _sendChannelFrame(MuxChannelLink link, MuxFrame frame) {
+    if (!_writable) {
+      return;
+    }
+    final id = link.id;
+    final isData = frame.command == MuxCommand.data;
+    var queue = _outQueues[id];
+    if (queue == null) {
+      if (!isData || (_heldOutputFrames == 0 && _outputReady)) {
+        _write(frame.encode());
+        return;
+      }
+      queue = _outQueues[id] = _OutQueue(id);
+    }
+    final bytes = frame.encode();
+    queue.frames.add(_OutFrame(bytes, isData: isData));
+    _heldOutputFrames++;
+    _heldOutputBytes += bytes.length;
+    if (!queue.listed) {
+      _takeTurn(queue);
+    }
+    _pump();
+  }
+
+  /// Puts [queue] at the end of the turns of its channel's tier.
+  void _takeTurn(_OutQueue queue) {
+    queue.listed = true;
+    final link = _links[queue.id];
+    if (link != null && link.channel.priority == MuxPriority.bulk) {
+      _bulkTurns.add(queue);
+    } else {
+      _ordinaryTurns.add(queue);
+    }
+  }
+
+  /// The queue whose turn it is, or null when none holds a frame.
+  _OutQueue? _nextTurn() {
+    while (true) {
+      final bulkWaiting = _bulkTurns.isNotEmpty;
+      final _OutQueue queue;
+      if (_ordinaryTurns.isNotEmpty &&
+          (!bulkWaiting || _ordinarySinceBulk < options.bulkZipper)) {
+        queue = _ordinaryTurns.removeFirst();
+        if (bulkWaiting) {
+          _ordinarySinceBulk++;
+        }
+      } else if (bulkWaiting) {
+        queue = _bulkTurns.removeFirst();
+        _ordinarySinceBulk = 0;
+      } else {
+        return null;
+      }
+      if (queue.frames.isNotEmpty) {
+        return queue;
+      }
+      // Emptied by dropQueuedData.
+      queue.listed = false;
+    }
+  }
+
+  /// Writes held frames while the transport takes them.
+  void _pump() {
+    if (_pumping) {
+      return;
+    }
+    _pumping = true;
+    try {
+      while (_heldOutputFrames > 0 && _writable) {
+        if (!_outputReady) {
+          _awaitOutput();
+          return;
+        }
+        final queue = _nextTurn();
+        if (queue == null) {
+          return;
+        }
+        _writeHead(queue);
+      }
+    } finally {
+      _pumping = false;
+    }
+  }
+
+  /// Writes the first frame of [queue] and gives it its next turn.
+  void _writeHead(_OutQueue queue) {
+    final frame = queue.frames.removeFirst();
+    _heldOutputFrames--;
+    _heldOutputBytes -= frame.bytes.length;
+    if (queue.frames.isEmpty) {
+      queue.listed = false;
+      _outQueues.remove(queue.id);
+    } else {
+      _takeTurn(queue);
+    }
+    _write(frame.bytes);
+  }
+
+  void _awaitOutput() {
+    if (_awaitingOutput) {
+      return;
+    }
+    _awaitingOutput = true;
+    (_transport as OutputReadyTransport).outputReady.then(
+      (_) {
+        _awaitingOutput = false;
+        _pump();
+      },
+      onError: (Object _) {
+        _awaitingOutput = false;
+      },
+    );
+  }
+
+  void _dropQueuedData(MuxChannelLink link) {
+    final queue = _outQueues[link.id];
+    if (queue == null) {
+      return;
+    }
+    _outQueues.remove(link.id);
+    final rest = <Uint8List>[];
+    for (final frame in queue.frames) {
+      _heldOutputFrames--;
+      _heldOutputBytes -= frame.bytes.length;
+      if (!frame.isData) {
+        rest.add(frame.bytes);
+      }
+    }
+    // Left in its turn list, skipped once empty.
+    queue.frames.clear();
+    rest.forEach(_write);
+  }
+
+  /// Writes everything held, in the order of the turns, whether or not
+  /// the transport is ready: the connection is closing, and the transport
+  /// writes what it was given before it closes.
+  void _flushHeld() {
+    while (_heldOutputFrames > 0 && _writable) {
+      final queue = _nextTurn();
+      if (queue == null) {
+        break;
+      }
+      _writeHead(queue);
     }
   }
 
@@ -1599,6 +1835,7 @@ class MuxConnection {
 
   Future<void> _doShutdown(Status status, Status channelStatus) async {
     _closing = true;
+    _flushHeld();
     _finish(status, channelStatus);
     _writable = false;
     try {
@@ -1671,6 +1908,13 @@ class _Host implements MuxChannelHost {
   void sendFrame(MuxFrame frame) => _connection._sendFrame(frame);
 
   @override
+  void sendChannelFrame(MuxChannelLink link, MuxFrame frame) =>
+      _connection._sendChannelFrame(link, frame);
+
+  @override
+  void dropQueuedData(MuxChannelLink link) => _connection._dropQueuedData(link);
+
+  @override
   void release(MuxChannelLink link) => _connection._release(link);
 
   @override
@@ -1681,6 +1925,25 @@ class _Host implements MuxChannelHost {
 
   @override
   int get peerMaxFrameSize => _connection._peerMaxFrameSize;
+}
+
+/// The frames of one channel id waiting for the transport.
+class _OutQueue {
+  _OutQueue(this.id);
+
+  final int id;
+  final Queue<_OutFrame> frames = Queue<_OutFrame>();
+
+  /// Whether the queue is in a turn list.
+  bool listed = false;
+}
+
+/// An encoded frame waiting for the transport.
+class _OutFrame {
+  _OutFrame(this.bytes, {required this.isData});
+
+  final Uint8List bytes;
+  final bool isData;
 }
 
 class _PendingPing {
