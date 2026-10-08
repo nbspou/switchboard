@@ -181,11 +181,13 @@ void main() {
         options: TalkOptions(streamBulk: (_) => true),
       );
       final messages = StreamQueue(reader.messages);
-      sender.send(
-        'BIG',
-        Uint8List(0),
-        bulk: Stream.value(pattern(300000)),
-        bulkLength: 300000,
+      unawaited(
+        sender.send(
+          'BIG',
+          Uint8List(0),
+          bulk: Stream.value(pattern(300000)),
+          bulkLength: 300000,
+        ),
       );
       final source = await atProxy.next;
       TalkChannel.adoptBulk(source);
@@ -355,7 +357,7 @@ void main() {
         // payload waits in its scheduler when the client's CLOSE arrives.
         gate.allow(-1000000);
         final talk = TalkChannel(client.open(Uint8List(0)));
-        talk.send('BIG', Uint8List(100000));
+        unawaited(talk.send('BIG', Uint8List(100000)));
         await talk.close();
         gate.allow(1000000);
         expect(await backendDone.future, Status.ok);
@@ -585,8 +587,8 @@ void main() {
       final reply = await client.request('ASK', bytes('q'));
       expect(reply.procedureName, 'CHAIN');
       expect(reply.expectsStream, isTrue);
-      reply.replyItem(bytes('item'));
-      reply.reply(Uint8List(0));
+      unawaited(reply.replyItem(bytes('item')));
+      unawaited(reply.reply(Uint8List(0)));
       await client.close();
       await p.pipe;
       expect(await backend.done, hasCode(StatusCode.ok));
@@ -783,7 +785,7 @@ void main() {
 
     test('backend close status reaches the client', () async {
       final talk = await client.openTalk(ServiceAddress(chat));
-      talk.send('KILL', Uint8List(0));
+      unawaited(talk.send('KILL', Uint8List(0)));
       expect(await talk.done, Status.of(StatusCode.aborted, 'killed'));
     });
 

@@ -289,7 +289,12 @@ class TalkAbortException extends SwitchboardException {
 /// listener) returns its credit once the frame forwarded for it went out
 /// on the other channel. A stream that is paused or not listened to
 /// therefore stalls its channel once the window is used up (see
-/// [messages]), and only that channel.
+/// [messages]), and only that channel. On the sending side, [send] and the
+/// reply methods of [TalkMessage] return a future that completes once the
+/// frame was handed to the connection within the peer's window (for a
+/// bulk payload, once the payload went whole): a sender that awaits it is
+/// paced by the receiver, one that does not queues what the window does
+/// not take.
 ///
 /// Bulk payloads (wiki page "Polyverse Switchboard Talk", "Bulk
 /// payloads"), over a mux channel: a message whose frame would exceed what
@@ -575,7 +580,7 @@ class TalkChannel {
     BulkRoutes.register(mux, _adoptBulk);
   }
 
-  /// Sends a plain message (fire and forget).
+  /// Sends a plain message.
   ///
   /// [name], when given, is the procedure instead of [procedure], which is
   /// then ignored: generated code passes the exact wire name (a [Name]
@@ -587,10 +592,26 @@ class TalkChannel {
   /// whose length is [bulkLength] (null: not known in advance) and
   /// [payload] must be empty; see [startRequest].
   ///
+  /// Pacing: the returned future completes once the message was handed to
+  /// the connection within the channel's send window (the future of
+  /// [MuxChannel.send]), at once when the window takes it now; for a bulk
+  /// payload, once that payload went whole as well. A sender that awaits
+  /// it holds at most one message beyond what the receiver granted, and
+  /// waits while the receiver does not read; one that does not await
+  /// queues what the window does not take, as before. The future fails
+  /// with [StatusCode.failedPrecondition] when the channel can no longer
+  /// send the message (the peer closed it, the connection ended), with
+  /// [StatusCode.frameTooLarge] when a limit the peer announced after the
+  /// call does not take it, and for a bulk payload as
+  /// [TalkMessage.replyBulk]'s does. It never reports an unhandled error
+  /// (a failure nobody waits for is logged at FINE), so it may be ignored.
+  /// Over a `StreamChannel` that is not a mux channel it completes at
+  /// once.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
   /// the channel is closed, and [ArgumentError] if [procedure] is not a
   /// valid name.
-  void send(
+  Future<void> send(
     String procedure,
     Uint8List payload, {
     Name? name,
@@ -602,12 +623,15 @@ class TalkChannel {
     bulk: _bulkSource(payload, bulk, bulkLength),
   );
 
-  void _send(Name procedure, Uint8List payload, {_BulkSource? bulk}) {
-    _sendFrame(
-      TalkFrame(kind: TalkKind.message, procedure: procedure, payload: payload),
-      bulk: bulk,
-    );
-  }
+  Future<void> _send(Name procedure, Uint8List payload, {_BulkSource? bulk}) =>
+      _sendFrame(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: procedure,
+          payload: payload,
+        ),
+        bulk: bulk,
+      );
 
   /// The source of an explicit bulk payload, checking the arguments.
   static _BulkSource? _bulkSource(
@@ -915,12 +939,18 @@ class TalkChannel {
   /// then reported to [onFailure] (logged without one) instead of thrown,
   /// and so is the end of the channel before the frame went out.
   ///
-  /// With [onAccepted] (forwarding), the frame goes through the awaitable
-  /// send of the mux channel, and [onAccepted] is called once the frame
+  /// With [onAccepted] (forwarding), [onAccepted] is called once the frame
   /// (for a bulk payload: its `BULK` frame) was handed to the connection,
   /// the channel's send window having taken it, or once it was discarded:
   /// exactly once whenever this returns normally, never when it throws.
-  void _sendFrame(
+  ///
+  /// Returns a future that completes once the frame was handed to the
+  /// connection (the awaitable send of the mux channel, or of the slot
+  /// channel carrying one; at once over any other `StreamChannel`), and
+  /// for a bulk payload once that payload went whole too; it fails as
+  /// they fail, or with the failure reported to [onFailure]. Safe to
+  /// ignore: a failure is logged at FINE.
+  Future<void> _sendFrame(
     TalkFrame frame, {
     _BulkSource? bulk,
     void Function(_BulkOut out)? onBulk,
@@ -936,16 +966,20 @@ class TalkChannel {
     }
     if (_mustDefer()) {
       final accepted = onAccepted == null ? null : _once(onAccepted);
+      final sent = Completer<void>();
       void dropped(SwitchboardException error) {
         accepted?.call();
         onFailure?.call(error);
+        if (!sent.isCompleted) {
+          sent.completeError(error);
+        }
       }
 
       _deferred.add(
         _Deferred(() {
-          final _BulkOut? out;
+          final ({Future<void> sent, _BulkOut? out}) result;
           try {
-            out = _sendNow(frame, bulk, accepted);
+            result = _sendNow(frame, bulk, accepted);
           } on Object catch (e) {
             final error = e is SwitchboardException
                 ? e
@@ -956,19 +990,36 @@ class TalkChannel {
             dropped(error);
             return;
           }
+          final out = result.out;
           if (out != null) {
             onBulk?.call(out);
           }
           onSent?.call(out);
+          sent.complete(result.sent);
         }, dropped),
       );
-      return;
+      return _quiet(sent.future, frame);
     }
-    final out = _sendNow(frame, bulk, onAccepted);
+    final result = _sendNow(frame, bulk, onAccepted);
+    final out = result.out;
     if (out != null) {
       onBulk?.call(out);
     }
     onSent?.call(out);
+    return _quiet(result.sent, frame);
+  }
+
+  /// [future], safe to drop: a failure nobody waits for is logged at FINE
+  /// rather than reported as unhandled, and still reaches whoever waits.
+  static Future<void> _quiet(Future<void> future, TalkFrame frame) {
+    unawaited(
+      future.then<void>(
+        (_) {},
+        onError: (Object e, StackTrace st) =>
+            _log.fine('${frame.kind.name} frame not sent', e, st),
+      ),
+    );
+    return future;
   }
 
   /// [callback], called once however often the result is.
@@ -1019,8 +1070,9 @@ class TalkChannel {
     }
   }
 
-  /// [_sendFrame] without the wait for LIMITS; throws its failures.
-  _BulkOut? _sendNow(
+  /// [_sendFrame] without the wait for LIMITS; throws its failures, and
+  /// returns the future of the frame (and its payload, if bulk) going out.
+  ({Future<void> sent, _BulkOut? out}) _sendNow(
     TalkFrame frame,
     _BulkSource? bulk, [
     void Function()? onAccepted,
@@ -1028,8 +1080,7 @@ class TalkChannel {
     if (bulk == null) {
       final bytes = frame.encode();
       if (!_needsBulk(frame, bytes.length)) {
-        _sendRaw(bytes, onAccepted);
-        return null;
+        return (sent: _sendRaw(bytes, onAccepted), out: null);
       }
       bulk = _BulkSource.bytes(frame.payload);
     }
@@ -1041,8 +1092,9 @@ class TalkChannel {
       );
     }
     final out = _openBulk(mux, bulk.length);
+    final Future<void> sent;
     try {
-      _sendRaw(
+      sent = _sendRaw(
         frame
             .withBulk(TalkBulkReference(out.number, length: bulk.length))
             .encode(),
@@ -1057,38 +1109,41 @@ class TalkChannel {
       rethrow;
     }
     out.start(bulk);
-    return out;
+    // The message went once its frame and its payload did.
+    return (sent: sent.then((_) => out.done), out: out);
   }
 
   /// [_sendFrame] for frames that never carry a bulk payload.
-  void _sendChecked(TalkFrame frame, {void Function()? onAccepted}) =>
+  Future<void> _sendChecked(TalkFrame frame, {void Function()? onAccepted}) =>
       _sendFrame(frame, onAccepted: onAccepted);
 
   /// Frames waiting for the peer's LIMITS (see [_sendFrame]).
   final Queue<_Deferred> _deferred = Queue<_Deferred>();
 
-  /// Hands [bytes] to the raw channel. With [onAccepted], through the
-  /// awaitable send of a mux channel (or of the slot channel carrying
-  /// one), calling it once the send window took them, or they were
-  /// discarded; as the sink drops a frame for a channel that can no
-  /// longer send, so does this, calling [onAccepted] at once.
-  void _sendRaw(Uint8List bytes, [void Function()? onAccepted]) {
+  /// Hands [bytes] to the raw channel: through the awaitable send of a
+  /// mux channel (or of the slot channel carrying one), whose future this
+  /// returns, else its sink (completed at once). [onAccepted] is called
+  /// once the send window took them, or they were discarded: a frame for
+  /// a channel that can no longer send is dropped, as the sink drops it,
+  /// [onAccepted] called at once and the future failing
+  /// [StatusCode.failedPrecondition].
+  Future<void> _sendRaw(Uint8List bytes, [void Function()? onAccepted]) {
     final r = raw;
     final Future<void> sent;
     try {
-      if (onAccepted != null && r is MuxChannel) {
+      if (r is MuxChannel) {
         sent = r.send(bytes);
-      } else if (onAccepted != null && r is MuxChannelCarrier) {
+      } else if (r is MuxChannelCarrier) {
         sent = (r as MuxChannelCarrier).send(bytes);
       } else {
         r.sink.add(bytes);
         onAccepted?.call();
-        return;
+        return Future<void>.value();
       }
     } on SwitchboardException catch (e) {
-      if (onAccepted != null && e.code == StatusCode.failedPrecondition) {
-        onAccepted();
-        return;
+      if (e.code == StatusCode.failedPrecondition) {
+        onAccepted?.call();
+        return Future<void>.error(e);
       }
       rethrow;
     } catch (e) {
@@ -1097,9 +1152,12 @@ class TalkChannel {
         'channel closed: $e',
       );
     }
-    unawaited(
-      sent.then((_) => onAccepted(), onError: (Object _) => onAccepted()),
-    );
+    if (onAccepted != null) {
+      unawaited(
+        sent.then((_) => onAccepted(), onError: (Object _) => onAccepted()),
+      );
+    }
+    return sent;
   }
 
   /// Whether [frame], [length] bytes encoded, goes as a bulk payload.
@@ -3151,7 +3209,7 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void reply(Uint8List payload, {String? procedure, Name? name}) =>
+  Future<void> reply(Uint8List payload, {String? procedure, Name? name}) =>
       _reply(payload, _name(procedure, name));
 
   @override
@@ -3173,7 +3231,7 @@ class _Message extends TalkMessage {
     return sent.done;
   }
 
-  void _reply(
+  Future<void> _reply(
     Uint8List payload,
     Name? procedure, {
     _BulkSource? bulk,
@@ -3182,7 +3240,7 @@ class _Message extends TalkMessage {
     void Function()? onAccepted,
   }) {
     _check();
-    _sendReply(
+    return _sendReply(
       () => channel._sendFrame(
         TalkFrame(
           kind: TalkKind.message,
@@ -3282,7 +3340,7 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void replyItem(Uint8List payload, {String? procedure, Name? name}) =>
+  Future<void> replyItem(Uint8List payload, {String? procedure, Name? name}) =>
       _replyItem(payload, _name(procedure, name));
 
   @override
@@ -3304,7 +3362,7 @@ class _Message extends TalkMessage {
     return sent.done;
   }
 
-  void _replyItem(
+  Future<void> _replyItem(
     Uint8List payload,
     Name? procedure, {
     _BulkSource? bulk,
@@ -3313,7 +3371,7 @@ class _Message extends TalkMessage {
     void Function()? onAccepted,
   }) {
     _check(item: true);
-    _sendReply(
+    final sent = _sendReply(
       () => channel._sendFrame(
         TalkFrame(
           kind: TalkKind.streamItem,
@@ -3333,6 +3391,7 @@ class _Message extends TalkMessage {
       ),
     );
     _replied();
+    return sent;
   }
 
   @override
@@ -3416,14 +3475,14 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void replyAbort(Status status) {
+  Future<void> replyAbort(Status status) {
     TalkChannel._checkAbortStatus(status);
-    _replyAbort(status);
+    return _replyAbort(status);
   }
 
-  void _replyAbort(Status status) {
+  Future<void> _replyAbort(Status status) {
     _check();
-    _sendReply(
+    return _sendReply(
       () => channel._sendChecked(
         TalkFrame(
           kind: TalkKind.abort,
@@ -3436,7 +3495,7 @@ class _Message extends TalkMessage {
   }
 
   @override
-  void extend({Duration? deadline, Duration? renew, Duration? buffer}) {
+  Future<void> extend({Duration? deadline, Duration? renew, Duration? buffer}) {
     for (final (name, value) in [
       ('deadline', deadline),
       ('renew', renew),
@@ -3464,10 +3523,10 @@ class _Message extends TalkMessage {
         renew: localRenew == null ? null : localRenew + extra,
       ),
     );
-    _sendReply(() => channel._sendChecked(frame));
+    final sent = _sendReply(() => channel._sendChecked(frame));
     final expiry = _expiry;
     if (expiry == null || _finished) {
-      return;
+      return sent;
     }
     final now = monotonicNow();
     if (localDeadline == null && localRenew == null) {
@@ -3476,6 +3535,7 @@ class _Message extends TalkMessage {
       expiry.declare(now, localDeadline, localRenew);
     }
     _arm();
+    return sent;
   }
 
   /// The longest deadline or renewal an `EXTEND` field can carry.

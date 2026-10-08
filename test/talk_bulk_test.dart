@@ -212,7 +212,7 @@ void main() {
       expect((await items.next).payload, pattern(100));
     }
     expect(retained(message, '_bulkOuts'), 0);
-    message.reply(Uint8List(0));
+    unawaited(message.reply(Uint8List(0)));
     await request.done;
     await items.cancel();
   });
@@ -241,7 +241,7 @@ void main() {
           payload: Status.of(StatusCode.cancelled).encode(),
         ).encode(),
       );
-      talk.send('AFTER', Uint8List.fromList([7]));
+      unawaited(talk.send('AFTER', Uint8List.fromList([7])));
       await pumpEventQueue();
       expect(seen.single.payload, [7]);
       final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
@@ -387,7 +387,7 @@ void main() {
     final held = <TalkMessage>[];
     final subscription = talk.messages.listen(held.add)..pause();
     server.messages.listen((message) => message.reply(pattern(1000, 2)));
-    server.send('NOTE', pattern(1000));
+    unawaited(server.send('NOTE', pattern(1000)));
     await until(() => counted(talk, '_assemblyBytes') == 1000);
     final answer = await talk.request('GET', Uint8List(0));
     expect(answer.payload, pattern(1000, 2));
@@ -433,7 +433,7 @@ void main() {
     for (var i = 0; i < 6; i++) {
       await until(() => seen.length > i);
       expect(await collect(seen[i].bulk), pattern(100000, i));
-      seen[i].reply(Uint8List(0));
+      unawaited(seen[i].reply(Uint8List(0)));
     }
     for (final answer in sent) {
       expect(await answer, isA<TalkMessage>());
@@ -1161,7 +1161,7 @@ void main() {
               for (var i = 0; i < 3; i++) {
                 unawaited(m.replyItemBulk(generated(70000 + i)));
               }
-              m.reply(Uint8List.fromList([9]));
+              unawaited(m.reply(Uint8List.fromList([9])));
             case 'NOTE':
               plain.complete(m);
           }
@@ -1182,7 +1182,9 @@ void main() {
         }
         expect(lengths, [70000, 70001, 70002]);
         expect((await stream.done).payload, [9]);
-        talk.send('NOTE', Uint8List(0), bulk: Stream.value(pattern(50000)));
+        unawaited(
+          talk.send('NOTE', Uint8List(0), bulk: Stream.value(pattern(50000))),
+        );
         final note = await plain.future;
         expect(note.isBulk, isTrue);
         expect(note.payload, pattern(50000));
@@ -1218,6 +1220,44 @@ void main() {
     });
   }
 
+  test('a send with a bulk payload completes once the payload went whole, '
+      'and fails with how its transfer ended', () async {
+    final peers = await Peers.connect(
+      serverOptions: TalkOptions(streamBulk: (m) => m.procedureName == 'DROP'),
+    );
+    final (talk, server) = await peers.open();
+    final seen = <TalkMessage>[];
+    server.messages.listen((m) {
+      seen.add(m);
+      if (m.procedureName == 'DROP') {
+        // The receiver does not want it: the transfer is cancelled.
+        m.bulk.listen(null).cancel().ignore();
+      }
+    });
+    final source = StreamController<List<int>>();
+    var sent = false;
+    final put = talk
+        .send('PUT', Uint8List(0), bulk: source.stream)
+        .then((_) => sent = true);
+    source.add(pattern(1000));
+    await pumpEventQueue();
+    // Its frame went, a chunk too, but the payload is not whole yet.
+    expect(sent, isFalse);
+    await source.close();
+    await put;
+    await until(() => seen.length == 1);
+    expect(seen.single.payload, pattern(1000));
+    // A payload too large for a frame goes bulk: the same.
+    await talk.send('BIG', pattern(100000));
+    await until(() => seen.length == 2);
+    expect(seen.last.payload, pattern(100000));
+    final dropped = StreamController<List<int>>();
+    final drop = talk.send('DROP', Uint8List(0), bulk: dropped.stream);
+    dropped.add(pattern(1000));
+    await expectLater(drop, throwsStatus(StatusCode.cancelled));
+    await dropped.close();
+  });
+
   test('a message keeps its place while its payload is reassembled', () async {
     final peers = await Peers.connect();
     final (talk, server) = await peers.open();
@@ -1229,11 +1269,12 @@ void main() {
         all.complete();
       }
     });
-    talk
-      ..send('A', Uint8List(1))
-      ..send('B', Uint8List(0), bulk: generated(500000, piece: 1000))
-      ..send('C', Uint8List(2))
-      ..send('D', pattern(100000));
+    unawaited(talk.send('A', Uint8List(1)));
+    unawaited(
+      talk.send('B', Uint8List(0), bulk: generated(500000, piece: 1000)),
+    );
+    unawaited(talk.send('C', Uint8List(2)));
+    unawaited(talk.send('D', pattern(100000)));
     await all.future;
     expect(seen, ['A 1', 'B 500000', 'C 2', 'D 100000']);
   });
@@ -1295,13 +1336,13 @@ void main() {
       final (talk, server) = await peers.open(options: short);
       server.messages.listen((m) async {
         // A long read is declared, as any long work on a request is.
-        m.extend(deadline: const Duration(seconds: 5));
+        unawaited(m.extend(deadline: const Duration(seconds: 5)));
         var n = 0;
         await for (final chunk in m.bulk) {
           n += chunk.length;
           await Future<void>.delayed(const Duration(milliseconds: 30));
         }
-        m.reply(Uint8List.fromList([n ~/ 100000]));
+        unawaited(m.reply(Uint8List.fromList([n ~/ 100000])));
       });
       final answer = await talk.request(
         'PUT',
@@ -1366,10 +1407,10 @@ void main() {
     client.incoming.listen(TalkChannel.adoptBulk);
     final raw = client.open(Uint8List(0));
     expect(raw.maxSubframeLength, 32752);
-    TalkChannel(raw)
-      ..send('SMALL', pattern(50))
-      ..send('BIG', pattern(200))
-      ..send('AFTER', pattern(10));
+    final talk = TalkChannel(raw);
+    unawaited(talk.send('SMALL', pattern(50)));
+    unawaited(talk.send('BIG', pattern(200)));
+    unawaited(talk.send('AFTER', pattern(10)));
     await all.future.timeout(const Duration(seconds: 2));
     expect(raw.maxSubframeLength, 112);
     expect(received, ['SMALL 50 false', 'BIG 200 true', 'AFTER 10 false']);
@@ -1389,7 +1430,7 @@ void main() {
       final drained = peers.client.goAway();
       await Future<void>.delayed(const Duration(milliseconds: 20));
       expect(peers.server.peerGoingAway, isTrue);
-      request.reply(pattern(150000));
+      unawaited(request.reply(pattern(150000)));
       final answer = await big;
       expect(answer.isBulk, isTrue);
       expect(answer.payload, pattern(150000));
@@ -1437,7 +1478,7 @@ void main() {
           await Future<void>.delayed(const Duration(milliseconds: 5));
         }
       }
-      m.reply(Uint8List(0));
+      unawaited(m.reply(Uint8List(0)));
       done.complete();
     });
     await talk.request(
@@ -1510,7 +1551,7 @@ void main() {
       server.messages.listen((m) async {
         final first = await m.bulk.first;
         expect(first, isNotEmpty);
-        m.reply(Uint8List.fromList([1]));
+        unawaited(m.reply(Uint8List.fromList([1])));
       });
       final answer = await talk.request(
         'PUT',
@@ -1591,13 +1632,15 @@ void main() {
       server.messages.listen((m) {
         m.bulk.listen((_) {}, onError: failed.complete);
       });
-      talk.send(
-        'PUT',
-        Uint8List(0),
-        bulk: () async* {
-          yield pattern(10);
-          throw SwitchboardException.of(StatusCode.dataLoss, 'disk');
-        }(),
+      unawaited(
+        talk.send(
+          'PUT',
+          Uint8List(0),
+          bulk: () async* {
+            yield pattern(10);
+            throw SwitchboardException.of(StatusCode.dataLoss, 'disk');
+          }(),
+        ),
       );
       expect(
         await failed.future,
@@ -1667,7 +1710,7 @@ void main() {
       );
       // The message stands, the channel too.
       expect(requests.single.canReply, isTrue);
-      requests.single.reply(Uint8List(0));
+      unawaited(requests.single.reply(Uint8List(0)));
       expect(raw.canSend, isTrue);
     });
 
@@ -1727,9 +1770,9 @@ void main() {
         try {
           final bytes = await m.payloadBytes(maxLength: 60000);
           expect(m.payload, bytes);
-          m.reply(Uint8List.fromList([bytes.length ~/ 1000]));
+          unawaited(m.reply(Uint8List.fromList([bytes.length ~/ 1000])));
         } on SwitchboardException catch (e) {
-          m.replyAbort(e.status);
+          unawaited(m.replyAbort(e.status));
         }
       });
       final ok = await talk.request('PUT', pattern(50000));
@@ -1805,7 +1848,7 @@ void main() {
         final unread = <TalkMessage>[];
         server.messages.listen(unread.add);
         for (var i = 0; i < 20; i++) {
-          talk.send('PUT', pattern(200000));
+          unawaited(talk.send('PUT', pattern(200000)));
         }
         await until(() => unread.length == 20);
         await Future<void>.delayed(const Duration(milliseconds: 50));
@@ -1897,7 +1940,7 @@ void main() {
           source.add(pattern(1000));
         }
       });
-      talk.send('PUT', Uint8List(0), bulk: source.stream);
+      unawaited(talk.send('PUT', Uint8List(0), bulk: source.stream));
       await sent.future;
       expect((await talk.done).known, StatusCode.aborted);
       await source.close();
@@ -1908,7 +1951,7 @@ void main() {
       final (talk, server) = await peers.open();
       final got = Completer<TalkMessage>();
       server.messages.listen(got.complete);
-      talk.send('PUT', pattern(300000));
+      unawaited(talk.send('PUT', pattern(300000)));
       await talk.close();
       final m = await got.future;
       expect(m.payload, pattern(300000));

@@ -359,7 +359,7 @@ class NamingClient {
     }
     if (message.canReply) {
       try {
-        message.reply(Uint8List(0));
+        unawaited(message.reply(Uint8List(0)));
       } on SwitchboardException catch (e) {
         _log.fine('CONNECT reply failed: $e');
       }

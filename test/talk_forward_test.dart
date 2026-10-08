@@ -194,8 +194,8 @@ void main() {
         test('plain messages both ways', () async {
           final atBackend = StreamQueue(chain.backend.messages);
           final atClient = StreamQueue(chain.client.messages);
-          chain.client.send('HELLO', bytes([1]));
-          chain.backend.send('BACK', bytes([2]));
+          unawaited(chain.client.send('HELLO', bytes([1])));
+          unawaited(chain.backend.send('BACK', bytes([2])));
           final m1 = await atBackend.next;
           expect(m1.procedureName, 'HELLO');
           expect(m1.payload, [1]);
@@ -279,9 +279,9 @@ void main() {
           expect(r5.payload, [6]);
           expect(r5.procedureName, 'S');
           expect(r5.expectsStream, isTrue);
-          r5.replyItem(bytes([7]));
-          r5.replyItem(bytes([8]));
-          r5.reply(bytes([9]));
+          unawaited(r5.replyItem(bytes([7])));
+          unawaited(r5.replyItem(bytes([8])));
+          unawaited(r5.reply(bytes([9])));
           await chain.settle();
           chain.expectIdle();
         });
@@ -295,7 +295,11 @@ void main() {
                 .toList();
             final subEnd = await sub.done;
             final a = await answer;
-            m.reply(bytes([a.payload.single, ...subItems, subEnd.payload[0]]));
+            unawaited(
+              m.reply(
+                bytes([a.payload.single, ...subItems, subEnd.payload[0]]),
+              ),
+            );
           });
           final s = chain.client.streamRequest('ASK', Uint8List(0));
           s.items.listen((item) {
@@ -1047,7 +1051,7 @@ void main() {
       final chain = Chain();
       serve(chain.backend, (m) async {
         final r = await m.replyRequest(bytes([1]));
-        r.reply(bytes([r.payload.single + 1]));
+        unawaited(r.reply(bytes([r.payload.single + 1])));
       });
       final r1 = await chain.client.request('Q', Uint8List(0));
       await pumpEventQueue();
@@ -1070,7 +1074,7 @@ void main() {
       serve(chain.backend, received.complete);
       final pending = chain.client.request('X', Uint8List(0));
       final m = await received.future;
-      m.reply(Uint8List(0));
+      unawaited(m.reply(Uint8List(0)));
       await forwardMessage(m, other.client);
       await pending;
       expect(other.client.outgoingRequestCount, 0);
@@ -1195,7 +1199,7 @@ void main() {
           plain.complete(m);
         }
       });
-      client.send('NOTE', pattern(100000));
+      unawaited(client.send('NOTE', pattern(100000)));
       final note = await plain.future;
       expect(note.isBulk, isTrue);
       expect(note.payload, pattern(100000));
@@ -1214,7 +1218,7 @@ void main() {
         forwardMessage(message, back).then((_) => forwarded = true);
       });
       final received = backend.messages.first;
-      client.send('NOTE', Uint8List(0), bulk: source.stream);
+      unawaited(client.send('NOTE', Uint8List(0), bulk: source.stream));
       await pumpEventQueue();
       expect(forwarded, isFalse);
       source.add(pattern(100000));
@@ -1489,7 +1493,7 @@ void main() {
         })..pause();
         final answers = <Future<TalkMessage>>[];
         for (var i = 0; i < 100; i++) {
-          client.send('NOTE', Uint8List(1000));
+          unawaited(client.send('NOTE', Uint8List(1000)));
           answers.add(client.request('PUT', Uint8List(1000)));
         }
         await pumpEventQueue();

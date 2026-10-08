@@ -276,8 +276,11 @@ class _ClientSlots {
       if (!message.canReply || !session.usable) {
         throw SwitchboardException.of(StatusCode.cancelled, 'not confirmed');
       }
-      message.reply(
-        AssignResponse(notHolding: result == AssignResult.notHolding).encode(),
+      unawaited(
+        message.reply(
+          AssignResponse(notHolding: result == AssignResult.notHolding)
+              .encode(),
+        ),
       );
     } on SwitchboardException {
       if (before != null) {

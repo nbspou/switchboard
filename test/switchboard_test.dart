@@ -793,7 +793,7 @@ void main() {
           pushed.add(
             '${message.procedureName} ${utf8.decode(message.payload)}',
           );
-          message.reply(Uint8List(0));
+          unawaited(message.reply(Uint8List(0)));
         }
       });
       final accepted = <MuxConnection>[];

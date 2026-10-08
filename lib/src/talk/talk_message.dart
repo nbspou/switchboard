@@ -155,11 +155,18 @@ abstract class TalkMessage {
   /// frames (or for [TalkOptions.bulkThreshold]) is sent as a bulk payload
   /// transparently; so are those of the other reply methods.
   ///
+  /// The returned future completes once the response was handed to the
+  /// connection within the channel's send window (for a bulk payload,
+  /// once that payload went whole as well), and fails when it could not
+  /// be, as the future of [TalkChannel.send] does; it never reports an
+  /// unhandled error, so it may be ignored. The request is answered
+  /// either way: the future is for pacing.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
   /// the message expects no reply, was already finally replied (including
   /// by the responder timeout or because the peer cancelled it), or the
   /// channel is closed.
-  void reply(Uint8List payload, {String? procedure, Name? name});
+  Future<void> reply(Uint8List payload, {String? procedure, Name? name});
 
   /// Sends the final response as a request of our own (a chained response)
   /// and returns the peer's answer to it. Shorthand for
@@ -228,10 +235,16 @@ abstract class TalkMessage {
 
   /// Sends one stream item. Restarts the responder timeout.
   ///
+  /// The returned future completes once the item was handed to the
+  /// connection within the channel's send window (for a bulk payload,
+  /// once that payload went whole as well), as [reply]'s does: a responder
+  /// that awaits it before the next item is paced by the requester, and
+  /// holds at most one item beyond what the requester granted.
+  ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
   /// like [reply], and also if the request is not a stream request
   /// ([expectsStream] is false).
-  void replyItem(Uint8List payload, {String? procedure, Name? name});
+  Future<void> replyItem(Uint8List payload, {String? procedure, Name? name});
 
   /// Sends one stream item with a bulk payload read from [bytes], as
   /// [replyBulk] does for the final response. Restarts the responder
@@ -283,7 +296,9 @@ abstract class TalkMessage {
   /// Answers a stream request with [items]: each one is sent with
   /// [replyItem] as it arrives, then the final reply carries [trailer]
   /// (empty by default). [procedure] or [name] go with every item and the
-  /// final reply.
+  /// final reply. The subscription to [items] is paused while an item
+  /// waits for the channel's send window ([replyItem]'s future), so that
+  /// a requester that does not read paces the source.
   ///
   /// An error event on [items] ends the answer with [replyAbort]: the
   /// error's status if it is a [SwitchboardException] (a
@@ -368,12 +383,17 @@ abstract class TalkMessage {
           unawaited(stop());
           return;
         }
+        final Future<void> sent;
         try {
-          replyItem(item, name: wire);
+          sent = replyItem(item, name: wire);
         } on SwitchboardException catch (e, st) {
           abort(e, st);
           unawaited(stop());
+          return;
         }
+        // The source waits while the item waits for the window; a failed
+        // item (the channel ended) resumes it, for the end to be seen.
+        subscription.pause(sent.then<void>((_) {}, onError: (Object _) {}));
       },
       onError: (Object error, StackTrace stackTrace) {
         abort(error, stackTrace);
@@ -417,9 +437,12 @@ abstract class TalkMessage {
   /// For an unknown procedure the convention is
   /// `replyAbort(Status.of(StatusCode.unimplemented))`.
   ///
+  /// The returned future completes once the abort was handed to the
+  /// connection, as [reply]'s does.
+  ///
   /// Throws [ArgumentError] if [status] is OK (an abort cannot report
   /// success), otherwise throws like [reply].
-  void replyAbort(Status status);
+  Future<void> replyAbort(Status status);
 
   /// Sends `EXTEND`: tells the requester how long the answer may still
   /// take.
@@ -455,8 +478,11 @@ abstract class TalkMessage {
   /// phase completed, the estimate was revised), not from a timer:
   /// progress travels as stream items.
   ///
+  /// The returned future completes once the `EXTEND` was handed to the
+  /// connection, as [reply]'s does; the local timeout changes at once.
+  ///
   /// Throws like [reply], and [ArgumentError] for a negative value.
-  void extend({Duration? deadline, Duration? renew, Duration? buffer});
+  Future<void> extend({Duration? deadline, Duration? renew, Duration? buffer});
 
   /// Overrides the responder timeout for this request:
   /// [TalkOptions.replyTimeout] when [timeout] is null, none when it is

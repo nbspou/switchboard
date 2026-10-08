@@ -336,8 +336,8 @@ void main() {
       );
       expect(h.service.table, isEmpty);
       // Plain messages are ignored, the channel stays usable.
-      c.send('REGISTER', RegisterRequest(Name('npc')).encode());
-      c.send('FROB', Uint8List(0));
+      unawaited(c.send('REGISTER', RegisterRequest(Name('npc')).encode()));
+      unawaited(c.send('FROB', Uint8List(0)));
       expect(await register(c, 'npc'), 1);
       expect(h.service.table.length, 1);
     });

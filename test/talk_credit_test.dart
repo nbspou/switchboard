@@ -72,7 +72,7 @@ void main() {
     const count = 200;
     final payload = Uint8List(1000);
     for (var i = 0; i < count; i++) {
-      talk.send('MSG', payload);
+      unawaited(talk.send('MSG', payload));
     }
     await settle();
     // The window is spent and nothing more arrives: what the server holds
@@ -102,7 +102,7 @@ void main() {
     // and the server sends it plain messages until the window is spent.
     serverTalk.messages.listen((m) => m.reply(Uint8List(0)));
     for (var i = 0; i < 100; i++) {
-      serverTalk.send('EVENT', Uint8List(1000));
+      unawaited(serverTalk.send('EVENT', Uint8List(1000)));
     }
     await settle();
     final answer = talk.request('REQ', Uint8List(0));
@@ -184,7 +184,7 @@ void main() {
     final (talk, serverTalk, _, serverRaw) = await talkPair(client, server);
     final subscription = serverTalk.messages.listen((_) {})..pause();
     for (var i = 0; i < 30; i++) {
-      talk.send('MSG', Uint8List(1000));
+      unawaited(talk.send('MSG', Uint8List(1000)));
     }
     await settle();
     expect(serverRaw.heldBytes, greaterThan(30000));
@@ -192,7 +192,7 @@ void main() {
     expect(serverRaw.heldBytes, 0);
     // Later messages are dropped, their credit returned at once.
     for (var i = 0; i < 100; i++) {
-      talk.send('MSG', Uint8List(1000));
+      unawaited(talk.send('MSG', Uint8List(1000)));
     }
     await settle();
     expect(serverRaw.heldBytes, 0);
@@ -314,5 +314,180 @@ void main() {
     await right.close();
     await a.close();
     await b.close();
+  });
+
+  group('awaitable sends', () {
+    /// The flow-control cost of a plain message [procedure] carrying
+    /// [length] bytes.
+    int costOf(String procedure, int length) => MuxCredit.costOf(
+      TalkFrame(
+        kind: TalkKind.message,
+        procedure: Name(procedure),
+        payload: Uint8List(length),
+      ).encode().length,
+    );
+
+    /// The flow-control cost of a stream item carrying [length] bytes.
+    int itemCost(int length) => MuxCredit.costOf(
+      TalkFrame(
+        kind: TalkKind.streamItem,
+        responseId: 1,
+        payload: Uint8List(length),
+      ).encode().length,
+    );
+
+    test('send completes once the window took the message, waits beyond '
+        'it, and fails when the channel can no longer send', () async {
+      final (talk, serverTalk, raw, _) = await talkPair(client, server);
+      final subscription = serverTalk.messages.listen((_) {})..pause();
+      // The window takes it now: completed at once.
+      await talk.send('MSG', Uint8List(1000));
+      final pending = [
+        for (var i = 0; i < 100; i++) talk.send('MSG', Uint8List(1000)),
+      ];
+      var done = 0;
+      for (final sent in pending) {
+        unawaited(sent.then((_) => done++));
+      }
+      await settle();
+      final window = MuxOptions.defaultInitialWindow ~/ costOf('MSG', 1000);
+      expect(done, window - 1);
+      // The listener takes messages: credit comes back, the rest goes.
+      subscription.resume();
+      await Future.wait(pending);
+      subscription.pause();
+      final stuck = [
+        for (var i = 0; i < 100; i++) talk.send('MSG', Uint8List(1000)),
+      ];
+      await settle();
+      // The peer closes the channel: what still waits for credit fails.
+      await serverTalk.close();
+      await expectLater(
+        stuck.last,
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+      expect(raw.canSend, isFalse);
+      await subscription.cancel();
+    });
+
+    test('a failure nobody waits for is not reported as unhandled', () async {
+      final errors = <Object>[];
+      await runZonedGuarded(() async {
+        final (talk, serverTalk, _, _) = await talkPair(client, server);
+        serverTalk.messages.listen((m) {
+          // Nobody waits for these either.
+          unawaited(m.reply(Uint8List(0)));
+        }).pause();
+        for (var i = 0; i < 100; i++) {
+          unawaited(talk.send('MSG', Uint8List(1000)));
+        }
+        await settle();
+        await serverTalk.close();
+        await settle();
+      }, (error, _) => errors.add(error));
+      expect(errors, isEmpty);
+    });
+
+    test('a publisher awaiting each send holds at most one message beyond '
+        'the window of a stalled subscriber', () async {
+      final (talk, serverTalk, raw, serverRaw) = await talkPair(client, server);
+      final received = <TalkMessage>[];
+      final subscription = serverTalk.messages.listen(received.add)..pause();
+      const count = 300;
+      var sent = 0;
+      final publisher = () async {
+        for (var i = 0; i < count; i++) {
+          await talk.send('EVENT', Uint8List(1000));
+          sent++;
+        }
+      }();
+      await settle();
+      final window = MuxOptions.defaultInitialWindow ~/ costOf('EVENT', 1000);
+      // What the window took went out; the publisher waits on the next one
+      // instead of queueing the rest.
+      expect(sent, window);
+      await settle();
+      expect(sent, window);
+      expect(raw.sendWindow, lessThan(costOf('EVENT', 1000)));
+      expect(client.heldOutputBytes, 0);
+      expect(
+        serverRaw.heldBytes,
+        lessThanOrEqualTo(MuxOptions.defaultInitialWindow),
+      );
+      subscription.resume();
+      await publisher;
+      await settle();
+      expect(received, hasLength(count));
+      await subscription.cancel();
+      await talk.close();
+    });
+
+    test('a responder awaiting each replyItem is paced by a stalled items '
+        'subscription', () async {
+      final (talk, serverTalk, raw, _) = await talkPair(client, server);
+      const count = 300;
+      var sent = 0;
+      final responded = Completer<void>();
+      serverTalk.messages.listen((m) async {
+        for (var i = 0; i < count; i++) {
+          await m.replyItem(Uint8List(1000));
+          sent++;
+        }
+        await m.reply(Uint8List(0));
+        responded.complete();
+      });
+      final stream = talk.streamRequest('LIST', Uint8List(0));
+      final items = <TalkMessage>[];
+      final itemsDone = Completer<void>();
+      final subscription = stream.items.listen(
+        items.add,
+        onDone: itemsDone.complete,
+      )..pause();
+      await settle();
+      final window = MuxOptions.defaultInitialWindow ~/ itemCost(1000);
+      // The request took its share of the window too.
+      expect(sent, lessThanOrEqualTo(window));
+      expect(sent, greaterThan(window - 3));
+      expect(raw.heldBytes, lessThanOrEqualTo(MuxOptions.defaultInitialWindow));
+      subscription.resume();
+      await stream.done;
+      await responded.future;
+      await itemsDone.future;
+      expect(items, hasLength(count));
+      await subscription.cancel();
+      await talk.close();
+    });
+
+    test('replyStream pauses its source while an item waits for the '
+        'window', () async {
+      final (talk, serverTalk, _, _) = await talkPair(client, server);
+      const count = 300;
+      var produced = 0;
+      Stream<Uint8List> source() async* {
+        for (var i = 0; i < count; i++) {
+          produced++;
+          yield Uint8List(1000);
+        }
+      }
+
+      serverTalk.messages.listen((m) => unawaited(m.replyStream(source())));
+      final stream = talk.streamRequest('LIST', Uint8List(0));
+      final items = <TalkMessage>[];
+      final itemsDone = Completer<void>();
+      final subscription = stream.items.listen(
+        items.add,
+        onDone: itemsDone.complete,
+      )..pause();
+      await settle();
+      final window = MuxOptions.defaultInitialWindow ~/ itemCost(1000);
+      expect(produced, lessThanOrEqualTo(window + 3));
+      subscription.resume();
+      await stream.done;
+      await itemsDone.future;
+      expect(items, hasLength(count));
+      expect(produced, count);
+      await subscription.cancel();
+      await talk.close();
+    });
   });
 }

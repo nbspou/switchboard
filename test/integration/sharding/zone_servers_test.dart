@@ -128,7 +128,7 @@ class ZoneServer extends SlotLifecycle {
       await reached.future;
     }
     if (m.canReply) {
-      m.reply(bytes('$name ${after + 1}'));
+      unawaited(m.reply(bytes('$name ${after + 1}')));
     }
   }
 

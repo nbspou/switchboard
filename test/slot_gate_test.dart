@@ -1156,7 +1156,7 @@ void main() {
           (m) => gate.serveRequest(m, slot, (m) async {
             await hold?.future;
             answered.add(text(m.payload));
-            m.reply(bytes('$slot:${text(m.payload)}'));
+            unawaited(m.reply(bytes('$slot:${text(m.payload)}')));
           }),
         );
       };

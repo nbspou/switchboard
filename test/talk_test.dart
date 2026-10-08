@@ -310,8 +310,8 @@ void main() {
       final p = Pair();
       final atA = StreamQueue(p.a.messages);
       final atB = StreamQueue(p.b.messages);
-      p.a.send('HELLO', bytes([1, 2]));
-      p.b.send('WORLD', bytes([3]));
+      unawaited(p.a.send('HELLO', bytes([1, 2])));
+      unawaited(p.b.send('WORLD', bytes([3])));
       final onB = await atB.next;
       expect(onB.procedureName, 'HELLO');
       expect(onB.procedure, Name('HELLO'));
@@ -375,7 +375,7 @@ void main() {
         final r4 = await r2.replyRequest(bytes([4]));
         expect(r4.payload, [5]);
         expect(r4.expectsReply, isTrue);
-        r4.reply(bytes([6]));
+        unawaited(r4.reply(bytes([6])));
       });
       final r1 = await p.a.request('Q1', bytes([1]));
       expect(r1.payload, [2]);
@@ -406,7 +406,7 @@ void main() {
     test('reply on a message that expects no reply throws', () async {
       final p = Pair();
       final atB = StreamQueue(p.b.messages);
-      p.a.send('NOTE', Uint8List(0));
+      unawaited(p.a.send('NOTE', Uint8List(0)));
       final m = await atB.next;
       final failed = throwsStatus(StatusCode.failedPrecondition);
       expect(() => m.reply(Uint8List(0)), failed);
@@ -454,7 +454,7 @@ void main() {
       expect(() => m.replyItem(Uint8List(0)), failed);
       expect(() => m.replyItemRequest(Uint8List(0)), failed);
       expect(m.canReply, isTrue);
-      m.reply(bytes([7]));
+      unawaited(m.reply(bytes([7])));
       expect((await f).payload, [7]);
       await p.close();
     });
@@ -477,7 +477,7 @@ void main() {
       expect(p.a.outgoingRequestCount, 200);
       expect(p.b.incomingRequestCount, 200);
       for (final m in held.reversed) {
-        m.reply(bytes([...m.payload, 0xEE]));
+        unawaited(m.reply(bytes([...m.payload, 0xEE])));
       }
       final results = await Future.wait(futures);
       for (var i = 0; i < 200; i++) {
@@ -535,7 +535,11 @@ void main() {
           m.replyItemRequest(bytes([1]), procedure: 'MORE'),
           m.replyItemRequest(bytes([2])),
         ]);
-        m.reply(bytes([answers[0].payload.single + answers[1].payload.single]));
+        unawaited(
+          m.reply(
+            bytes([answers[0].payload.single + answers[1].payload.single]),
+          ),
+        );
       });
       final s = p.a.streamRequest('ASK', Uint8List(0));
       s.items.listen((item) {
@@ -564,9 +568,9 @@ void main() {
       final r = await p.a.request('START', Uint8List(0));
       expect(r.expectsReply, isTrue);
       expect(r.expectsStream, isTrue);
-      r.replyItem(bytes([7]));
-      r.replyItem(bytes([8]));
-      r.reply(bytes([9]));
+      unawaited(r.replyItem(bytes([7])));
+      unawaited(r.replyItem(bytes([8])));
+      unawaited(r.reply(bytes([9])));
       await pumpEventQueue();
       expect(p.b.outgoingRequestCount, 0);
       await p.close();
@@ -717,7 +721,7 @@ void main() {
       );
       expect((await p.a.request('LATE', Uint8List(0))).payload, [1]);
       expect((await p.a.request('FINE', Uint8List(0))).payload, [2]);
-      p.a.send('BOOM', Uint8List(0));
+      unawaited(p.a.send('BOOM', Uint8List(0)));
       await pumpEventQueue();
       expect(p.b.isOpen, isTrue);
       expect(p.b.incomingRequestCount, 0);
@@ -755,9 +759,9 @@ void main() {
       serve(p.b, (m) async {
         try {
           await m.replyItemRequest(bytes([1]));
-          m.reply(bytes([0]));
+          unawaited(m.reply(bytes([0])));
         } on SwitchboardException catch (e) {
-          m.reply(bytes([e.status.code]));
+          unawaited(m.reply(bytes([e.status.code])));
         }
       });
       final s = p.a.streamRequest('S', Uint8List(0));
@@ -1238,13 +1242,13 @@ void main() {
       final f3 = p.a.request('C', Uint8List(0));
       await expectLater(f3, throwsStatus(StatusCode.resourceExhausted));
       expect(held.map((m) => m.procedureName), ['A', 'B']);
-      held[0].reply(Uint8List(0));
+      unawaited(held[0].reply(Uint8List(0)));
       await f1;
       final f4 = p.a.request('D', Uint8List(0));
       await pumpEventQueue();
       expect(held.map((m) => m.procedureName), ['A', 'B', 'D']);
-      held[1].reply(Uint8List(0));
-      held[2].reply(Uint8List(0));
+      unawaited(held[1].reply(Uint8List(0)));
+      unawaited(held[2].reply(Uint8List(0)));
       await Future.wait([f2, f4]);
       await p.close();
     });
@@ -1269,14 +1273,14 @@ void main() {
           m.reply(Uint8List(0));
         });
         await p.b.request('Z', Uint8List(0));
-        held[0].reply(Uint8List(0));
-        held[1].reply(Uint8List(0));
+        unawaited(held[0].reply(Uint8List(0)));
+        unawaited(held[1].reply(Uint8List(0)));
         await f1;
         await s2.done;
         final f4 = p.a.request('D', Uint8List(0));
         await pumpEventQueue();
         expect(held.last.procedureName, 'D');
-        held.last.reply(Uint8List(0));
+        unawaited(held.last.reply(Uint8List(0)));
         await f4;
         await p.close();
       },
@@ -1372,7 +1376,7 @@ void main() {
           () => held[0].reply(Uint8List(0)),
           throwsStatus(StatusCode.failedPrecondition),
         );
-        held[1].reply(bytes([1]));
+        unawaited(held[1].reply(bytes([1])));
         await pumpEventQueue();
         expect(peer.received.single.responseId, 1);
         expect(peer.received.single.payload, [1]);
@@ -1636,7 +1640,7 @@ void main() {
       );
       final s = peer.talk.streamRequest('S', Uint8List(0));
       await pumpEventQueue();
-      held.single.replyAbort(lost);
+      unawaited(held.single.replyAbort(lost));
       s.cancel(lost);
       await pumpEventQueue();
       final replyAbort = peer.received.firstWhere((f) => f.hasResponse);
@@ -1805,7 +1809,7 @@ void main() {
         await pumpEventQueue();
         expect(r.requestId, p.aToB.first.requestId);
         expect(c.requestId, p.aToB.last.requestId);
-        held.first.reply(bytes([3]));
+        unawaited(held.first.reply(bytes([3])));
         expect((await r.response).payload, [3]);
         c.cancel();
         await expectLater(
@@ -1830,8 +1834,8 @@ void main() {
       void Function(Duration?, Duration?) counter(String key) =>
           (_, _) => counts[key] = (counts[key] ?? 0) + 1;
       serve(p.b, (m) async {
-        m.extend();
-        m.extend();
+        unawaited(m.extend());
+        unawaited(m.extend());
         if (m.procedureName == 'CHAIN') {
           final r = m.startReplyRequest(
             Uint8List(0),
@@ -1855,9 +1859,9 @@ void main() {
           );
           await r.response;
           await s.done;
-          m.reply(Uint8List(0));
+          unawaited(m.reply(Uint8List(0)));
         } else {
-          m.reply(Uint8List(0));
+          unawaited(m.reply(Uint8List(0)));
         }
       });
       final plain = p.a.startRequest(
@@ -1874,8 +1878,8 @@ void main() {
       await stream.done;
       for (final procedure in ['CHAIN', 'CHAINS']) {
         final r = await p.a.request(procedure, Uint8List(0));
-        r.extend();
-        r.reply(Uint8List(0));
+        unawaited(r.extend());
+        unawaited(r.reply(Uint8List(0)));
       }
       final items = p.a.streamRequest('ITEMS', Uint8List(0));
       items.items.listen((item) {
@@ -1990,7 +1994,7 @@ void main() {
         final sub = m.replyItemStreamRequest(bytes([1]), procedure: 'SUB');
         final got = await sub.items.map((i) => i.payload.single).toList();
         final end = await sub.done;
-        m.reply(bytes([...got, end.payload.single]));
+        unawaited(m.reply(bytes([...got, end.payload.single])));
       });
       final s = p.a.streamRequest('S', Uint8List(0));
       s.items.listen((item) {
@@ -2644,7 +2648,7 @@ void main() {
       final second = a.request('B', Uint8List(0), timeout: Duration.zero);
       await expectLater(second, throwsStatus(StatusCode.resourceExhausted));
       await pumpEventQueue();
-      held.single.reply(Uint8List(0));
+      unawaited(held.single.reply(Uint8List(0)));
       await first;
       expect(a.outgoingRequestCount, 0);
       await a.close();
@@ -2681,7 +2685,7 @@ void main() {
       );
       expect(talk.outgoingRequestCount, 0);
       expect(held.single.canReply, isTrue);
-      held.single.reply(Uint8List(0));
+      unawaited(held.single.reply(Uint8List(0)));
       await talk.close();
     });
 
@@ -3159,7 +3163,7 @@ void main() {
       await pumpEventQueue();
       final first = await peer.talk.messages.first;
       expect(first.procedureName, 'A');
-      first.reply(Uint8List(0));
+      unawaited(first.reply(Uint8List(0)));
       await pumpEventQueue();
       final answers = {
         for (final f in peer.received)
@@ -3199,7 +3203,7 @@ void main() {
       final cancel = peer.received.firstWhere((f) => f.hasRequest);
       expect(cancel.requestId, s.requestId);
       expect(first.canReply, isTrue, reason: 'delivered items stay usable');
-      first.reply(Uint8List(0));
+      unawaited(first.reply(Uint8List(0)));
       expect(peer.talk.incomingRequestCount, 0);
       peer.send(
         TalkFrame(
@@ -3335,7 +3339,7 @@ void main() {
         itemResults[2],
         throwsStatus(StatusCode.resourceExhausted),
       );
-      items[0].reply(Uint8List(0));
+      unawaited(items[0].reply(Uint8List(0)));
       expect((await itemResults[0]).expectsReply, isFalse);
       await p.close();
     });
@@ -3394,13 +3398,13 @@ void main() {
           return;
         }
         if (m.expectsStream) {
-          m.replyItem(bytes([1]), procedure: ignored, name: other);
+          unawaited(m.replyItem(bytes([1]), procedure: ignored, name: other));
           final answer = await m.replyItemRequest(
             bytes([2]),
             procedure: ignored,
             name: other,
           );
-          m.reply(answer.payload, procedure: ignored, name: odd);
+          unawaited(m.reply(answer.payload, procedure: ignored, name: odd));
         } else {
           final back = await m.replyRequest(
             bytes([3]),
@@ -3410,17 +3414,17 @@ void main() {
           expect(back.payload, [4]);
         }
       });
-      p.a.send(ignored, bytes([0]), name: odd);
+      unawaited(p.a.send(ignored, bytes([0]), name: odd));
       final chained = await p.a.request(ignored, bytes([0]), name: odd);
       expect(chained.procedure, other);
-      chained.reply(bytes([4]));
+      unawaited(chained.reply(bytes([4])));
       final stream = p.a.streamRequest(ignored, bytes([0]), name: odd);
       final items = StreamQueue(stream.items);
       final item = await items.next;
       expect(item.procedure, other);
       final asking = await items.next;
       expect(asking.procedure, other);
-      asking.reply(bytes([5]));
+      unawaited(asking.reply(bytes([5])));
       final end = await stream.done;
       expect(end.procedure, odd);
       expect(end.payload, [5]);
@@ -3641,7 +3645,7 @@ void main() {
         final p = Pair();
         final source = StreamController<Uint8List>();
         final arrived = StreamQueue(p.b.messages);
-        p.a.send('PLAIN', Uint8List(0));
+        unawaited(p.a.send('PLAIN', Uint8List(0)));
         final plain = await arrived.next;
         expect(
           () => plain.replyStream(source.stream),
@@ -3653,11 +3657,11 @@ void main() {
           () => single.replyStream(source.stream),
           throwsStatus(StatusCode.failedPrecondition),
         );
-        single.reply(Uint8List(0));
+        unawaited(single.reply(Uint8List(0)));
         await answer;
         final stream = p.a.streamRequest('MANY', Uint8List(0));
         final many = await arrived.next;
-        many.reply(Uint8List(0));
+        unawaited(many.reply(Uint8List(0)));
         await stream.done;
         expect(
           () => many.replyStream(source.stream),

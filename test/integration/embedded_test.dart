@@ -93,7 +93,7 @@ void main() {
       connection.open(hexBytes('01 64 65 76 00 00 00 00 00')),
     );
     for (var i = 0; i < 3; i++) {
-      talk.send('PUT', Uint8List(100));
+      unawaited(talk.send('PUT', Uint8List(100)));
     }
     final peer = await accepted;
     addTearDown(peer.destroy);

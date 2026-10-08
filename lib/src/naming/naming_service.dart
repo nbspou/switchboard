@@ -1755,7 +1755,10 @@ class _Session {
   /// Sends one event. Returns false if the channel no longer takes any.
   bool send(Name procedure, Uint8List payload) {
     try {
-      channel.send(procedure.toString(), payload, name: procedure);
+      // Not awaited: a watcher that does not read stalls its own channel
+      // at its window, never the service (what the window does not take
+      // waits in the channel).
+      unawaited(channel.send(procedure.toString(), payload, name: procedure));
       return true;
     } on SwitchboardException catch (e) {
       _log.fine('$procedure event not sent: $e');
