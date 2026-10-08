@@ -205,7 +205,8 @@ class PeerEvent {
 /// GOAWAY and the peer is offline (with [StatusCode.internal] for a hook,
 /// the channel's close status for the channel) until the next attempt
 /// after the backoff. The hooks run again after every reconnect. A hook
-/// may close the set synchronously; its timeout is cancelled with the connection.
+/// may close the set, at once or later; its timeout is cancelled with the
+/// connection.
 ///
 /// The per-peer channel behaves like a `PersistentChannel` of a
 /// `ReconnectingClient`: when it ends while the connection stays up, the
@@ -646,9 +647,13 @@ class PeerSet {
   /// GOAWAY; it works while the peer is connecting with its hooks running,
   /// while its per-peer channel is being re-opened, and while it is held)
   /// or the set is closed, and like [MuxConnection.open] and
-  /// [Switchboard.credentialFor]. A connection or record that changes while
-  /// the credential is being chosen fails with `FAILED_PRECONDITION`:
-  /// credentials for the previous destination are never sent to its replacement.
+  /// [Switchboard.credentialFor]. Without [payload], the credential is
+  /// chosen for the peer's connection and record as they are at the call;
+  /// when either changes before it is chosen (the peer reconnected, moved
+  /// or was removed, or the set closed), the open fails with
+  /// [StatusCode.failedPrecondition] and nothing is sent, so a credential
+  /// chosen for one destination never reaches another. Opening again once
+  /// the peer is usable chooses one for its new connection.
   Future<MuxChannel> openChannel(int instance, {Uint8List? payload}) async {
     if (_closed) {
       throw SwitchboardException.of(
