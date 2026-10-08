@@ -962,7 +962,7 @@ class NamingClient {
       return;
     }
     entry.pending = session;
-    final requested = instance ?? entry.instance;
+    final requested = entry.pendingInstance = instance ?? entry.instance;
     final int assigned;
     try {
       // Ordered: the UP of the record, which the naming service sends
@@ -1002,13 +1002,21 @@ class NamingClient {
     _Entry entry,
     int assigned,
   ) async {
-    if (entry.superseded) {
-      // A newer registration of the same id took over; it registers the
-      // endpoints and metadata it wants on its own.
-      return;
-    }
-    if (!_entries.contains(entry)) {
-      // Unregistered while the request was in flight.
+    if (entry.superseded || !_entries.contains(entry)) {
+      // Superseded by a newer registration, or unregistered, while the
+      // request was in flight. The record is the newer registration's if
+      // that one registers the same id on this channel: its REGISTER
+      // follows this one, and replaces the record. Otherwise nothing
+      // tracks the record any more (this one may have been given another
+      // id than the newer one asked for), and it is removed.
+      final successor = _successorOn(session, entry, assigned);
+      if (successor != null) {
+        if (!identical(successor.session, session)) {
+          // Should its REGISTER be refused, the record would stay.
+          successor.replacesOn = session;
+        }
+        return;
+      }
       if (session.usable) {
         try {
           await _sendUnregister(session, entry.type, assigned);
@@ -1143,6 +1151,21 @@ class NamingClient {
         'replacement REGISTER $address failed; dropping the old record',
       );
     }
+  }
+
+  /// The registration other than [entry] that holds `type/assigned` on
+  /// [session], or whose `REGISTER` of it is in flight there; null if none.
+  _Entry? _successorOn(_Session session, _Entry entry, int assigned) {
+    for (final e in _entries) {
+      if (!identical(e, entry) &&
+          e.type == entry.type &&
+          ((identical(e.session, session) && e.instance == assigned) ||
+              (identical(e.pending, session) &&
+                  e.pendingInstance == assigned))) {
+        return e;
+      }
+    }
+    return null;
   }
 
   /// Whether a failed request may still have taken effect: the naming
@@ -1375,6 +1398,9 @@ class _Entry {
 
   /// The session a REGISTER for this entry is in flight on.
   _Session? pending;
+
+  /// The id that REGISTER asks for (0: any).
+  int pendingInstance = 0;
 
   /// Replaced by a newer registration of the same address.
   bool superseded = false;

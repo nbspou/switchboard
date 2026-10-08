@@ -1707,6 +1707,68 @@ void main() {
       expect(h.service.table.keys.map((a) => a.type), [Name('api')]);
     });
 
+    test('register, unregister and register again of one id while the '
+        'first REGISTER is in flight keeps the second record', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final published = <String>[];
+      h.service.events.listen((e) => published.add(describeEvent(e)));
+      final type = Name('npc');
+      final first = client.register(type, [uriA], instance: 7);
+      final cancelled = expectLater(first, throwsStatus(StatusCode.cancelled));
+      await client.unregister(type, 7);
+      expect(await client.register(type, [uriB], instance: 7), 7);
+      await cancelled;
+      await Future<void>.delayed(ms50);
+      // The first REGISTER's late answer sends no UNREGSTR: the second
+      // REGISTER, after it on the channel, replaced its record.
+      expect(published, ['UP npc/7 $uriA', 'UP npc/7 $uriB']);
+      expect(h.service.table.values.single.endpoints, [uriB]);
+      expect(connector.calls, 1);
+      await client.unregister(type, 7);
+      expect(h.service.table, isEmpty);
+    });
+
+    test('a superseded registration given a new id does not stay '
+        'published', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final assigned = <int>[];
+      expect(
+        await client.register(
+          type,
+          [uriA],
+          instance: 5,
+          onAssigned: assigned.add,
+        ),
+        5,
+      );
+      // The naming service restarts; meanwhile another channel takes 5.
+      connector.down = true;
+      final h2 = Harness(assignmentHold: const Duration(milliseconds: 300));
+      addTearDown(h2.close);
+      connector.harness = h2;
+      await h.service.close();
+      await until(() => !client.isConnected);
+      final other = h2.link().$1;
+      expect(await register(other, 'npc', instance: 5), 5);
+      connector.down = false;
+      // REGISTER 5 is refused, the REGISTER for any id that follows is held.
+      await until(() => client.isConnected);
+      await Future<void>.delayed(ms50);
+      // 5 is free again and the application registers it again: the held
+      // registration is superseded, and its answer comes with another id.
+      await unregister(other, 'npc', 5);
+      expect(await client.register(type, [uriB], instance: 5), 5);
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(h2.service.table.keys, [ServiceAddress(type, 5)]);
+      expect(h2.service.table.values.single.endpoints, [uriB]);
+      expect(assigned, [5]);
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();
