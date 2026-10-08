@@ -462,6 +462,44 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     return pending.future;
   }
 
+  /// Opens a channel on the same connection, as [MuxConnection.open] does,
+  /// whose OPEN keeps its place among the frames of this channel: it goes
+  /// out after the subframes handed to [send] before the call (those
+  /// waiting for credit included, and those the output scheduler holds)
+  /// and before the ones after it, so that the peer receives the OPEN
+  /// before any of them, and never long before. DATA and the CLOSE of the
+  /// new channel wait until its OPEN has gone out; what the window takes
+  /// of them meanwhile is held in the channel.
+  ///
+  /// This is how a Talk bulk channel is opened: the peer must see it
+  /// before the message referencing it, and a receiver bounds the bulk
+  /// channels opened ahead of their messages, which an OPEN sent at once
+  /// could overtake while the message waits for credit or for the
+  /// transport.
+  ///
+  /// If this channel stops sending before the OPEN goes out (the peer
+  /// closed it, the connection ended, or this channel's close confirmation
+  /// timed out with the OPEN still waiting for credit), the new channel is
+  /// never opened: it ends at once with [StatusCode.cancelled], its id
+  /// released. Throws like [MuxConnection.open], and with
+  /// [StatusCode.failedPrecondition] when [canSend] is false.
+  MuxChannel openAfter(Uint8List openPayload) {
+    if (!canSend) {
+      throw SwitchboardException.of(
+        StatusCode.failedPrecondition,
+        'channel $id is ${_state.name}',
+      );
+    }
+    final link = _link.host.openAfter(_link, openPayload);
+    final frame = MuxFrame.open(link.id, link.channel.openPayload);
+    if (_pendingSends.isEmpty) {
+      _link.host.sendChannelFrame(_link, frame, opens: link);
+    } else {
+      _pendingSends.add(_PendingSend.open(frame, link));
+    }
+    return link.channel;
+  }
+
   /// The largest chunk of a bulk payload: [MuxOptions.bulkChunkSize], and
   /// what the peer's frame limit leaves after the header.
   int get _bulkChunkMax {
@@ -565,6 +603,15 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     try {
       while (_pendingSends.isNotEmpty) {
         final head = _pendingSends.first;
+        final opens = head.opens;
+        if (opens != null) {
+          // An OPEN ordered behind what came before it; not flow
+          // controlled.
+          _pendingSends.removeFirst();
+          _link.host.sendChannelFrame(_link, head.openFrame!, opens: opens);
+          head.completer.complete();
+          continue;
+        }
         try {
           // The peer may have lowered its frame limit meanwhile.
           if (head.split) {
@@ -605,7 +652,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     }
   }
 
-  /// Fails every subframe still waiting for credit.
+  /// Fails every subframe still waiting for credit; a channel whose OPEN
+  /// waited behind them ([openAfter]) is never opened.
   void _failPendingSends() {
     if (_pendingSends.isEmpty) {
       return;
@@ -618,6 +666,16 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _pendingSends.clear();
     for (final send in pending) {
       send.completer.completeError(error);
+      final opens = send.opens;
+      if (opens != null) {
+        _link.host.openFailed(
+          opens,
+          Status.of(
+            StatusCode.cancelled,
+            'channel $id stopped sending before the OPEN went out',
+          ),
+        );
+      }
     }
   }
 
@@ -869,8 +927,24 @@ abstract interface class MuxChannelHost {
 
   /// Hands [frame] of [link] to the output scheduler: DATA waits for the
   /// transport to take it, in [link]'s queue; a CLOSE follows what is
-  /// queued before it, and goes at once when nothing is.
-  void sendChannelFrame(MuxChannelLink link, MuxFrame frame);
+  /// queued before it, and goes at once when nothing is. An OPEN of the
+  /// channel [opens] ([MuxChannel.openAfter]) likewise; once it is
+  /// written, what that channel sent meanwhile follows. Frames of a
+  /// channel whose OPEN has not gone out wait for it.
+  void sendChannelFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  });
+
+  /// Creates the channel of [MuxChannel.openAfter] on [parent]'s
+  /// connection, its OPEN not sent: the caller hands it to
+  /// [sendChannelFrame] in its place. Throws like [MuxConnection.open].
+  MuxChannelLink openAfter(MuxChannelLink parent, Uint8List openPayload);
+
+  /// The OPEN of [link] ([MuxChannel.openAfter]) will never go out: ends
+  /// the channel locally with [status] and frees its id.
+  void openFailed(MuxChannelLink link, Status status);
 
   /// Drops the DATA of [link] waiting for the transport (the peer closed
   /// the channel) and sends at once what remains queued for it.
@@ -932,6 +1006,25 @@ class MuxChannelLink {
   /// Whether the connection still holds this channel for incoming delivery.
   /// Kept separately so queue removal and membership checks stay constant time.
   bool incomingPending = false;
+
+  /// False while the OPEN of a channel opened with [MuxChannel.openAfter]
+  /// waits behind its parent's frames; its own frames wait in [preOpen].
+  bool openWritten = true;
+
+  /// Frames of this channel handed to the connection before its OPEN was
+  /// written, in order, each with the channel it opens if it is an OPEN
+  /// ordered behind this channel's frames.
+  List<(MuxFrame, MuxChannelLink?)> preOpen = const [];
+
+  /// Ends a channel whose OPEN never went out, with [status].
+  void neverOpened(Status status) {
+    final c = channel;
+    preOpen = const [];
+    c._noteStatus(status);
+    c._closeSent = true;
+    c._closeReceived = true;
+    c._complete();
+  }
 
   /// Whether the peer's CLOSE has been received.
   bool get closeReceived => channel._closeReceived;
@@ -1082,9 +1175,22 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
 /// A subframe waiting for flow-control credit, or the rest of a bulk
 /// payload.
 class _PendingSend {
-  _PendingSend(this.subframe, {required this.split});
+  _PendingSend(this.subframe, {required this.split})
+    : openFrame = null,
+      opens = null;
+
+  /// The OPEN of [opens], ordered behind the subframes before it.
+  _PendingSend.open(MuxFrame this.openFrame, MuxChannelLink this.opens)
+    : subframe = Uint8List(0),
+      split = false;
 
   final Uint8List subframe;
+
+  /// The OPEN frame of [opens] ([MuxChannel.openAfter]); null for DATA.
+  final MuxFrame? openFrame;
+
+  /// The channel [openFrame] opens.
+  final MuxChannelLink? opens;
 
   /// Whether [subframe] is a bulk payload, sent in chunks.
   final bool split;

@@ -780,7 +780,13 @@ class MuxConnection {
   /// if no channel id is free or the peer's announced channel limit is
   /// reached; with [StatusCode.frameTooLarge] if the OPEN frame would
   /// exceed the peer's announced frame limit.
-  MuxChannel open(Uint8List openPayload) {
+  MuxChannel open(Uint8List openPayload) =>
+      _openLink(openPayload, openWritten: true).channel;
+
+  /// Opens a channel: sends its OPEN unless [openWritten] is false, when
+  /// the caller hands it to the output scheduler in its place
+  /// ([MuxChannel.openAfter]).
+  MuxChannelLink _openLink(Uint8List openPayload, {required bool openWritten}) {
     if (_closing || _goAwaySent) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
@@ -830,8 +836,32 @@ class MuxConnection {
     if (_isOwnShortId(id)) {
       _shortIdsInUse++;
     }
-    _sendFrame(MuxFrame.open(id, payload));
-    return link.channel;
+    if (openWritten) {
+      _sendFrame(MuxFrame.open(id, payload));
+    } else {
+      link.openWritten = false;
+    }
+    return link;
+  }
+
+  /// The OPEN of [link] will never be written: the channel ends locally
+  /// and its id is free again (the peer never heard of it).
+  void _openFailed(MuxChannelLink link, Status status) {
+    if (!identical(_links[link.id], link) || link.openWritten) {
+      return;
+    }
+    _links.remove(link.id);
+    _openCount--;
+    if (_isOwnShortId(link.id)) {
+      _shortIdsInUse--;
+    }
+    _awaitingLimits.remove(link);
+    final nested = [for (final (_, opens) in link.preOpen) ?opens];
+    link.neverOpened(status);
+    for (final opens in nested) {
+      _openFailed(opens, status);
+    }
+    scheduleMicrotask(_checkIdle);
   }
 
   /// Ends the wait for the peer's LIMITS: the channels opened meanwhile
@@ -1068,8 +1098,20 @@ class MuxConnection {
         (transport as OutputReadyTransport).isOutputReady;
   }
 
-  void _sendChannelFrame(MuxChannelLink link, MuxFrame frame) {
+  void _sendChannelFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) {
     if (!_writable) {
+      return;
+    }
+    if (!link.openWritten) {
+      // The channel's own OPEN waits behind its parent's frames.
+      (link.preOpen = link.preOpen.isEmpty ? [] : link.preOpen).add((
+        frame,
+        opens,
+      ));
       return;
     }
     final id = link.id;
@@ -1078,12 +1120,15 @@ class MuxConnection {
     if (queue == null) {
       if (!isData || (_heldOutputFrames == 0 && _outputReady)) {
         _write(frame.encode());
+        if (opens != null) {
+          _openWritten(opens);
+        }
         return;
       }
       queue = _outQueues[id] = _OutQueue(id);
     }
     final bytes = frame.encode();
-    queue.frames.add(_OutFrame(bytes, isData: isData));
+    queue.frames.add(_OutFrame(bytes, isData: isData, opens: opens));
     _heldOutputFrames++;
     _heldOutputBytes += bytes.length;
     if (!queue.listed) {
@@ -1163,6 +1208,21 @@ class MuxConnection {
       _takeTurn(queue);
     }
     _write(frame.bytes);
+    final opens = frame.opens;
+    if (opens != null) {
+      _openWritten(opens);
+    }
+  }
+
+  /// The OPEN of [link] ([MuxChannel.openAfter]) was written: what the
+  /// channel sent meanwhile follows it.
+  void _openWritten(MuxChannelLink link) {
+    link.openWritten = true;
+    final frames = link.preOpen;
+    link.preOpen = const [];
+    for (final (frame, opens) in frames) {
+      _sendChannelFrame(link, frame, opens: opens);
+    }
   }
 
   void _awaitOutput() {
@@ -1189,17 +1249,23 @@ class MuxConnection {
     if (queue == null) {
       return;
     }
-    final rest = <Uint8List>[];
+    final rest = <_OutFrame>[];
     for (final frame in queue.frames) {
       _heldOutputFrames--;
       _heldOutputBytes -= frame.bytes.length;
       if (!frame.isData) {
-        rest.add(frame.bytes);
+        rest.add(frame);
       }
     }
     // Left in its turn list, skipped once empty.
     queue.frames.clear();
-    rest.forEach(_write);
+    for (final frame in rest) {
+      _write(frame.bytes);
+      final opens = frame.opens;
+      if (opens != null) {
+        _openWritten(opens);
+      }
+    }
   }
 
   /// Writes everything held, in the order of the turns, whether or not
@@ -1989,8 +2055,19 @@ class _Host implements MuxChannelHost {
   void sendFrame(MuxFrame frame) => _connection._sendFrame(frame);
 
   @override
-  void sendChannelFrame(MuxChannelLink link, MuxFrame frame) =>
-      _connection._sendChannelFrame(link, frame);
+  void sendChannelFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) => _connection._sendChannelFrame(link, frame, opens: opens);
+
+  @override
+  MuxChannelLink openAfter(MuxChannelLink parent, Uint8List openPayload) =>
+      _connection._openLink(openPayload, openWritten: false);
+
+  @override
+  void openFailed(MuxChannelLink link, Status status) =>
+      _connection._openFailed(link, status);
 
   @override
   void dropQueuedData(MuxChannelLink link) =>
@@ -2022,10 +2099,13 @@ class _OutQueue {
 
 /// An encoded frame waiting for the transport.
 class _OutFrame {
-  _OutFrame(this.bytes, {required this.isData});
+  _OutFrame(this.bytes, {required this.isData, this.opens});
 
   final Uint8List bytes;
   final bool isData;
+
+  /// For an OPEN of [MuxChannel.openAfter], the channel it opens.
+  final MuxChannelLink? opens;
 }
 
 class _PendingPing {

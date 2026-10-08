@@ -15,6 +15,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
@@ -421,5 +422,153 @@ void main() {
         await normalAtB.cancel();
       },
     );
+  });
+
+  group('openAfter', () {
+    /// (command, channel id) of every frame written but control messages.
+    List<(MuxCommand, int)> commands(GatedTransport gate) => [
+      for (final frame in gate.written)
+        if (frame.channelId != 0) (frame.command, frame.channelId),
+    ];
+
+    test('the OPEN goes at once when nothing waits on the parent', () async {
+      final (a, b, gate) = gatedPair();
+      addTearDown(a.close);
+      gate.allow(1000);
+      await a.ping();
+      final parent = a.open(empty);
+      final child = parent.openAfter(Uint8List.fromList([9]));
+      await child.send(tagged(child, 0));
+      await pumpEventQueue();
+      expect(commands(gate), [
+        (MuxCommand.open, parent.id),
+        (MuxCommand.open, child.id),
+        (MuxCommand.data, child.id),
+      ]);
+      expect(b.isOpen, isTrue);
+    });
+
+    test('the OPEN keeps its place behind DATA the scheduler holds, and the '
+        'new channel\'s frames wait for it', () async {
+      final (a, b, gate) = gatedPair();
+      addTearDown(a.close);
+      final opened = <int>[];
+      b.incoming.listen((c) => opened.add(c.id));
+      final parent = a.open(empty);
+      await pumpEventQueue();
+      await parent.send(tagged(parent, 0));
+      await parent.send(tagged(parent, 1));
+      final child = parent.openAfter(empty);
+      await parent.send(tagged(parent, 2));
+      // Taken by the child's window, held until its OPEN is written.
+      await child.send(tagged(child, 0));
+      unawaited(child.close());
+      expect(child.canSend, isFalse);
+      await pumpEventQueue();
+      expect(commands(gate), [(MuxCommand.open, parent.id)]);
+      gate.allow(10);
+      await pumpEventQueue();
+      expect(commands(gate), [
+        (MuxCommand.open, parent.id),
+        (MuxCommand.data, parent.id),
+        (MuxCommand.data, parent.id),
+        (MuxCommand.open, child.id),
+        (MuxCommand.data, parent.id),
+        (MuxCommand.data, child.id),
+        (MuxCommand.close, child.id),
+      ]);
+      expect(opened, [parent.id, child.id]);
+      expect(b.isOpen, isTrue);
+    });
+
+    test('the OPEN waits behind DATA waiting for credit', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(
+        hexString(
+          MuxControlMessage.limits(
+            const MuxLimits(maxFrameSize: 0, maxChannels: 0, initialWindow: 64),
+          ).toFrame().encode(),
+        ),
+      );
+      raw.send('02 00 00 01 5E');
+      await raw.nextControl(MuxControlType.pong);
+      final parent = mux.open(empty);
+      expect((await raw.next()).command, MuxCommand.open);
+      // 16 + 16 each: the window takes two.
+      await parent.send(Uint8List(16));
+      await parent.send(Uint8List(16));
+      final third = parent.send(Uint8List(16));
+      final child = parent.openAfter(empty);
+      unawaited(child.send(Uint8List(5)));
+      expect((await raw.next()).command, MuxCommand.data);
+      expect((await raw.next()).command, MuxCommand.data);
+      await pumpEventQueue();
+      // CREDIT for one: the third goes, then the OPEN, then the child's
+      // DATA.
+      raw.send(
+        hexString(
+          MuxControlMessage.credit(MuxCredit(parent.id, 32)).toFrame().encode(),
+        ),
+      );
+      await third;
+      final frames = [await raw.next(), await raw.next(), await raw.next()];
+      expect(frames.map((f) => (f.command, f.channelId)), [
+        (MuxCommand.data, parent.id),
+        (MuxCommand.open, child.id),
+        (MuxCommand.data, child.id),
+      ]);
+    });
+
+    test('a parent closed before the OPEN went out ends the new channel '
+        'unopened, its id free', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      raw.send(
+        hexString(
+          MuxControlMessage.limits(
+            const MuxLimits(maxFrameSize: 0, maxChannels: 0, initialWindow: 64),
+          ).toFrame().encode(),
+        ),
+      );
+      raw.send('02 00 00 01 5E');
+      await raw.nextControl(MuxControlType.pong);
+      final parent = mux.open(empty);
+      await raw.next();
+      await parent.send(Uint8List(16));
+      await parent.send(Uint8List(16));
+      final waiting = parent.send(Uint8List(16));
+      final child = parent.openAfter(empty);
+      final childSend = child.send(Uint8List(5));
+      expect(mux.openChannelCount, 2);
+      await raw.next();
+      await raw.next();
+      // The peer closes the parent.
+      raw.send('22 02 00');
+      await expectLater(waiting, throwsStatus(StatusCode.failedPrecondition));
+      // Handed to the connection (the window took it), then dropped with
+      // the channel.
+      await childSend;
+      expect((await child.done).known, StatusCode.cancelled);
+      expect(child.state, MuxChannelState.closed);
+      expect(mux.openChannelCount, 0);
+      // Only the parent's confirming CLOSE went out.
+      expect(await raw.nextHex(), '22 02 00');
+      expect(mux.channels, isEmpty);
+      final next = mux.open(empty);
+      expect((await raw.next()).channelId, next.id);
+    });
+
+    test('refused once the parent can no longer send', () async {
+      final (a, b) = muxPair();
+      addTearDown(a.close);
+      addTearDown(b.close);
+      final parent = a.open(empty);
+      unawaited(parent.close());
+      expect(
+        () => parent.openAfter(empty),
+        throwsStatus(StatusCode.failedPrecondition),
+      );
+    });
   });
 }
