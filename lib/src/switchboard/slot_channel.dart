@@ -444,7 +444,8 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
   }
 
   /// Sends every subframe of [stream], each once the one before it was
-  /// handed over, as [MuxChannel.sink]'s `addStream` does.
+  /// handed over, as [MuxChannel.sink]'s `addStream` does. A size refusal
+  /// after waiting for LIMITS, or an overflow during retry, fails the call.
   @override
   Future<void> addStream(Stream<Uint8List> stream) async {
     await for (final subframe in stream) {
@@ -456,7 +457,10 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
         final sent = _channel.send(subframe);
         try {
           await sent;
-        } on SwitchboardException {
+        } on SwitchboardException catch (e) {
+          if (e.code != StatusCode.failedPrecondition) {
+            rethrow;
+          }
           // Closed while waiting: dropped, as add drops it.
         }
       }

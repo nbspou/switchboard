@@ -1195,7 +1195,8 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
   /// Sends every subframe of [stream], waiting for each to be handed to
   /// the connection before taking the next, so that the stream is paused
   /// while the channel waits for credit. Subframes are dropped once the
-  /// channel can no longer send.
+  /// channel can no longer send. Size refusals, including those after
+  /// waiting for LIMITS, fail the call.
   @override
   Future<void> addStream(Stream<Uint8List> stream) async {
     await for (final subframe in stream) {
@@ -1207,7 +1208,10 @@ class _MuxChannelSink implements StreamSink<Uint8List> {
         final sent = _channel.send(subframe);
         try {
           await sent;
-        } on SwitchboardException {
+        } on SwitchboardException catch (e) {
+          if (e.code != StatusCode.failedPrecondition) {
+            rethrow;
+          }
           // Closed while waiting: dropped, as add drops it.
         }
       }

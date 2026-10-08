@@ -20,7 +20,9 @@ import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/mux/mux_frame.dart';
+import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/status.dart';
+import 'package:switchboard/src/switchboard/slot_channel.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
 
@@ -316,6 +318,24 @@ void main() {
 
   group('DATA waits for the peer LIMITS', () {
     final waiting = rawOptions.copyWith(awaitPeerLimits: true);
+
+    for (final slot in [false, true]) {
+      test(
+        'addStream reports a size refusal after LIMITS arrives (slot: $slot)',
+        () async {
+          final (mux, raw) = rawPair(options: waiting);
+          addTearDown(mux.close);
+          final channel = mux.open(empty);
+          final sink = slot
+              ? SlotChannel(Name('test'), 0, channel, (_) async => null).sink
+              : channel.sink;
+          final added = sink.addStream(Stream.value(Uint8List(1000)));
+          await pumpEventQueue();
+          raw.send(limitsHex(256));
+          await expectLater(added, throwsStatus(StatusCode.frameTooLarge));
+        },
+      );
+    }
 
     test('OPEN goes at once, DATA once the LIMITS arrived, within the window '
         'it announced', () async {
