@@ -72,7 +72,9 @@ final Logger _log = Logger('Switchboard.Router');
 /// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`,
 /// `tcp://host:port` and, within one isolate, `mem://id` (see
 /// [listenMemory]). A URI fragment (the text form of a service address, as
-/// in `ws://host/path#npc/1a2b`) is ignored for connecting.
+/// in `ws://host/path#npc/1a2b`) is ignored for connecting. An endpoint of
+/// one of the node's own listeners is reached in-process, without a
+/// socket (see [localConnections]).
 class Switchboard {
   /// Creates a node.
   ///
@@ -92,6 +94,10 @@ class Switchboard {
   ///
   /// [maxConnectionsPerEndpoint] bounds the pooled connections to one
   /// endpoint; see [connect].
+  ///
+  /// [localConnections] (default true) has the connections this node
+  /// initiates to one of its own listeners go over an in-process
+  /// [MemoryTransport] pair instead of a socket; see [localConnections].
   ///
   /// [slotRefreshTimeout] bounds every `LOCATE` slot routing sends: the
   /// lookup of a slot the table has no owner for (see [selectAndConnect])
@@ -157,6 +163,7 @@ class Switchboard {
     this.identityTimeout = const Duration(seconds: 10),
     this.expectedIdentityFor,
     this.relay,
+    this.localConnections = true,
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        _identity = credential,
        muxOptions = verifier == null
@@ -344,6 +351,34 @@ class Switchboard {
   /// connection is only opened when every pooled one has as many channels
   /// open as its peer announced it accepts. Default 4.
   final int maxConnectionsPerEndpoint;
+
+  /// Whether a connection this node initiates to one of its own listeners
+  /// (an endpoint [isOwnEndpoint] recognises, TCP, WebSocket or `mem`) is
+  /// made in-process instead of through a socket. Default true.
+  ///
+  /// Such a connection is a [MemoryTransport] pair (frames delivered
+  /// through the event queue, as from a socket): one side is adopted as
+  /// the listener that endpoint designates adopts a connection it
+  /// accepts, under that listener's policy, dispatched, reported on
+  /// [connections] and sent GOAWAY by [close], with `local` as its remote
+  /// description ([IncomingChannel.remote]); the other side is the
+  /// initiated connection, established exactly as one through a socket
+  /// would be: pooled by the endpoint as given (repeated opens reuse it),
+  /// its policy chosen by [connect]'s or [dial]'s `policy`,
+  /// [endpointPolicy] and [outgoingPolicy], the node identifying on it as
+  /// [identifyOutgoing], [identifyFor] and [expectedIdentityFor] say,
+  /// [credentialFor] asked about the endpoint, and the mux limits and flow
+  /// control of any connection. Nothing differs on the wire. This is what
+  /// a node does when it opens a channel to a service it publishes, joins
+  /// the naming service it hosts (`MeshNode.join` with its own listener's
+  /// endpoint), or dials itself back for `CONNECT`.
+  ///
+  /// The proxy, the relay and slot gate forwarding still never connect to
+  /// the node's own listeners (`excludeOwnEndpoints`). False dials own
+  /// endpoints like any other, through a socket (or, for `mem`, the
+  /// isolate's registry of memory listeners), as a test of the socket path
+  /// needs.
+  final bool localConnections;
 
   /// Longest wait for a `LOCATE` of slot routing
   /// ([SlotResolver.locateSlot]): for a slot the table has no owner for,
@@ -544,7 +579,7 @@ class Switchboard {
   }) async {
     _checkOpen();
     final base = _normalizePath(path);
-    return _listen(await HttpServer.bind(address, port), (server) {
+    return _listen(await HttpServer.bind(address, port), policy, (server) {
       _httpServers.add(server);
       server.listen(
         (request) =>
@@ -578,7 +613,7 @@ class Switchboard {
     ChannelPolicy? policy,
   }) async {
     _checkOpen();
-    return _listen(await ServerSocket.bind(address, port), (server) {
+    return _listen(await ServerSocket.bind(address, port), policy, (server) {
       _tcpServers.add(server);
       server.listen(
         (socket) => _onSocket(socket, policy),
@@ -628,7 +663,7 @@ class Switchboard {
     );
     _memoryIds.add(uri.host);
     _endpoints.add(uri);
-    _ownEndpoints.add(_OwnEndpoint(uri, {_canonicalHost(uri.host)}));
+    _ownEndpoints.add(_OwnEndpoint(uri, {_canonicalHost(uri.host)}, policy));
     _log.info('listening on $uri');
     return uri;
   }
@@ -725,6 +760,7 @@ class Switchboard {
 
   Future<Uri> _listen<T>(
     T server,
+    ChannelPolicy? policy,
     (Uri, InternetAddress) Function(T server) start,
     Future<Object?> Function(T server) stop,
   ) async {
@@ -734,7 +770,7 @@ class Switchboard {
     }
     final (uri, bound) = start(server);
     _endpoints.add(uri);
-    final own = _OwnEndpoint(uri, _hostsOf(bound));
+    final own = _OwnEndpoint(uri, _hostsOf(bound), policy);
     _ownEndpoints.add(own);
     _log.info('listening on $uri');
     if (bound.address == InternetAddress.anyIPv4.address ||
@@ -802,8 +838,16 @@ class Switchboard {
   /// addresses, the host name and the addresses of the local network
   /// interfaces. Host names that resolve to this host by other means are
   /// not recognised. A `mem` URI matches by its id alone
-  /// ([listenMemory]).
-  bool isOwnEndpoint(Uri endpoint) {
+  /// ([listenMemory]). Nothing matches once [close] has started, which
+  /// stops every listener.
+  ///
+  /// The node connects to such an endpoint in-process (see
+  /// [localConnections]); the proxy never forwards to one.
+  bool isOwnEndpoint(Uri endpoint) => _ownListener(endpoint) != null;
+
+  /// The listener of this node that [endpoint] designates (see
+  /// [isOwnEndpoint]), or null.
+  _OwnEndpoint? _ownListener(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
     final port = _portOf(endpoint);
     final host = _canonicalHost(endpoint.host);
@@ -814,10 +858,10 @@ class Switchboard {
           own.uri.port == port &&
           (!isWs || own.uri.path == path) &&
           own.hosts.contains(host)) {
-        return true;
+        return own;
       }
     }
-    return false;
+    return null;
   }
 
   /// The URIs returned by [listenWebSocket], [listenTcp] and
@@ -1019,7 +1063,12 @@ class Switchboard {
   /// [StatusCode.resourceExhausted]).
   ///
   /// A `mem://id` endpoint ([listenMemory]) is reached in this isolate
-  /// over a [MemoryTransport] pair, at once.
+  /// over a [MemoryTransport] pair, at once. So is an endpoint of one of
+  /// this node's own listeners ([isOwnEndpoint]), whatever its scheme,
+  /// unless [localConnections] is false: the other side of the pair is
+  /// accepted by this node as that listener would accept it, and the
+  /// connection is otherwise like one through a socket (see
+  /// [localConnections]).
   ///
   /// Channels the peer opens on the connection are dispatched to the local
   /// services under the connection's policy: [policy] if given, else
@@ -1092,12 +1141,13 @@ class Switchboard {
   }
 
   /// A new connection to [endpoint] that is not pooled: established
-  /// through the same path as [connect] (schemes, [connectTimeout], the
-  /// connection's policy chosen from [policy], [endpointPolicy] and
-  /// [outgoingPolicy], [credentialFor] for the channels opened on it with
-  /// [openChannelOn]), adopted for dispatch, reported on [connections] and
-  /// sent GOAWAY by [close], but never handed out by [connect] or used by
-  /// the open methods.
+  /// through the same path as [connect] (schemes, [connectTimeout], an
+  /// endpoint of the node's own listeners in-process with
+  /// [localConnections], the connection's policy chosen from [policy],
+  /// [endpointPolicy] and [outgoingPolicy], [credentialFor] for the
+  /// channels opened on it with [openChannelOn]), adopted for dispatch,
+  /// reported on [connections] and sent GOAWAY by [close], but never
+  /// handed out by [connect] or used by the open methods.
   ///
   /// The caller owns it: it opens channels on it ([openChannelOn] applies
   /// the node's payload rules) and ends it with [MuxConnection.goAway]
@@ -1249,18 +1299,23 @@ class Switchboard {
     ServiceRecord? record,
   }) async {
     final StreamChannel<Uint8List> transport;
-    switch (endpoint.scheme.toLowerCase()) {
-      case 'ws' || 'wss':
-        transport = await _connectWebSocket(endpoint);
-      case 'tcp':
-        transport = await _connectTcp(endpoint);
-      case MemoryEndpoints.scheme:
-        transport = _connectMemory(endpoint);
-      default:
-        throw SwitchboardException.of(
-          StatusCode.unimplemented,
-          'unsupported endpoint scheme: $endpoint',
-        );
+    final own = localConnections ? _ownListener(endpoint) : null;
+    if (own != null) {
+      transport = _connectLocal(own);
+    } else {
+      switch (endpoint.scheme.toLowerCase()) {
+        case 'ws' || 'wss':
+          transport = await _connectWebSocket(endpoint);
+        case 'tcp':
+          transport = await _connectTcp(endpoint);
+        case MemoryEndpoints.scheme:
+          transport = _connectMemory(endpoint);
+        default:
+          throw SwitchboardException.of(
+            StatusCode.unimplemented,
+            'unsupported endpoint scheme: $endpoint',
+          );
+      }
     }
     final connection = _adopt(
       transport,
@@ -1463,6 +1518,26 @@ class Switchboard {
       );
     }
   }
+
+  /// Connects to [own], one of this node's listeners, in-process (see
+  /// [localConnections]): one side of a new [MemoryTransport] pair is
+  /// adopted as that listener adopts a connection it accepts, and the
+  /// other is returned, to be adopted as the initiated connection.
+  StreamChannel<Uint8List> _connectLocal(_OwnEndpoint own) {
+    // Through the event queue, as for a mem endpoint (see _connectMemory).
+    final (local, accepted) = MemoryTransport.pair(delay: Duration.zero);
+    _adopt(
+      accepted,
+      isInitiator: false,
+      remote: _localRemote,
+      policy: own.policy,
+    );
+    return local;
+  }
+
+  /// The remote description of the accepted side of a connection the node
+  /// made to one of its own listeners.
+  static const String _localRemote = 'local';
 
   /// Hands one side of a new [MemoryTransport] pair to the listener at
   /// [endpoint] and returns the other.
@@ -2895,10 +2970,12 @@ class _Identification {
   final String? receiver;
 }
 
-/// A listening endpoint and the host names that designate it.
+/// A listening endpoint, the host names that designate it, and the policy
+/// of the connections its listener accepts.
 class _OwnEndpoint {
-  _OwnEndpoint(this.uri, this.hosts);
+  _OwnEndpoint(this.uri, this.hosts, this.policy);
 
   final Uri uri;
   final Set<String> hosts;
+  final ChannelPolicy? policy;
 }
