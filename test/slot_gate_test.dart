@@ -392,30 +392,38 @@ void main() {
       expect(await ask(peer.open(shard: 1), 'x'), '1:x');
     });
 
-    test(
-      'a closed gate with a pending load keeps its lifecycle attached',
-      () async {
-        newGate();
-        final hold = lifecycle.loadGate = Completer<void>();
-        addTearDown(() {
-          if (!hold.isCompleted) hold.complete();
-        });
-        final loading = gate.onAssign(assign(1));
-        loading.ignore();
-        await gate.close();
-        expect(
-          () => SlotGate(node, client, kv, lifecycle: lifecycle),
-          throwsStateError,
-        );
-        expect(lifecycle.gate, same(gate));
-        hold.complete();
-        await expectLater(loading, throwsCode(StatusCode.unavailable));
-        final next = SlotGate(node, client, kv, lifecycle: lifecycle);
-        addTearDown(next.close);
-        await next.onAssign(assign(1, epoch: 2));
-        expect(next.serves(1), isTrue);
-      },
-    );
+    test('a new gate on the lifecycle refuses the slots its closed gate is '
+        'still loading, and only those', () async {
+      newGate();
+      final hold = lifecycle.loadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1));
+      loading.ignore();
+      await gate.close();
+      // A failed publishSharded can be repeated with the same lifecycle.
+      final next = SlotGate(node, client, kv, lifecycle: lifecycle);
+      addTearDown(next.close);
+      expect(lifecycle.gate, same(next));
+      lifecycle.loadGate = null;
+      await expectLater(
+        next.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      await next.onAssign(assign(2));
+      expect(next.serves(2), isTrue);
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      await next.onAssign(assign(1, epoch: 2));
+      expect(next.serves(1), isTrue);
+      expect(lifecycle.log, [
+        'load 1 e1 h0',
+        'load 2 e1 h0',
+        'unload 1',
+        'load 1 e2 h0',
+      ]);
+    });
 
     test('an unload must finish before another ASSIGN', () async {
       newGate();
