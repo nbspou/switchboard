@@ -1123,6 +1123,13 @@ class MuxConnection {
     if (_peerNonce != null) {
       throw ProtocolException('second NONCE');
     }
+    final local = _localNonce;
+    if (local != null && _bytesEqual(local, payload)) {
+      // Only a peer that echoes ours sends it: with both nonces equal, the
+      // proof of our IDENT verifies as one of the peer's, which could then
+      // send it back and be identified as this node.
+      throw ProtocolException('NONCE equal to ours');
+    }
     final nonce = Uint8List.fromList(payload);
     _peerNonce = nonce;
     final requested = _localNonce == null;

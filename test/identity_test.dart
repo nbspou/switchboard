@@ -484,6 +484,35 @@ void main() {
       expect(b.peerIdentity, isNull);
     });
 
+    test('a peer that echoes our NONCE cannot send our IDENT back to be '
+        'identified as us', () async {
+      final credential = await edIssuer.issue(
+        kind: CredentialKind.node,
+        identity: 'admin-1',
+        scopes: [Scope.of(Right.admin, '*')],
+        holderKey: holder.publicKey,
+      );
+      // A node that checks identities identifies, naming nobody, to a peer
+      // it dialled.
+      final (a, m) = rawPair(
+        options: rawOptions.copyWith(
+          identityVerifier: await verifierFor([edIssuer]),
+        ),
+      );
+      a.localIdentity = 'admin-1';
+      final identifying = a.identify(credential, holderKey: holder);
+      identifying.ignore();
+      final nonce = await m.nextControl(MuxControlType.nonce);
+      // The same nonce back: a proof over SWBIDENT || N || N || intent ||
+      // receiver would verify both ways.
+      m.send(control(MuxControlType.nonce, nonce.payload));
+      final goAway = await m.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus, hasCode(StatusCode.protocolError));
+      await expectLater(identifying, throwsStatus(StatusCode.protocolError));
+      expect(await a.done, hasCode(StatusCode.protocolError));
+      expect(a.peerIdentity, isNull);
+    });
+
     test('a replayed bearer IDENT is accepted, by design', () async {
       // A bearer credential is a password (wiki "Security considerations"):
       // its IDENT carries no proof, so nothing binds it to the nonces of
