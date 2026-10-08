@@ -644,7 +644,9 @@ class PeerSet {
   /// GOAWAY; it works while the peer is connecting with its hooks running,
   /// while its per-peer channel is being re-opened, and while it is held)
   /// or the set is closed, and like [MuxConnection.open] and
-  /// [Switchboard.credentialFor].
+  /// [Switchboard.credentialFor]. A connection or record that changes while
+  /// the credential is being chosen fails with `FAILED_PRECONDITION`:
+  /// credentials for the previous destination are never sent to its replacement.
   Future<MuxChannel> openChannel(int instance, {Uint8List? payload}) async {
     if (_closed) {
       throw SwitchboardException.of(
@@ -659,21 +661,21 @@ class PeerSet {
         'no peer ${ServiceAddress(type, instance)}',
       );
     }
-    var connection = peer._usable;
+    final connection = peer._usable;
     if (connection == null) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         '${peer.address} is ${peer.state.name}',
       );
     }
+    final record = peer.record;
     final application =
-        payload ??
-        await switchboard.payloadFor(connection, record: peer.record);
-    connection = peer._usable;
-    if (connection == null) {
+        payload ?? await switchboard.payloadFor(connection, record: record);
+    if (!identical(connection, peer._usable) ||
+        !identical(record, peer.record)) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
-        '${peer.address} is ${peer.state.name}',
+        '${peer.address} changed while choosing its credential',
       );
     }
     return connection.open(

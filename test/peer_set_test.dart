@@ -451,6 +451,39 @@ void main() {
     );
   });
 
+  test(
+    'credentials pending during an endpoint change stay at their destination',
+    () async {
+      final a = await worker(1);
+      final b = await worker(1);
+      final credential = Completer<Uint8List?>();
+      final requested = Completer<void>();
+      consumer = Switchboard(
+        muxOptions: fast,
+        credentialFor: (endpoint, record) {
+          requested.complete();
+          expect(endpoint, a.uri);
+          return credential.future;
+        },
+      );
+      addTearDown(consumer.close);
+      resolver.add(a.record());
+      final set = watch();
+      await until(() => set.online.length == 1);
+      final opening = set.openChannel(1);
+      final refused = expectLater(
+        opening,
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      await requested.future;
+      resolver.add(b.record());
+      await until(() => set.peers[1]!.endpoint == b.uri);
+      credential.complete(bytes('only-for-a'));
+      await refused;
+      expect(b.payloads, isEmpty);
+    },
+  );
+
   test('credentials: each worker sees its own key, never the mesh '
       'credential', () async {
     final ws = [for (var id = 1; id <= 4; id++) await worker(id)];
