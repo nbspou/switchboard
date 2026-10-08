@@ -1077,4 +1077,152 @@ void main() {
       await other.close();
     });
   });
+
+  group('bulk payloads', () {
+    /// [n] bytes 0, 1, 2, ... modulo 251.
+    Uint8List pattern(int n, [int offset = 0]) =>
+        Uint8List.fromList([for (var i = 0; i < n; i++) (offset + i) % 251]);
+
+    /// A mux connection whose `_bulk` channels are routed: the near end of
+    /// a Talk channel with [near], and its far end with [far].
+    Future<(TalkChannel, TalkChannel)> muxTalk({
+      TalkOptions near = const TalkOptions(),
+      TalkOptions far = const TalkOptions(),
+    }) async {
+      const options = MuxOptions(keepAliveInterval: null);
+      final (a, b) = MemoryTransport.pair();
+      final left = MuxConnection(a, isInitiator: true, options: options);
+      final right = MuxConnection(b, isInitiator: false, options: options);
+      final accepted = Completer<MuxChannel>();
+      void route(MuxChannel channel) {
+        if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+          TalkChannel.adoptBulk(channel);
+        } else {
+          accepted.complete(channel);
+        }
+      }
+
+      final subscriptions = [
+        left.incoming.listen(route),
+        right.incoming.listen(route),
+      ];
+      addTearDown(() async {
+        for (final s in subscriptions) {
+          await s.cancel();
+        }
+        await left.close();
+        await right.close();
+      });
+      final nearEnd = TalkChannel(left.open(Uint8List(0)), options: near);
+      return (nearEnd, TalkChannel(await accepted.future, options: far));
+    }
+
+    /// client ↔ intermediary ↔ backend over mux connections; the
+    /// intermediary forwards every message both ways and streams bulk
+    /// payloads unless [reassemble]; [seen] gets what it forwarded toward
+    /// the backend.
+    Future<(TalkChannel, TalkChannel)> chain({
+      bool reassemble = false,
+      bool backendStreams = false,
+      List<TalkMessage>? seen,
+    }) async {
+      final proxyOptions = reassemble
+          ? const TalkOptions()
+          : TalkOptions(streamBulk: (_) => true);
+      final (client, front) = await muxTalk(far: proxyOptions);
+      final (back, backend) = await muxTalk(
+        near: proxyOptions,
+        far: backendStreams
+            ? TalkOptions(streamBulk: (_) => true)
+            : const TalkOptions(),
+      );
+      front.messages.listen((m) {
+        seen?.add(m);
+        forwardMessage(m, back).ignore();
+      });
+      back.messages.listen((m) => forwardMessage(m, front).ignore());
+      return (client, backend);
+    }
+
+    test('a request, its bulk response and bulk items are piped through, '
+        'never reassembled by the intermediary', () async {
+      final seen = <TalkMessage>[];
+      final (client, backend) = await chain(seen: seen);
+      serve(backend, (m) {
+        switch (m.procedureName) {
+          case 'PUT':
+            expect(m.payload, pattern(300000));
+            m.reply(Uint8List.fromList([m.payload.length ~/ 10000]));
+          case 'GET':
+            m.replyBulk(Stream.value(pattern(150000)), length: 150000).ignore();
+          case 'LIST':
+            for (var i = 0; i < 2; i++) {
+              m.replyItemBulk(Stream.value(pattern(60000 + i))).ignore();
+            }
+            m.reply(Uint8List(0));
+        }
+      });
+      final put = await client.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(pattern(300000)),
+        bulkLength: 300000,
+      );
+      expect(put.payload, [30]);
+      expect(seen.single.isBulk, isTrue);
+      expect(seen.single.bulkLength, 300000);
+      // Streamed through, not reassembled.
+      expect(() => seen.single.payload, throwsStateError);
+      final got = await client.request('GET', Uint8List(0));
+      expect(got.isBulk, isTrue);
+      expect(got.bulkLength, 150000);
+      expect(got.payload, pattern(150000));
+      final list = client.streamRequest('LIST', Uint8List(0));
+      final items = await list.items.toList();
+      expect([for (final i in items) i.payload.length], [60000, 60001]);
+      expect(items.every((i) => i.isBulk), isTrue);
+      await list.done;
+    });
+
+    test('a plain bulk message, and forwarding a reassembled one', () async {
+      final (client, backend) = await chain(reassemble: true);
+      final plain = Completer<TalkMessage>();
+      serve(backend, (m) {
+        if (m.expectsReply) {
+          m.reply(m.payload.sublist(0, 2));
+        } else {
+          plain.complete(m);
+        }
+      });
+      client.send('NOTE', pattern(100000));
+      final note = await plain.future;
+      expect(note.isBulk, isTrue);
+      expect(note.payload, pattern(100000));
+      final answer = await client.request('PUT', pattern(100000, 7));
+      expect(answer.payload, [7, 8]);
+    });
+
+    test('a cancel stops the piped payload on both hops', () async {
+      final (client, backend) = await chain(backendStreams: true);
+      final failed = Completer<Object>();
+      final cancelled = Completer<void>();
+      backend.messages.listen((m) {
+        m.bulk.listen((_) {}, onError: failed.complete);
+        m.onCancel.then((_) => cancelled.complete());
+      });
+      final source = StreamController<List<int>>();
+      source.add(pattern(1000));
+      final pending = client.startRequest(
+        'PUT',
+        Uint8List(0),
+        bulk: source.stream,
+      );
+      await pumpEventQueue();
+      pending.cancel();
+      await cancelled.future;
+      expect(await failed.future, isStatus(StatusCode.cancelled));
+      expect(source.hasListener, isFalse);
+      await source.close();
+    });
+  });
 }

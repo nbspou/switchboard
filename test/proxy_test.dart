@@ -421,6 +421,14 @@ void main() {
               unawaited(
                 incoming.reject(Status.of(StatusCode.aborted, 'killed')),
               );
+            case 'PUT':
+              final number = m.frame.bulk ? m.frame.bulkReference.number : 0;
+              m.reply(bytes('${m.payload.length} ${m.isBulk} $number'));
+              expect(m.payload, pattern(m.payload.length));
+            case 'GET':
+              unawaited(
+                m.replyBulk(Stream.value(pattern(300000)), length: 300000),
+              );
           }
         });
       }, instance: 7);
@@ -464,6 +472,28 @@ void main() {
       await talk.close();
       await sharded.close();
       await api.close();
+    });
+
+    test('bulk payloads through the endpoint, both ways', () async {
+      final talk = await client.openTalk(ServiceAddress(chat));
+      // The bulk number is kept: the BULK message passes unchanged.
+      for (final number in [1, 2]) {
+        final put = await talk.request('PUT', pattern(200000));
+        expect(utf8.decode(put.payload), '200000 true $number');
+      }
+      final streamed = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.fromIterable([pattern(50000), pattern(50000, 50000 * 31)]),
+      );
+      expect(utf8.decode(streamed.payload), '100000 true 3');
+      final got = await talk.request('GET', Uint8List(0));
+      expect(got.isBulk, isTrue);
+      expect(got.payload, pattern(300000));
+      // Inline still inline.
+      final small = await talk.request('PUT', pattern(10));
+      expect(utf8.decode(small.payload), '10 false 0');
+      await talk.close();
     });
 
     test('stream through the endpoint', () async {
@@ -1061,6 +1091,14 @@ void main() {
             channel.stream.first
                 .then((_) => incoming.reject(fields.toStatus(relocated: true)))
                 .ignore();
+          case 'talk':
+            incoming.talk().messages.listen((m) {
+              if (m.procedureName == 'BIG') {
+                m.reply(pattern(200000));
+              } else {
+                m.reply(bytes('$id ${m.payload.length} ${m.isBulk}'));
+              }
+            });
         }
       }, instance: id);
       final uri = await node.listenTcp('127.0.0.1', 0);
@@ -1127,6 +1165,39 @@ void main() {
       expect(await second.done, hasCode(StatusCode.resourceExhausted));
       await channel.close();
       expect(await channel.done, Status.ok);
+    });
+
+    test('bulk payloads through a slot channel', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(2, epoch: 1));
+      modes[2] = 'talk';
+      final talk = await client.openTalk(ServiceAddress(zone), shard: 4);
+      final answer = await talk.request('PUT', pattern(150000));
+      expect(utf8.decode(answer.payload), '2 150000 true');
+      final big = await talk.request('BIG', Uint8List(0));
+      expect(big.isBulk, isTrue);
+      expect(big.payload, pattern(200000));
+      await talk.close();
+    });
+
+    test('bulk payloads through a slot channel retried after MOVED', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'moved:2:2';
+      modes[2] = 'talk';
+      final talk = await client.openTalk(ServiceAddress(zone), shard: 4);
+      // The rejection and the retry happen before the first message.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(opened[2], hasLength(1));
+      final answer = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(pattern(70000)),
+      );
+      expect(utf8.decode(answer.payload), '2 70000 true');
+      // A bulk payload the new owner opens comes back through the
+      // replacement channel.
+      final big = await talk.request('BIG', Uint8List(0));
+      expect(big.payload, pattern(200000));
+      await talk.close();
     });
 
     test('MOVED naming no owner: the proxy asks', () async {

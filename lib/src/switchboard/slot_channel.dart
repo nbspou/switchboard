@@ -20,6 +20,7 @@ import '../mux/mux_frame.dart';
 import '../name.dart';
 import '../status.dart';
 import '../status_closable.dart';
+import '../talk/talk_bulk.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
@@ -204,6 +205,14 @@ class SlotChannel
   void consumed(int bytes, {int subframes = 1}) =>
       _current.consumed(bytes, subframes: subframes);
 
+  /// Gives up the retry: the channel stays on its current mux channel
+  /// whatever ends it, as once something was sent. A forwarded bulk
+  /// channel, opened on the current mux channel, commits it.
+  @internal
+  void commit() {
+    _sent = true;
+  }
+
   /// Whether a subframe must be held for a possible replacement: one is
   /// being opened, or the first channel is already closing (a rejection
   /// on its way) and nothing has gone out on it.
@@ -366,6 +375,8 @@ class SlotChannel
     }
     _log.fine('$type/$slot moved ($moved), retried on $next');
     next.manualCredit = _manualCredit;
+    // Bulk channels the new owner opens go where the first one's would.
+    BulkRoutes.follow(_current, next);
     _current = next;
     _watch(next);
     if (_incoming.hasListener) {

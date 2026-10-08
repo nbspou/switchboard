@@ -20,6 +20,7 @@ import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
+import '../talk/talk_bulk.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
@@ -55,6 +56,15 @@ final Logger _log = Logger('Switchboard.Router');
 /// whose [MuxChannel.priority] is [MuxPriority.bulk] splits what it sends
 /// instead, which suits a byte stream (a Talk bulk payload).
 ///
+/// Talk bulk payloads (wiki page "Polyverse Switchboard Proxying", step
+/// 4): a `_bulk` channel the peer of one side opens for its channel is
+/// forwarded as a bulk channel toward the other side, opened in order with
+/// that side's frames ([MuxChannel.openAfter]) with the same bulk number
+/// and the other side's channel as its parent, so that the `BULK` message
+/// passes unchanged; the two bulk channels are piped the same way, in the
+/// bulk output tier of both connections. A side that cannot take one (it
+/// is closing) refuses it `UNAVAILABLE`.
+///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
 /// Neither stream may have been listened to already (for example by
@@ -70,6 +80,9 @@ Future<void> pipeChannels(MuxChannel a, MuxChannel b) =>
 /// with when [b] ends.
 Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
   try {
+    // Before listening: a bulk channel may wait for its parent's target.
+    _routeBulk(a, b);
+    _routeBulk(b, a);
     _forward(a, b);
     _forward(b, a, rewrite: toA);
   } on Object catch (e) {
@@ -84,6 +97,12 @@ Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
 /// One side of a pipe: a mux channel, or a [SlotChannel] (which may
 /// replace its mux channel once).
 abstract interface class _End {
+  /// The mux channel the subframes travel on now.
+  MuxChannel get mux;
+
+  /// No retry any more (a slot channel): something was forwarded on it.
+  void commit();
+
   Stream<Uint8List> get stream;
   bool get canSend;
   Future<void> send(Uint8List subframe);
@@ -99,6 +118,10 @@ class _MuxEnd implements _End {
 
   final MuxChannel channel;
 
+  @override
+  MuxChannel get mux => channel;
+  @override
+  void commit() {}
   @override
   Stream<Uint8List> get stream => channel.stream;
   @override
@@ -123,6 +146,10 @@ class _SlotEnd implements _End {
   final SlotChannel channel;
 
   @override
+  MuxChannel get mux => channel.channel;
+  @override
+  void commit() => channel.commit();
+  @override
   Stream<Uint8List> get stream => channel.stream;
   @override
   bool get canSend => channel.canSend;
@@ -138,6 +165,42 @@ class _SlotEnd implements _End {
   Future<Status> get done => channel.done;
   @override
   int get id => channel.channel.id;
+}
+
+/// Forwards the bulk channels the peer of [from] opens for it toward [to]
+/// (see [pipeChannels]). A slot channel that replaces [from]'s mux channel
+/// keeps the route.
+void _routeBulk(_End from, _End to) {
+  final mux = from.mux;
+  if (BulkRoutes.isBulk(mux)) {
+    // A bulk channel is never a parent.
+    return;
+  }
+  BulkRoutes.register(mux, (bulk, number) => _forwardBulk(bulk, number, to));
+}
+
+/// Opens the twin of [bulk] (bulk number [number]) on [to]'s side, in
+/// order with its frames, and pipes the two.
+void _forwardBulk(MuxChannel bulk, int number, _End to) {
+  bulk.priority = MuxPriority.bulk;
+  final parent = to.mux;
+  final MuxChannel twin;
+  try {
+    twin = parent.openAfter(TalkBulkOpen(parent.id, number).encode());
+  } on SwitchboardException catch (e) {
+    _log.fine(
+      'proxy: bulk channel ${bulk.id} not forwarded to channel '
+      '${parent.id}: ${e.status}',
+    );
+    unawaited(bulk.close(genericStatus(StatusCode.unavailable)));
+    return;
+  }
+  // The message referencing it follows on the slot channel: no retry
+  // elsewhere may separate them.
+  to.commit();
+  twin.priority = MuxPriority.bulk;
+  BulkRoutes.markBulk(twin);
+  unawaited(_pipe(_MuxEnd(bulk), _MuxEnd(twin)));
 }
 
 /// Returns the credit of a subframe of [length] bytes [from] delivered.

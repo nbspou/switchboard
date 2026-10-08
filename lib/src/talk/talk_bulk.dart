@@ -206,6 +206,12 @@ abstract final class BulkRoutes {
   );
   static final Expando<bool> _bulk = Expando<bool>('bulk channel');
 
+  /// The target registered for a parent, kept after the parent closed for
+  /// [follow].
+  static final Expando<BulkTarget> _targets = Expando<BulkTarget>(
+    'bulk target',
+  );
+
   /// Bulk channels held for a parent that no target took yet, beyond
   /// which a `_bulk` OPEN is closed `RESOURCE_EXHAUSTED`.
   static const int maxHeld = 16;
@@ -221,6 +227,7 @@ abstract final class BulkRoutes {
   /// on, and first those held for it until now, in order. Does nothing
   /// once [parent] is closed.
   static void register(MuxChannel parent, BulkTarget target) {
+    _targets[parent] = target;
     if (parent.state == MuxChannelState.closed) {
       return;
     }
@@ -230,6 +237,15 @@ abstract final class BulkRoutes {
     route.held = [];
     for (final (bulk, number) in held) {
       target(bulk, number);
+    }
+  }
+
+  /// The target of [from], if any, takes the bulk channels of [to] too:
+  /// [to] replaced [from] (a slot channel retried after `MOVED`).
+  static void follow(MuxChannel from, MuxChannel to) {
+    final target = _targets[from];
+    if (target != null) {
+      register(to, target);
     }
   }
 

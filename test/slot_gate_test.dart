@@ -200,19 +200,34 @@ class DelayedResolver extends StaticResolver {
   }
 }
 
-/// A peer linked to the gate's dispatch over memory.
+/// A peer linked to the gate's dispatch over memory; bulk channels go to
+/// their parent's Talk layer, as a Switchboard routes them.
 class Peer {
   Peer(this.gate) {
     final (a, b) = MemoryTransport.pair();
     client = MuxConnection(a, isInitiator: true, options: quiet);
     server = MuxConnection(b, isInitiator: false, options: quiet);
     server.incoming.listen((channel) {
+      if (_isBulk(channel)) {
+        TalkChannel.adoptBulk(channel);
+        return;
+      }
       final result = gate.handler(IncomingChannel(channel));
       if (result is Future<void>) {
         result.ignore();
       }
     });
+    client.incoming.listen((channel) {
+      if (_isBulk(channel)) {
+        TalkChannel.adoptBulk(channel);
+      } else {
+        unawaited(channel.close(Status.of(StatusCode.notFound)));
+      }
+    });
   }
+
+  static bool _isBulk(MuxChannel channel) =>
+      TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload));
 
   final SlotGate gate;
   late final MuxConnection client;
@@ -1240,6 +1255,26 @@ void main() {
       expect(arrived, hasLength(1));
       expect(arrived.single.address.shard, 1);
       expect(arrived.single.address.instance, 2);
+      await talk.close();
+    });
+
+    test('a forwarded request and its answer carry bulk payloads', () async {
+      newGate(trackChannels: false);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      target.registerService(kv, (incoming) {
+        incoming.talk().messages.listen((m) {
+          expect(m.isBulk, isTrue);
+          m.reply(Uint8List.fromList([...m.payload, ...m.payload]));
+        });
+      }, instance: 2);
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      final big = Uint8List.fromList(List.generate(100000, (i) => i % 251));
+      final answer = await talk.request('PUT', big).timeout(limit);
+      expect(answer.isBulk, isTrue);
+      expect(answer.payload, [...big, ...big]);
       await talk.close();
     });
 
