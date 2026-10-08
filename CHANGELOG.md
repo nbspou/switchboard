@@ -235,8 +235,8 @@ The protocol specification lives in the project wiki (section
   delivered at once and read as a stream (`TalkMessage.bulk`,
   `payloadBytes`, `isBulk`, `bulkLength`). Messages keep their order either
   way. Receiving is bounded: what waits behind a listener (reassembled
-  payloads, streamed ones not delivered yet) shares a budget of
-  `maxInlinePayload` per channel; a bulk channel being read is granted its
+  payloads, streamed ones not delivered yet) shares a per-channel budget
+  (see Talk pacing below); a bulk channel being read is granted its
   declared length as window, at most `TalkOptions.bulkWindow` (1 MiB); at
   most `TalkOptions.maxUnclaimedBulk` (16) bulk channels may wait for their
   messages, and as many messages for their bulk channels, at most
@@ -249,6 +249,25 @@ The protocol specification lives in the project wiki (section
   before any policy (`TalkChannel.adoptBulk` for raw mux users);
   `pipeChannels`, `proxyHandler`, the relay and `forwardMessage` forward
   bulk payloads without reassembling them.
+- Talk pacing: `TalkChannel.send` and `TalkMessage.reply`, `replyItem`,
+  `replyAbort` and `extend` return a `Future<void>` that completes once the
+  frame was handed to the connection within the peer's window (the
+  `MuxChannel.send` future; for a bulk payload, once the payload went
+  whole) and fails `FAILED_PRECONDITION` when the channel can no longer
+  send it, or `FRAME_TOO_LARGE`; ignored, it behaves as before and never
+  surfaces unhandled, awaited it paces the sender. `replyStream` pauses its
+  source while an item waits for the window. `MuxChannel.whenWritable` and
+  `isWritable` (also on `TalkChannel`, and on `SlotChannel`, which follows
+  a `MOVED` replacement) report room in the send window for the largest
+  subframe with nothing waiting for credit: the way to pace the request
+  API, whose sends are not awaited. `TalkOptions.reassemblyBudget`
+  (16 MiB) is the per-channel bound of what Talk holds for the application,
+  split from `maxInlinePayload`, which now caps one payload only; a full
+  budget no longer fails payloads but leaves further ones unread, admitted
+  in arrival order as the application takes messages, their senders
+  stalled at their windows (only a backlog beyond `maxUnclaimedBulk`
+  payloads holding more than the budget fails one `RESOURCE_EXHAUSTED`),
+  and the idle timeout does not run meanwhile.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row
