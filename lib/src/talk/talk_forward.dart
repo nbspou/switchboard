@@ -67,22 +67,23 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
     );
   }
   final procedure = incoming.frame.procedure ?? Name.empty;
-  final payload = incoming.payload;
   if (!incoming.expectsReply) {
     try {
-      target._send(procedure, payload);
+      final (payload, bulk) = incoming._forwardPayload();
+      target._send(procedure, payload, bulk: bulk);
     } on SwitchboardException catch (e) {
       _log.fine('forwarded ${incoming.frame} dropped: $e');
     }
     return Future<void>.value();
   }
   final stream = incoming.expectsStream;
-  return _Relay.start(
-    incoming,
-    (relay) => target._startRequest(
+  return _Relay.start(incoming, (relay) {
+    final (payload, bulk) = incoming._forwardPayload();
+    return target._startRequest(
       stream: stream,
       timeout: Duration.zero,
       sink: relay,
+      bulk: bulk,
       build: (id) => TalkFrame(
         kind: TalkKind.message,
         procedure: procedure,
@@ -90,8 +91,8 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
         stream: stream,
         payload: payload,
       ),
-    ),
-  );
+    );
+  });
 }
 
 /// Relays what one forwarded request receives back to the request it was
@@ -234,7 +235,10 @@ class _Relay implements _ResponseSink {
   @override
   void item(_Message item) {
     if (!item.expectsReply) {
-      _deliver(() => incoming._replyItem(item.payload, item.frame.procedure));
+      _deliver(() {
+        final (payload, bulk) = item._forwardPayload();
+        incoming._replyItem(payload, item.frame.procedure, bulk: bulk);
+      });
       return;
     }
     if (!item.canReply) {
@@ -244,39 +248,44 @@ class _Relay implements _ResponseSink {
       return;
     }
     _addNested(
-      start(
-        item,
-        (relay) => incoming._startItemRequest(
-          item.payload,
+      start(item, (relay) {
+        final (payload, bulk) = item._forwardPayload();
+        return incoming._startItemRequest(
+          payload,
           item.frame.procedure,
           stream: item.expectsStream,
           timeout: Duration.zero,
           sink: relay,
-        ),
-      ),
+          bulk: bulk,
+        );
+      }),
     );
   }
 
   @override
   void complete(_Message message) {
     if (!message.expectsReply) {
-      _deliver(() => incoming._reply(message.payload, message.frame.procedure));
+      _deliver(() {
+        final (payload, bulk) = message._forwardPayload();
+        incoming._reply(payload, message.frame.procedure, bulk: bulk);
+      });
     } else if (!message.canReply) {
       // The chained request was refused by the channel (incoming request
       // limit), so the chain cannot continue.
       _abortIncoming(_localFailure(Status.of(StatusCode.resourceExhausted)));
     } else {
       _addNested(
-        start(
-          message,
-          (relay) => incoming._startReplyRequest(
-            message.payload,
+        start(message, (relay) {
+          final (payload, bulk) = message._forwardPayload();
+          return incoming._startReplyRequest(
+            payload,
             message.frame.procedure,
             stream: message.expectsStream,
             timeout: Duration.zero,
             sink: relay,
-          ),
-        ),
+            bulk: bulk,
+          );
+        }),
       );
       // Sent, the chained request is the final of [incoming], which is then
       // finished and this does nothing. Not sent (over the outgoing request

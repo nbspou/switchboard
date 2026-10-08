@@ -12,12 +12,19 @@ Authors:
 /// message carries, and the open payload of a `_bulk` channel.
 library;
 
+import 'dart:async';
 import 'dart:typed_data';
+
+import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
 
 import '../address/channel_address.dart';
 import '../bytes.dart';
+import '../mux/mux_channel.dart';
 import '../name.dart';
 import '../status.dart';
+
+final Logger _log = Logger('Switchboard.Talk');
 
 /// The payload field of a Talk message with the `BULK` flag
 /// ([TalkFrame.bulk]): which bulk channel carries the payload, and how
@@ -181,4 +188,142 @@ class TalkBulkOpen {
 
   @override
   String toString() => 'TalkBulkOpen(parent $parentId, number $number)';
+}
+
+/// Takes a bulk channel the peer opened for a parent channel, with its bulk
+/// number: the parent's Talk layer, or a pipe forwarding it.
+typedef BulkTarget = void Function(MuxChannel bulk, int number);
+
+/// Where the `_bulk` channels of a connection go: per parent channel, the
+/// target that takes them (wiki page "Polyverse Switchboard Addressing and
+/// Dispatch", reserved type `_bulk`). Internal to the package; Talk
+/// registers its channels, `pipeChannels` its piped ones, and the
+/// Switchboard dispatcher (or `TalkChannel.adoptBulk`) routes.
+@internal
+abstract final class BulkRoutes {
+  static final Expando<Map<int, _Route>> _routes = Expando<Map<int, _Route>>(
+    'bulk routes',
+  );
+  static final Expando<bool> _bulk = Expando<bool>('bulk channel');
+
+  /// Bulk channels held for a parent that no target took yet, beyond
+  /// which a `_bulk` OPEN is closed `RESOURCE_EXHAUSTED`.
+  static const int maxHeld = 16;
+
+  /// Marks [channel] as a bulk channel, which no bulk channel may name as
+  /// its parent.
+  static void markBulk(MuxChannel channel) => _bulk[channel] = true;
+
+  /// Whether [channel] is a bulk channel.
+  static bool isBulk(MuxChannel channel) => _bulk[channel] ?? false;
+
+  /// [target] takes the bulk channels the peer opens for [parent] from now
+  /// on, and first those held for it until now, in order. Does nothing
+  /// once [parent] is closed.
+  static void register(MuxChannel parent, BulkTarget target) {
+    if (parent.state == MuxChannelState.closed) {
+      return;
+    }
+    final route = _routeOf(parent);
+    route.target = target;
+    final held = route.held;
+    route.held = [];
+    for (final (bulk, number) in held) {
+      target(bulk, number);
+    }
+  }
+
+  /// Routes [bulk], a channel the peer opened with the open payload
+  /// [open], to the target of its parent: closed `FAILED_PRECONDITION` when
+  /// no such channel is open on its connection (or it is itself a bulk
+  /// channel), or when something that is not a target reads it; held for
+  /// a target to come while nothing reads it yet, at most [maxHeld], then
+  /// `RESOURCE_EXHAUSTED`. Held channels are closed `CANCELLED` when the
+  /// parent closes.
+  static void route(MuxChannel bulk, TalkBulkOpen open) {
+    markBulk(bulk);
+    bulk.priority = MuxPriority.bulk;
+    final parent = bulk.connection.channelWithId(open.parentId);
+    if (parent == null ||
+        identical(parent, bulk) ||
+        isBulk(parent) ||
+        parent.state == MuxChannelState.closed) {
+      _refuse(
+        bulk,
+        Status.of(
+          StatusCode.failedPrecondition,
+          'no open parent channel for the bulk channel',
+        ),
+      );
+      return;
+    }
+    final route = _routeOf(parent);
+    final target = route.target;
+    if (target != null) {
+      target(bulk, open.number);
+      return;
+    }
+    if (parent.hasListener) {
+      _refuse(
+        bulk,
+        Status.of(
+          StatusCode.failedPrecondition,
+          'the parent channel takes no bulk payloads',
+        ),
+      );
+      return;
+    }
+    if (route.held.length >= maxHeld) {
+      _refuse(
+        bulk,
+        Status.of(
+          StatusCode.resourceExhausted,
+          'too many bulk channels before their messages',
+        ),
+      );
+      return;
+    }
+    route.held.add((bulk, open.number));
+  }
+
+  static void _refuse(MuxChannel bulk, Status status) {
+    _log.fine('bulk channel ${bulk.id} refused: $status');
+    unawaited(bulk.close(status));
+  }
+
+  static _Route _routeOf(MuxChannel parent) {
+    final routes = _routes[parent.connection] ??= <int, _Route>{};
+    final existing = routes[parent.id];
+    if (existing != null && identical(existing.parent, parent)) {
+      return existing;
+    }
+    final route = routes[parent.id] = _Route(parent);
+    unawaited(
+      parent.done.then((_) {
+        if (identical(routes[parent.id], route)) {
+          routes.remove(parent.id);
+        }
+        final held = route.held;
+        route
+          ..held = []
+          ..target = null;
+        for (final (bulk, _) in held) {
+          unawaited(
+            bulk.close(
+              Status.of(StatusCode.cancelled, 'parent channel closed'),
+            ),
+          );
+        }
+      }),
+    );
+    return route;
+  }
+}
+
+class _Route {
+  _Route(this.parent);
+
+  final MuxChannel parent;
+  BulkTarget? target;
+  List<(MuxChannel, int)> held = [];
 }

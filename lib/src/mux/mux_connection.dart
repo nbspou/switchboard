@@ -535,6 +535,11 @@ class MuxConnection {
   /// whose close confirmation timed out, are not counted.
   int get openChannelCount => _openCount;
 
+  /// The channel with [id] that is not mutually closed yet, if any: one
+  /// of [channels].
+  @internal
+  MuxChannel? channelWithId(int id) => _links[id]?.channel;
+
   /// The channels counted by [openChannelCount], as a snapshot.
   Iterable<MuxChannel> get channels => [
     for (final link in _links.values) link.channel,

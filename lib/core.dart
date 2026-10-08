@@ -52,7 +52,7 @@ export 'src/switchboard/channel_policy.dart';
 export 'src/switchboard/incoming_channel.dart';
 export 'src/switchboard/resolver.dart';
 export 'src/switchboard/slot_key.dart';
-export 'src/talk/talk_bulk.dart';
+export 'src/talk/talk_bulk.dart' hide BulkRoutes, BulkTarget;
 export 'src/talk/talk_channel.dart';
 export 'src/talk/talk_frame.dart';
 export 'src/talk/talk_message.dart';

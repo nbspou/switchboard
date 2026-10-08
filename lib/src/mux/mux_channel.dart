@@ -207,6 +207,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   @override
   Stream<Uint8List> get stream => _incoming.stream;
 
+  /// Whether [stream] has a listener: something reads the channel.
+  @internal
+  bool get hasListener => _incoming.hasListener;
+
   /// Bytes of cost (a subframe's length plus 16) the peer may still send on
   /// the channel before this side returns credit.
   ///
