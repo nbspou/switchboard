@@ -421,6 +421,11 @@ class _BulkIn {
   /// Called each time the reader took a chunk: the transfer progresses.
   void Function()? onProgress;
 
+  /// Its payload waits for the reassembly budget
+  /// ([TalkOptions.reassemblyBudget]): nothing reads it, and the silence
+  /// is this side's.
+  bool waitingForBudget = false;
+
   // The idle timeout ([TalkOptions.bulkIdleTimeout]): one timer while the
   // channel is open and read, checking the last progress when it fires.
   Timer? _idleTimer;
@@ -456,9 +461,11 @@ class _BulkIn {
     }
     final timeout = talk.options.bulkIdleTimeout;
     final now = monotonicNow();
-    if (channel.heldBytes > 0 || channel.bufferedBytes > 0) {
-      // What arrived waits to be consumed here: the peer may be waiting
-      // for this side's credit.
+    if (waitingForBudget ||
+        channel.heldBytes > 0 ||
+        channel.bufferedBytes > 0) {
+      // What arrived waits to be consumed here, or the payload waits for
+      // room to be read: the peer may be waiting for this side's credit.
       _lastProgress = now;
     }
     final idle = now - _lastProgress;
@@ -704,7 +711,7 @@ class _BulkIn {
 
   /// Reads the whole payload, at most [max] bytes: beyond, the bulk channel
   /// is closed `RESOURCE_EXHAUSTED` and the future fails with it.
-  Future<Uint8List> collect(int max, {bool Function(int bytes)? reserve}) {
+  Future<Uint8List> collect(int max) {
     final completer = Completer<Uint8List>()..future.ignore();
     final declared = length;
     if (declared != null && declared > max) {
@@ -726,11 +733,10 @@ class _BulkIn {
         if (completer.isCompleted) {
           return;
         }
-        if (builder.length + data.length > max ||
-            (reserve != null && !reserve(data.length))) {
+        if (builder.length + data.length > max) {
           final status = Status.of(
             StatusCode.resourceExhausted,
-            'bulk reassembly exceeds the $max byte budget',
+            'bulk payload of more than $max bytes',
           );
           close(status);
           subscription.cancel().ignore();

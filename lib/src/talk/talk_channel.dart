@@ -54,6 +54,7 @@ class TalkOptions {
     this.bulkThreshold,
     this.bulkChunkSize = defaultBulkChunkSize,
     this.maxInlinePayload = defaultMaxInlinePayload,
+    this.reassemblyBudget = defaultReassemblyBudget,
     this.bulkWindow = defaultBulkWindow,
     this.maxUnclaimedBulk = defaultMaxUnclaimedBulk,
     this.bulkOpenTimeout = const Duration(seconds: 10),
@@ -66,6 +67,9 @@ class TalkOptions {
 
   /// Default [maxInlinePayload]: 16 MiB.
   static const int defaultMaxInlinePayload = 16 * 1024 * 1024;
+
+  /// Default [reassemblyBudget]: 16 MiB.
+  static const int defaultReassemblyBudget = 16 * 1024 * 1024;
 
   /// Default [bulkWindow]: 1 MiB.
   static const int defaultBulkWindow = 1024 * 1024;
@@ -131,26 +135,59 @@ class TalkOptions {
   /// channel's window (the stream is paused meanwhile). Default 64 KiB.
   final int bulkChunkSize;
 
-  /// Receiving: the largest bulk payload reassembled in memory, for a
-  /// message delivered with its payload ([TalkMessage.payload]) and by
-  /// [TalkMessage.payloadBytes] without a `maxLength`. A larger one fails
-  /// with `RESOURCE_EXHAUSTED`, toward the sender (its bulk channel is
-  /// closed with it, a request is answered with it) and the receiver.
-  /// Default 16 MiB.
-  ///
-  /// Also caps the total of the reassembled payloads this channel holds
-  /// for the application, finished or not, of the messages behind a
-  /// listener ([TalkChannel.messages], [TalkStream.items], the answers of
-  /// `ordered` requests), streamed payloads not delivered yet counted at
-  /// what their bulk channel may hold (its window, or the declared length
-  /// if smaller): exceeding it fails the payload with `RESOURCE_EXHAUSTED`
-  /// (and the message, as a failed reassembly does), so that small `BULK`
-  /// frames behind a paused listener cannot hold more.
-  /// Delivery, discard or failure releases a payload's share, and so does
-  /// the end of a stream request for its unread items (as their credit).
-  /// The final response completing a request's future is not counted: Talk
-  /// takes it itself.
+  /// Receiving: the largest bulk payload reassembled in memory, per
+  /// message: for a message delivered with its payload
+  /// ([TalkMessage.payload]) and by [TalkMessage.payloadBytes] without a
+  /// `maxLength`. A larger one fails with `RESOURCE_EXHAUSTED`, toward the
+  /// sender (its bulk channel is closed with it, a request is answered
+  /// with it) and the receiver; one whose declared length is larger fails
+  /// at once, before it waits for [reassemblyBudget]. Default 16 MiB.
   final int maxInlinePayload;
+
+  /// Receiving: what this channel holds, at most, for bulk payloads the
+  /// application has not taken yet: payloads being reassembled for a
+  /// listener ([TalkChannel.messages], [TalkStream.items], the answers of
+  /// `ordered` requests), reassembled ones waiting for it, and streamed
+  /// ones not delivered yet, counted at what their bulk channel may hold
+  /// until then (its window, or the declared length if smaller). 0: no
+  /// budget. Default 16 MiB.
+  ///
+  /// It is backpressure, not a limit that fails anything. A bulk payload
+  /// is read (its bulk channel credited, its window raised to
+  /// [bulkWindow]) only once the budget admits it, in the order the
+  /// messages arrived: while the budget is full, the bulk channels of the
+  /// payloads that wait get no credit and no grant, so that their senders
+  /// stall at the window they have, and the messages behind them wait in
+  /// their order. A payload is admitted while the budget is not full, and
+  /// charged at once what it may come to (its declared length; the
+  /// per-message cap [maxInlinePayload] when the length is not declared;
+  /// for a streamed payload, what its bulk channel may hold), so that an
+  /// admitted payload never waits again: the budget overshoots by at most
+  /// the last payload admitted. A reassembled payload is then charged its
+  /// length until it is taken. When the application takes messages (or
+  /// they are discarded, fail, or a stream request ends with items
+  /// unread), their share goes back and the payloads waiting are admitted.
+  ///
+  /// Nothing waits for itself: the final response completing one of this
+  /// side's own request futures is not counted (Talk takes it itself), nor
+  /// are the replies `forwardMessage` relays; frames Talk consumes itself
+  /// return their credit as before; and the payloads are admitted in
+  /// arrival order, so that one admitted is never behind one waiting in
+  /// the order of delivery. As with the channel's window, a listener that
+  /// does not read holds up the others: payloads the application never
+  /// takes from [TalkChannel.messages] stall the items of a stream request
+  /// once the budget is full, until it reads, cancels the subscription, or
+  /// the request times out.
+  ///
+  /// A payload waiting for admission holds what its bulk channel's window
+  /// lets the sender send before any credit (the window granted at its
+  /// OPEN, or the declared length if smaller). Those are bounded too: up
+  /// to [maxUnclaimedBulk] payloads may wait whatever they hold, and more
+  /// while what they hold together fits this budget; beyond both, a
+  /// payload fails `RESOURCE_EXHAUSTED` toward both sides, as it does
+  /// over [maxInlinePayload]. Only a sender that does not wait for its
+  /// bulk payloads to go out gets there (see [TalkChannel.send]).
+  final int reassemblyBudget;
 
   /// Receiving: the window granted to a bulk channel being read whose
   /// length is declared, at most: the window is raised to the declared
@@ -182,7 +219,8 @@ class TalkOptions {
   /// Restarted by every chunk that arrives, and by every chunk this side
   /// consumes; it does not run while what arrived waits to be consumed
   /// here (a reader that is paused, or a forwarded payload waiting for
-  /// the far side's window), since then the silence is this side's. The
+  /// the far side's window), nor while the payload waits for
+  /// [reassemblyBudget], since then the silence is this side's. The
   /// request and reply timeouts do not cover a final response's payload,
   /// nor a request's once delivered: this bounds a peer that keeps its
   /// connection alive but stalls a transfer. [Duration.zero]: none.
@@ -266,7 +304,10 @@ class TalkAbortException extends SwitchboardException {
 /// like an inline one; messages [TalkOptions.streamBulk] selects are
 /// delivered at once instead, the payload read as it arrives
 /// ([TalkMessage.bulk]). Either way a message keeps its place in the
-/// order: the ones behind it wait while it is reassembled. The peer's bulk
+/// order: the ones behind it wait while it is reassembled. What the
+/// channel holds for payloads the application has not taken is bounded by
+/// [TalkOptions.reassemblyBudget], as backpressure: while it is full,
+/// further payloads are not read, and their senders wait. The peer's bulk
 /// channels reach this channel through [adoptBulk] (a `Switchboard` routes
 /// them itself). A channel abort or a close with a failure status cancels
 /// the bulk payloads in transfer both ways; a [close] with `OK` waits for
@@ -398,9 +439,24 @@ class TalkChannel {
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
 
-  /// The reassembly budget in use ([TalkOptions.maxInlinePayload]): the
-  /// payloads being reassembled for a listener, and those waiting for it.
+  /// The reassembly budget in use ([TalkOptions.reassemblyBudget]): what
+  /// the payloads admitted for a listener are charged, until taken.
   int _assemblyBytes = 0;
+
+  /// The bulk payloads waiting for the budget to admit them, in the order
+  /// their messages arrived (entries that left are skipped, see
+  /// [_Message._inAdmission]).
+  final Queue<_Message> _admission = Queue<_Message>();
+
+  /// How many payloads in [_admission] have their bulk channel, and what
+  /// those channels may hold together: bounded too (see
+  /// [TalkOptions.reassemblyBudget]).
+  int _waitingCount = 0;
+  int _waitingBytes = 0;
+
+  /// [_admit] is running; set [_admitAgain] instead of re-entering.
+  bool _admitting = false;
+  bool _admitAgain = false;
 
   /// The order of [messages], kept while bulk payloads arrive.
   final _Lane _messagesLane = _Lane();
@@ -1585,6 +1641,7 @@ class TalkChannel {
     final number = reference.number;
     final b = _bulkUnclaimed.remove(number);
     if (b != null) {
+      _queueForBudget(message);
       _attachBulk(message, b);
       return true;
     }
@@ -1595,7 +1652,68 @@ class TalkChannel {
       );
       return false;
     }
-    return _awaitBulk(number, message);
+    if (!_awaitBulk(number, message)) {
+      return false;
+    }
+    // Its place in the order of admission is where its frame arrived,
+    // even when its bulk channel is dispatched after later ones.
+    _queueForBudget(message);
+    return true;
+  }
+
+  /// Puts [message], whose bulk payload is about to be claimed, in line
+  /// for the reassembly budget if it is charged to it: held for a
+  /// listener, and the channel has a budget.
+  void _queueForBudget(_Message message) {
+    if (message._budgeted &&
+        !message._forSink &&
+        options.reassemblyBudget > 0) {
+      message._inAdmission = true;
+      _admission.add(message);
+    }
+  }
+
+  /// Admits the payloads waiting for the reassembly budget, in order,
+  /// while it is not full: each is charged what it may come to and read
+  /// from then on (see [TalkOptions.reassemblyBudget]). One whose bulk
+  /// channel is not dispatched yet holds up those behind it.
+  void _admit() {
+    if (_admitting) {
+      _admitAgain = true;
+      return;
+    }
+    _admitting = true;
+    try {
+      do {
+        _admitAgain = false;
+        while (_admission.isNotEmpty && !_closing) {
+          final message = _admission.first;
+          if (!message._inAdmission) {
+            _admission.removeFirst();
+            continue;
+          }
+          final b = message._bulk;
+          if (b == null) {
+            break;
+          }
+          if (_assemblyBytes >= options.reassemblyBudget) {
+            break;
+          }
+          _admission.removeFirst();
+          message._leaveAdmission();
+          final length = message._bulkRef!.length;
+          message._charge(
+            message._streams
+                ? _streamHold(b, length)
+                : length ?? options.maxInlinePayload,
+          );
+          _startBulk(message);
+          message._lane?.advance();
+        }
+      } while (_admitAgain);
+    } finally {
+      _admitting = false;
+    }
   }
 
   /// The bulk payload of [frame], a message dropped on arrival, is not
@@ -1644,13 +1762,15 @@ class TalkChannel {
   }
 
   /// [b] carries the payload of [message]: delivered as a stream, or
-  /// reassembled first (see [TalkOptions.streamBulk]).
+  /// reassembled first (see [TalkOptions.streamBulk]), once the
+  /// reassembly budget admits it if it is charged to it.
   void _attachBulk(_Message message, _BulkIn b) {
     b.unclaimedTimer?.cancel();
     b.unclaimedTimer = null;
     message._bulk = b;
+    final length = message._bulkRef!.length;
     b
-      ..length = message._bulkRef!.length
+      ..length = length
       ..onProgress = message._onBulkProgress;
     // Until its bytes were all read, or it was abandoned.
     if (b._endStatus == null) {
@@ -1670,43 +1790,93 @@ class TalkChannel {
         _log.warning('streamBulk failed; reassembling the payload', e, st);
       }
     }
-    if (stream &&
-        !message._forSink &&
-        !message._reserveAssembly(_streamHold(b, message._bulkRef!.length))) {
-      // Until delivered, its bulk channel holds what its window lets the
-      // peer send, read by nobody: like a reassembly, a share of the
-      // budget of what waits behind a listener.
-      final status = Status.of(
-        StatusCode.resourceExhausted,
-        'bulk payloads waiting for the listener exceed the '
-        '${options.maxInlinePayload} byte budget',
+    message._streams = stream;
+    final cap = options.maxInlinePayload;
+    if (!stream && length != null && length > cap) {
+      // Over the per-message cap: fails at once, without waiting for the
+      // budget.
+      _failBulk(
+        message,
+        Status.of(
+          StatusCode.resourceExhausted,
+          'bulk payload of $length bytes, more than $cap',
+        ),
       );
-      b
-        ..close(status)
-        ..abandon();
-      message._bulkFailure = status;
-    } else if (stream) {
-      message._streamBulk = true;
-      message._startDeferredTimer();
-    } else {
-      b
-          .collect(options.maxInlinePayload, reserve: message._reserveAssembly)
-          .then(
-            (bytes) {
-              message._assembled = bytes;
-              message._startDeferredTimer();
-              message._lane?.advance();
-            },
-            onError: (Object error) {
-              message._releaseAssembly();
-              message._bulkFailure = error is SwitchboardException
-                  ? error.status
-                  : Status.of(StatusCode.internal, '$error');
-              message._lane?.advance();
-            },
+    } else if (message._inAdmission) {
+      // Until admitted, nothing reads it: its bulk channel holds what its
+      // window lets the peer send, and gets no credit.
+      b.waitingForBudget = true;
+      _admit();
+      if (message._inAdmission) {
+        // As many as may wait unclaimed, and more while what they hold
+        // fits the budget.
+        final hold = _streamHold(b, length);
+        final budget = options.reassemblyBudget;
+        if (_waitingCount >= options.maxUnclaimedBulk &&
+            _waitingBytes + hold > budget) {
+          _failBulk(
+            message,
+            Status.of(
+              StatusCode.resourceExhausted,
+              '$_waitingCount bulk payloads wait for the reassembly budget, '
+              'holding $_waitingBytes bytes',
+            ),
           );
+        } else {
+          message._waiting = true;
+          message._waitBytes = hold;
+          _waitingCount++;
+          _waitingBytes += hold;
+        }
+      }
+    } else {
+      _startBulk(message);
     }
     message._lane?.advance();
+  }
+
+  /// Reads the bulk payload of [message], admitted (or not charged to the
+  /// budget): a stream is ready for delivery, a reassembly starts.
+  void _startBulk(_Message message) {
+    final b = message._bulk!;
+    b.waitingForBudget = false;
+    // The idle timeout counts from now: the wait was this side's.
+    b._progressed();
+    if (message._streams) {
+      message._streamBulk = true;
+      message._startDeferredTimer();
+      return;
+    }
+    b
+        .collect(options.maxInlinePayload)
+        .then(
+          (bytes) {
+            message._assembled = bytes;
+            // Charged what it came to from now on, not what it might have.
+            message._settleAssembly(bytes.length);
+            message._startDeferredTimer();
+            message._lane?.advance();
+          },
+          onError: (Object error) {
+            message._releaseAssembly();
+            message._bulkFailure = error is SwitchboardException
+                ? error.status
+                : Status.of(StatusCode.internal, '$error');
+            message._lane?.advance();
+          },
+        );
+  }
+
+  /// The bulk payload of [message] fails with [status] before it is read:
+  /// its bulk channel is closed with it, and the message fails as a
+  /// failed reassembly does.
+  void _failBulk(_Message message, Status status) {
+    message
+      .._leaveAdmission()
+      .._bulkFailure = status;
+    message._bulk
+      ?..close(status)
+      ..abandon();
   }
 
   /// What the bulk channel of [b], a payload of [length] bytes (null:
@@ -2078,6 +2248,12 @@ class TalkChannel {
     // in transfer is dropped with it.
     _messagesLane.flush();
     _undeliveredRequests.clear();
+    // Nothing is admitted any more (the item lanes were dropped with
+    // their requests).
+    for (final message in List.of(_admission)) {
+      message._leaveAdmission();
+    }
+    _admission.clear();
     _endBulk(keepOutgoing: keepOutgoingBulk);
     if (reportOnMessages) {
       _messages.addError(error);
@@ -2626,6 +2802,10 @@ class _Message extends TalkMessage {
   TalkBulkReference? _bulkRef;
   bool _forSink = false;
   _BulkIn? _bulk;
+
+  /// Its payload is delivered as a stream ([TalkOptions.streamBulk]);
+  /// [_streamBulk] once it may be.
+  bool _streams = false;
   bool _streamBulk = false;
   Uint8List? _assembled;
   Status? _bulkFailure;
@@ -2634,28 +2814,62 @@ class _Message extends TalkMessage {
   int _assemblyBytes = 0;
   bool _dropped = false;
 
-  /// Its reassembly counts toward the channel's budget: it is held for a
-  /// listener (see [TalkOptions.maxInlinePayload]).
+  /// Its payload counts toward the channel's budget: it is held for a
+  /// listener (see [TalkOptions.reassemblyBudget]).
   bool _budgeted = true;
 
-  bool _reserveAssembly(int bytes) {
-    if (_dropped) {
-      return false;
-    }
-    if (!_budgeted) {
-      return true;
-    }
-    if (channel._assemblyBytes + bytes > channel.options.maxInlinePayload) {
-      return false;
-    }
+  /// Waiting in the channel's line for the budget ([TalkChannel._admit]).
+  bool _inAdmission = false;
+
+  /// Its bulk channel is there while it waits, holding at most
+  /// [_waitBytes] ([TalkChannel._waitingCount]).
+  bool _waiting = false;
+  int _waitBytes = 0;
+
+  /// Charges [bytes] to the channel's budget.
+  void _charge(int bytes) {
     _assemblyBytes += bytes;
     channel._assemblyBytes += bytes;
-    return true;
+  }
+
+  /// The reassembly completed with [length] bytes: what it is charged
+  /// from now on, its reservation having been what it might come to.
+  void _settleAssembly(int length) {
+    final excess = _assemblyBytes - length;
+    if (excess > 0) {
+      _assemblyBytes = length;
+      channel
+        .._assemblyBytes -= excess
+        .._admit();
+    }
   }
 
   void _releaseAssembly() {
+    if (_assemblyBytes == 0) {
+      return;
+    }
     channel._assemblyBytes -= _assemblyBytes;
     _assemblyBytes = 0;
+    // Room for what waits.
+    channel._admit();
+  }
+
+  /// Leaves the line for the budget: admitted, failed or dropped.
+  void _leaveAdmission() {
+    if (!_inAdmission) {
+      return;
+    }
+    _inAdmission = false;
+    if (_waiting) {
+      _waiting = false;
+      channel
+        .._waitingCount -= 1
+        .._waitingBytes -= _waitBytes;
+      _waitBytes = 0;
+    }
+    _bulk?.waitingForBudget = false;
+    // It may have held up those behind it.
+    channel._admit();
   }
 
   /// Held in a controller with its bulk payload unread ([_Held.bulk]).
@@ -2701,6 +2915,7 @@ class _Message extends TalkMessage {
       return;
     }
     _dropped = true;
+    _leaveAdmission();
     _bulkFailure ??= Status.of(StatusCode.cancelled, 'message dropped');
     channel._creditMessage(this);
     final b = _bulk;

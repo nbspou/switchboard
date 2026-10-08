@@ -162,6 +162,16 @@ void main() {
     return (mirror.getField(symbol).reflectee as Iterable).length;
   }
 
+  // The reassembly budget's counters, likewise.
+  int counted(TalkChannel owner, String field) {
+    final mirror = reflect(owner);
+    final symbol = MirrorSystem.getSymbol(
+      field,
+      mirror.type.owner as LibraryMirror,
+    );
+    return mirror.getField(symbol).reflectee as int;
+  }
+
   test(
     'bulk channels finished before their references are not retained',
     () async {
@@ -278,7 +288,10 @@ void main() {
 
   test('failed reassembly releases its partial memory budget', () async {
     final peers = await Peers.connect(
-      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+      serverOptions: const TalkOptions(
+        maxInlinePayload: 1000,
+        reassemblyBudget: 1000,
+      ),
     );
     final (talk, server) = await peers.open(
       options: const TalkOptions(bulkChunkSize: 100),
@@ -291,30 +304,53 @@ void main() {
     await talk.request('PUT', Uint8List(0), bulk: Stream.value(pattern(1000)));
   });
 
-  test('a running stream keeps its unread items within the reassembly '
-      'budget', () async {
+  test('a full reassembly budget holds the next payload back, its sender '
+      'stalled at its window, until the listener takes a message', () async {
     final peers = await Peers.connect(
       serverOptions: const TalkOptions(bulkThreshold: 100),
     );
     final (talk, server) = await peers.open(
-      options: const TalkOptions(maxInlinePayload: 1000),
+      options: const TalkOptions(reassemblyBudget: 100000),
     );
     server.messages.listen((message) {
       message
-        ..replyItem(pattern(1000))
-        ..replyItem(pattern(1000, 1))
+        ..replyItem(pattern(100000))
+        ..replyItem(pattern(100000, 1))
         ..reply(Uint8List(0));
     });
     final stream = talk.streamRequest('LIST', Uint8List(0));
-    await expectLater(stream.done, throwsStatus(StatusCode.resourceExhausted));
+    var ended = false;
+    unawaited(
+      stream.done.then(
+        (_) => ended = true,
+        onError: (Object _) => ended = true,
+      ),
+    );
+    // The first item fills the budget and waits for a listener; the second
+    // is not read, and its sender spends the window granted at its OPEN.
+    await until(() => counted(talk, '_waitingBytes') > 0);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final stalled = [
+      for (final c in peers.server.channels)
+        if (c.isLocallyOpened &&
+            c.priority == MuxPriority.bulk &&
+            c.canSend &&
+            c.sendWindow == 0)
+          c,
+    ];
+    expect(stalled, hasLength(1));
+    expect(counted(talk, '_assemblyBytes'), 100000);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    // No credit came meanwhile, and nothing failed.
+    expect(stalled.single.sendWindow, 0);
+    expect(ended, isFalse);
     final items = StreamQueue(stream.items);
-    expect((await items.next).payload, pattern(1000));
-    await expectLater(items.next, throwsStatus(StatusCode.resourceExhausted));
-    // Nothing is left charged: the next stream gets the whole budget.
-    final next = talk.streamRequest('LIST', Uint8List(0));
-    final more = StreamQueue(next.items);
-    expect((await more.next).payload, pattern(1000));
-    await more.cancel();
+    expect((await items.next).payload, pattern(100000));
+    expect((await items.next).payload, pattern(100000, 1));
+    await stream.done;
+    expect(await items.hasNext, isFalse);
+    expect(counted(talk, '_assemblyBytes'), 0);
+    expect(counted(talk, '_waitingBytes'), 0);
   });
 
   test('the end of a stream releases the reassembly budget of its unread '
@@ -323,7 +359,7 @@ void main() {
       serverOptions: const TalkOptions(bulkThreshold: 100),
     );
     final (talk, server) = await peers.open(
-      options: const TalkOptions(maxInlinePayload: 1000),
+      options: const TalkOptions(reassemblyBudget: 1000),
     );
     server.messages.listen((message) {
       message.replyItem(pattern(1000));
@@ -345,14 +381,14 @@ void main() {
       serverOptions: const TalkOptions(bulkThreshold: 100),
     );
     final (talk, server) = await peers.open(
-      options: const TalkOptions(maxInlinePayload: 1000),
+      options: const TalkOptions(reassemblyBudget: 1000),
     );
-    // A paused listener holds a reassembled message: the budget is used.
+    // A paused listener holds a reassembled message: the budget is full.
     final held = <TalkMessage>[];
     final subscription = talk.messages.listen(held.add)..pause();
     server.messages.listen((message) => message.reply(pattern(1000, 2)));
     server.send('NOTE', pattern(1000));
-    await pumpEventQueue();
+    await until(() => counted(talk, '_assemblyBytes') == 1000);
     final answer = await talk.request('GET', Uint8List(0));
     expect(answer.payload, pattern(1000, 2));
     subscription.resume();
@@ -361,17 +397,18 @@ void main() {
     await subscription.cancel();
   });
 
-  test('streamed payloads waiting for a paused listener share the budget, '
-      'at what their window lets the peer send', () async {
+  test('streamed payloads waiting for a paused listener are admitted at '
+      'what their window lets the peer send; the others wait', () async {
     final peers = await Peers.connect(
       serverOptions: TalkOptions(
-        maxInlinePayload: 200000,
+        reassemblyBudget: 200000,
         streamBulk: (_) => true,
       ),
     );
     final (talk, server) = await peers.open();
     final seen = <TalkMessage>[];
     final subscription = server.messages.listen(seen.add)..pause();
+    var answered = 0;
     final sent = [
       for (var i = 0; i < 6; i++)
         talk
@@ -381,54 +418,184 @@ void main() {
               bulk: Stream.value(pattern(100000, i)),
               bulkLength: 100000,
             )
-            .then<Object>((m) => m, onError: (Object e) => e),
+            .whenComplete(() => answered++),
     ];
-    // A window (64 KiB) each: three fit, the others are refused.
-    for (final refused in sent.skip(3)) {
-      expect(
-        await refused,
-        isA<TalkAbortException>().having(
-          (e) => e.code,
-          'code',
-          StatusCode.resourceExhausted,
-        ),
-      );
-    }
+    // A window (64 KiB) each: four are admitted (the budget overshoots by
+    // the last one), two wait, and nothing fails.
+    await until(() => counted(server, '_waitingBytes') > 0);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    final charged = counted(server, '_assemblyBytes');
+    expect(charged, greaterThanOrEqualTo(200000));
+    expect(charged, lessThanOrEqualTo(200000 + 65536));
+    expect(counted(server, '_waitingBytes'), lessThanOrEqualTo(2 * 65536));
+    expect(answered, 0);
     subscription.resume();
-    await until(() => seen.length == 3);
-    for (var i = 0; i < 3; i++) {
+    for (var i = 0; i < 6; i++) {
+      await until(() => seen.length > i);
       expect(await collect(seen[i].bulk), pattern(100000, i));
       seen[i].reply(Uint8List(0));
     }
-    for (final answered in sent.take(3)) {
-      expect(await answered, isA<TalkMessage>());
+    for (final answer in sent) {
+      expect(await answer, isA<TalkMessage>());
     }
+    expect(counted(server, '_assemblyBytes'), 0);
     await subscription.cancel();
   });
 
-  test('unread reassemblies share a channel memory budget', () async {
+  test('a request over a full budget waits for it instead of failing, and '
+      'is read once the listener takes a message', () async {
     final peers = await Peers.connect(
-      serverOptions: const TalkOptions(maxInlinePayload: 1000),
+      serverOptions: const TalkOptions(reassemblyBudget: 1000),
     );
     final (talk, server) = await peers.open(
       options: const TalkOptions(bulkThreshold: 100),
     );
     final subscription = server.messages.listen((message) {
-      expect(message.payload, pattern(1000));
+      message.reply(Uint8List.fromList([message.payload[1]]));
+    })..pause();
+    var answered = 0;
+    final first = talk
+        .request('PUT', pattern(1000))
+        .whenComplete(() => answered++);
+    final second = talk
+        .request('PUT', pattern(1000, 1))
+        .whenComplete(() => answered++);
+    await until(() => counted(server, '_waitingBytes') == 1000);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(answered, 0);
+    expect(counted(server, '_assemblyBytes'), 1000);
+    subscription.resume();
+    expect((await first).payload, [1]);
+    expect((await second).payload, [2]);
+    expect(counted(server, '_assemblyBytes'), 0);
+    expect(counted(server, '_waitingBytes'), 0);
+    await subscription.cancel();
+  });
+
+  test('what waits for a full budget is bounded: beyond maxUnclaimedBulk '
+      'payloads holding more than the budget, the payload fails '
+      'RESOURCE_EXHAUSTED', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(
+        reassemblyBudget: 1000,
+        maxUnclaimedBulk: 1,
+      ),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkThreshold: 100),
+    );
+    final subscription = server.messages.listen((message) {
+      message.reply(Uint8List(0));
+    })..pause();
+    final outcomes = [
+      for (var i = 0; i < 3; i++)
+        talk
+            .request('PUT', pattern(1000, i))
+            .then<Object>((m) => m, onError: (Object e) => e),
+    ];
+    await until(() => counted(server, '_waitingBytes') == 1000);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    subscription.resume();
+    expect(await outcomes[0], isA<TalkMessage>());
+    expect(await outcomes[1], isA<TalkMessage>());
+    expect(
+      await outcomes[2],
+      isA<TalkAbortException>().having(
+        (e) => e.code,
+        'code',
+        StatusCode.resourceExhausted,
+      ),
+    );
+    await subscription.cancel();
+  });
+
+  test('a payload over the per-message cap fails at once, without waiting '
+      'for a full budget', () async {
+    final peers = await Peers.connect(
+      serverOptions: const TalkOptions(
+        maxInlinePayload: 2000,
+        reassemblyBudget: 1000,
+      ),
+    );
+    final (talk, server) = await peers.open(
+      options: const TalkOptions(bulkThreshold: 100),
+    );
+    final subscription = server.messages.listen((message) {
       message.reply(Uint8List(0));
     })..pause();
     final first = talk.request('PUT', pattern(1000));
-    await pumpEventQueue();
-    final second = talk.request('PUT', pattern(1000));
+    await until(() => counted(server, '_assemblyBytes') == 1000);
     await expectLater(
-      second.timeout(const Duration(seconds: 1)),
-      throwsStatus(StatusCode.resourceExhausted),
+      talk.request('PUT', pattern(5000)),
+      throwsA(
+        isA<TalkAbortException>().having(
+          (e) => e.code,
+          'code',
+          StatusCode.resourceExhausted,
+        ),
+      ),
     );
     subscription.resume();
     await first;
-    // Delivery releases the budget; subsequent large requests still work.
-    await talk.request('PUT', pattern(1000));
     await subscription.cancel();
+  });
+
+  group('no deadlock', () {
+    test('payloads are admitted in the order their messages arrived, not '
+        'in the order their bulk channels were dispatched', () async {
+      final peers = await Peers.connect(
+        serverOptions: const TalkOptions(reassemblyBudget: 1000),
+      );
+      final (talk, server) = await peers.open();
+      final seen = <String>[];
+      server.messages.listen(
+        (m) => seen.add('${m.procedureName} ${m.payload[0]}'),
+      );
+      final raw = talk.raw as MuxChannel;
+      // ONE references the bulk channel opened second: when the first
+      // one arrives, TWO must not take the budget ONE needs, since TWO is
+      // delivered after ONE.
+      for (final (name, number) in [('ONE', 2), ('TWO', 1)]) {
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name(name),
+            bulk: true,
+            payload: TalkBulkReference(number, length: 1000).encode(),
+          ).encode(),
+        );
+      }
+      for (final number in [1, 2]) {
+        final bulk = raw.openAfter(TalkBulkOpen(raw.id, number).encode());
+        await bulk.send(pattern(1000, number));
+        await bulk.close();
+      }
+      await until(() => seen.length == 2);
+      expect(seen, ['ONE 2', 'TWO 1']);
+      expect(counted(server, '_assemblyBytes'), 0);
+    });
+
+    test('a payload larger than the whole budget is admitted alone and '
+        'completes', () async {
+      final peers = await Peers.connect(
+        serverOptions: const TalkOptions(reassemblyBudget: 1000),
+      );
+      final (talk, server) = await peers.open();
+      final subscription = server.messages.listen((message) {
+        message.reply(Uint8List.fromList([message.payload.length ~/ 1000]));
+      })..pause();
+      final first = talk.request('PUT', pattern(200000));
+      final second = talk.request('PUT', pattern(100000, 1));
+      await until(
+        () =>
+            counted(server, '_assemblyBytes') == 200000 &&
+            counted(server, '_waitingBytes') > 0,
+      );
+      subscription.resume();
+      expect((await first).payload, [200]);
+      expect((await second).payload, [100]);
+      await subscription.cancel();
+    });
   });
 
   test('cancelling a stream request closes a delivered item bulk channel '
@@ -791,6 +958,39 @@ void main() {
         // Nothing is in transfer: no timer is left.
         expect(async.pendingTimers, isEmpty);
         reading!.cancel();
+        close();
+      });
+    });
+
+    test('a payload waiting for the reassembly budget does not time out; '
+        'once admitted, the timeout counts from then', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(reassemblyBudget: 1000),
+          far: const TalkOptions(bulkThreshold: 100),
+        );
+        final seen = <TalkMessage>[];
+        final subscription = talk.messages.listen(seen.add)..pause();
+        // Fills the budget, held by the paused listener.
+        server.send('FULL', pattern(1000));
+        async.elapse(Duration.zero);
+        // Waits for the budget, its sender silent meanwhile.
+        final source = StreamController<List<int>>();
+        server.send('NEXT', Uint8List(0), bulk: source.stream);
+        async.elapse(const Duration(minutes: 2));
+        expect(seen, isEmpty);
+        subscription.resume();
+        async.elapse(Duration.zero);
+        expect(seen.map((m) => m.procedureName), ['FULL']);
+        async.elapse(const Duration(seconds: 29));
+        source
+          ..add(pattern(500))
+          ..close();
+        async.elapse(Duration.zero);
+        expect(seen.map((m) => m.procedureName), ['FULL', 'NEXT']);
+        expect(seen.last.payload, pattern(500));
+        subscription.cancel();
         close();
       });
     });
