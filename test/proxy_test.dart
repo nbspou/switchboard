@@ -159,6 +159,62 @@ void main() {
       },
     );
 
+    test('a bulk payload whose source ended waits for a reader slower than '
+        'the close confirmation timeout', () async {
+      final options = fast.copyWith(
+        closeConfirmTimeout: const Duration(milliseconds: 100),
+      );
+      final (client, proxyIn) = muxPair(initiator: options, acceptor: options);
+      final (proxyOut, backend) = muxPair(
+        initiator: options,
+        acceptor: options,
+      );
+      await client.ping();
+      await proxyOut.ping();
+      final atProxy = StreamQueue(proxyIn.incoming);
+      final atBackend = StreamQueue(backend.incoming);
+      final sender = TalkChannel(client.open(Uint8List(0)));
+      final inbound = await atProxy.next;
+      final pipe = pipeChannels(inbound, proxyOut.open(inbound.openPayload));
+      final reader = TalkChannel(
+        await atBackend.next,
+        options: TalkOptions(streamBulk: (_) => true),
+      );
+      final messages = StreamQueue(reader.messages);
+      sender.send(
+        'BIG',
+        Uint8List(0),
+        bulk: Stream.value(pattern(300000)),
+        bulkLength: 300000,
+      );
+      final source = await atProxy.next;
+      TalkChannel.adoptBulk(source);
+      final twin = await atBackend.next;
+      TalkChannel.adoptBulk(twin);
+      final message = await messages.next;
+      final received = BytesBuilder();
+      final ended = Completer<void>();
+      final reading = message.bulk.listen(
+        received.add,
+        onError: ended.completeError,
+        onDone: ended.complete,
+        cancelOnError: true,
+      )..pause();
+      // The sender is done and its bulk channel closed, while the twin
+      // still waits for the reader's credit for the end of the payload.
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(source.state, MuxChannelState.closed);
+      expect(twin.state, MuxChannelState.open);
+      reading.resume();
+      await ended.future;
+      await reading.cancel();
+      expect(received.takeBytes(), pattern(300000));
+      expect(await twin.done, hasCode(StatusCode.ok));
+      await sender.close();
+      await pipe;
+      await messages.cancel();
+    });
+
     for (final fromClient in [false, true]) {
       test(
         'failed parent cancels forwarded bulk twins (client: $fromClient)',

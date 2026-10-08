@@ -66,10 +66,15 @@ final Logger _log = Logger('Switchboard.Router');
 /// and the other side's channel as its parent, so that the `BULK` message
 /// passes unchanged; the two bulk channels are piped the same way, in the
 /// bulk output tier of both connections. A side that cannot take one (it
-/// is closing) refuses it `UNAVAILABLE`. A failed parent cancels its bulk
-/// twins in both directions; a graceful close waits for the transfers it
-/// follows, then cancels any twins left when the pipe ends. A drain that
-/// times out is forwarded as `DEADLINE_EXCEEDED`.
+/// is closing) refuses it `UNAVAILABLE`. A bulk channel's graceful close
+/// is forwarded once the last subframe forwarded before it went out, as a
+/// Talk sender closes a payload once the window took it: the CLOSE would
+/// wait behind them anyway, but its confirmation is timed from the call,
+/// which would cut a payload whose reader is slower than that. A failed
+/// parent cancels its bulk twins in both directions; a graceful close
+/// waits for the transfers it follows, then cancels any twins left when
+/// the pipe ends. A drain that times out is forwarded as
+/// `DEADLINE_EXCEEDED`.
 ///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
@@ -95,12 +100,14 @@ Future<void> pipeChannelsWithin(
 
 /// [pipeChannels] over [_End]s; [toA] rewrites the status [a] is closed
 /// with when [b] ends; [bulkBound], if given, counts the bulk channels
-/// [a]'s peer opens against [a]'s connection.
+/// [a]'s peer opens against [a]'s connection; [bulk]: [a] and [b] are bulk
+/// channels, closed gracefully only once what was forwarded went out.
 Future<void> _pipe(
   _End a,
   _End b, {
   Status Function(Status status)? toA,
   ForwardingBound? bulkBound,
+  bool bulk = false,
 }) {
   // The bulk transfers forwarded each way, which a graceful close of the
   // channel they belong to follows.
@@ -122,8 +129,8 @@ Future<void> _pipe(
     // Before listening: a bulk channel may wait for its parent's target.
     _routeBulk(a, b, towardB, bound: bulkBound);
     _routeBulk(b, a, towardA);
-    _forward(a, b, twins: towardB);
-    _forward(b, a, rewrite: toA, twins: towardA);
+    _forward(a, b, twins: towardB, bulk: bulk);
+    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
@@ -274,7 +281,7 @@ void _forwardBulk(
   to.commit();
   twin.priority = MuxPriority.bulk;
   BulkRoutes.markBulk(twin);
-  final piped = _pipe(_MuxEnd(bulk), _MuxEnd(twin));
+  final piped = _pipe(_MuxEnd(bulk), _MuxEnd(twin), bulk: true);
   final transfer = (source: bulk, target: twin, done: piped);
   twins.add(transfer);
   unawaited(
@@ -302,14 +309,20 @@ void _consumed(_End from, int length) {
   }
 }
 
+/// Forwards what [from] receives to [to], and its end; [twins] are the
+/// bulk transfers a graceful close follows; [bulk]: the channels are bulk
+/// channels, whose graceful close also follows the last send.
 void _forward(
   _End from,
   _End to, {
   Status Function(Status status)? rewrite,
   Set<_BulkTwin> twins = const {},
+  bool bulk = false,
 }) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
+  // The last forward; sends complete in order. Never fails.
+  var sending = Future<void>.value();
   void failed(Object error, int length) {
     _consumed(from, length);
     if (error is SwitchboardException &&
@@ -336,7 +349,7 @@ void _forward(
         return;
       }
       try {
-        to
+        sending = to
             .send(subframe)
             .then(
               (_) => _consumed(from, length),
@@ -351,6 +364,16 @@ void _forward(
       unawaited(
         from.done.then((status) async {
           var forwarded = _closeStatusFor(status);
+          if (forwarded.isOk && bulk) {
+            // Closed once the window took the payload, as a Talk sender
+            // closes one: the CLOSE would wait behind what still waits
+            // for credit, but its confirmation is timed from the call, and
+            // would cut a reader slower than that. A reader that stalls is
+            // bounded by the parent: its graceful close waits for this
+            // transfer at most the close confirmation timeout, then cancels
+            // it, as its failure and the end of its pipe do.
+            await sending;
+          }
           if (forwarded.isOk && twins.isNotEmpty) {
             // A graceful close follows the bulk payloads forwarded before
             // it, as it follows the subframes: the receiver must have them
