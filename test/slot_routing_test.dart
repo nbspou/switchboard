@@ -452,14 +452,14 @@ void main() {
           await asked.future.timeout(limit);
           final held = [for (var i = 0; i < 3; i++) '$i' * 300];
           for (final subframe in held) {
-            channel.send(bytes(subframe));
+            unawaited(channel.send(bytes(subframe)));
           }
           expect(channel.canSend, isTrue);
           answer.complete(const SlotEntry.owned(2, epoch: 2));
           await until(() => b.received.length == held.length);
           expect(b.received, held);
           expect(channel.retried, isTrue);
-          channel.send(bytes('after'));
+          unawaited(channel.send(bytes('after')));
           await until(() => b.received.length > held.length);
           expect(b.received.last, 'after');
           await channel.close();
@@ -472,11 +472,11 @@ void main() {
         final channel = await small.openChannelToSlot(svc, 1);
         await asked.future.timeout(limit);
         for (var i = 0; i < 3; i++) {
-          channel.send(bytes('x' * 300));
+          unawaited(channel.send(bytes('x' * 300)));
         }
         expect(channel.canSend, isTrue);
         // A fourth would hold 1264 bytes.
-        channel.send(bytes('x' * 300));
+        unawaited(channel.send(bytes('x' * 300)));
         expect(channel.canSend, isFalse);
         // Before the LOCATE has answered.
         final status = await channel.done.timeout(limit);

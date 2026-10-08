@@ -33,6 +33,16 @@ final Logger _log = Logger('Switchboard.Router');
 /// Channel proxying: forwards every DATA subframe between [a] and [b], in
 /// order and unchanged, and forwards the close.
 ///
+/// Flow control passes through hop by hop: both channels are switched to
+/// [MuxChannel.manualCredit], and a subframe received on one counts as
+/// consumed, and its credit goes back to that side's peer, only once the
+/// other side's [MuxChannel.send] has taken it (its future completed). So
+/// a slow consumer behind one side slows the sender behind the other, and
+/// what the proxy holds for each direction is bounded by the window it
+/// grants the sending side plus the window the receiving side grants it.
+/// The output tier ([MuxChannel.priority]) of each side is its own; set it
+/// on the channels before or after the call.
+///
 /// When one side's stream ends (its peer sent CLOSE, or its connection was
 /// lost) the other side is closed with that side's end status.
 /// `CONNECTION_LOST`, which is local only, is sent as `UNAVAILABLE`, and
@@ -71,7 +81,9 @@ Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
 abstract interface class _End {
   Stream<Uint8List> get stream;
   bool get canSend;
-  void send(Uint8List subframe);
+  Future<void> send(Uint8List subframe);
+  set manualCredit(bool value);
+  void consumed(int bytes);
   Future<void> close(Status status);
   Future<Status> get done;
   int get id;
@@ -87,7 +99,11 @@ class _MuxEnd implements _End {
   @override
   bool get canSend => channel.canSend;
   @override
-  void send(Uint8List subframe) => channel.send(subframe);
+  Future<void> send(Uint8List subframe) => channel.send(subframe);
+  @override
+  set manualCredit(bool value) => channel.manualCredit = value;
+  @override
+  void consumed(int bytes) => channel.consumed(bytes);
   @override
   Future<void> close(Status status) => channel.close(status);
   @override
@@ -106,7 +122,11 @@ class _SlotEnd implements _End {
   @override
   bool get canSend => channel.canSend;
   @override
-  void send(Uint8List subframe) => channel.send(subframe);
+  Future<void> send(Uint8List subframe) => channel.send(subframe);
+  @override
+  set manualCredit(bool value) => channel.manualCredit = value;
+  @override
+  void consumed(int bytes) => channel.consumed(bytes);
   @override
   Future<void> close(Status status) => channel.close(status);
   @override
@@ -115,16 +135,37 @@ class _SlotEnd implements _End {
   int get id => channel.channel.id;
 }
 
+/// Returns the credit of a subframe of [length] bytes [from] delivered.
+void _consumed(_End from, int length) {
+  try {
+    from.consumed(length);
+  } on StateError catch (e) {
+    _log.warning('proxy: credit accounting of channel ${from.id}: $e');
+  }
+}
+
 void _forward(_End from, _End to, {Status Function(Status status)? rewrite}) {
+  // Credit for what [from] receives goes back once [to] has taken it.
+  from.manualCredit = true;
   from.stream.listen(
     (subframe) {
+      final length = subframe.length;
       if (!to.canSend) {
         // The other side is closing; its CLOSE ends this side too.
+        _consumed(from, length);
         return;
       }
       try {
-        to.send(subframe);
+        to
+            .send(subframe)
+            .then(
+              (_) => _consumed(from, length),
+              // [to] ended while the subframe waited: its end closes
+              // [from] too.
+              onError: (Object _) => _consumed(from, length),
+            );
       } on SwitchboardException catch (e) {
+        _consumed(from, length);
         _log.warning(
           'proxy: cannot forward ${subframe.length} bytes from channel '
           '${from.id} to channel ${to.id}: ${e.status}',
@@ -252,11 +293,10 @@ Status _closeStatusFor(Status status) {
 ///    entry, or found with [SlotResolver.locateSlot] within
 ///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
 ///    instance set to the new owner's, and the client does not notice.
-///    What the client sends meanwhile is held, at most one window,
-///    [MuxOptions.initialWindow] of the node's [Switchboard.muxOptions]
-///    ([SlotChannel.maxHeldBytes]); beyond, the channel is closed with
-///    `RESOURCE_EXHAUSTED` (nothing was processed: the client may open it
-///    again).
+///    What the client sends meanwhile is held, and its credit goes back
+///    only once the replacement has taken it, so the client waits once it
+///    has used the window the proxy grants it: the proxy holds at most
+///    that window.
 ///    After the first subframe, or when no other owner is found, the
 ///    `MOVED` is forwarded to the client, which may open the channel again
 ///    and resend, since `MOVED` means nothing was processed (see
@@ -448,7 +488,10 @@ ChannelHandler proxyHandler(
             excludeOwnEndpoints: true,
             mayLocate: () => locates.take(client),
           ),
-          maxHeldBytes: switchboard.muxOptions.initialWindow,
+          // Bounded by flow control: what the client sends is held within
+          // the window granted to it, and its credit goes back only once
+          // the replacement takes it.
+          maxHeldBytes: 0,
         );
         await _pipe(
           _MuxEnd(incoming.channel),

@@ -78,6 +78,8 @@ class RacingSwitchboard extends Switchboard {
 /// client ⇄ (proxyIn | pipe | proxyOut) ⇄ backend.
 class Piped {
   late MuxConnection clientConnection;
+  late MuxConnection proxyIn;
+  late MuxConnection proxyOut;
   late MuxConnection backendConnection;
   late MuxChannel client;
   late MuxChannel backend;
@@ -101,6 +103,8 @@ Future<Piped> piped({
     acceptor: backendOptions ?? options,
   );
   p.clientConnection = clientConnection;
+  p.proxyIn = proxyIn;
+  p.proxyOut = proxyOut;
   p.backendConnection = backendConnection;
   // The LIMITS of each side have arrived: they set the windows.
   await clientConnection.ping();
@@ -134,6 +138,42 @@ void main() {
       expect(await atClient, toClient);
       await p.client.close();
       await p.pipe;
+    });
+
+    test('credit passes hop by hop: a slow far consumer slows the near '
+        'sender, the proxy holds at most a window', () async {
+      final p = await piped();
+      final received = <int>[];
+      final backend = p.backend.stream.listen((d) => received.add(d[0]))
+        ..pause();
+      var sent = 0;
+      final sending = () async {
+        for (var i = 0; i < 100; i++) {
+          await p.client.send(Uint8List(8000)..[0] = i);
+          sent++;
+        }
+      }();
+      for (var i = 0; i < 5; i++) {
+        await p.clientConnection.ping();
+        await p.proxyOut.ping();
+      }
+      // The backend holds its window (8 subframes of 8016 bytes of cost),
+      // the proxy at most the window it grants the client (the subframes
+      // waiting for the backend's credit), and the client waits for the
+      // proxy's.
+      expect(sent, greaterThan(8));
+      expect(sent * 8016, lessThanOrEqualTo(2 * 65536));
+      expect(p.backend.bufferedBytes, 8 * 8016);
+      expect(p.proxyIn.bufferedBytes, lessThanOrEqualTo(65536));
+      expect(p.proxyIn.bufferedBytes, greaterThan(0));
+      expect(p.client.sendWindow, lessThan(8016));
+      backend.resume();
+      await sending;
+      await p.client.close();
+      await p.pipe;
+      expect(received, [for (var i = 0; i < 100; i++) i]);
+      expect(p.proxyIn.bufferedBytes, 0);
+      await backend.cancel();
     });
 
     test('forwards large subframes', () async {
@@ -1099,7 +1139,7 @@ void main() {
       expect(opened[2], isEmpty);
       // Not retried by a client either.
       final slotChannel = await client.openChannelToSlot(zone, 4);
-      slotChannel.send(bytes('y'));
+      unawaited(slotChannel.send(bytes('y')));
       expect(await slotChannel.done, hasCode(StatusCode.relocated));
       expect(slotChannel.retried, isFalse);
       expect(opened[1], hasLength(2));
@@ -1185,11 +1225,8 @@ void main() {
       await named.close();
     });
 
-    test('what the client sends during a retry is held up to the node\'s '
-        'channel buffer limit, then RESOURCE_EXHAUSTED', () async {
-      // In memory, so that each subframe reaches the proxy's pipe before
-      // the next is sent: the client leg's own receive buffer, with the
-      // same limit, never fills up.
+    test('what the client sends during a retry waits for credit: the proxy '
+        'holds at most the window it grants', () async {
       await startProxy(
         options: fast.copyWith(initialWindow: 1000),
         memory: true,
@@ -1209,26 +1246,32 @@ void main() {
       };
       final channel = await open(4);
       await asked.future;
-      // Each subframe counts its length plus 16: the fourth goes beyond.
-      var sent = 0;
-      while (channel.canSend && sent < 10) {
-        unawaited(channel.send(pattern(300, sent++)));
-        await Future<void>.delayed(Duration.zero);
-      }
-      final status = await channel.done;
-      expect(status, hasCode(StatusCode.resourceExhausted));
-      expect(status.reason, 'send buffer of 1000 bytes exceeded');
-      expect(sent, lessThan(10));
-      // The LOCATE answers after all: the new owner's channel is closed at
-      // once.
+      final messages = [
+        for (var i = 0; i < 250; i++) bytes('$i'.padLeft(300, '.')),
+      ];
+      var taken = 0;
+      final sends = [
+        for (final message in messages)
+          channel.send(message)..then((_) => taken++).ignore(),
+      ];
+      await pumpEventQueue();
+      // The client sent what its window allows (1000 bytes, or 64 KiB if
+      // it opened the channel before the proxy's LIMITS arrived), each
+      // subframe costing its length plus 16; the proxy holds it and
+      // returns no credit, so the rest waits at the client.
+      expect(taken, greaterThan(0));
+      expect(taken * 316, lessThanOrEqualTo(65536));
+      expect(channel.canSend, isTrue);
+      final echoes = channel.stream.skip(1).take(messages.length).toList();
+      // The LOCATE answers: everything reaches the new owner, in order.
       answer.complete(const SlotEntry.owned(2, epoch: 2));
-      final watch = Stopwatch()..start();
-      while (ended[2]!.isEmpty) {
-        expect(watch.elapsed, lessThan(const Duration(seconds: 5)));
-        await Future<void>.delayed(const Duration(milliseconds: 1));
-      }
-      expect(ended[2]!.single, hasCode(StatusCode.resourceExhausted));
+      expect((await echoes).map(utf8.decode), [
+        for (final message in messages) '2:${utf8.decode(message)}',
+      ]);
+      await Future.wait(sends);
+      expect(taken, messages.length);
       expect(opened[2]!.single.instance, 2);
+      await channel.close();
     });
 
     test('LOCATEs per client connection are bounded', () async {
@@ -1300,7 +1343,7 @@ void main() {
       table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'movedAfter:2:2';
       final channel = await client.openChannelToSlot(zone, 6);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(await channel.done, hasCode(StatusCode.moved));
       expect(channel.retried, isFalse);
       // The client opens again; the proxy's table is still stale, and the
