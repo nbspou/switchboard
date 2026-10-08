@@ -938,6 +938,23 @@ void main() {
       expect(await push.done.timeout(limit), hasCode(denied));
     });
 
+    test('a dial-back already received is closed when CONNECT fails', () async {
+      final (_, _, workerMesh, id, consumer, _) = await setUp();
+      final dialBack = workerMesh.client.connectHandler!;
+      late MuxConnection dialled;
+      workerMesh.client.connectHandler = (request) async {
+        await dialBack(request);
+        dialled = workerMesh.brokeredConnections.single;
+        throw SwitchboardException.of(StatusCode.unavailable, 'dial failed');
+      };
+      await expectLater(
+        consumer.broker(ServiceAddress(workerType, id)),
+        throwsCode(StatusCode.unavailable),
+      );
+      expect(await dialled.done.timeout(limit), hasCode(StatusCode.goingAway));
+      expect(workerMesh.brokeredConnections, isEmpty);
+    });
+
     test('refusals', () async {
       final (mesh, _, _, id, _, _) = await setUp();
       final consumer = await node(

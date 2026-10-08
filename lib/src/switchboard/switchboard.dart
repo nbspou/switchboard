@@ -1495,7 +1495,9 @@ class Switchboard {
   /// [StatusCode.permissionDenied], [StatusCode.unavailable]);
   /// [StatusCode.unavailable] when the instance did not dial back within
   /// [connectTimeout]; [StatusCode.unauthenticated] when the connection
-  /// that arrived is not the instance's, or identifying on it failed.
+  /// that arrived is not the instance's, or identifying on it failed. A
+  /// failed attempt sends GOAWAY to a dial-back already received, including
+  /// when the CONNECT response itself fails after the peer identified.
   Future<MuxConnection> broker(ServiceAddress address, {Resolver? resolver}) {
     if (_closing) {
       return Future.error(_closedException());
@@ -1630,6 +1632,16 @@ class Switchboard {
         _abandoned.add(key);
         if (_abandoned.length > _maxAbandoned) {
           _abandoned.remove(_abandoned.first);
+        }
+      }
+      if (connection == null && arrived.isCompleted) {
+        // The instance may have identified before CONNECT failed. Its
+        // arrival already removed the waiter, but this attempt still owns
+        // the connection and must send it GOAWAY.
+        try {
+          connection = await arrived.future;
+        } on SwitchboardException {
+          // Closing the node fails a waiter that has not received a peer.
         }
       }
       if (connection != null) {
