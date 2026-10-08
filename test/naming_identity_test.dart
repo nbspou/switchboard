@@ -120,6 +120,7 @@ class Mesh {
   static Future<Mesh> start({
     bool requireCredential = true,
     bool withIssuer = true,
+    CredentialVerifier? payloadVerifier,
     bool Function(Credential credential)? renewable,
     Duration brokerTimeout = const Duration(seconds: 5),
     bool close = true,
@@ -129,7 +130,7 @@ class Mesh {
     final service = NamingService(
       assignmentHold: Duration.zero,
       holdingSettle: Duration.zero,
-      verifier: await verifier(),
+      verifier: payloadVerifier ?? await verifier(),
       requireCredential: requireCredential,
       issuer: withIssuer ? authority : null,
       renewable: renewable,
@@ -629,6 +630,139 @@ void main() {
   });
 
   group('expiry and RENEW', () {
+    test(
+      'connection expiry is enforced while the OPEN credential verifies',
+      () {
+        fakeAsync((async) {
+          final checked = Completer<void>();
+          late Mesh mesh;
+          late Switchboard worker;
+          Status? closed;
+          Future<void> setUp() async {
+            mesh = await Mesh.start(
+              close: false,
+              payloadVerifier: _DelayedVerifier(
+                await verifier(),
+                checked.future,
+              ),
+            );
+            worker = await node(
+              credential: await issue(
+                'worker-a1',
+                workerScopes,
+                lifetime: const Duration(hours: 1),
+              ),
+              close: false,
+            );
+            final payload = await issue('wide', adminScopes, bearer: true);
+            final channel = await worker.openTalkAt(
+              mesh.uri,
+              ChannelAddress(type: naming, payload: payload.encode()),
+            );
+            unawaited(channel.done.then((status) => closed = status));
+          }
+
+          unawaited(setUp());
+          async.elapse(const Duration(seconds: 1));
+          expect(mesh.service.channelCount, 1);
+          async.elapse(const Duration(hours: 1));
+          expect(closed, hasCode(StatusCode.unauthenticated));
+          expect(mesh.service.channelCount, 0);
+          checked.complete();
+          async.flushMicrotasks();
+          expect(mesh.service.channelCount, 0);
+          unawaited(worker.close());
+          unawaited(mesh.close());
+          async.elapse(const Duration(seconds: 30));
+          expect(async.pendingTimers, isEmpty);
+        });
+      },
+    );
+
+    test('connection expiry cannot fall back to the OPEN credential', () {
+      fakeAsync((async) {
+        late Mesh mesh;
+        late Switchboard worker;
+        late TalkChannel channel;
+        final ended = <Status>[];
+        final changes = <ServiceEvent>[];
+        Status? closed;
+        Future<void> setUp() async {
+          mesh = await Mesh.start(close: false);
+          mesh.service.events.listen(changes.add);
+          worker = await node(
+            credential: await issue(
+              'worker-a1',
+              workerScopes,
+              lifetime: const Duration(hours: 1),
+            ),
+            close: false,
+          );
+          worker.connections.listen((c) => c.peerGoAwayStatus.then(ended.add));
+          final payload = await issue('wide', adminScopes, bearer: true);
+          channel = await worker.openTalkAt(
+            mesh.uri,
+            ChannelAddress(type: naming, payload: payload.encode()),
+          );
+          unawaited(channel.done.then((status) => closed = status));
+          await channel.request('REGISTER', registerPayload(workerType));
+        }
+
+        unawaited(setUp());
+        async.elapse(const Duration(seconds: 1));
+        expect(mesh.service.table, hasLength(1));
+        async.elapse(const Duration(hours: 1));
+        expect(closed, hasCode(StatusCode.unauthenticated));
+        expect(ended, [hasCode(StatusCode.unauthenticated)]);
+        expect(mesh.service.table, isEmpty);
+        expect(changes.map((e) => e.up), [true, false]);
+        unawaited(worker.close());
+        unawaited(mesh.close());
+        async.elapse(const Duration(seconds: 30));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('a replacement IDENT updates expiry without another request', () {
+      fakeAsync((async) {
+        late Mesh mesh;
+        late Switchboard worker;
+        late TalkChannel channel;
+        Status? closed;
+        Future<void> setUp() async {
+          mesh = await Mesh.start(close: false);
+          worker = await node(
+            credential: await issue('worker-a1', workerScopes),
+            close: false,
+          );
+          channel = await worker.openTalkAt(
+            mesh.uri,
+            ChannelAddress(type: naming),
+          );
+          unawaited(channel.done.then((status) => closed = status));
+          await channel.request('REGISTER', registerPayload(workerType));
+          await worker.updateCredential(
+            await issue(
+              'worker-a1',
+              workerScopes,
+              lifetime: const Duration(hours: 1),
+            ),
+          );
+        }
+
+        unawaited(setUp());
+        async.elapse(const Duration(seconds: 1));
+        expect(mesh.service.table, hasLength(1));
+        async.elapse(const Duration(hours: 1));
+        expect(closed, hasCode(StatusCode.unauthenticated));
+        expect(mesh.service.table, isEmpty);
+        unawaited(worker.close());
+        unawaited(mesh.close());
+        async.elapse(const Duration(seconds: 30));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     test('RENEW re-issues the channel\'s credential', () async {
       final mesh = await Mesh.start();
       final original = await issue(
@@ -1121,4 +1255,18 @@ void main() {
       );
     });
   });
+}
+
+/// Holds just the naming OPEN check across the connection's expiry.
+class _DelayedVerifier extends CredentialVerifier {
+  _DelayedVerifier(this.delegate, this.ready);
+
+  final CredentialVerifier delegate;
+  final Future<void> ready;
+
+  @override
+  Future<Credential> verify(Uint8List bytes, {DateTime? now}) async {
+    await ready;
+    return delegate.verify(bytes, now: now);
+  }
 }

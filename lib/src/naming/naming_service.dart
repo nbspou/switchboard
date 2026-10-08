@@ -446,6 +446,9 @@ class NamingService {
   /// channel in its payload: a credential that names a holder key proves
   /// nothing without the `IDENT` proof, and is ignored there, as are bytes
   /// that are not a valid credential (the channel is then unidentified).
+  /// Once the connection identifies, its credential remains authoritative:
+  /// expiry ends the session rather than falling back to the payload.
+  /// Every later `IDENT` updates the expiry, even without another request.
   /// [handler] passes both.
   ///
   /// Takes over [TalkChannel.messages], so each channel can be served only
@@ -475,12 +478,14 @@ class NamingService {
     );
     _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
+    _listenIdentity(session);
+    // Observe the connection before waiting for the payload verifier: its
+    // credential can expire while that check is still in flight.
+    _watchIdentity(session);
     if (credential != null && credential.isNotEmpty && verifier != null) {
       // Requests wait until the credential is checked.
       session.subscription!.pause();
       unawaited(_checkPayload(session, Uint8List.fromList(credential)));
-    } else {
-      _watchIdentity(session);
     }
   }
 
@@ -878,11 +883,16 @@ class NamingService {
   static final Name _everything = Name('*');
 
   /// The valid credential identifying [session] now: its connection's peer
-  /// identity, else its payload credential, else null.
+  /// identity, else its payload credential only until the connection first
+  /// identifies, else null.
   static Credential? _identityOf(_Session session) {
     final connection = session.connection?.peerIdentity?.credential;
     if (connection != null) {
+      session.byConnection = true;
       return connection;
+    }
+    if (session.byConnection) {
+      return null;
     }
     final payload = session.payloadCredential;
     return payload != null && !payload.isExpired() ? payload : null;
@@ -932,6 +942,24 @@ class NamingService {
     });
   }
 
+  /// Observe later IDENTs as well as requests: a replacement credential
+  /// may expire sooner, or identify a previously anonymous connection.
+  /// The subscription can be cancelled when just this channel ends.
+  void _listenIdentity(_Session session) {
+    final connection = session.connection;
+    if (connection == null || !connection.isOpen || !session.active) {
+      return;
+    }
+    session.identitySubscription = connection.identityChanged.asStream().listen(
+      (_) {
+        if (session.active && connection.isOpen) {
+          _watchIdentity(session);
+          _listenIdentity(session);
+        }
+      },
+    );
+  }
+
   void _onExpiry(_Session session) {
     if (!session.active) {
       return;
@@ -943,8 +971,7 @@ class NamingService {
       return;
     }
     final connection = session.connection;
-    final byConnection =
-        connection != null && session.payloadCredential == null;
+    final byConnection = session.byConnection;
     _log.info(
       'naming channel ${byConnection ? 'and connection ' : ''}ended: the '
       'credential expired',
@@ -952,7 +979,7 @@ class NamingService {
     final status = Status.of(StatusCode.unauthenticated, 'credential expired');
     _drop(session);
     unawaited(session.channel.close(status));
-    if (byConnection && connection.isOpen) {
+    if (byConnection && connection != null && connection.isOpen) {
       unawaited(connection.goAway(status));
     }
   }
@@ -1522,6 +1549,11 @@ class _Session {
   /// ends it, rather than leaving it unidentified.
   bool wasIdentified = false;
 
+  /// A connection identity has taken precedence over any OPEN credential.
+  bool byConnection = false;
+
+  StreamSubscription<void>? identitySubscription;
+
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
 
@@ -1550,6 +1582,8 @@ class _Session {
 
   /// Stops listening to the channel.
   void cancel() {
+    identitySubscription?.cancel().ignore();
+    identitySubscription = null;
     subscription?.cancel().ignore();
     subscription = null;
   }
