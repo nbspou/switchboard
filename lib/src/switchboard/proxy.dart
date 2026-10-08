@@ -13,6 +13,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
 
 import '../address/channel_address.dart';
 import '../mux/mux_channel.dart';
@@ -76,15 +77,36 @@ final Logger _log = Logger('Switchboard.Router');
 Future<void> pipeChannels(MuxChannel a, MuxChannel b) =>
     _pipe(_MuxEnd(a), _MuxEnd(b));
 
+/// [pipeChannels] for a forwarder that bounds the channels it forwards per
+/// client connection: the bulk channels [a]'s peer opens count toward
+/// [bound] for [a]'s connection while they are piped (beyond it they are
+/// refused `RESOURCE_EXHAUSTED`). Used by the relay.
+@internal
+Future<void> pipeChannelsWithin(
+  MuxChannel a,
+  MuxChannel b,
+  ForwardingBound bound,
+) => _pipe(_MuxEnd(a), _MuxEnd(b), bulkBound: bound);
+
 /// [pipeChannels] over [_End]s; [toA] rewrites the status [a] is closed
-/// with when [b] ends.
-Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
+/// with when [b] ends; [bulkBound], if given, counts the bulk channels
+/// [a]'s peer opens against [a]'s connection.
+Future<void> _pipe(
+  _End a,
+  _End b, {
+  Status Function(Status status)? toA,
+  ForwardingBound? bulkBound,
+}) {
+  // The bulk transfers forwarded each way, which a graceful close of the
+  // channel they belong to follows.
+  final towardB = <Future<void>>{};
+  final towardA = <Future<void>>{};
   try {
     // Before listening: a bulk channel may wait for its parent's target.
-    _routeBulk(a, b);
-    _routeBulk(b, a);
-    _forward(a, b);
-    _forward(b, a, rewrite: toA);
+    _routeBulk(a, b, towardB, bound: bulkBound);
+    _routeBulk(b, a, towardA);
+    _forward(a, b, twins: towardB);
+    _forward(b, a, rewrite: toA, twins: towardA);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
@@ -170,24 +192,48 @@ class _SlotEnd implements _End {
 /// Forwards the bulk channels the peer of [from] opens for it toward [to]
 /// (see [pipeChannels]). A slot channel that replaces [from]'s mux channel
 /// keeps the route.
-void _routeBulk(_End from, _End to) {
+void _routeBulk(
+  _End from,
+  _End to,
+  Set<Future<void>> twins, {
+  ForwardingBound? bound,
+}) {
   final mux = from.mux;
   if (BulkRoutes.isBulk(mux)) {
     // A bulk channel is never a parent.
     return;
   }
-  BulkRoutes.register(mux, (bulk, number) => _forwardBulk(bulk, number, to));
+  BulkRoutes.register(
+    mux,
+    (bulk, number) => _forwardBulk(bulk, number, to, twins, bound),
+  );
 }
 
 /// Opens the twin of [bulk] (bulk number [number]) on [to]'s side, in
 /// order with its frames, and pipes the two.
-void _forwardBulk(MuxChannel bulk, int number, _End to) {
+void _forwardBulk(
+  MuxChannel bulk,
+  int number,
+  _End to,
+  Set<Future<void>> twins,
+  ForwardingBound? bound,
+) {
   bulk.priority = MuxPriority.bulk;
+  final client = bulk.connection;
+  if (bound != null && !bound.enter(client)) {
+    _log.info(
+      'proxy: bulk channel ${bulk.id} refused, ${bound.countOf(client)} '
+      'channels of this connection are being forwarded',
+    );
+    unawaited(bulk.close(genericStatus(StatusCode.resourceExhausted)));
+    return;
+  }
   final parent = to.mux;
   final MuxChannel twin;
   try {
     twin = parent.openAfter(TalkBulkOpen(parent.id, number).encode());
   } on SwitchboardException catch (e) {
+    bound?.exit(client);
     _log.fine(
       'proxy: bulk channel ${bulk.id} not forwarded to channel '
       '${parent.id}: ${e.status}',
@@ -200,7 +246,22 @@ void _forwardBulk(MuxChannel bulk, int number, _End to) {
   to.commit();
   twin.priority = MuxPriority.bulk;
   BulkRoutes.markBulk(twin);
-  unawaited(_pipe(_MuxEnd(bulk), _MuxEnd(twin)));
+  final piped = _pipe(_MuxEnd(bulk), _MuxEnd(twin));
+  twins.add(piped);
+  unawaited(
+    piped.whenComplete(() {
+      twins.remove(piped);
+      bound?.exit(client);
+    }),
+  );
+}
+
+/// How long a graceful CLOSE forwarded toward [to] waits for the bulk
+/// payloads forwarded before it: the close confirmation timeout of [to]'s
+/// connection (30 s when that waits for ever).
+Duration _twinWait(_End to) {
+  final timeout = to.mux.connection.options.closeConfirmTimeout;
+  return timeout > Duration.zero ? timeout : const Duration(seconds: 30);
 }
 
 /// Returns the credit of a subframe of [length] bytes [from] delivered.
@@ -212,7 +273,12 @@ void _consumed(_End from, int length) {
   }
 }
 
-void _forward(_End from, _End to, {Status Function(Status status)? rewrite}) {
+void _forward(
+  _End from,
+  _End to, {
+  Status Function(Status status)? rewrite,
+  Set<Future<void>> twins = const {},
+}) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
   from.stream.listen(
@@ -248,8 +314,21 @@ void _forward(_End from, _End to, {Status Function(Status status)? rewrite}) {
     onError: (Object e) => _log.fine('proxy: channel ${from.id} failed: $e'),
     onDone: () {
       unawaited(
-        from.done.then((status) {
+        from.done.then((status) async {
           final forwarded = _closeStatusFor(status);
+          if (forwarded.isOk && twins.isNotEmpty) {
+            // A graceful close follows the bulk payloads forwarded before
+            // it, as it follows the subframes: the receiver must have them
+            // whole before the channel they belong to ends.
+            try {
+              await Future.wait<void>(List.of(twins)).timeout(_twinWait(to));
+            } on TimeoutException {
+              _log.fine(
+                'proxy: channel ${to.id} closed with bulk payloads still '
+                'being forwarded',
+              );
+            }
+          }
           return to.close(rewrite == null ? forwarded : rewrite(forwarded));
         }),
       );
@@ -565,10 +644,16 @@ ChannelHandler proxyHandler(
           _MuxEnd(incoming.channel),
           _SlotEnd(slotChannel),
           toA: hide,
+          bulkBound: forwarding,
         );
         return;
       }
-      await _pipe(_MuxEnd(incoming.channel), _MuxEnd(channel), toA: hide);
+      await _pipe(
+        _MuxEnd(incoming.channel),
+        _MuxEnd(channel),
+        toA: hide,
+        bulkBound: forwarding,
+      );
     } finally {
       forwarding.exit(client);
     }

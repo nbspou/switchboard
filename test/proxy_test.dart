@@ -17,6 +17,8 @@ import 'package:async/async.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
+import 'mux_harness.dart' show GatedTransport;
+
 const fast = MuxOptions(
   goAwayGrace: Duration(milliseconds: 100),
   keepAliveInterval: null,
@@ -140,6 +142,57 @@ void main() {
       await p.client.close();
       await p.pipe;
     });
+
+    test(
+      'a graceful close follows the bulk payloads forwarded before it',
+      () async {
+        bool isBulk(MuxChannel ch) =>
+            TalkBulkOpen.isBulk(ChannelAddress.decode(ch.openPayload));
+        final (c1, p1) = MemoryTransport.pair();
+        final client = MuxConnection(c1, isInitiator: true, options: fast);
+        final proxyIn = MuxConnection(p1, isInitiator: false, options: fast);
+        final (p2, b2) = MemoryTransport.pair();
+        final gate = GatedTransport(p2)..allow(1000);
+        final proxyOut = MuxConnection(gate, isInitiator: true, options: fast);
+        final backend = MuxConnection(b2, isInitiator: false, options: fast);
+        addTearDown(() async {
+          for (final c in [client, proxyIn, proxyOut, backend]) {
+            await c.close();
+          }
+        });
+        final received = <String>[];
+        final backendDone = Completer<Status>();
+        backend.incoming.listen((ch) {
+          if (isBulk(ch)) {
+            TalkChannel.adoptBulk(ch);
+            return;
+          }
+          final talk = TalkChannel(ch);
+          talk.messages.listen(
+            (m) => received.add('${m.procedureName} ${m.payload.length}'),
+          );
+          unawaited(talk.done.then(backendDone.complete));
+        });
+        proxyIn.incoming.listen((ch) {
+          if (isBulk(ch)) {
+            TalkChannel.adoptBulk(ch);
+            return;
+          }
+          unawaited(pipeChannels(ch, proxyOut.open(ch.openPayload)));
+        });
+        await client.ping();
+        await proxyOut.ping();
+        // The proxy's output toward the backend is congested: the bulk
+        // payload waits in its scheduler when the client's CLOSE arrives.
+        gate.allow(-1000000);
+        final talk = TalkChannel(client.open(Uint8List(0)));
+        talk.send('BIG', Uint8List(100000));
+        await talk.close();
+        gate.allow(1000000);
+        expect(await backendDone.future, Status.ok);
+        expect(received, ['BIG 100000']);
+      },
+    );
 
     test('credit passes hop by hop: a slow far consumer slows the near '
         'sender, the proxy holds at most a window', () async {
@@ -494,6 +547,28 @@ void main() {
       final small = await talk.request('PUT', pattern(10));
       expect(utf8.decode(small.payload), '10 false 0');
       await talk.close();
+    });
+
+    test('bulk channels count toward the per-connection bound', () async {
+      final tight = node();
+      tight.catchAll = proxyHandler(
+        tight,
+        allow: (address) => address.type == chat,
+        resolver: StaticResolver([
+          ServiceRecord(ServiceAddress(chat, 7), endpoints: [backendUri]),
+        ]),
+        maxChannelsPerConnection: 2,
+      );
+      final tightUri = await tight.listenTcp('127.0.0.1', 0);
+      final c = node(resolver: EndpointResolver(tightUri));
+      final parent = await c.openChannel(ServiceAddress(chat));
+      // The parent is one, a first bulk channel the second.
+      final first = parent.openAfter(TalkBulkOpen(parent.id, 1).encode());
+      final second = parent.openAfter(TalkBulkOpen(parent.id, 2).encode());
+      expect(await second.done, hasCode(StatusCode.resourceExhausted));
+      expect(first.state, MuxChannelState.open);
+      await first.close();
+      await parent.close();
     });
 
     test('stream through the endpoint', () async {
