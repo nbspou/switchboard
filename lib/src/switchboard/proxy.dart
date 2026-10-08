@@ -65,7 +65,10 @@ final Logger _log = Logger('Switchboard.Router');
 /// and the other side's channel as its parent, so that the `BULK` message
 /// passes unchanged; the two bulk channels are piped the same way, in the
 /// bulk output tier of both connections. A side that cannot take one (it
-/// is closing) refuses it `UNAVAILABLE`.
+/// is closing) refuses it `UNAVAILABLE`. A failed parent cancels its bulk
+/// twins in both directions; a graceful close waits for the transfers it
+/// follows, then cancels any twins left when the pipe ends. A drain that
+/// times out is forwarded as `DEADLINE_EXCEEDED`.
 ///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
@@ -100,8 +103,20 @@ Future<void> _pipe(
 }) {
   // The bulk transfers forwarded each way, which a graceful close of the
   // channel they belong to follows.
-  final towardB = <Future<void>>{};
-  final towardA = <Future<void>>{};
+  final towardB = <_BulkTwin>{};
+  final towardA = <_BulkTwin>{};
+  void cancelTwins() {
+    _cancelTwins(towardB);
+    _cancelTwins(towardA);
+  }
+
+  for (final end in [a, b]) {
+    unawaited(
+      end.done.then((status) {
+        if (!status.isOk) cancelTwins();
+      }),
+    );
+  }
   try {
     // Before listening: a bulk channel may wait for its parent's target.
     _routeBulk(a, b, towardB, bound: bulkBound);
@@ -114,7 +129,16 @@ Future<void> _pipe(
     unawaited(a.close(status));
     unawaited(b.close(status));
   }
-  return Future.wait<Status>([a.done, b.done]).then<void>((_) {});
+  return Future.wait<Status>([a.done, b.done]).then<void>((_) => cancelTwins());
+}
+
+typedef _BulkTwin = ({MuxChannel source, MuxChannel target, Future<void> done});
+
+void _cancelTwins(Set<_BulkTwin> twins) {
+  for (final twin in twins.toList()) {
+    unawaited(twin.source.close(genericStatus(StatusCode.cancelled)));
+    unawaited(twin.target.close(genericStatus(StatusCode.cancelled)));
+  }
 }
 
 /// One side of a pipe: a mux channel, or a [SlotChannel] (which may
@@ -196,7 +220,7 @@ class _SlotEnd implements _End {
 void _routeBulk(
   _End from,
   _End to,
-  Set<Future<void>> twins, {
+  Set<_BulkTwin> twins, {
   ForwardingBound? bound,
 }) {
   final mux = from.mux;
@@ -217,7 +241,7 @@ void _forwardBulk(
   int number,
   _End from,
   _End to,
-  Set<Future<void>> twins,
+  Set<_BulkTwin> twins,
   ForwardingBound? bound,
 ) {
   bulk.priority = MuxPriority.bulk;
@@ -250,10 +274,11 @@ void _forwardBulk(
   twin.priority = MuxPriority.bulk;
   BulkRoutes.markBulk(twin);
   final piped = _pipe(_MuxEnd(bulk), _MuxEnd(twin));
-  twins.add(piped);
+  final transfer = (source: bulk, target: twin, done: piped);
+  twins.add(transfer);
   unawaited(
     piped.whenComplete(() {
-      twins.remove(piped);
+      twins.remove(transfer);
       bound?.exit(client);
     }),
   );
@@ -280,7 +305,7 @@ void _forward(
   _End from,
   _End to, {
   Status Function(Status status)? rewrite,
-  Set<Future<void>> twins = const {},
+  Set<_BulkTwin> twins = const {},
 }) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
@@ -324,18 +349,21 @@ void _forward(
     onDone: () {
       unawaited(
         from.done.then((status) async {
-          final forwarded = _closeStatusFor(status);
+          var forwarded = _closeStatusFor(status);
           if (forwarded.isOk && twins.isNotEmpty) {
             // A graceful close follows the bulk payloads forwarded before
             // it, as it follows the subframes: the receiver must have them
             // whole before the channel they belong to ends.
             try {
-              await Future.wait<void>(List.of(twins)).timeout(_twinWait(to));
+              await Future.wait<void>(twins.map((twin) => twin.done))
+                  .timeout(_twinWait(to));
             } on TimeoutException {
               _log.fine(
                 'proxy: channel ${to.id} closed with bulk payloads still '
                 'being forwarded',
               );
+              forwarded = genericStatus(StatusCode.deadlineExceeded);
+              _cancelTwins(twins);
             }
           }
           return to.close(rewrite == null ? forwarded : rewrite(forwarded));

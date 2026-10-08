@@ -127,6 +127,69 @@ Future<Piped> piped({
 
 void main() {
   group('pipeChannels', () {
+    test(
+      'a bulk drain timeout forwards failure and cancels the twins',
+      () async {
+        final options = fast.copyWith(
+          closeConfirmTimeout: const Duration(milliseconds: 30),
+        );
+        final (client, proxyIn) = muxPair(
+          initiator: options,
+          acceptor: options,
+        );
+        final (proxyOut, backend) = muxPair(
+          initiator: options,
+          acceptor: options,
+        );
+        final atProxy = StreamQueue(proxyIn.incoming);
+        final atBackend = StreamQueue(backend.incoming);
+        final parent = client.open(Uint8List(0));
+        final inbound = await atProxy.next;
+        final outbound = proxyOut.open(Uint8List(0));
+        final farParent = await atBackend.next;
+        pipeChannels(inbound, outbound).ignore();
+        final bulk = parent.openAfter(TalkBulkOpen(parent.id, 1).encode());
+        TalkChannel.adoptBulk(await atProxy.next);
+        final twin = await atBackend.next;
+        await parent.close();
+        expect(await farParent.done, hasCode(StatusCode.deadlineExceeded));
+        expect(await bulk.done, hasCode(StatusCode.cancelled));
+        expect(await twin.done, hasCode(StatusCode.cancelled));
+      },
+    );
+
+    for (final fromClient in [false, true]) {
+      test(
+        'failed parent cancels forwarded bulk twins (client: $fromClient)',
+        () async {
+          final (client, proxyIn) = muxPair();
+          final (proxyOut, backend) = muxPair();
+          final atProxy = StreamQueue(proxyIn.incoming);
+          final atBackend = StreamQueue(backend.incoming);
+          final atClient = StreamQueue(client.incoming);
+          final parent = client.open(Uint8List(0));
+          final inbound = await atProxy.next;
+          final outbound = proxyOut.open(Uint8List(0));
+          final farParent = await atBackend.next;
+          pipeChannels(inbound, outbound).ignore();
+          final opened = (fromClient ? parent : farParent).openAfter(
+            TalkBulkOpen(fromClient ? parent.id : farParent.id, 1).encode(),
+          );
+          final proxyBulk = fromClient
+              ? await atProxy.next
+              : await StreamQueue(proxyOut.incoming).next;
+          TalkChannel.adoptBulk(proxyBulk);
+          final twin = fromClient ? await atBackend.next : await atClient.next;
+          await parent.close(Status.of(StatusCode.cancelled));
+          await pumpEventQueue();
+          expect(opened.canSend, isFalse);
+          expect(twin.canSend, isFalse);
+          expect(await opened.done, hasCode(StatusCode.cancelled));
+          expect(await twin.done, hasCode(StatusCode.cancelled));
+        },
+      );
+    }
+
     test('a send rejected by delayed LIMITS closes both pipe ends', () async {
       final (clientConnection, proxyIn) = muxPair();
       final (outTransport, peerTransport) = MemoryTransport.pair();
