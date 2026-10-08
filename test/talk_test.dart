@@ -892,6 +892,64 @@ void main() {
   });
 
   group('timeouts', () {
+    test('long cancelled-id timeouts rearm until their deadline', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(days: 30)),
+        );
+        peer.talk.startRequest('Q', Uint8List(0)).cancel();
+        async.elapse(const Duration(days: 29));
+        expect(peer.talk.outgoingRequestCount, 1);
+        async.elapse(const Duration(days: 1));
+        expect(peer.talk.outgoingRequestCount, 0);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test(
+      'long requester timeouts do not overflow the platform timer',
+      () async {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(days: 30)),
+        );
+        addTearDown(peer.talk.close);
+        final request = peer.talk.startRequest('Q', Uint8List(0));
+        final result = Outcome(request.response);
+        await Future<void>.delayed(ms30);
+        expect(result.isDone, isFalse);
+        request.cancel();
+        await Future<void>.delayed(ms30);
+        expect(
+          peer.talk.outgoingRequestCount,
+          1,
+          reason: 'the cancelled id keeps its long release timeout',
+        );
+        await peer.talk.close();
+      },
+    );
+
+    test(
+      'long declared deadlines do not overflow the platform timer',
+      () async {
+        final p = Pair(a: const TalkOptions(maxExtension: Duration.zero));
+        addTearDown(p.close);
+        final held = <TalkMessage>[];
+        serve(p.b, (m) {
+          held.add(m);
+          m.extend(deadline: const Duration(days: 30));
+        });
+        final response = Outcome(p.a.request('Q', Uint8List(0)));
+        await pumpEventQueue();
+        await Future<void>.delayed(ms30);
+        expect(held, hasLength(1));
+        expect(held.single.canReply, isTrue);
+        expect(response.isDone, isFalse);
+        await p.close();
+      },
+    );
+
     test('responder side: ABORT DEADLINE_EXCEEDED, later replies throw', () {
       fakeAsync((async) {
         final p = Pair(b: const TalkOptions(replyTimeout: ms30));
@@ -2869,12 +2927,12 @@ void main() {
             expect(closed.isDone, isTrue);
             expect(response.isDone, isTrue);
             expect(response.error, isStatus(StatusCode.unavailable));
-          sub.resume();
-          async.flushMicrotasks();
-          expect(seen, isEmpty, reason: 'outcome markers stay internal');
-          sub.cancel();
-          async.flushMicrotasks();
-          expect(async.pendingTimers, isEmpty);
+            sub.resume();
+            async.flushMicrotasks();
+            expect(seen, isEmpty, reason: 'outcome markers stay internal');
+            sub.cancel();
+            async.flushMicrotasks();
+            expect(async.pendingTimers, isEmpty);
           });
         },
       );

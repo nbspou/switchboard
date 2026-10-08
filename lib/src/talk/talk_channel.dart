@@ -31,6 +31,10 @@ part 'talk_forward.dart';
 
 final Logger _log = Logger('Switchboard.Talk');
 
+/// JavaScript timers overflow above a signed 32-bit millisecond delay.
+/// Longer expiries are rearmed from the monotonic deadline in chunks.
+const Duration _maxTimerDelay = Duration(milliseconds: 0x7FFFFFFF);
+
 /// Per-channel Talk policy.
 class TalkOptions {
   /// Creates options; the defaults are the reference defaults of the wiki.
@@ -1160,11 +1164,10 @@ class _Outgoing {
 
   /// Keeps the id of a cancelled request for [duration] at most.
   void armRelease(Duration duration) {
-    stopTimer();
-    _armedEnd = null;
-    if (duration > Duration.zero) {
-      timer = Timer(duration, () => channel._onRequestTimeout(this));
-    }
+    expiry
+      ..gap = duration
+      ..start(monotonicNow());
+    _arm();
   }
 
   /// When [timer] fires, if it was armed by [_arm].
@@ -1184,7 +1187,14 @@ class _Outgoing {
     if (left.isNegative) {
       left = Duration.zero;
     }
-    timer = Timer(left, () => channel._onRequestTimeout(this));
+    if (left > _maxTimerDelay) {
+      timer = Timer(_maxTimerDelay, () {
+        timer = null;
+        _arm();
+      });
+    } else {
+      timer = Timer(left, () => channel._onRequestTimeout(this));
+    }
   }
 
   /// [value] within [TalkOptions.minExtension] and
@@ -1806,7 +1816,14 @@ class _Message extends TalkMessage {
     if (left.isNegative) {
       left = Duration.zero;
     }
-    _timer = Timer(left, _onTimeout);
+    if (left > _maxTimerDelay) {
+      _timer = Timer(_maxTimerDelay, () {
+        _timer = null;
+        _arm();
+      });
+    } else {
+      _timer = Timer(left, _onTimeout);
+    }
   }
 
   void _onTimeout() {
