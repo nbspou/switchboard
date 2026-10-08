@@ -404,12 +404,16 @@ class MeshNode {
       final declared = held.isNotEmpty
           ? client.declareHolding(type, held)
           : Future<List<int>>.value(const []);
-      // The slots to discard reach lifecycle.discard through the gate.
-      await Future.wait<void>([
-        defined,
-        declared.then<void>((_) {}),
-      ], eagerError: true);
+      // Observed at once, so that a HOLDING failing while SLOTS is pending
+      // (its slots are checked before it is sent) is not an unhandled
+      // error; awaited below.
+      declared.ignore();
+      await defined;
+      // Known from here on, so that a leave() meanwhile withdraws this
+      // node's capacity for the space.
       _spaces[type] = space;
+      // The slots to discard reach lifecycle.discard through the gate.
+      await declared;
       return gate;
     } catch (_) {
       gates.remove(type);
