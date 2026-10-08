@@ -148,6 +148,8 @@ void main() {
   test('cross calls over TCP and WebSocket', () async {
     expect(await call(c, ServiceAddress(alpha), 'UPPER', 'hi'), 'HI');
     expect(await call(c, ServiceAddress(beta, 2), 'X', 'c'), 'beta(c)');
+    // A reaches its own beta through its WebSocket listener's endpoint:
+    // in-process, no socket to itself.
     expect(await call(a, ServiceAddress(beta), 'X', 'self'), 'beta(self)');
     // B reaches alpha on A over TCP, from inside a request from C.
     expect(await call(c, ServiceAddress(gamma), 'ALPHA', 'up'), 'UP');
