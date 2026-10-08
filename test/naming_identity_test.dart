@@ -509,6 +509,51 @@ void main() {
       await joined.leave().timeout(limit);
     });
 
+    test(
+      'a relay record names the identity of the channel registering it',
+      () async {
+        final mesh = await Mesh.start(requireCredential: false);
+        final relayType = Services.relay;
+        Uint8List relayRecord(String identity) => RegisterRequest(
+          relayType,
+          endpoints: [Uri.parse('mem://relay')],
+          metadata: bytes(identity),
+        ).encode();
+        final relay = await node(
+          credential: await issue('relay-1', [
+            Scope.of(Right.register, relayType.toString()),
+          ]),
+        );
+        final r = await channelTo(relay, mesh);
+        // Consumers name the metadata as the receiver of their IDENT: a
+        // relay naming another node could pass their identification on.
+        for (final other in ['ns', 'worker-a1', '']) {
+          expect(
+            await call(r, Procedures.register, relayRecord(other)),
+            denied,
+          );
+        }
+        expect(mesh.service.table, isEmpty);
+        expect(await call(r, Procedures.register, relayRecord('relay-1')), ok);
+        expect(
+          utf8.decode(mesh.service.table.values.single.metadata),
+          'relay-1',
+        );
+        // Admin is held to it too; an unidentified channel, which may do
+        // everything here, is not checked.
+        final admin = await node(credential: await issue('root', adminScopes));
+        final a = await channelTo(admin, mesh);
+        expect(
+          await call(a, Procedures.register, relayRecord('relay-1')),
+          denied,
+        );
+        final anonymous = await node();
+        final n = await channelTo(anonymous, mesh);
+        expect(await call(n, Procedures.register, relayRecord('relay-2')), ok);
+        expect(mesh.service.table, hasLength(2));
+      },
+    );
+
     test('the connection identity takes precedence over a credential in '
         'the open payload', () async {
       final mesh = await Mesh.start();

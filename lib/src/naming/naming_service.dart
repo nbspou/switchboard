@@ -10,6 +10,7 @@ Authors:
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -693,7 +694,8 @@ class NamingService {
       _abort(message, Status.of(StatusCode.invalidArgument, e.status.reason));
       return;
     }
-    if (!_permits(session, message, Right.register, request.type)) {
+    if (!_permits(session, message, Right.register, request.type) ||
+        !_permitsRelay(session, message, request)) {
       return;
     }
     try {
@@ -1156,6 +1158,34 @@ class NamingService {
     _log.info(
       '${message.procedureName} refused: "${credential.identity}" has no '
       '${right.name} scope for every type',
+    );
+    _abort(message, _permissionDenied);
+    return false;
+  }
+
+  /// Whether [session] may register [request]: a `_relay` record's
+  /// metadata is the identity consumers name as the receiver of their
+  /// `IDENT` to the relay, so an identified channel registers one only
+  /// with its own identity there; another identity would have consumers
+  /// name a node the registrant could then relay their identification to.
+  /// Answers [message] `PERMISSION_DENIED` when it may not. An
+  /// unidentified channel (without [requireCredential]) is not checked.
+  bool _permitsRelay(
+    _Session session,
+    TalkMessage message,
+    RegisterRequest request,
+  ) {
+    if (request.type != Services.relay) {
+      return true;
+    }
+    final credential = _identityOf(session);
+    if (credential == null ||
+        _sameBytes(utf8.encode(credential.identity), request.metadata)) {
+      return true;
+    }
+    _log.info(
+      'REGISTER refused: "${credential.identity}" registers a relay whose '
+      'metadata names another identity',
     );
     _abort(message, _permissionDenied);
     return false;
