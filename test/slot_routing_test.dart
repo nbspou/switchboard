@@ -421,11 +421,11 @@ void main() {
       late Completer<SlotEntry?> answer;
 
       setUp(() {
-        // Channels of this node buffer at most 1000 bytes, each subframe
-        // counted as its length plus 32.
+        // A window of 1000 bytes: a slot channel of this node holds at most
+        // that much, each subframe counted as its length plus 16.
         small = Switchboard(
           resolver: resolver,
-          muxOptions: fast.copyWith(maxChannelBufferBytes: 1000),
+          muxOptions: fast.copyWith(initialWindow: 1000),
           slotRefreshTimeout: limit,
         );
         addTearDown(small.close);
@@ -452,14 +452,14 @@ void main() {
           await asked.future.timeout(limit);
           final held = [for (var i = 0; i < 3; i++) '$i' * 300];
           for (final subframe in held) {
-            channel.send(bytes(subframe));
+            unawaited(channel.send(bytes(subframe)));
           }
           expect(channel.canSend, isTrue);
           answer.complete(const SlotEntry.owned(2, epoch: 2));
           await until(() => b.received.length == held.length);
           expect(b.received, held);
           expect(channel.retried, isTrue);
-          channel.send(bytes('after'));
+          unawaited(channel.send(bytes('after')));
           await until(() => b.received.length > held.length);
           expect(b.received.last, 'after');
           await channel.close();
@@ -472,11 +472,11 @@ void main() {
         final channel = await small.openChannelToSlot(svc, 1);
         await asked.future.timeout(limit);
         for (var i = 0; i < 3; i++) {
-          channel.send(bytes('x' * 300));
+          unawaited(channel.send(bytes('x' * 300)));
         }
         expect(channel.canSend, isTrue);
-        // A fourth would hold 1328 bytes.
-        channel.send(bytes('x' * 300));
+        // A fourth would hold 1264 bytes.
+        unawaited(channel.send(bytes('x' * 300)));
         expect(channel.canSend, isFalse);
         // Before the LOCATE has answered.
         final status = await channel.done.timeout(limit);
@@ -506,6 +506,20 @@ void main() {
       expect(hello.procedureName, 'HELLO');
       expect(text(hello.payload), 'B');
       expect(text((await talk.request('GET', bytes('k'))).payload), 'B:k');
+      await talk.close();
+    });
+
+    test('Talk: bulk payloads both ways on the retried slot channel', () async {
+      a
+        ..mode = Mode.moved
+        ..moved = MovedStatus(owner: 2, epoch: 2);
+      b.mode = Mode.talk;
+      final talk = await router.openTalkToSlot(svc, 1);
+      await talk.messages.first.timeout(limit);
+      final big = 'k' * 100000;
+      final answer = await talk.request('GET', bytes(big)).timeout(limit);
+      expect(answer.isBulk, isTrue);
+      expect(text(answer.payload), 'B:$big');
       await talk.close();
     });
 

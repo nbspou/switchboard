@@ -43,6 +43,12 @@ Status closeStatus(MuxFrame frame) {
   return Status.decode(frame.payload);
 }
 
+/// Sends PING and waits for its PONG: frames sent before it were handled.
+Future<void> settleRaw(RawPeer raw) async {
+  raw.send('02 00 00 01 5E');
+  await raw.nextControl(MuxControlType.pong);
+}
+
 /// An output that accepts one chunk each time [take] is called, like a
 /// socket whose peer reads slowly.
 class SlowSink implements StreamSink<List<int>> {
@@ -200,7 +206,8 @@ void main() {
       raw.send('22 03 00');
       expect(closeStatus(await raw.next()), Status.ok);
       expect(mux.openPayloadBytes, 100);
-      expect(mux.bufferedBytes, 133);
+      // The payload and one subframe at its cost, 1 + 16.
+      expect(mux.bufferedBytes, 117);
       raw.send(openHex(3, 1));
       raw.send('22 03 00');
       expect(closeStatus(await raw.next()).known, StatusCode.resourceExhausted);
@@ -274,7 +281,7 @@ void main() {
       final c1 = a.open(empty);
       final c2 = a.open(empty);
       final c3 = a.open(empty);
-      c2.send(hexBytes('01 02 03'));
+      unawaited(c2.send(hexBytes('01 02 03')));
       await a.ping();
       expect(b.openChannelCount, 3);
       expect(b.bufferedBytes, greaterThan(0));
@@ -321,55 +328,89 @@ void main() {
   });
 
   group('receive buffers', () {
-    test('a channel nobody reads is closed with RESOURCE_EXHAUSTED at its '
-        'cap; the connection survives', () async {
+    test('a channel nobody reads holds at most its window, the others '
+        'flow; DATA beyond the window ends the connection', () async {
       final (mux, raw) = rawPair(
-        options: rawOptions.copyWith(maxChannelBufferBytes: 4096),
+        options: rawOptions.copyWith(announceLimits: true, initialWindow: 4096),
       );
-      final channels = StreamQueue(mux.incoming);
-      raw.send(openHex(3));
-      raw.send(openHex(5));
-      final unread = await channels.next;
-      final read = await channels.next;
+      expect(
+        MuxLimits.decode((await raw.nextControl(MuxControlType.limits)).payload)
+            .initialWindow,
+        4096,
+      );
+      // Channels this side opens: the peer saw the LIMITS first, so their
+      // window is the one announced.
+      final unread = mux.open(empty);
+      final read = mux.open(empty);
+      expect(await raw.nextHex(), '12 02 00');
+      expect(await raw.nextHex(), '12 04 00');
       final readData = read.stream.toList();
-      for (var i = 0; i < 3; i++) {
-        raw.send(dataHex(3, 1000));
-        raw.send(dataHex(5, 1000));
+      for (var i = 0; i < 4; i++) {
+        raw.send(dataHex(2, 1000));
+        raw.send(dataHex(4, 1000));
       }
       raw.send('02 00 00 01 AA');
-      expect(await raw.nextHex(), '02 00 00 02 AA');
-      // 3 * (1000 + 32) bytes buffered for the unread channel.
-      expect(unread.bufferedBytes, 3096);
-      expect(mux.bufferedBytes, 3096);
+      // The channel that is read returns credit at half its window.
+      final credits = <MuxCredit>[];
+      while (true) {
+        final frame = await raw.next();
+        final control = MuxControlMessage.decode(frame.payload);
+        if (control.knownType == MuxControlType.pong) {
+          break;
+        }
+        credits.add(MuxCredit.decode(control.payload));
+      }
+      // In batches of at least half the window, as the listener takes
+      // them; what is consumed and not returned yet is less than half.
+      expect(credits, isNotEmpty);
+      var returned = 0;
+      for (final credit in credits) {
+        expect(credit.channelId, 4);
+        expect(credit.bytes, greaterThanOrEqualTo(2048));
+        returned += credit.bytes;
+      }
+      expect(4064 - returned, inInclusiveRange(0, 2047));
+      expect(read.receiveWindow, 4096 - 4064 + returned);
+      // 4 * (1000 + 16) bytes buffered for the unread channel: its window
+      // is used up.
+      expect(unread.bufferedBytes, 4064);
+      expect(unread.receiveWindow, 32);
+      expect(mux.bufferedBytes, 4064);
       expect(unread.state, MuxChannelState.open);
 
-      raw.send(dataHex(3, 1000));
-      final close = await raw.next();
-      expect(close.channelId, 3);
-      expect(closeStatus(close).known, StatusCode.resourceExhausted);
-      expect(unread.state, MuxChannelState.halfClosedLocal);
-      expect(unread.bufferedBytes, 0);
-      expect(mux.bufferedBytes, 0);
-      // In flight before the peer saw the CLOSE: dropped, not an error.
-      raw.send(dataHex(3, 1000));
-      raw.send('22 03 00');
-      expect(await unread.done, hasCode(StatusCode.resourceExhausted));
-      expect(await unread.stream.toList(), isEmpty);
-
-      raw.send(dataHex(5, 10));
-      raw.send('22 05 00');
-      expect(await raw.nextHex(), '22 05 00');
-      expect((await readData).map((d) => d.length), [1000, 1000, 1000, 10]);
-      expect(mux.isOpen, isTrue);
-      expect(mux.bufferedBytes, 0);
-      await mux.close();
-      await channels.cancel();
+      // Beyond it: GOAWAY PROTOCOL_ERROR.
+      raw.send(dataHex(2, 17));
+      final goAway = await raw.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus.known, StatusCode.protocolError);
+      expect(goAway.goAwayStatus.reason, contains('beyond the window'));
+      expect((await mux.done).known, StatusCode.protocolError);
+      expect((await readData).map((d) => d.length), [1000, 1000, 1000, 1000]);
     });
 
-    test('a cancelled channel subscription drops later DATA', () async {
+    test('a channel the peer opened accepts 64 KiB however small the '
+        'announced window', () async {
       final (mux, raw) = rawPair(
-        options: rawOptions.copyWith(maxChannelBufferBytes: 4096),
+        options: rawOptions.copyWith(announceLimits: true, initialWindow: 4096),
       );
+      // Opened before the LIMITS reached the peer, as far as this side can
+      // tell: the peer's window is 64 KiB.
+      raw.send(openHex(3));
+      final channel = await mux.incoming.first;
+      expect(channel.receiveWindow, 65536);
+      for (var i = 0; i < 64; i++) {
+        raw.send(dataHex(3, 1008));
+      }
+      await settleRaw(raw);
+      expect(channel.receiveWindow, 0);
+      expect(mux.isOpen, isTrue);
+      raw.send(dataHex(3, 0));
+      final goAway = await raw.nextControl(MuxControlType.goAway);
+      expect(goAway.goAwayStatus.known, StatusCode.protocolError);
+    });
+
+    test('a cancelled channel subscription drops later DATA, returning its '
+        'credit', () async {
+      final (mux, raw) = rawPair();
       raw.send(openHex(3));
       final channel = await mux.incoming.first;
       final sub = channel.stream.listen((_) {});
@@ -380,8 +421,12 @@ void main() {
         raw.send(dataHex(3, 3000));
       }
       raw.send('02 00 00 01 AA');
+      // 11 * 3016 bytes consumed: past half the window of 64 KiB.
+      final credit = await raw.nextControl(MuxControlType.credit);
+      expect(MuxCredit.decode(credit.payload), const MuxCredit(3, 33176));
       expect(await raw.nextHex(), '02 00 00 02 AA');
       expect(channel.state, MuxChannelState.open);
+      expect(channel.receiveWindow, 65536);
       expect(mux.bufferedBytes, 0);
       await mux.close();
     });
@@ -407,6 +452,7 @@ void main() {
         return mux.incoming.first;
       }
 
+      // At most the channel's window of 64 KiB: 64 * 1016 bytes.
       void sendData(int count) {
         for (var i = 0; i < count; i++) {
           toMux.add(StreamTransport.encodeFrame(hexBytes(dataHex(2, 1000))));
@@ -424,7 +470,7 @@ void main() {
         );
         final sizes = <int>[];
         final sub = channel.stream.listen((d) => sizes.add(d.length))..pause();
-        sendData(100);
+        sendData(60);
         await pumpEventQueue();
         expect(mux.isReceivePaused, isTrue);
         expect(toMux.isPaused, isTrue);
@@ -436,7 +482,7 @@ void main() {
 
         sub.resume();
         await pumpEventQueue();
-        expect(sizes, hasLength(100));
+        expect(sizes, hasLength(60));
         expect(mux.isReceivePaused, isFalse);
         expect(toMux.isPaused, isFalse);
         expect(mux.bufferedBytes, 0);
@@ -600,9 +646,10 @@ void main() {
         keepAliveTimeout: const Duration(milliseconds: 20),
       ),
     );
-    final channel = mux.open(empty);
+    // OPEN frames are not flow controlled, so they fill the transport's
+    // output where DATA would wait for credit.
     for (var i = 0; i < 2000; i++) {
-      channel.send(Uint8List(1000));
+      mux.open(Uint8List(1000));
     }
     expect(transport.isInputThrottled, isTrue);
     // Nothing arrives, but the peer reads a chunk every 10 ms: longer than
@@ -622,6 +669,46 @@ void main() {
     await mux.close();
     await transport.sink.done;
     expect(transport.bufferedOutputBytes, 0);
+    await output.close();
+    await toMux.close();
+  });
+
+  test('keep-alive counts a peer that reads output the scheduler holds as '
+      'alive', () async {
+    final toMux = StreamController<List<int>>();
+    final output = SlowSink();
+    final transport = StreamTransport.wrap(toMux.stream, output);
+    final mux = MuxConnection(
+      transport,
+      isInitiator: true,
+      options: rawOptions.copyWith(
+        keepAliveInterval: const Duration(milliseconds: 20),
+        keepAliveTimeout: const Duration(milliseconds: 20),
+      ),
+    );
+    // A window of 64 KiB: the transport takes the first frames, the
+    // scheduler holds the rest.
+    final channel = mux.open(empty);
+    for (var i = 0; i < 64; i++) {
+      unawaited(channel.send(Uint8List(1000)));
+    }
+    await pumpEventQueue();
+    expect(transport.isInputThrottled, isFalse);
+    expect(mux.heldOutputBytes, greaterThan(32 * 1000));
+    // Nothing arrives, but the peer reads a chunk every 10 ms: longer than
+    // interval and timeout together, the connection stays.
+    for (var i = 0; i < 15; i++) {
+      output.take();
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect(mux.heldOutputBytes, greaterThan(0));
+    expect(mux.isOpen, isTrue);
+    // The peer stops reading: keep-alive gives up.
+    expect(
+      await mux.done.timeout(const Duration(seconds: 5)),
+      hasCode(StatusCode.connectionLost),
+    );
+    await mux.close();
     await output.close();
     await toMux.close();
   });
@@ -949,7 +1036,7 @@ void main() {
       expect(b.isReceivePaused, isFalse);
       // Unread data on top of them pauses it, and reading that data
       // resumes it although the payloads are still held.
-      second.send(Uint8List(120));
+      unawaited(second.send(Uint8List(120)));
       await pumpEventQueue();
       expect(b.isReceivePaused, isTrue);
       await held.stream.first;

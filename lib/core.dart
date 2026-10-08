@@ -29,13 +29,14 @@ export 'src/identity/credential_issuer.dart' show CredentialIssuer;
 export 'src/identity/credential_verifier.dart';
 export 'src/identity/holder_key.dart';
 export 'src/identity/peer_identity.dart';
-export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState;
+export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState, MuxPriority;
 export 'src/mux/mux_connection.dart';
 export 'src/mux/mux_frame.dart'
     show
         MuxCommand,
         MuxControlMessage,
         MuxControlType,
+        MuxCredit,
         MuxFrame,
         MuxIdent,
         MuxLimits;
@@ -51,6 +52,7 @@ export 'src/switchboard/channel_policy.dart';
 export 'src/switchboard/incoming_channel.dart';
 export 'src/switchboard/resolver.dart';
 export 'src/switchboard/slot_key.dart';
+export 'src/talk/talk_bulk.dart' hide BulkRoutes, BulkTarget;
 export 'src/talk/talk_channel.dart';
 export 'src/talk/talk_frame.dart';
 export 'src/talk/talk_message.dart';

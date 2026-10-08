@@ -16,6 +16,7 @@ import 'package:clock/clock.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/core.dart';
+import 'package:switchboard/src/switchboard/slot_channel.dart';
 import 'package:test/fake.dart';
 import 'package:test/test.dart';
 
@@ -1076,5 +1077,430 @@ void main() {
       await chain.close();
       await other.close();
     });
+  });
+
+  group('bulk payloads', () {
+    /// [n] bytes 0, 1, 2, ... modulo 251.
+    Uint8List pattern(int n, [int offset = 0]) =>
+        Uint8List.fromList([for (var i = 0; i < n; i++) (offset + i) % 251]);
+
+    /// A mux connection whose `_bulk` channels are routed: the near end of
+    /// a Talk channel with [near], and its far end with [far].
+    Future<(TalkChannel, TalkChannel)> muxTalk({
+      TalkOptions near = const TalkOptions(),
+      TalkOptions far = const TalkOptions(),
+    }) async {
+      const options = MuxOptions(keepAliveInterval: null);
+      final (a, b) = MemoryTransport.pair();
+      final left = MuxConnection(a, isInitiator: true, options: options);
+      final right = MuxConnection(b, isInitiator: false, options: options);
+      final accepted = Completer<MuxChannel>();
+      void route(MuxChannel channel) {
+        if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+          TalkChannel.adoptBulk(channel);
+        } else {
+          accepted.complete(channel);
+        }
+      }
+
+      final subscriptions = [
+        left.incoming.listen(route),
+        right.incoming.listen(route),
+      ];
+      addTearDown(() async {
+        for (final s in subscriptions) {
+          await s.cancel();
+        }
+        await left.close();
+        await right.close();
+      });
+      final nearEnd = TalkChannel(left.open(Uint8List(0)), options: near);
+      return (nearEnd, TalkChannel(await accepted.future, options: far));
+    }
+
+    /// client ↔ intermediary ↔ backend over mux connections; the
+    /// intermediary forwards every message both ways and streams bulk
+    /// payloads unless [reassemble]; [seen] gets what it forwarded toward
+    /// the backend.
+    Future<(TalkChannel, TalkChannel)> chain({
+      bool reassemble = false,
+      bool backendStreams = false,
+      List<TalkMessage>? seen,
+    }) async {
+      final proxyOptions = reassemble
+          ? const TalkOptions()
+          : TalkOptions(streamBulk: (_) => true);
+      final (client, front) = await muxTalk(far: proxyOptions);
+      final (back, backend) = await muxTalk(
+        near: proxyOptions,
+        far: backendStreams
+            ? TalkOptions(streamBulk: (_) => true)
+            : const TalkOptions(),
+      );
+      front.messages.listen((m) {
+        seen?.add(m);
+        forwardMessage(m, back).ignore();
+      });
+      back.messages.listen((m) => forwardMessage(m, front).ignore());
+      return (client, backend);
+    }
+
+    test('a request, its bulk response and bulk items are piped through, '
+        'never reassembled by the intermediary', () async {
+      final seen = <TalkMessage>[];
+      final (client, backend) = await chain(seen: seen);
+      serve(backend, (m) {
+        switch (m.procedureName) {
+          case 'PUT':
+            expect(m.payload, pattern(300000));
+            m.reply(Uint8List.fromList([m.payload.length ~/ 10000]));
+          case 'GET':
+            m.replyBulk(Stream.value(pattern(150000)), length: 150000).ignore();
+          case 'LIST':
+            for (var i = 0; i < 2; i++) {
+              m.replyItemBulk(Stream.value(pattern(60000 + i))).ignore();
+            }
+            m.reply(Uint8List(0));
+        }
+      });
+      final put = await client.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(pattern(300000)),
+        bulkLength: 300000,
+      );
+      expect(put.payload, [30]);
+      expect(seen.single.isBulk, isTrue);
+      expect(seen.single.bulkLength, 300000);
+      // Streamed through, not reassembled.
+      expect(() => seen.single.payload, throwsStateError);
+      final got = await client.request('GET', Uint8List(0));
+      expect(got.isBulk, isTrue);
+      expect(got.bulkLength, 150000);
+      expect(got.payload, pattern(150000));
+      final list = client.streamRequest('LIST', Uint8List(0));
+      final items = await list.items.toList();
+      expect([for (final i in items) i.payload.length], [60000, 60001]);
+      expect(items.every((i) => i.isBulk), isTrue);
+      await list.done;
+    });
+
+    test('a plain bulk message, and forwarding a reassembled one', () async {
+      final (client, backend) = await chain(reassemble: true);
+      final plain = Completer<TalkMessage>();
+      serve(backend, (m) {
+        if (m.expectsReply) {
+          m.reply(m.payload.sublist(0, 2));
+        } else {
+          plain.complete(m);
+        }
+      });
+      client.send('NOTE', pattern(100000));
+      final note = await plain.future;
+      expect(note.isBulk, isTrue);
+      expect(note.payload, pattern(100000));
+      final answer = await client.request('PUT', pattern(100000, 7));
+      expect(answer.payload, [7, 8]);
+    });
+
+    test('forwarding a plain message waits for its bulk payload', () async {
+      final (client, front) = await muxTalk(
+        far: TalkOptions(streamBulk: (_) => true),
+      );
+      final (back, backend) = await muxTalk();
+      final source = StreamController<List<int>>();
+      var forwarded = false;
+      front.messages.listen((message) {
+        forwardMessage(message, back).then((_) => forwarded = true);
+      });
+      final received = backend.messages.first;
+      client.send('NOTE', Uint8List(0), bulk: source.stream);
+      await pumpEventQueue();
+      expect(forwarded, isFalse);
+      source.add(pattern(100000));
+      await source.close();
+      expect((await received).payload, pattern(100000));
+      await pumpEventQueue();
+      expect(forwarded, isTrue);
+    });
+
+    test('forwarding stays active until the bulk reply has finished', () async {
+      final (client, front) = await muxTalk();
+      final (back, backend) = await muxTalk();
+      final source = StreamController<List<int>>();
+      var forwarded = false;
+      front.messages.listen((message) {
+        forwardMessage(message, back).then((_) {
+          forwarded = true;
+          // A forwarding owner may release its target when the exchange
+          // ends, as the slot gate does after its idle delay.
+          back.close();
+        });
+      });
+      backend.messages.listen((message) => message.replyBulk(source.stream));
+      final response = client.request('GET', Uint8List(0));
+      await pumpEventQueue();
+      expect(forwarded, isFalse);
+      source.add(pattern(100000));
+      await source.close();
+      expect((await response).payload, pattern(100000));
+      await pumpEventQueue();
+      expect(forwarded, isTrue);
+    });
+
+    test('a cancel stops the piped payload on both hops', () async {
+      final (client, backend) = await chain(backendStreams: true);
+      final failed = Completer<Object>();
+      final cancelled = Completer<void>();
+      backend.messages.listen((m) {
+        m.bulk.listen((_) {}, onError: failed.complete);
+        m.onCancel.then((_) => cancelled.complete());
+      });
+      final source = StreamController<List<int>>();
+      source.add(pattern(1000));
+      final pending = client.startRequest(
+        'PUT',
+        Uint8List(0),
+        bulk: source.stream,
+      );
+      await pumpEventQueue();
+      pending.cancel();
+      await cancelled.future;
+      expect(await failed.future, isStatus(StatusCode.cancelled));
+      expect(source.hasListener, isFalse);
+      await source.close();
+    });
+  });
+
+  // Message chain forwarding passes flow control through (wiki page
+  // "Switchboard Proxying"): the credit of a forwarded frame goes back
+  // once the frame forwarded for it went out on the other channel, over a
+  // mux channel or a slot channel carrying one.
+  group('forwarding credit', () {
+    /// A mux connection and a channel on it: the opener's end, a slot
+    /// channel over it with [slot], and the acceptor's end. The bulk
+    /// channels of both sides are routed.
+    Future<(StreamChannel<Uint8List>, MuxChannel)> link({
+      bool slot = false,
+    }) async {
+      const options = MuxOptions(keepAliveInterval: null);
+      final (a, b) = MemoryTransport.pair();
+      final left = MuxConnection(a, isInitiator: true, options: options);
+      final right = MuxConnection(b, isInitiator: false, options: options);
+      final accepted = Completer<MuxChannel>();
+      void route(MuxChannel channel) {
+        if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+          TalkChannel.adoptBulk(channel);
+        } else {
+          accepted.complete(channel);
+        }
+      }
+
+      final subscriptions = [
+        left.incoming.listen(route),
+        right.incoming.listen(route),
+      ];
+      addTearDown(() async {
+        for (final s in subscriptions) {
+          await s.cancel();
+        }
+        await left.close();
+        await right.close();
+      });
+      final opened = left.open(Uint8List(0));
+      final StreamChannel<Uint8List> near = slot
+          ? SlotChannel(Name('svc'), 0, opened, (_) async => null)
+          : opened;
+      return (near, await accepted.future);
+    }
+
+    /// Polls [condition] until it holds, at most 2 s.
+    Future<void> until(bool Function() condition) async {
+      final deadline = DateTime.now().add(const Duration(seconds: 2));
+      while (!condition()) {
+        if (DateTime.now().isAfter(deadline)) {
+          fail('condition not met');
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    }
+
+    /// What the mux channel under [talk] holds for it, not consumed: at
+    /// least half a window once its sender is held back (credit goes back
+    /// in batches of half the window), nothing while it is not.
+    int heldOf(TalkChannel talk) => switch (talk.raw) {
+      final MuxChannel raw => raw.heldBytes,
+      final SlotChannel raw => raw.channel.heldBytes,
+      _ => throw StateError('not a mux channel'),
+    };
+
+    /// client ↔ front, intermediary, back ↔ backend: the intermediary
+    /// opens both channels (a slot channel toward the client with
+    /// [slotFront], toward the backend with [slotBack]) and forwards what
+    /// the client sends, from the listener. The client's end is a raw mux
+    /// channel nobody reads yet.
+    Future<(MuxChannel, TalkChannel, TalkChannel, TalkChannel)> relay({
+      bool slotFront = false,
+      bool slotBack = false,
+    }) async {
+      final (frontRaw, client) = await link(slot: slotFront);
+      final (backRaw, backendRaw) = await link(slot: slotBack);
+      final front = TalkChannel(frontRaw);
+      final back = TalkChannel(backRaw);
+      final backend = TalkChannel(backendRaw);
+      front.messages.listen((m) => forwardMessage(m, back).ignore());
+      return (client, front, back, backend);
+    }
+
+    /// Sends request [id] on [client], a raw mux channel.
+    void request(MuxChannel client, int id, {bool stream = false}) =>
+        client.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('GET'),
+            requestId: id,
+            stream: stream,
+            payload: Uint8List(0),
+          ).encode(),
+        );
+
+    for (final slot in [false, true]) {
+      final over = slot ? 'over a slot channel' : 'over a mux channel';
+
+      test('forwarded items withhold credit while the requester does not '
+          'read, $over', () async {
+        final (frontRaw, clientRaw) = await link(slot: slot);
+        final (backRaw, backendRaw) = await link();
+        final client = TalkChannel(clientRaw);
+        final back = TalkChannel(backRaw);
+        final backend = TalkChannel(backendRaw);
+        TalkChannel(frontRaw).messages.listen((m) => forwardMessage(m, back));
+        backend.messages.listen((message) {
+          for (var i = 0; i < 300; i++) {
+            message.replyItem(Uint8List(1000));
+          }
+          message.reply(Uint8List(0));
+        });
+        final request = client.streamRequest('LIST', Uint8List(0));
+        var received = 0;
+        final ended = Completer<void>();
+        final items = request.items.listen(
+          (_) => received++,
+          onDone: ended.complete,
+        )..pause();
+        await pumpEventQueue();
+        // The backend is held back by the intermediary's window, which
+        // holds what waits for the client's.
+        expect(heldOf(back), greaterThan(30000));
+        expect(
+          (backend.raw as MuxChannel).sendWindow,
+          lessThan(MuxCredit.costOf(1004)),
+        );
+        items.resume();
+        await request.done;
+        await ended.future;
+        expect(received, 300);
+        await pumpEventQueue();
+        expect(heldOf(back), 0);
+        await items.cancel();
+      });
+
+      test('forwarded final responses withhold credit, $over', () async {
+        final (client, _, back, backend) = await relay(slotFront: slot);
+        backend.messages.listen((m) => m.reply(Uint8List(1000)));
+        for (var id = 1; id <= 200; id++) {
+          request(client, id);
+        }
+        await pumpEventQueue();
+        expect(heldOf(back), greaterThan(30000));
+        var answers = 0;
+        client.stream.listen((_) => answers++);
+        await until(() => answers == 200);
+        await pumpEventQueue();
+        expect(heldOf(back), 0);
+      });
+
+      test('forwarded chained requests withhold credit, $over', () async {
+        final (client, _, back, backend) = await relay(slotFront: slot);
+        backend.messages.listen(
+          (m) => m.startReplyRequest(Uint8List(1000)).response.ignore(),
+        );
+        for (var id = 1; id <= 200; id++) {
+          request(client, id);
+        }
+        await pumpEventQueue();
+        expect(heldOf(back), greaterThan(30000));
+        var answers = 0;
+        client.stream.listen((_) => answers++);
+        await until(() => answers == 200);
+        await pumpEventQueue();
+        expect(heldOf(back), 0);
+      });
+
+      test('forwarded item requests withhold credit, $over', () async {
+        final (client, _, back, backend) = await relay(slotFront: slot);
+        backend.messages.listen((m) {
+          for (var i = 0; i < 200; i++) {
+            m.startReplyItemRequest(Uint8List(1000)).response.ignore();
+          }
+        });
+        request(client, 1, stream: true);
+        await pumpEventQueue();
+        expect(heldOf(back), greaterThan(30000));
+        var answers = 0;
+        client.stream.listen((_) => answers++);
+        await until(() => answers == 200);
+        await pumpEventQueue();
+        expect(heldOf(back), 0);
+      });
+
+      test('forwarded EXTENDs withhold credit, $over', () async {
+        final (client, _, back, backend) = await relay(slotFront: slot);
+        backend.messages.listen((m) {
+          for (var i = 0; i < 8000; i++) {
+            m.extend();
+          }
+        });
+        request(client, 1);
+        await pumpEventQueue();
+        expect(heldOf(back), greaterThan(30000));
+        var answers = 0;
+        client.stream.listen((_) => answers++);
+        await until(() => answers == 8000);
+        await pumpEventQueue();
+        expect(heldOf(back), 0);
+      });
+
+      test('forwarded messages and requests withhold credit while the far '
+          'end does not read, $over', () async {
+        final (clientRaw, frontRaw) = await link();
+        final (backRaw, backendRaw) = await link(slot: slot);
+        final client = TalkChannel(clientRaw);
+        final front = TalkChannel(frontRaw);
+        final back = TalkChannel(backRaw);
+        final backend = TalkChannel(backendRaw);
+        front.messages.listen((m) => forwardMessage(m, back));
+        var received = 0;
+        final subscription = backend.messages.listen((m) {
+          received++;
+          if (m.expectsReply) {
+            m.reply(Uint8List(0));
+          }
+        })..pause();
+        final answers = <Future<TalkMessage>>[];
+        for (var i = 0; i < 100; i++) {
+          client.send('NOTE', Uint8List(1000));
+          answers.add(client.request('PUT', Uint8List(1000)));
+        }
+        await pumpEventQueue();
+        expect(heldOf(front), greaterThan(30000));
+        subscription.resume();
+        await Future.wait(answers);
+        await pumpEventQueue();
+        expect(received, 200);
+        expect(heldOf(front), 0);
+        await subscription.cancel();
+      });
+    }
   });
 }

@@ -176,7 +176,11 @@ abstract final class StreamTransport {
 /// connection be torn down.
 final class StreamTransportChannel
     with StreamChannelMixin<Uint8List>
-    implements FrameLimited, AbortableTransport, OutputBufferedTransport {
+    implements
+        FrameLimited,
+        AbortableTransport,
+        OutputBufferedTransport,
+        OutputReadyTransport {
   StreamTransportChannel._(
     Stream<List<int>> input,
     StreamSink<List<int>> output, {
@@ -228,6 +232,15 @@ final class StreamTransportChannel
   /// [outputHighWaterMark] bytes wait for the output.
   @override
   bool get isInputThrottled => _core.isInputThrottled;
+
+  /// Whether the output takes a frame written now without it waiting
+  /// behind earlier output: nothing is queued in the transport and the
+  /// output is not pausing it.
+  @override
+  bool get isOutputReady => _core.isOutputReady;
+
+  @override
+  Future<void> get outputReady => _core.outputReady;
 
   /// Destroys the connection: calls the `abort` hook given to
   /// [StreamTransport.wrap] (`Socket.destroy` for sockets), drops buffered

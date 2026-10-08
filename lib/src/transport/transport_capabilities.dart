@@ -53,3 +53,23 @@ abstract interface class OutputBufferedTransport {
   /// Whether reading the input is paused because too much output waits.
   bool get isInputThrottled;
 }
+
+/// A transport that tells whether it takes more output at once, so that the
+/// layer above keeps what it cannot take yet, where it can still choose the
+/// order.
+///
+/// A `MuxConnection` over such a transport holds DATA frames in per-channel
+/// queues while [isOutputReady] is false, and writes them in the order of
+/// its output scheduler once [outputReady] completes: control messages
+/// first, then ordinary channels, then bulk ones. A transport without this
+/// capability takes every frame at once, in the order written.
+abstract interface class OutputReadyTransport {
+  /// Whether a frame written now goes to the connection without waiting
+  /// behind earlier output. True once the transport is closing or closed
+  /// (what is written is then dropped).
+  bool get isOutputReady;
+
+  /// Completes when [isOutputReady] becomes true, at once if it is. Never
+  /// fails.
+  Future<void> get outputReady;
+}

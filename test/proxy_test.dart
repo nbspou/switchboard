@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -16,6 +17,8 @@ import 'dart:typed_data';
 import 'package:async/async.dart';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
+
+import 'mux_harness.dart' show GatedTransport;
 
 const fast = MuxOptions(
   goAwayGrace: Duration(milliseconds: 100),
@@ -61,22 +64,28 @@ class RacingSwitchboard extends Switchboard {
 }
 
 /// Two mux connections over an in-memory transport, closed after the test.
-(MuxConnection, MuxConnection) muxPair({MuxOptions acceptor = fast}) {
+(MuxConnection, MuxConnection) muxPair({
+  MuxOptions initiator = fast,
+  MuxOptions acceptor = fast,
+}) {
   final (a, b) = MemoryTransport.pair();
-  final initiator = MuxConnection(a, isInitiator: true, options: fast);
+  final initiating = MuxConnection(a, isInitiator: true, options: initiator);
   final accepting = MuxConnection(b, isInitiator: false, options: acceptor);
   addTearDown(() async {
-    await initiator.close();
+    await initiating.close();
     await accepting.close();
   });
-  return (initiator, accepting);
+  return (initiating, accepting);
 }
 
 /// client ⇄ (proxyIn | pipe | proxyOut) ⇄ backend.
 class Piped {
   late MuxConnection clientConnection;
+  late MuxConnection proxyIn;
+  late MuxConnection proxyOut;
   late MuxConnection backendConnection;
   late MuxChannel client;
+  late MuxChannel inbound;
   late MuxChannel backend;
   late Future<void> pipe;
 }
@@ -85,19 +94,31 @@ class Piped {
 /// proxy attaches the pipe.
 Future<Piped> piped({
   void Function(MuxChannel client)? early,
-  MuxOptions backendOptions = fast,
+  MuxOptions options = fast,
+  MuxOptions? backendOptions,
 }) async {
   final p = Piped();
-  final (clientConnection, proxyIn) = muxPair();
-  final (proxyOut, backendConnection) = muxPair(acceptor: backendOptions);
+  final (clientConnection, proxyIn) = muxPair(
+    initiator: options,
+    acceptor: options,
+  );
+  final (proxyOut, backendConnection) = muxPair(
+    initiator: options,
+    acceptor: backendOptions ?? options,
+  );
   p.clientConnection = clientConnection;
+  p.proxyIn = proxyIn;
+  p.proxyOut = proxyOut;
   p.backendConnection = backendConnection;
+  // The LIMITS of each side have arrived: they set the windows.
+  await clientConnection.ping();
+  await proxyOut.ping();
   final atProxy = StreamQueue(proxyIn.incoming);
   final atBackend = StreamQueue(backendConnection.incoming);
   p.client = clientConnection.open(bytes('header'));
   early?.call(p.client);
   await pumpEventQueue();
-  final inbound = await atProxy.next;
+  final inbound = p.inbound = await atProxy.next;
   final outbound = proxyOut.open(inbound.openPayload);
   p.pipe = pipeChannels(inbound, outbound);
   p.backend = await atBackend.next;
@@ -107,6 +128,174 @@ Future<Piped> piped({
 
 void main() {
   group('pipeChannels', () {
+    test(
+      'a bulk drain timeout forwards failure and cancels the twins',
+      () async {
+        final options = fast.copyWith(
+          closeConfirmTimeout: const Duration(milliseconds: 30),
+        );
+        final (client, proxyIn) = muxPair(
+          initiator: options,
+          acceptor: options,
+        );
+        final (proxyOut, backend) = muxPair(
+          initiator: options,
+          acceptor: options,
+        );
+        final atProxy = StreamQueue(proxyIn.incoming);
+        final atBackend = StreamQueue(backend.incoming);
+        final parent = client.open(Uint8List(0));
+        final inbound = await atProxy.next;
+        final outbound = proxyOut.open(Uint8List(0));
+        final farParent = await atBackend.next;
+        pipeChannels(inbound, outbound).ignore();
+        final bulk = parent.openAfter(TalkBulkOpen(parent.id, 1).encode());
+        TalkChannel.adoptBulk(await atProxy.next);
+        final twin = await atBackend.next;
+        await parent.close();
+        expect(await farParent.done, hasCode(StatusCode.deadlineExceeded));
+        expect(await bulk.done, hasCode(StatusCode.cancelled));
+        expect(await twin.done, hasCode(StatusCode.cancelled));
+      },
+    );
+
+    test('a bulk payload whose source ended waits for a reader slower than '
+        'the close confirmation timeout', () async {
+      final options = fast.copyWith(
+        closeConfirmTimeout: const Duration(milliseconds: 100),
+      );
+      final (client, proxyIn) = muxPair(initiator: options, acceptor: options);
+      final (proxyOut, backend) = muxPair(
+        initiator: options,
+        acceptor: options,
+      );
+      await client.ping();
+      await proxyOut.ping();
+      final atProxy = StreamQueue(proxyIn.incoming);
+      final atBackend = StreamQueue(backend.incoming);
+      final sender = TalkChannel(client.open(Uint8List(0)));
+      final inbound = await atProxy.next;
+      final pipe = pipeChannels(inbound, proxyOut.open(inbound.openPayload));
+      final reader = TalkChannel(
+        await atBackend.next,
+        options: TalkOptions(streamBulk: (_) => true),
+      );
+      final messages = StreamQueue(reader.messages);
+      sender.send(
+        'BIG',
+        Uint8List(0),
+        bulk: Stream.value(pattern(300000)),
+        bulkLength: 300000,
+      );
+      final source = await atProxy.next;
+      TalkChannel.adoptBulk(source);
+      final twin = await atBackend.next;
+      TalkChannel.adoptBulk(twin);
+      final message = await messages.next;
+      final received = BytesBuilder();
+      final ended = Completer<void>();
+      final reading = message.bulk.listen(
+        received.add,
+        onError: ended.completeError,
+        onDone: ended.complete,
+        cancelOnError: true,
+      )..pause();
+      // The sender is done and its bulk channel closed, while the twin
+      // still waits for the reader's credit for the end of the payload.
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(source.state, MuxChannelState.closed);
+      expect(twin.state, MuxChannelState.open);
+      reading.resume();
+      await ended.future;
+      await reading.cancel();
+      expect(received.takeBytes(), pattern(300000));
+      expect(await twin.done, hasCode(StatusCode.ok));
+      await sender.close();
+      await pipe;
+      await messages.cancel();
+    });
+
+    for (final fromClient in [false, true]) {
+      test(
+        'failed parent cancels forwarded bulk twins (client: $fromClient)',
+        () async {
+          final (client, proxyIn) = muxPair();
+          final (proxyOut, backend) = muxPair();
+          final atProxy = StreamQueue(proxyIn.incoming);
+          final atBackend = StreamQueue(backend.incoming);
+          final atClient = StreamQueue(client.incoming);
+          final parent = client.open(Uint8List(0));
+          final inbound = await atProxy.next;
+          final outbound = proxyOut.open(Uint8List(0));
+          final farParent = await atBackend.next;
+          pipeChannels(inbound, outbound).ignore();
+          final opened = (fromClient ? parent : farParent).openAfter(
+            TalkBulkOpen(fromClient ? parent.id : farParent.id, 1).encode(),
+          );
+          final proxyBulk = fromClient
+              ? await atProxy.next
+              : await StreamQueue(proxyOut.incoming).next;
+          TalkChannel.adoptBulk(proxyBulk);
+          final twin = fromClient ? await atBackend.next : await atClient.next;
+          await parent.close(Status.of(StatusCode.cancelled));
+          await pumpEventQueue();
+          expect(opened.canSend, isFalse);
+          expect(twin.canSend, isFalse);
+          expect(await opened.done, hasCode(StatusCode.cancelled));
+          expect(await twin.done, hasCode(StatusCode.cancelled));
+        },
+      );
+    }
+
+    test('a send rejected by delayed LIMITS closes both pipe ends', () async {
+      final (clientConnection, proxyIn) = muxPair();
+      final (outTransport, peerTransport) = MemoryTransport.pair();
+      final proxyOut = MuxConnection(
+        outTransport,
+        isInitiator: true,
+        options: fast,
+      );
+      addTearDown(proxyOut.close);
+      final wire = StreamQueue(peerTransport.stream);
+      final incoming = StreamQueue(proxyIn.incoming);
+      final client = clientConnection.open(Uint8List(0));
+      final inbound = await incoming.next;
+      final outbound = proxyOut.open(Uint8List(0));
+      pipeChannels(inbound, outbound).ignore();
+      await client.send(Uint8List(1000));
+      await pumpEventQueue();
+      expect(inbound.heldBytes, 1016);
+      peerTransport.sink.add(
+        MuxControlMessage.limits(
+          const MuxLimits(
+            maxFrameSize: 256,
+            maxChannels: 4,
+            initialWindow: 256,
+          ),
+        ).toFrame().encode(),
+      );
+      await pumpEventQueue();
+      expect(outbound.canSend, isFalse);
+      expect(await client.done, hasCode(StatusCode.frameTooLarge));
+      final sent = <MuxFrame>[];
+      await proxyOut.close();
+      while (await wire.hasNext) {
+        sent.add(MuxFrame.decode(await wire.next));
+      }
+      expect(
+        Status.decode(
+          sent
+              .where(
+                (f) =>
+                    f.channelId == outbound.id && f.command == MuxCommand.close,
+              )
+              .single
+              .payload,
+        ),
+        hasCode(StatusCode.frameTooLarge),
+      );
+    });
+
     test('forwards subframes both ways, in order', () async {
       final p = await piped();
       final toBackend = [for (var i = 0; i < 100; i++) pattern(i, i)];
@@ -114,8 +303,8 @@ void main() {
       final atBackend = p.backend.stream.take(100).toList();
       final atClient = p.client.stream.take(100).toList();
       for (var i = 0; i < 100; i++) {
-        p.client.send(toBackend[i]);
-        p.backend.send(toClient[i]);
+        unawaited(p.client.send(toBackend[i]));
+        unawaited(p.backend.send(toClient[i]));
       }
       expect(await atBackend, toBackend);
       expect(await atClient, toClient);
@@ -123,14 +312,134 @@ void main() {
       await p.pipe;
     });
 
-    test('forwards large subframes', () async {
+    test(
+      'a graceful close follows the bulk payloads forwarded before it',
+      () async {
+        bool isBulk(MuxChannel ch) =>
+            TalkBulkOpen.isBulk(ChannelAddress.decode(ch.openPayload));
+        final (c1, p1) = MemoryTransport.pair();
+        final client = MuxConnection(c1, isInitiator: true, options: fast);
+        final proxyIn = MuxConnection(p1, isInitiator: false, options: fast);
+        final (p2, b2) = MemoryTransport.pair();
+        final gate = GatedTransport(p2)..allow(1000);
+        final proxyOut = MuxConnection(gate, isInitiator: true, options: fast);
+        final backend = MuxConnection(b2, isInitiator: false, options: fast);
+        addTearDown(() async {
+          for (final c in [client, proxyIn, proxyOut, backend]) {
+            await c.close();
+          }
+        });
+        final received = <String>[];
+        final backendDone = Completer<Status>();
+        backend.incoming.listen((ch) {
+          if (isBulk(ch)) {
+            TalkChannel.adoptBulk(ch);
+            return;
+          }
+          final talk = TalkChannel(ch);
+          talk.messages.listen(
+            (m) => received.add('${m.procedureName} ${m.payload.length}'),
+          );
+          unawaited(talk.done.then(backendDone.complete));
+        });
+        proxyIn.incoming.listen((ch) {
+          if (isBulk(ch)) {
+            TalkChannel.adoptBulk(ch);
+            return;
+          }
+          unawaited(pipeChannels(ch, proxyOut.open(ch.openPayload)));
+        });
+        await client.ping();
+        await proxyOut.ping();
+        // The proxy's output toward the backend is congested: the bulk
+        // payload waits in its scheduler when the client's CLOSE arrives.
+        gate.allow(-1000000);
+        final talk = TalkChannel(client.open(Uint8List(0)));
+        talk.send('BIG', Uint8List(100000));
+        await talk.close();
+        gate.allow(1000000);
+        expect(await backendDone.future, Status.ok);
+        expect(received, ['BIG 100000']);
+      },
+    );
+
+    test('credit passes hop by hop: a slow far consumer slows the near '
+        'sender, the proxy holds at most a window', () async {
       final p = await piped();
+      final received = <int>[];
+      final backend = p.backend.stream.listen((d) => received.add(d[0]))
+        ..pause();
+      var sent = 0;
+      final sending = () async {
+        for (var i = 0; i < 100; i++) {
+          await p.client.send(Uint8List(8000)..[0] = i);
+          sent++;
+        }
+      }();
+      for (var i = 0; i < 5; i++) {
+        await p.clientConnection.ping();
+        await p.proxyOut.ping();
+      }
+      // The backend holds its window (8 subframes of 8016 bytes of cost),
+      // the proxy at most the window it grants the client (the subframes
+      // waiting for the backend's credit), and the client waits for the
+      // proxy's.
+      expect(sent, greaterThan(8));
+      expect(sent * 8016, lessThanOrEqualTo(2 * 65536));
+      expect(p.backend.bufferedBytes, 8 * 8016);
+      expect(p.inbound.heldBytes, lessThanOrEqualTo(65536));
+      expect(p.inbound.heldBytes, greaterThan(0));
+      // Held for the other side, not counted by the connection's mark:
+      // only the OPEN payload is.
+      expect(p.proxyIn.bufferedBytes, p.inbound.openPayload.length);
+      expect(p.client.sendWindow, lessThan(8016));
+      backend.resume();
+      await sending;
+      await p.client.close();
+      await p.pipe;
+      expect(received, [for (var i = 0; i < 100; i++) i]);
+      expect(p.inbound.heldBytes, 0);
+      await backend.cancel();
+    });
+
+    test('a client that does not read holds the proxy\'s data within the '
+        'window, and does not pause the backend connection', () async {
+      final p = await piped(
+        options: fast.copyWith(receiveHighWaterMarkBytes: 20000),
+      );
+      // The client listens but never reads.
+      final paused = p.client.stream.listen((_) {})..pause();
+      for (var i = 0; i < 40; i++) {
+        unawaited(p.backend.send(Uint8List(8000)));
+      }
+      for (var i = 0; i < 5; i++) {
+        await p.backendConnection.ping();
+        await p.proxyOut.ping();
+      }
+      // The proxy holds what the client has no window for, without
+      // counting it toward the backend connection's mark: other channels
+      // on it, and its keep-alive, are not stalled.
+      expect(p.inbound.heldBytes, 0);
+      expect(p.proxyOut.isReceivePaused, isFalse);
+      expect(p.proxyOut.channels.single.heldBytes, inInclusiveRange(1, 65536));
+      expect(p.clientConnection.isReceivePaused, isTrue);
+      await paused.cancel();
+      await p.backend.close();
+      await p.pipe;
+    });
+
+    test('forwards large subframes', () async {
+      // Windows of 2 MiB on every connection: a subframe costs at most half
+      // the window.
+      final p = await piped(
+        options: fast.copyWith(initialWindow: 2 * 1024 * 1024),
+      );
       final big = pattern(900 * 1024, 7);
       final atBackend = p.backend.stream.first;
-      p.client.send(big);
+      unawaited(p.client.send(big));
       expect(await atBackend, big);
       final atClient = p.client.stream.first;
-      p.backend.send(big);
+      unawaited(p.backend.send(big));
       expect(await atClient, big);
       await p.backend.close();
       await p.pipe;
@@ -139,7 +448,7 @@ void main() {
     test('client close status reaches the backend', () async {
       final p = await piped();
       final atBackend = p.backend.stream.toList();
-      p.client.send(bytes('last'));
+      unawaited(p.client.send(bytes('last')));
       await p.client.close(Status.of(StatusCode.cancelled, 'bye'));
       expect(await atBackend, [bytes('last')]);
       expect(await p.backend.done, Status.of(StatusCode.cancelled, 'bye'));
@@ -150,7 +459,7 @@ void main() {
     test('backend close status reaches the client', () async {
       final p = await piped();
       final atClient = p.client.stream.toList();
-      p.backend.send(bytes('result'));
+      unawaited(p.backend.send(bytes('result')));
       await p.backend.close(Status.of(StatusCode.aborted, 'conflict'));
       expect(await atClient, [bytes('result')]);
       expect(await p.client.done, Status.of(StatusCode.aborted, 'conflict'));
@@ -223,7 +532,7 @@ void main() {
 
     test('a subframe over the receiving peer limit closes both', () async {
       final p = await piped(backendOptions: fast.copyWith(maxFrameSize: 1000));
-      p.client.send(pattern(2000));
+      unawaited(p.client.send(pattern(2000)));
       expect(await p.client.done, hasCode(StatusCode.frameTooLarge));
       expect(await p.backend.done, hasCode(StatusCode.frameTooLarge));
       await p.pipe;
@@ -249,7 +558,7 @@ void main() {
       await p.backend.stream.listen(null).cancel();
       var finished = false;
       unawaited(p.pipe.then((_) => finished = true));
-      p.client.send(bytes('dropped'));
+      unawaited(p.client.send(bytes('dropped')));
       await p.clientConnection.ping();
       await p.backendConnection.ping();
       await pumpEventQueue();
@@ -257,7 +566,7 @@ void main() {
       expect(p.client.state, MuxChannelState.open);
       expect(p.backend.state, MuxChannelState.open);
       // The other direction still flows.
-      p.backend.send(bytes('still'));
+      unawaited(p.backend.send(bytes('still')));
       expect(await p.client.stream.first, bytes('still'));
       await p.backend.close();
       await p.pipe;
@@ -334,6 +643,14 @@ void main() {
               unawaited(
                 incoming.reject(Status.of(StatusCode.aborted, 'killed')),
               );
+            case 'PUT':
+              final number = m.frame.bulk ? m.frame.bulkReference.number : 0;
+              m.reply(bytes('${m.payload.length} ${m.isBulk} $number'));
+              expect(m.payload, pattern(m.payload.length));
+            case 'GET':
+              unawaited(
+                m.replyBulk(Stream.value(pattern(300000)), length: 300000),
+              );
           }
         });
       }, instance: 7);
@@ -377,6 +694,50 @@ void main() {
       await talk.close();
       await sharded.close();
       await api.close();
+    });
+
+    test('bulk payloads through the endpoint, both ways', () async {
+      final talk = await client.openTalk(ServiceAddress(chat));
+      // The bulk number is kept: the BULK message passes unchanged.
+      for (final number in [1, 2]) {
+        final put = await talk.request('PUT', pattern(200000));
+        expect(utf8.decode(put.payload), '200000 true $number');
+      }
+      final streamed = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.fromIterable([pattern(50000), pattern(50000, 50000 * 31)]),
+      );
+      expect(utf8.decode(streamed.payload), '100000 true 3');
+      final got = await talk.request('GET', Uint8List(0));
+      expect(got.isBulk, isTrue);
+      expect(got.payload, pattern(300000));
+      // Inline still inline.
+      final small = await talk.request('PUT', pattern(10));
+      expect(utf8.decode(small.payload), '10 false 0');
+      await talk.close();
+    });
+
+    test('bulk channels count toward the per-connection bound', () async {
+      final tight = node();
+      tight.catchAll = proxyHandler(
+        tight,
+        allow: (address) => address.type == chat,
+        resolver: StaticResolver([
+          ServiceRecord(ServiceAddress(chat, 7), endpoints: [backendUri]),
+        ]),
+        maxChannelsPerConnection: 2,
+      );
+      final tightUri = await tight.listenTcp('127.0.0.1', 0);
+      final c = node(resolver: EndpointResolver(tightUri));
+      final parent = await c.openChannel(ServiceAddress(chat));
+      // The parent is one, a first bulk channel the second.
+      final first = parent.openAfter(TalkBulkOpen(parent.id, 1).encode());
+      final second = parent.openAfter(TalkBulkOpen(parent.id, 2).encode());
+      expect(await second.done, hasCode(StatusCode.resourceExhausted));
+      expect(first.state, MuxChannelState.open);
+      await first.close();
+      await parent.close();
     });
 
     test('stream through the endpoint', () async {
@@ -677,7 +1038,7 @@ void main() {
       while (held.length < 4) {
         await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      held.last.channel.send(bytes('served'));
+      unawaited(held.last.channel.send(bytes('served')));
       expect(await channel.stream.first, bytes('served'));
       // A channel of the greedy client that ends frees its allowance, once
       // the proxy has closed both sides of it.
@@ -695,7 +1056,7 @@ void main() {
       while (held.length < 5) {
         await Future<void>.delayed(const Duration(milliseconds: 1));
       }
-      held.last.channel.send(bytes('again'));
+      unawaited(held.last.channel.send(bytes('again')));
       expect(await more.stream.first, bytes('again'));
     });
 
@@ -965,6 +1326,13 @@ void main() {
             );
           case 'moved':
             unawaited(incoming.reject(moved));
+          case 'bulkMoved':
+            channel.openAfter(TalkBulkOpen(channel.id, 1).encode());
+            unawaited(() async {
+              await channel.connection.ping();
+              await pumpEventQueue();
+              await incoming.reject(moved);
+            }());
           case 'movedAfter':
             channel.stream.first.then((_) => incoming.reject(moved)).ignore();
           case 'greetMoved':
@@ -974,6 +1342,14 @@ void main() {
             channel.stream.first
                 .then((_) => incoming.reject(fields.toStatus(relocated: true)))
                 .ignore();
+          case 'talk':
+            incoming.talk().messages.listen((m) {
+              if (m.procedureName == 'BIG') {
+                m.reply(pattern(200000));
+              } else {
+                m.reply(bytes('$id ${m.payload.length} ${m.isBulk}'));
+              }
+            });
         }
       }, instance: id);
       final uri = await node.listenTcp('127.0.0.1', 0);
@@ -1028,7 +1404,7 @@ void main() {
       final channel = await open(4);
       final answers = StreamQueue(channel.stream);
       expect(await answers.next, bytes('2 4'));
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(await answers.next, bytes('2:x'));
       expect(opened[1], hasLength(1));
       // The open payload is sent again, the instance set to the new owner.
@@ -1040,6 +1416,55 @@ void main() {
       expect(await second.done, hasCode(StatusCode.resourceExhausted));
       await channel.close();
       expect(await channel.done, Status.ok);
+    });
+
+    test('bulk payloads through a slot channel', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(2, epoch: 1));
+      modes[2] = 'talk';
+      final talk = await client.openTalk(ServiceAddress(zone), shard: 4);
+      final answer = await talk.request('PUT', pattern(150000));
+      expect(utf8.decode(answer.payload), '2 150000 true');
+      final big = await talk.request('BIG', Uint8List(0));
+      expect(big.isBulk, isTrue);
+      expect(big.payload, pattern(200000));
+      await talk.close();
+    });
+
+    test('a bulk channel from the owner prevents a MOVED retry', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'bulkMoved:2:2';
+      final channel = await open(4);
+      final outcome = Completer<void>();
+      void ended() {
+        if (!outcome.isCompleted) outcome.complete();
+      }
+
+      channel.stream.listen((_) => ended());
+      unawaited(channel.done.then((_) => ended()));
+      await outcome.future;
+      expect(opened[2], isEmpty);
+      expect(await channel.done, hasCode(StatusCode.moved));
+    });
+
+    test('bulk payloads through a slot channel retried after MOVED', () async {
+      table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
+      modes[1] = 'moved:2:2';
+      modes[2] = 'talk';
+      final talk = await client.openTalk(ServiceAddress(zone), shard: 4);
+      // The rejection and the retry happen before the first message.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(opened[2], hasLength(1));
+      final answer = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(pattern(70000)),
+      );
+      expect(utf8.decode(answer.payload), '2 70000 true');
+      // A bulk payload the new owner opens comes back through the
+      // replacement channel.
+      final big = await talk.request('BIG', Uint8List(0));
+      expect(big.payload, pattern(200000));
+      await talk.close();
     });
 
     test('MOVED naming no owner: the proxy asks', () async {
@@ -1056,7 +1481,7 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'movedAfter:2:2';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.moved));
       expect(MovedStatus.fromStatus(status), MovedStatus.unknown);
@@ -1075,14 +1500,14 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       final status = await channel.done;
       expect(status, hasCode(StatusCode.relocated));
       expect(status.encode(), MovedStatus.unknown.encode(relocated: true));
       expect(opened[2], isEmpty);
       // Not retried by a client either.
       final slotChannel = await client.openChannelToSlot(zone, 4);
-      slotChannel.send(bytes('y'));
+      unawaited(slotChannel.send(bytes('y')));
       expect(await slotChannel.done, hasCode(StatusCode.relocated));
       expect(slotChannel.retried, isFalse);
       expect(opened[1], hasLength(2));
@@ -1093,7 +1518,7 @@ void main() {
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'relocatedAfter:0xFFFFFFFFFF80:0x80000000';
       final channel = await open(4);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(
         (await channel.done).encode(),
         MovedStatus(
@@ -1103,7 +1528,7 @@ void main() {
       );
       modes[1] = 'movedAfter:2:2';
       final moved = await open(4);
-      moved.send(bytes('x'));
+      unawaited(moved.send(bytes('x')));
       final status = await moved.done;
       expect(MovedStatus.fromStatus(status), MovedStatus(owner: 2, epoch: 2));
     });
@@ -1168,13 +1593,10 @@ void main() {
       await named.close();
     });
 
-    test('what the client sends during a retry is held up to the node\'s '
-        'channel buffer limit, then RESOURCE_EXHAUSTED', () async {
-      // In memory, so that each subframe reaches the proxy's pipe before
-      // the next is sent: the client leg's own receive buffer, with the
-      // same limit, never fills up.
+    test('what the client sends during a retry waits for credit: the proxy '
+        'holds at most the window it grants', () async {
       await startProxy(
-        options: fast.copyWith(maxChannelBufferBytes: 1000),
+        options: fast.copyWith(initialWindow: 1000),
         memory: true,
       );
       table.setSlot(zone, 4, const SlotEntry.owned(1, epoch: 1));
@@ -1192,26 +1614,32 @@ void main() {
       };
       final channel = await open(4);
       await asked.future;
-      // Each subframe counts its length plus 32: the fourth goes beyond.
-      var sent = 0;
-      while (channel.canSend && sent < 10) {
-        channel.send(pattern(300, sent++));
-        await Future<void>.delayed(Duration.zero);
-      }
-      final status = await channel.done;
-      expect(status, hasCode(StatusCode.resourceExhausted));
-      expect(status.reason, 'send buffer of 1000 bytes exceeded');
-      expect(sent, lessThan(10));
-      // The LOCATE answers after all: the new owner's channel is closed at
-      // once.
+      final messages = [
+        for (var i = 0; i < 250; i++) bytes('$i'.padLeft(300, '.')),
+      ];
+      var taken = 0;
+      final sends = [
+        for (final message in messages)
+          channel.send(message)..then((_) => taken++).ignore(),
+      ];
+      await pumpEventQueue();
+      // The client sent what its window allows (1000 bytes, or 64 KiB if
+      // it opened the channel before the proxy's LIMITS arrived), each
+      // subframe costing its length plus 16; the proxy holds it and
+      // returns no credit, so the rest waits at the client.
+      expect(taken, greaterThan(0));
+      expect(taken * 316, lessThanOrEqualTo(65536));
+      expect(channel.canSend, isTrue);
+      final echoes = channel.stream.skip(1).take(messages.length).toList();
+      // The LOCATE answers: everything reaches the new owner, in order.
       answer.complete(const SlotEntry.owned(2, epoch: 2));
-      final watch = Stopwatch()..start();
-      while (ended[2]!.isEmpty) {
-        expect(watch.elapsed, lessThan(const Duration(seconds: 5)));
-        await Future<void>.delayed(const Duration(milliseconds: 1));
-      }
-      expect(ended[2]!.single, hasCode(StatusCode.resourceExhausted));
+      expect((await echoes).map(utf8.decode), [
+        for (final message in messages) '2:${utf8.decode(message)}',
+      ]);
+      await Future.wait(sends);
+      expect(taken, messages.length);
       expect(opened[2]!.single.instance, 2);
+      await channel.close();
     });
 
     test('LOCATEs per client connection are bounded', () async {
@@ -1283,7 +1711,7 @@ void main() {
       table.setSlot(zone, 6, const SlotEntry.owned(1, epoch: 1));
       modes[1] = 'movedAfter:2:2';
       final channel = await client.openChannelToSlot(zone, 6);
-      channel.send(bytes('x'));
+      unawaited(channel.send(bytes('x')));
       expect(await channel.done, hasCode(StatusCode.moved));
       expect(channel.retried, isFalse);
       // The client opens again; the proxy's table is still stale, and the

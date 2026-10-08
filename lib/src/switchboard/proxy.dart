@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -13,6 +14,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
+import 'package:meta/meta.dart';
 
 import '../address/channel_address.dart';
 import '../mux/mux_channel.dart';
@@ -20,6 +22,7 @@ import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
+import '../talk/talk_bulk.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
@@ -33,12 +36,45 @@ final Logger _log = Logger('Switchboard.Router');
 /// Channel proxying: forwards every DATA subframe between [a] and [b], in
 /// order and unchanged, and forwards the close.
 ///
+/// Flow control passes through hop by hop: both channels are switched to
+/// [MuxChannel.manualCredit], and a subframe received on one counts as
+/// consumed, and its credit goes back to that side's peer, only once the
+/// other side's [MuxChannel.send] has taken it (its future completed). So
+/// a slow consumer behind one side slows the sender behind the other, and
+/// what the proxy holds for each direction is bounded by the window it
+/// grants the sending side plus the window the receiving side grants it.
+/// The output tier ([MuxChannel.priority]) of each side is its own; set it
+/// on the channels before or after the call.
+///
 /// When one side's stream ends (its peer sent CLOSE, or its connection was
 /// lost) the other side is closed with that side's end status.
 /// `CONNECTION_LOST`, which is local only, is sent as `UNAVAILABLE`, and
 /// application codes (256 and above), which mux CLOSE must not carry, as
 /// `UNKNOWN`. A subframe that cannot be forwarded (it exceeds the frame
-/// limit the receiving peer announced) closes both sides with that error.
+/// limit the receiving peer announced, or costs more than half the window
+/// it grants: [MuxChannel.maxSubframeLength]) closes both sides with that
+/// error, including when LIMITS arrives after the send began waiting.
+/// Subframes are forwarded whole, so a proxy should not grant its
+/// clients more (window, frame size) than its backends grant it; a side
+/// whose [MuxChannel.priority] is [MuxPriority.bulk] splits what it sends
+/// instead, which suits a byte stream (a Talk bulk payload).
+///
+/// Talk bulk payloads (wiki page "Polyverse Switchboard Proxying", step
+/// 4): a `_bulk` channel the peer of one side opens for its channel is
+/// forwarded as a bulk channel toward the other side, opened in order with
+/// that side's frames ([MuxChannel.openAfter]) with the same bulk number
+/// and the other side's channel as its parent, so that the `BULK` message
+/// passes unchanged; the two bulk channels are piped the same way, in the
+/// bulk output tier of both connections. A side that cannot take one (it
+/// is closing) refuses it `UNAVAILABLE`. A bulk channel's graceful close
+/// is forwarded once the last subframe forwarded before it went out, as a
+/// Talk sender closes a payload once the window took it: the CLOSE would
+/// wait behind them anyway, but its confirmation is timed from the call,
+/// which would cut a payload whose reader is slower than that. A failed
+/// parent cancels its bulk twins in both directions; a graceful close
+/// waits for the transfers it follows, then cancels any twins left when
+/// the pipe ends. A drain that times out is forwarded as
+/// `DEADLINE_EXCEEDED`.
 ///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
@@ -51,27 +87,82 @@ final Logger _log = Logger('Switchboard.Router');
 Future<void> pipeChannels(MuxChannel a, MuxChannel b) =>
     _pipe(_MuxEnd(a), _MuxEnd(b));
 
+/// [pipeChannels] for a forwarder that bounds the channels it forwards per
+/// client connection: the bulk channels [a]'s peer opens count toward
+/// [bound] for [a]'s connection while they are piped (beyond it they are
+/// refused `RESOURCE_EXHAUSTED`). Used by the relay.
+@internal
+Future<void> pipeChannelsWithin(
+  MuxChannel a,
+  MuxChannel b,
+  ForwardingBound bound,
+) => _pipe(_MuxEnd(a), _MuxEnd(b), bulkBound: bound);
+
 /// [pipeChannels] over [_End]s; [toA] rewrites the status [a] is closed
-/// with when [b] ends.
-Future<void> _pipe(_End a, _End b, {Status Function(Status status)? toA}) {
+/// with when [b] ends; [bulkBound], if given, counts the bulk channels
+/// [a]'s peer opens against [a]'s connection; [bulk]: [a] and [b] are bulk
+/// channels, closed gracefully only once what was forwarded went out.
+Future<void> _pipe(
+  _End a,
+  _End b, {
+  Status Function(Status status)? toA,
+  ForwardingBound? bulkBound,
+  bool bulk = false,
+}) {
+  // The bulk transfers forwarded each way, which a graceful close of the
+  // channel they belong to follows.
+  final towardB = <_BulkTwin>{};
+  final towardA = <_BulkTwin>{};
+  void cancelTwins() {
+    _cancelTwins(towardB);
+    _cancelTwins(towardA);
+  }
+
+  for (final end in [a, b]) {
+    unawaited(
+      end.done.then((status) {
+        if (!status.isOk) cancelTwins();
+      }),
+    );
+  }
   try {
-    _forward(a, b);
-    _forward(b, a, rewrite: toA);
+    // Before listening: a bulk channel may wait for its parent's target.
+    _routeBulk(a, b, towardB, bound: bulkBound);
+    _routeBulk(b, a, towardA);
+    _forward(a, b, twins: towardB, bulk: bulk);
+    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
     unawaited(a.close(status));
     unawaited(b.close(status));
   }
-  return Future.wait<Status>([a.done, b.done]).then<void>((_) {});
+  return Future.wait<Status>([a.done, b.done]).then<void>((_) => cancelTwins());
+}
+
+typedef _BulkTwin = ({MuxChannel source, MuxChannel target, Future<void> done});
+
+void _cancelTwins(Set<_BulkTwin> twins) {
+  for (final twin in twins.toList()) {
+    unawaited(twin.source.close(genericStatus(StatusCode.cancelled)));
+    unawaited(twin.target.close(genericStatus(StatusCode.cancelled)));
+  }
 }
 
 /// One side of a pipe: a mux channel, or a [SlotChannel] (which may
 /// replace its mux channel once).
 abstract interface class _End {
+  /// The mux channel the subframes travel on now.
+  MuxChannel get mux;
+
+  /// No retry any more (a slot channel): something was forwarded on it.
+  void commit();
+
   Stream<Uint8List> get stream;
   bool get canSend;
-  void send(Uint8List subframe);
+  Future<void> send(Uint8List subframe);
+  set manualCredit(bool value);
+  void consumed(int bytes);
   Future<void> close(Status status);
   Future<Status> get done;
   int get id;
@@ -83,11 +174,19 @@ class _MuxEnd implements _End {
   final MuxChannel channel;
 
   @override
+  MuxChannel get mux => channel;
+  @override
+  void commit() {}
+  @override
   Stream<Uint8List> get stream => channel.stream;
   @override
   bool get canSend => channel.canSend;
   @override
-  void send(Uint8List subframe) => channel.send(subframe);
+  Future<void> send(Uint8List subframe) => channel.send(subframe);
+  @override
+  set manualCredit(bool value) => channel.manualCredit = value;
+  @override
+  void consumed(int bytes) => channel.consumed(bytes);
   @override
   Future<void> close(Status status) => channel.close(status);
   @override
@@ -102,11 +201,19 @@ class _SlotEnd implements _End {
   final SlotChannel channel;
 
   @override
+  MuxChannel get mux => channel.channel;
+  @override
+  void commit() => channel.commit();
+  @override
   Stream<Uint8List> get stream => channel.stream;
   @override
   bool get canSend => channel.canSend;
   @override
-  void send(Uint8List subframe) => channel.send(subframe);
+  Future<void> send(Uint8List subframe) => channel.send(subframe);
+  @override
+  set manualCredit(bool value) => channel.manualCredit = value;
+  @override
+  void consumed(int bytes) => channel.consumed(bytes);
   @override
   Future<void> close(Status status) => channel.close(status);
   @override
@@ -115,32 +222,174 @@ class _SlotEnd implements _End {
   int get id => channel.channel.id;
 }
 
-void _forward(_End from, _End to, {Status Function(Status status)? rewrite}) {
+/// Forwards the bulk channels the peer of [from] opens for it toward [to]
+/// (see [pipeChannels]). A slot channel that replaces [from]'s mux channel
+/// keeps the route.
+void _routeBulk(
+  _End from,
+  _End to,
+  Set<_BulkTwin> twins, {
+  ForwardingBound? bound,
+}) {
+  final mux = from.mux;
+  if (BulkRoutes.isBulk(mux)) {
+    // A bulk channel is never a parent.
+    return;
+  }
+  BulkRoutes.register(
+    mux,
+    (bulk, number) => _forwardBulk(bulk, number, from, to, twins, bound),
+  );
+}
+
+/// Opens the twin of [bulk] (bulk number [number]) on [to]'s side, in
+/// order with its frames, and pipes the two.
+void _forwardBulk(
+  MuxChannel bulk,
+  int number,
+  _End from,
+  _End to,
+  Set<_BulkTwin> twins,
+  ForwardingBound? bound,
+) {
+  bulk.priority = MuxPriority.bulk;
+  final client = bulk.connection;
+  if (bound != null && !bound.enter(client)) {
+    _log.info(
+      'proxy: bulk channel ${bulk.id} refused, ${bound.countOf(client)} '
+      'channels of this connection are being forwarded',
+    );
+    unawaited(bulk.close(genericStatus(StatusCode.resourceExhausted)));
+    return;
+  }
+  final parent = to.mux;
+  final MuxChannel twin;
+  try {
+    twin = parent.openAfter(TalkBulkOpen(parent.id, number).encode());
+  } on SwitchboardException catch (e) {
+    bound?.exit(client);
+    _log.fine(
+      'proxy: bulk channel ${bulk.id} not forwarded to channel '
+      '${parent.id}: ${e.status}',
+    );
+    unawaited(bulk.close(genericStatus(StatusCode.unavailable)));
+    return;
+  }
+  // The message referencing it follows on the slot channel: no retry
+  // elsewhere may separate them, whichever side opened the bulk channel.
+  from.commit();
+  to.commit();
+  twin.priority = MuxPriority.bulk;
+  BulkRoutes.markBulk(twin);
+  final piped = _pipe(_MuxEnd(bulk), _MuxEnd(twin), bulk: true);
+  final transfer = (source: bulk, target: twin, done: piped);
+  twins.add(transfer);
+  unawaited(
+    piped.whenComplete(() {
+      twins.remove(transfer);
+      bound?.exit(client);
+    }),
+  );
+}
+
+/// How long a graceful CLOSE forwarded toward [to] waits for the bulk
+/// payloads forwarded before it: the close confirmation timeout of [to]'s
+/// connection (30 s when that waits for ever).
+Duration _twinWait(_End to) {
+  final timeout = to.mux.connection.options.closeConfirmTimeout;
+  return timeout > Duration.zero ? timeout : const Duration(seconds: 30);
+}
+
+/// Returns the credit of a subframe of [length] bytes [from] delivered.
+void _consumed(_End from, int length) {
+  try {
+    from.consumed(length);
+  } on StateError catch (e) {
+    _log.warning('proxy: credit accounting of channel ${from.id}: $e');
+  }
+}
+
+/// Forwards what [from] receives to [to], and its end; [twins] are the
+/// bulk transfers a graceful close follows; [bulk]: the channels are bulk
+/// channels, whose graceful close also follows the last send.
+void _forward(
+  _End from,
+  _End to, {
+  Status Function(Status status)? rewrite,
+  Set<_BulkTwin> twins = const {},
+  bool bulk = false,
+}) {
+  // Credit for what [from] receives goes back once [to] has taken it.
+  from.manualCredit = true;
+  // The last forward; sends complete in order. Never fails.
+  var sending = Future<void>.value();
+  void failed(Object error, int length) {
+    _consumed(from, length);
+    if (error is SwitchboardException &&
+        error.code == StatusCode.failedPrecondition) {
+      // The destination ended while waiting; its end closes from too.
+      return;
+    }
+    _log.warning(
+      'proxy: cannot forward $length bytes from channel '
+      '${from.id} to channel ${to.id}: $error',
+    );
+    final code = error is SwitchboardException ? error.code : null;
+    final status = genericStatus(code ?? StatusCode.internal);
+    unawaited(to.close(status));
+    unawaited(from.close(status));
+  }
+
   from.stream.listen(
     (subframe) {
+      final length = subframe.length;
       if (!to.canSend) {
         // The other side is closing; its CLOSE ends this side too.
+        _consumed(from, length);
         return;
       }
       try {
-        to.send(subframe);
+        sending = to
+            .send(subframe)
+            .then(
+              (_) => _consumed(from, length),
+              onError: (Object error) => failed(error, length),
+            );
       } on SwitchboardException catch (e) {
-        _log.warning(
-          'proxy: cannot forward ${subframe.length} bytes from channel '
-          '${from.id} to channel ${to.id}: ${e.status}',
-        );
-        final status = e.code == null
-            ? Status.of(StatusCode.internal)
-            : genericStatus(e.code!);
-        unawaited(to.close(status));
-        unawaited(from.close(status));
+        failed(e, length);
       }
     },
     onError: (Object e) => _log.fine('proxy: channel ${from.id} failed: $e'),
     onDone: () {
       unawaited(
-        from.done.then((status) {
-          final forwarded = _closeStatusFor(status);
+        from.done.then((status) async {
+          var forwarded = _closeStatusFor(status);
+          if (forwarded.isOk && bulk) {
+            // Closed once the window took the payload, as a Talk sender
+            // closes one: the CLOSE would wait behind what still waits
+            // for credit, but its confirmation is timed from the call, and
+            // would cut a reader slower than that. A reader that stalls is
+            // bounded by the parent: its graceful close waits for this
+            // transfer at most the close confirmation timeout, then cancels
+            // it, as its failure and the end of its pipe do.
+            await sending;
+          }
+          if (forwarded.isOk && twins.isNotEmpty) {
+            // A graceful close follows the bulk payloads forwarded before
+            // it, as it follows the subframes: the receiver must have them
+            // whole before the channel they belong to ends.
+            try {
+              await Future.wait<void>(twins.map((twin) => twin.done))
+                  .timeout(_twinWait(to));
+            } on TimeoutException {
+              _log.fine(
+                'proxy: channel ${to.id} closed with bulk payloads still '
+                'being forwarded',
+              );
+              forwarded = genericStatus(StatusCode.deadlineExceeded);
+              _cancelTwins(twins);
+            }
+          }
           return to.close(rewrite == null ? forwarded : rewrite(forwarded));
         }),
       );
@@ -189,7 +438,7 @@ Status _closeStatusFor(Status status) {
 ///    its time, for example to verify the session credential in the
 ///    application payload with an authentication service; meanwhile the
 ///    channel is not read (the mux buffers what the client sends, within
-///    its limits). It returns the address to forward to: the channel's
+///    the window it grants the client). It returns the address to forward to: the channel's
 ///    own [IncomingChannel.address], or a rewritten one (the shard slot
 ///    set from the verified account, the payload replaced by a credential
 ///    the backends trust, and so on), which steps 4 and 5 use instead of
@@ -252,11 +501,10 @@ Status _closeStatusFor(Status status) {
 ///    entry, or found with [SlotResolver.locateSlot] within
 ///    [Switchboard.slotRefreshTimeout]) with the same open payload, the
 ///    instance set to the new owner's, and the client does not notice.
-///    What the client sends meanwhile is held, at most
-///    [MuxOptions.maxChannelBufferBytes] of the node's
-///    [Switchboard.muxOptions] ([SlotChannel.maxHeldBytes]); beyond, the
-///    channel is closed with `RESOURCE_EXHAUSTED` (nothing was processed:
-///    the client may open it again).
+///    What the client sends meanwhile is held, and its credit goes back
+///    only once the replacement has taken it, so the client waits once it
+///    has used the window the proxy grants it: the proxy holds at most
+///    that window.
 ///    After the first subframe, or when no other owner is found, the
 ///    `MOVED` is forwarded to the client, which may open the channel again
 ///    and resend, since `MOVED` means nothing was processed (see
@@ -448,16 +696,25 @@ ChannelHandler proxyHandler(
             excludeOwnEndpoints: true,
             mayLocate: () => locates.take(client),
           ),
-          maxHeldBytes: switchboard.muxOptions.maxChannelBufferBytes,
+          // Bounded by flow control: what the client sends is held within
+          // the window granted to it, and its credit goes back only once
+          // the replacement takes it.
+          maxHeldBytes: 0,
         );
         await _pipe(
           _MuxEnd(incoming.channel),
           _SlotEnd(slotChannel),
           toA: hide,
+          bulkBound: forwarding,
         );
         return;
       }
-      await _pipe(_MuxEnd(incoming.channel), _MuxEnd(channel), toA: hide);
+      await _pipe(
+        _MuxEnd(incoming.channel),
+        _MuxEnd(channel),
+        toA: hide,
+        bulkBound: forwarding,
+      );
     } finally {
       forwarding.exit(client);
     }

@@ -188,6 +188,35 @@ class FramedByteTransport {
   /// Whether the stream has ended.
   bool get isEnded => _ended;
 
+  /// Whether a frame written now goes to the output without waiting behind
+  /// earlier output: nothing is queued and the output is not pausing the
+  /// transport. True once the output is closing or gone, where writes are
+  /// dropped.
+  bool get isOutputReady =>
+      _outputClosed ||
+      _outEndRequested ||
+      _aborted ||
+      (_outQueue.isEmpty && _canDeliver);
+
+  /// Completes when [isOutputReady] becomes true, at once if it is. Never
+  /// fails.
+  Future<void> get outputReady {
+    if (isOutputReady) {
+      return Future<void>.value();
+    }
+    return (_readyWaiter ??= Completer<void>()).future;
+  }
+
+  Completer<void>? _readyWaiter;
+
+  void _signalReady() {
+    final waiter = _readyWaiter;
+    if (waiter != null && isOutputReady) {
+      _readyWaiter = null;
+      waiter.complete();
+    }
+  }
+
   /// Destroys the connection: calls the abort hook, drops buffered output,
   /// ends the stream and completes the sink's `done`. Idempotent.
   void abort() {
@@ -200,6 +229,7 @@ class FramedByteTransport {
     );
     _outputClosed = true;
     _dropOutput();
+    _signalReady();
     _end();
     _stopLinger();
     _cancelInput();
@@ -467,6 +497,7 @@ class FramedByteTransport {
     if (_outEndRequested && _outQueue.isEmpty && !_out.isClosed) {
       unawaited(_out.close());
     }
+    _signalReady();
   }
 
   /// Pauses the input while too much output waits, resumes it once half
@@ -498,6 +529,7 @@ class FramedByteTransport {
   void _onOutputStreamDone() {
     _outputStreamCompleted = true;
     _outputClosed = true;
+    _signalReady();
     if (!_outputFinished.isCompleted) {
       _outputFinished.complete();
     }
@@ -513,6 +545,7 @@ class FramedByteTransport {
     _log.fine('${_framing.name}: output gone');
     _outputClosed = true;
     _dropOutput();
+    _signalReady();
     if (!_outputFinished.isCompleted) {
       _outputFinished.complete();
     }
@@ -522,6 +555,7 @@ class FramedByteTransport {
     _log.fine('${_framing.name} output failed: $error');
     _outputClosed = true;
     _dropOutput();
+    _signalReady();
     if (!_outputFinished.isCompleted) {
       _outputFinished.complete();
     }
@@ -546,6 +580,7 @@ class FramedByteTransport {
     }
     _outEndRequested = true;
     _drain();
+    _signalReady();
     try {
       await _closeSequence().timeout(closeTimeout);
     } on TimeoutException {

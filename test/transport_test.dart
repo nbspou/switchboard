@@ -463,9 +463,16 @@ void main() {
       expect(transport.bufferedOutputBytes, 8 + 10 * 104);
       expect(transport.isInputThrottled, isTrue);
       expect(toTransport.isPaused, isTrue);
+      expect(transport.isOutputReady, isFalse);
+      var ready = false;
+      final readiness = transport.outputReady.then((_) => ready = true);
+      await pumpEventQueue();
+      expect(ready, isFalse);
 
       output.resume();
-      await pumpEventQueue();
+      await readiness;
+      expect(transport.isOutputReady, isTrue);
+      await transport.outputReady;
       expect(transport.bufferedOutputBytes, 0);
       expect(transport.isInputThrottled, isFalse);
       expect(toTransport.isPaused, isFalse);
@@ -492,7 +499,11 @@ void main() {
       final output = fromTransport.stream.listen((_) {})..pause();
       transport.sink.add(hexBytes('02 02 00'));
       expect(transport.bufferedOutputBytes, 15);
+      expect(transport.isOutputReady, isFalse);
+      final readiness = transport.outputReady;
       await transport.sink.close();
+      await readiness;
+      expect(transport.isOutputReady, isTrue);
       expect(aborts, 1);
       expect(transport.bufferedOutputBytes, 0);
       expect(await received, isEmpty);

@@ -26,7 +26,7 @@ export 'src/naming/naming_client_io.dart';
 export 'src/switchboard/mesh.dart';
 export 'src/switchboard/outgoing_policy.dart';
 export 'src/switchboard/peer_set.dart';
-export 'src/switchboard/proxy.dart';
+export 'src/switchboard/proxy.dart' hide pipeChannelsWithin;
 export 'src/switchboard/relay.dart';
 export 'src/switchboard/relay_config.dart';
 export 'src/switchboard/slot_channel.dart';

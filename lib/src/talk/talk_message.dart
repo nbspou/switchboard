@@ -54,7 +54,57 @@ abstract class TalkMessage {
   String get procedureName => procedure.toString();
 
   /// The payload. It may be a view into the received buffer.
+  ///
+  /// For a bulk message ([isBulk]) delivered once its payload was
+  /// reassembled (the default, see [TalkOptions.streamBulk]), the
+  /// reassembled bytes, as if it had come inline. For one delivered with
+  /// its payload still arriving, [bulk] or [payloadBytes] read it: this
+  /// throws [StateError] until [payloadBytes] has completed, and the
+  /// failure's [SwitchboardException] if the payload failed.
   Uint8List get payload => frame.payload;
+
+  /// Whether the payload came on a bulk channel (the `BULK` flag) rather
+  /// than inline. See the wiki page "Polyverse Switchboard Talk", section
+  /// "Bulk payloads".
+  bool get isBulk;
+
+  /// The length the sender declared for a bulk payload; null when it did
+  /// not know it in advance, and for an inline message.
+  int? get bulkLength;
+
+  /// The payload as a byte stream, single subscription: for a bulk
+  /// message delivered as a stream ([TalkOptions.streamBulk]), the bytes as
+  /// they arrive, each chunk's flow-control credit going back to the
+  /// sender when the listener takes it, so that a paused subscription
+  /// stalls the transfer (and only it); otherwise the whole payload as one
+  /// event (none when empty).
+  ///
+  /// The stream ends with an error if the transfer failed: the status the
+  /// sender closed the bulk channel with, `PROTOCOL_ERROR` for another
+  /// number of bytes than declared, `DEADLINE_EXCEEDED` when the sender
+  /// sent nothing for [TalkOptions.bulkIdleTimeout] while this side waited
+  /// for it, `CONNECTION_LOST`. The message itself
+  /// stands: a request is still answered as usual. Cancelling the
+  /// subscription before the end tells the sender to stop (the bulk
+  /// channel is closed `CANCELLED`). A streamed payload can be read once:
+  /// a second call throws [StateError], as does one after [payloadBytes].
+  /// A payload nobody reads is cancelled once the request it belongs to
+  /// is answered, or when the channel closes.
+  ///
+  /// The responder timeout of a request with a bulk payload starts when
+  /// the request is delivered: once its payload is reassembled, or at once
+  /// when it is streamed. Reading a streamed payload for longer than
+  /// [TalkOptions.replyTimeout] is long work like any other: declare it
+  /// with [extend] (or [setReplyTimeout]), so that the requester waits too.
+  Stream<Uint8List> get bulk;
+
+  /// The whole payload, at most [maxLength] bytes (default
+  /// [TalkOptions.maxInlinePayload]): for a streamed bulk payload, read
+  /// from [bulk] and reassembled; beyond [maxLength] the bulk channel is
+  /// closed `RESOURCE_EXHAUSTED` and the future fails with it. Fails like
+  /// [bulk] when the transfer fails. Once it completes, [payload] returns
+  /// the same bytes.
+  Future<Uint8List> payloadBytes({int? maxLength});
 
   /// The peer's request id, or 0 if the peer expects no reply.
   int get requestId => frame.requestId;
@@ -101,7 +151,9 @@ abstract class TalkMessage {
   ///
   /// [procedure] is optional on responses; the requester knows what it
   /// asked. For a stream request this is the end of the stream and may
-  /// carry a trailing [payload].
+  /// carry a trailing [payload]. A [payload] too large for the channel's
+  /// frames (or for [TalkOptions.bulkThreshold]) is sent as a bulk payload
+  /// transparently; so are those of the other reply methods.
   ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition] if
   /// the message expects no reply, was already finally replied (including
@@ -154,12 +206,42 @@ abstract class TalkMessage {
     Name? name,
   });
 
+  /// Sends the final response with a bulk payload read from [bytes], whose
+  /// length is [length] (null: not known in advance): a bulk channel is
+  /// opened for it, the response goes with a reference to it, and the
+  /// stream is read in chunks as the receiver takes them (see
+  /// [TalkChannel.startRequest] for the details). [reply] does the same
+  /// with bytes in memory when they do not fit inline.
+  ///
+  /// The returned future completes once the payload was sent whole and
+  /// fails with the status the transfer ended with otherwise: the
+  /// receiver stopped it, the stream failed, the request was cancelled
+  /// (`CANCELLED`), the channel ended. It never reports an unhandled error.
+  /// Throws synchronously like [reply], and with
+  /// [StatusCode.unimplemented] over a channel that is not a mux channel.
+  Future<void> replyBulk(
+    Stream<List<int>> bytes, {
+    int? length,
+    String? procedure,
+    Name? name,
+  });
+
   /// Sends one stream item. Restarts the responder timeout.
   ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
   /// like [reply], and also if the request is not a stream request
   /// ([expectsStream] is false).
   void replyItem(Uint8List payload, {String? procedure, Name? name});
+
+  /// Sends one stream item with a bulk payload read from [bytes], as
+  /// [replyBulk] does for the final response. Restarts the responder
+  /// timeout. Throws like [replyItem].
+  Future<void> replyItemBulk(
+    Stream<List<int>> bytes, {
+    int? length,
+    String? procedure,
+    Name? name,
+  });
 
   /// Sends one stream item that is itself a request, and returns the peer's
   /// answer to it. Shorthand for [startReplyItemRequest] followed by

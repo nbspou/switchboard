@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@anthropic.com>
 */
 
 import 'dart:async';
@@ -20,6 +21,7 @@ import '../mux/mux_frame.dart';
 import '../name.dart';
 import '../status.dart';
 import '../status_closable.dart';
+import '../talk/talk_bulk.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
@@ -41,8 +43,8 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// refreshing the slot) with the same open payload, and takes over
 /// transparently. Subframes the caller sends while the replacement is
 /// being opened are sent on it, in order. At most [maxHeldBytes] are held
-/// meanwhile (each subframe counted as its length plus 32 bytes, as
-/// [MuxOptions.maxChannelBufferBytes] counts): a subframe beyond that is
+/// meanwhile (each subframe counted at its flow-control cost, its length
+/// plus 16 bytes, as the mux counts it): a subframe beyond that is
 /// dropped, the channel is closed with `RESOURCE_EXHAUSTED`, which [done]
 /// reports at once, and a replacement opened after all is closed with it
 /// too. Through `proxyHandler` the caller is a remote client, whose
@@ -64,18 +66,21 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// (`MovedStatus.fromStatus` reads them). It is never retried: the work
 /// may have taken effect, and only the application knows whether it can
 /// be repeated.
-class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
+class SlotChannel
+    with StreamChannelMixin<Uint8List>
+    implements StatusClosable, MuxChannelCarrier {
   /// Wraps [channel], the first channel opened for [slot] of [type];
   /// [reopen] opens the replacement. Created by
   /// `Switchboard.openChannelToSlot` and `proxyHandler`, with the node's
-  /// [MuxOptions.maxChannelBufferBytes] as [maxHeldBytes].
+  /// [MuxOptions.initialWindow] as [maxHeldBytes]: one window, what a
+  /// client of the proxy can send before it needs credit.
   @internal
   SlotChannel(
     this.type,
     this.slot,
     MuxChannel channel,
     this._reopen, {
-    this.maxHeldBytes = MuxOptions.defaultMaxChannelBufferBytes,
+    this.maxHeldBytes = MuxOptions.defaultInitialWindow,
   }) : _current = channel {
     _sink = _SlotChannelSink(this);
     _incoming = StreamController<Uint8List>(
@@ -99,14 +104,10 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   final int slot;
 
   /// Largest number of bytes held while the replacement is being opened,
-  /// each subframe counted as its length plus 32; beyond, the channel is
-  /// closed with `RESOURCE_EXHAUSTED`. 0 (or less) means no limit, as for
-  /// [MuxOptions.maxChannelBufferBytes].
+  /// each subframe counted at its flow-control cost (its length plus 16);
+  /// beyond, the channel is closed with `RESOURCE_EXHAUSTED`. 0 (or less)
+  /// means no limit.
   final int maxHeldBytes;
-
-  /// Accounting overhead of one held subframe, as the mux counts its
-  /// receive buffers, so that floods of empty subframes are bounded too.
-  static const int _subframeOverhead = 32;
 
   final SlotReopen _reopen;
   MuxChannel _current;
@@ -116,8 +117,9 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   late final StreamController<Uint8List> _incoming;
   StreamSubscription<Uint8List>? _subscription;
   final Completer<Status> _done = Completer<Status>();
-  final List<Uint8List> _pending = [];
+  final List<_Held> _pending = [];
   int _pendingBytes = 0;
+  bool _manualCredit = false;
 
   bool _sent = false;
   bool _received = false;
@@ -133,6 +135,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   /// The current underlying channel: the first one, or the replacement
   /// after a retry.
+  @override
   MuxChannel get channel => _current;
 
   /// Whether the channel was rejected with `MOVED` and replaced.
@@ -158,11 +161,15 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   @override
   Future<Status> get done => _done.future;
 
-  /// Sends one DATA subframe, as [MuxChannel.send]. While the replacement
-  /// channel is being opened the subframe is held and sent on it; one that
-  /// would take the held subframes beyond [maxHeldBytes] is dropped and
-  /// closes the channel with `RESOURCE_EXHAUSTED`.
-  void send(Uint8List subframe) {
+  /// Sends one DATA subframe, as [MuxChannel.send], whose future the
+  /// returned one is. While the replacement channel is being opened the
+  /// subframe is held and sent on it, and the future completes when that
+  /// send's does; it fails if the channel ends first. One that would take
+  /// the held subframes beyond [maxHeldBytes] is dropped and closes the
+  /// channel with `RESOURCE_EXHAUSTED`, and its future fails with that
+  /// status. A failure is never reported as unhandled.
+  @override
+  Future<void> send(Uint8List subframe) {
     if (_closeRequested != null) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
@@ -170,17 +177,43 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       );
     }
     if (_holding) {
-      final size = subframe.length + _subframeOverhead;
+      final size = MuxCredit.costOf(subframe.length);
       if (maxHeldBytes > 0 && _pendingBytes + size > maxHeldBytes) {
-        _overflowed();
-        return;
+        final status = _overflowed();
+        return Future<void>.error(SwitchboardException(status))..ignore();
       }
-      _pending.add(subframe);
+      final held = _Held(subframe);
+      _pending.add(held);
       _pendingBytes += size;
-      return;
+      return held.completer.future;
     }
     _sent = true;
-    _current.send(subframe);
+    return _current.send(subframe);
+  }
+
+  /// As [MuxChannel.manualCredit], for the current channel and a
+  /// replacement.
+  bool get manualCredit => _manualCredit;
+
+  @override
+  set manualCredit(bool value) {
+    _manualCredit = value;
+    _current.manualCredit = value;
+  }
+
+  /// As [MuxChannel.consumed], on the current channel: subframes come from
+  /// the replacement only if none came from the first channel.
+  @override
+  void consumed(int bytes, {int subframes = 1}) =>
+      _current.consumed(bytes, subframes: subframes);
+
+  /// Gives up the retry: the channel stays on its current mux channel
+  /// whatever ends it, as once something was sent. A forwarded bulk
+  /// channel, opened on the current mux channel in either direction,
+  /// commits it.
+  @internal
+  void commit() {
+    _sent = true;
   }
 
   /// Whether a subframe must be held for a possible replacement: one is
@@ -206,14 +239,25 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   }
 
   void _dropPending() {
+    if (_pending.isEmpty) {
+      return;
+    }
+    final error = SwitchboardException.of(
+      StatusCode.failedPrecondition,
+      'slot channel ended before the subframe was sent',
+    );
+    final held = List.of(_pending);
     _pending.clear();
     _pendingBytes = 0;
+    for (final h in held) {
+      h.completer.completeError(error);
+    }
   }
 
   /// Stops holding: the held subframes went beyond [maxHeldBytes]. The
   /// channel ends at once with `RESOURCE_EXHAUSTED`; a replacement being
   /// opened is closed with it as soon as it is open.
-  void _overflowed() {
+  Status _overflowed() {
     final status = Status.of(
       StatusCode.resourceExhausted,
       'send buffer of $maxHeldBytes bytes exceeded',
@@ -232,6 +276,7 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       unawaited(_current.close(status));
     }
     _finish(status);
+    return status;
   }
 
   void _watch(MuxChannel channel) {
@@ -332,6 +377,9 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       return;
     }
     _log.fine('$type/$slot moved ($moved), retried on $next');
+    next.manualCredit = _manualCredit;
+    // Bulk channels the new owner opens go where the first one's would.
+    BulkRoutes.follow(_current, next);
     _current = next;
     _watch(next);
     if (_incoming.hasListener) {
@@ -343,14 +391,20 @@ class SlotChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       return;
     }
     final pending = List.of(_pending);
-    _dropPending();
+    _pending.clear();
+    _pendingBytes = 0;
     try {
-      for (final subframe in pending) {
+      for (final held in pending) {
         _sent = true;
-        next.send(subframe);
+        held.completer.complete(next.send(held.subframe));
       }
     } on SwitchboardException catch (e) {
       _log.fine('$type/$slot: held subframes not sent: ${e.status}');
+      for (final held in pending) {
+        if (!held.completer.isCompleted) {
+          held.completer.completeError(e);
+        }
+      }
       unawaited(next.close(e.status.isOk ? Status.ok : e.status));
     }
   }
@@ -373,7 +427,7 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
       throw StateError('slot channel sink is closed');
     }
     if (_channel.canSend) {
-      _channel.send(event);
+      _channel.send(event).ignore();
     }
   }
 
@@ -392,6 +446,9 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
     unawaited(_channel.close(status));
   }
 
+  /// Sends every subframe of [stream], each once the one before it was
+  /// handed over, as [MuxChannel.sink]'s `addStream` does. A size refusal
+  /// after waiting for LIMITS, or an overflow during retry, fails the call.
   @override
   Future<void> addStream(Stream<Uint8List> stream) async {
     await for (final subframe in stream) {
@@ -399,7 +456,16 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
         break;
       }
       if (_channel.canSend) {
-        _channel.send(subframe);
+        // A subframe the channel refuses (too large) fails the call.
+        final sent = _channel.send(subframe);
+        try {
+          await sent;
+        } on SwitchboardException catch (e) {
+          if (e.code != StatusCode.failedPrecondition) {
+            rethrow;
+          }
+          // Closed while waiting: dropped, as add drops it.
+        }
       }
     }
   }
@@ -412,4 +478,16 @@ class _SlotChannelSink implements StreamSink<Uint8List> {
 
   @override
   Future<void> get done => _channel.done;
+}
+
+/// A subframe held while the replacement channel is being opened.
+class _Held {
+  _Held(this.subframe);
+
+  final Uint8List subframe;
+
+  final Completer<void> completer = Completer<void>()
+    // A failure is reported to whoever awaits the future, never as an
+    // unhandled error.
+    ..future.ignore();
 }

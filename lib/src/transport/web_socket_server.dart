@@ -254,7 +254,11 @@ abstract final class WebSocketServerTransport {
 /// the connection be torn down.
 final class WebSocketServerChannel
     with StreamChannelMixin<Uint8List>
-    implements FrameLimited, AbortableTransport, OutputBufferedTransport {
+    implements
+        FrameLimited,
+        AbortableTransport,
+        OutputBufferedTransport,
+        OutputReadyTransport {
   WebSocketServerChannel._(
     Socket socket, {
     required this.protocol,
@@ -321,6 +325,14 @@ final class WebSocketServerChannel
   /// Whether reading the socket is paused because too much output waits.
   @override
   bool get isInputThrottled => _core.isInputThrottled;
+
+  /// Whether the socket takes a frame written now without it waiting
+  /// behind earlier output.
+  @override
+  bool get isOutputReady => _core.isOutputReady;
+
+  @override
+  Future<void> get outputReady => _core.outputReady;
 
   /// Destroys the socket, drops buffered output, ends the stream and
   /// completes the sink's `done`. Idempotent.

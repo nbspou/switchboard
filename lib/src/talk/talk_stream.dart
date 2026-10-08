@@ -23,8 +23,14 @@ abstract class TalkStream {
   int get requestId;
 
   /// The `STREAM_ITEM` responses, in order. Single subscription; items are
-  /// buffered until listened, and while the subscription is paused, with no
-  /// byte bound, as for [TalkChannel.messages].
+  /// buffered until listened, and while the subscription is paused. As for
+  /// [TalkChannel.messages], over a mux channel the credit of an item goes
+  /// back to the peer when the item is handed to the listener, so the
+  /// channel's window bounds the buffer: a subscription that is paused, or
+  /// never made, stalls the whole channel once the window is used up (the
+  /// final response included) until the request ends, by its timeout
+  /// say, when what the items hold goes back at once (they stay
+  /// deliverable). Listen, or cancel the subscription.
   ///
   /// Ends normally when the final response arrives. Emits an error and ends
   /// when the request fails: a [TalkAbortException] when the peer aborts

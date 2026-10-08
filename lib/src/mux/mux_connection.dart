@@ -19,12 +19,15 @@ import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
 
+import '../address/channel_address.dart';
+import '../bytes.dart';
 import '../identity/credential.dart';
 import '../identity/credential_verifier.dart';
 import '../identity/ed25519.dart';
 import '../identity/holder_key.dart';
 import '../identity/peer_identity.dart';
 import '../identity/secure_random.dart';
+import '../name.dart';
 import '../status.dart';
 import '../transport/transport_capabilities.dart';
 import 'mux_channel.dart';
@@ -44,13 +47,16 @@ class MuxOptions {
     this.goAwayGrace = const Duration(seconds: 10),
     this.announceLimits = true,
     this.maxPendingRejections = defaultMaxPendingRejections,
-    this.maxChannelBufferBytes = defaultMaxChannelBufferBytes,
     this.receiveHighWaterMarkBytes = defaultReceiveHighWaterMarkBytes,
     this.closeConfirmTimeout = const Duration(seconds: 30),
     this.maxOpenPayloadBytes = defaultMaxOpenPayloadBytes,
     this.identityVerifier,
     this.identityTimeout = const Duration(seconds: 10),
     this.requireNamedIdent = false,
+    this.initialWindow = defaultInitialWindow,
+    this.bulkZipper = defaultBulkZipper,
+    this.bulkChunkSize = defaultBulkChunkSize,
+    this.awaitPeerLimits = true,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -62,14 +68,21 @@ class MuxOptions {
   /// Default [maxPendingRejections].
   static const int defaultMaxPendingRejections = 1024;
 
-  /// Default [maxChannelBufferBytes]: 4 MiB.
-  static const int defaultMaxChannelBufferBytes = 4 * 1024 * 1024;
-
   /// Default [receiveHighWaterMarkBytes]: 16 MiB.
   static const int defaultReceiveHighWaterMarkBytes = 16 * 1024 * 1024;
 
   /// Default [maxOpenPayloadBytes]: 16 MiB.
   static const int defaultMaxOpenPayloadBytes = 16 * 1024 * 1024;
+
+  /// Default [initialWindow]: 64 KiB, the window a peer assumes before our
+  /// LIMITS arrives ([MuxLimits.defaultInitialWindow]).
+  static const int defaultInitialWindow = MuxLimits.defaultInitialWindow;
+
+  /// Default [bulkZipper]: one bulk frame after 4 ordinary ones.
+  static const int defaultBulkZipper = 4;
+
+  /// Default [bulkChunkSize]: 64 KiB.
+  static const int defaultBulkChunkSize = 64 * 1024;
 
   /// Largest incoming mux frame, header included, that we accept; a larger
   /// one ends the connection with GOAWAY `FRAME_TOO_LARGE`. Announced with
@@ -104,9 +117,10 @@ class MuxOptions {
   /// A reply or connection close cancels the probe timer even when the
   /// transport delivers it synchronously during the PING write.
   ///
-  /// While a transport implementing [OutputBufferedTransport] has stopped
-  /// reading because of our unsent output, the peer reading that output
-  /// counts as hearing from it.
+  /// While our output to a transport implementing [OutputBufferedTransport]
+  /// is backed up (the transport stopped reading because of it, or the
+  /// output scheduler holds frames the transport has not taken), the peer
+  /// reading that output counts as hearing from it.
   final Duration keepAliveTimeout;
 
   /// How long [MuxConnection.goAway] waits for open channels to finish.
@@ -119,31 +133,31 @@ class MuxOptions {
   /// a channel and still wait for the peer's CLOSE: peer OPENs we rejected
   /// (beyond [maxChannels], after GOAWAY, or with nobody listening to
   /// [MuxConnection.incoming]) and channels whose close confirmation timed
-  /// out ([closeConfirmTimeout]). Each costs only its id; beyond the cap
-  /// the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. 0 means
-  /// unlimited.
+  /// out ([closeConfirmTimeout]). Each costs its id and the receive window
+  /// the peer may still use, against which its late DATA, dropped, is
+  /// still checked; beyond the cap the connection ends with GOAWAY
+  /// `RESOURCE_EXHAUSTED`. 0 means unlimited.
   final int maxPendingRejections;
 
-  /// Largest number of bytes buffered for one channel while nobody listens
-  /// to its stream or the subscription is paused. Each subframe counts as
-  /// its length plus 32 bytes. Beyond it the channel is closed with CLOSE
-  /// `RESOURCE_EXHAUSTED` and its buffer dropped; the connection is not
-  /// affected. 0 means unlimited.
-  final int maxChannelBufferBytes;
-
-  /// Bytes buffered over all channels (counted as for
-  /// [maxChannelBufferBytes]) above which the connection stops reading the
-  /// transport, which pushes back on the peer through the transport's own
-  /// flow control. Reading resumes once the buffers drain to half of it.
-  /// Keep-alive does not probe while reading is paused. 0 means never
-  /// pause.
+  /// Bytes buffered over all channels (see [MuxConnection.bufferedBytes],
+  /// each subframe counted at its flow-control cost, its length plus 16)
+  /// above which the connection stops reading the transport, which pushes
+  /// back on the peer through the transport's own flow control. Reading
+  /// resumes once the buffers drain to half of it. Keep-alive does not
+  /// probe while reading is paused. 0 means never pause.
+  ///
+  /// The window of each channel ([initialWindow]) bounds what a peer can
+  /// make one channel hold; this mark is the backstop for all of them
+  /// together. Default 16 MiB.
   final int receiveHighWaterMarkBytes;
 
   /// How long [MuxChannel.close] waits for the peer's confirming CLOSE.
   ///
   /// On expiry the channel is considered closed locally: [MuxChannel.done]
   /// completes with the first status sent or received and the channel no
-  /// longer counts as open. Nothing is sent. The id stays reserved until
+  /// longer counts as open. Nothing is sent but our CLOSE, if it still
+  /// waited behind subframes waiting for credit: they are dropped, and an
+  /// `OK` close becomes `DEADLINE_EXCEEDED`. The id stays reserved until
   /// the peer's CLOSE arrives after all, or until the connection ends,
   /// because reusing it while the peer may still consider the channel open
   /// would let the peer's late frames for the old channel land on a new
@@ -191,6 +205,44 @@ class MuxOptions {
   /// node's identification can be relayed to it.
   final bool requireNamedIdent;
 
+  /// The flow-control window, in bytes of cost (a subframe's length plus
+  /// 16), this side announces in LIMITS and grants every channel in the
+  /// peer's direction: what the peer may send on a channel before this side
+  /// returns credit. 1 to `2^32 - 1`; default 64 KiB.
+  ///
+  /// Only announced with [announceLimits]; without LIMITS the peer assumes
+  /// 64 KiB, which is then what this side grants too.
+  final int initialWindow;
+
+  /// The output scheduler's zipper between ordinary and bulk channels
+  /// ([MuxChannel.priority]): while frames of bulk channels wait for the
+  /// transport, one of them goes after this many ordinary frames, so that
+  /// sustained ordinary traffic cannot starve a transfer. At least 1;
+  /// default 4.
+  final int bulkZipper;
+
+  /// The largest chunk, in payload bytes, that [MuxChannel.send] cuts a
+  /// payload into on a bulk channel (also bounded by the peer's frame
+  /// limit and the window), so that a frame of another channel waits at
+  /// most one chunk's serialization time behind a transfer. At least 1;
+  /// default 64 KiB.
+  final int bulkChunkSize;
+
+  /// Whether DATA waits for the peer's LIMITS: on a channel opened before
+  /// the peer's first frame arrived, OPEN and CLOSE go at once but DATA
+  /// waits until that frame is here, so that the window and the frame
+  /// limit the peer announces apply to it (a peer announcing a small
+  /// window, an embedded device say, may treat DATA beyond it as a
+  /// protocol error). The wait ends with the peer's LIMITS, or with any
+  /// other first frame (a peer that announces sends LIMITS first, so one
+  /// that sends something else first does not announce), or after
+  /// [keepAliveTimeout]; then the window is the one announced, or the
+  /// 64 KiB a sender assumes without LIMITS. Default true; false sends at
+  /// once against the 64 KiB assumption, the window of a channel opened
+  /// before the LIMITS staying at it. See the wiki page "Polyverse
+  /// Switchboard Mux", section "Flow control".
+  final bool awaitPeerLimits;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -203,13 +255,16 @@ class MuxOptions {
     Duration? goAwayGrace,
     bool? announceLimits,
     int? maxPendingRejections,
-    int? maxChannelBufferBytes,
     int? receiveHighWaterMarkBytes,
     Duration? closeConfirmTimeout,
     int? maxOpenPayloadBytes,
     CredentialVerifier? identityVerifier,
     Duration? identityTimeout,
     bool? requireNamedIdent,
+    int? initialWindow,
+    int? bulkZipper,
+    int? bulkChunkSize,
+    bool? awaitPeerLimits,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -221,7 +276,6 @@ class MuxOptions {
     goAwayGrace: goAwayGrace ?? this.goAwayGrace,
     announceLimits: announceLimits ?? this.announceLimits,
     maxPendingRejections: maxPendingRejections ?? this.maxPendingRejections,
-    maxChannelBufferBytes: maxChannelBufferBytes ?? this.maxChannelBufferBytes,
     receiveHighWaterMarkBytes:
         receiveHighWaterMarkBytes ?? this.receiveHighWaterMarkBytes,
     closeConfirmTimeout: closeConfirmTimeout ?? this.closeConfirmTimeout,
@@ -229,6 +283,10 @@ class MuxOptions {
     identityVerifier: identityVerifier ?? this.identityVerifier,
     identityTimeout: identityTimeout ?? this.identityTimeout,
     requireNamedIdent: requireNamedIdent ?? this.requireNamedIdent,
+    initialWindow: initialWindow ?? this.initialWindow,
+    bulkZipper: bulkZipper ?? this.bulkZipper,
+    bulkChunkSize: bulkChunkSize ?? this.bulkChunkSize,
+    awaitPeerLimits: awaitPeerLimits ?? this.awaitPeerLimits,
   );
 }
 
@@ -244,7 +302,19 @@ class MuxConnection {
   /// Sends LIMITS at once if [MuxOptions.announceLimits] is set. If the
   /// transport implements [FrameLimited] with a limit below
   /// [MuxOptions.maxFrameSize], logs a warning and announces the
-  /// transport's limit.
+  /// transport's limit. Throws [ArgumentError] if
+  /// [MuxOptions.initialWindow] is not 1 to `2^32 - 1`, or if
+  /// [MuxOptions.bulkZipper] or [MuxOptions.bulkChunkSize] is below 1.
+  ///
+  /// Frames go to the transport as the application produces them; when the
+  /// transport implements [OutputReadyTransport] and is not ready, DATA
+  /// frames wait in per-channel queues and an output scheduler picks the
+  /// order in which they go once it is: control messages first (they are
+  /// never held), then ordinary channels, one frame per channel in turn,
+  /// then bulk channels ([MuxChannel.priority]), with one bulk frame after
+  /// [MuxOptions.bulkZipper] ordinary ones while bulk frames wait. The
+  /// order within a channel never changes. See the wiki page "Polyverse
+  /// Switchboard Mux", section "Output scheduling".
   MuxConnection(
     StreamChannel<Uint8List> transport, {
     required this.isInitiator,
@@ -252,6 +322,28 @@ class MuxConnection {
   }) : _transport = transport,
        _firstId = isInitiator ? 2 : 3,
        _firstLongId = MuxFrame.maxShortId + (isInitiator ? 1 : 2) {
+    if (options.initialWindow < 1 ||
+        options.initialWindow > MuxLimits.maxWindow) {
+      throw ArgumentError.value(
+        options.initialWindow,
+        'options.initialWindow',
+        'must be 1 to ${MuxLimits.maxWindow}',
+      );
+    }
+    if (options.bulkZipper < 1) {
+      throw ArgumentError.value(
+        options.bulkZipper,
+        'options.bulkZipper',
+        'must be at least 1',
+      );
+    }
+    if (options.bulkChunkSize < 1) {
+      throw ArgumentError.value(
+        options.bulkChunkSize,
+        'options.bulkChunkSize',
+        'must be at least 1',
+      );
+    }
     _nextShortId = _firstId;
     _nextLongId = _firstLongId;
     var shortIds = (MuxFrame.maxShortId - _firstId) ~/ 2 + 1;
@@ -283,6 +375,10 @@ class MuxConnection {
         receiveLimit = transportLimit;
       }
     }
+    // The peer may reply synchronously while our LIMITS is written.
+    // Establish the wait first so that such a reply ends it permanently.
+    _limitsKnown =
+        !options.awaitPeerLimits || options.keepAliveTimeout <= Duration.zero;
     _subscription = transport.stream.listen(
       _onFrame,
       onError: _onTransportError,
@@ -294,9 +390,23 @@ class MuxConnection {
           MuxLimits(
             maxFrameSize: _clampU32(receiveLimit),
             maxChannels: _clampU32(options.maxChannels),
+            initialWindow: options.initialWindow,
           ),
         ).toFrame(),
       );
+    }
+    if (!_limitsKnown && !_closing) {
+      _limitsTimer = Timer(options.keepAliveTimeout, () {
+        _limitsTimer = null;
+        if (!_limitsKnown) {
+          _log.fine(
+            '$this: no frame from the peer within '
+            '${options.keepAliveTimeout}; sending against the 64 KiB '
+            'window assumed without LIMITS',
+          );
+        }
+        _endLimitsWait();
+      });
     }
     _startKeepAlive();
   }
@@ -314,7 +424,8 @@ class MuxConnection {
   final Queue<MuxChannelLink> _undelivered = Queue<MuxChannelLink>();
   final Map<int, MuxChannelLink> _links = {};
   // Ids we sent CLOSE for, without a channel, awaiting the peer's CLOSE.
-  final Set<int> _awaitingClose = {};
+  // Remaining receive credit is kept even after channel state is released.
+  final Map<int, int> _awaitingClose = {};
   final Completer<Status> _done = Completer<Status>();
   final List<_PendingPing> _pings = [];
   final int _firstId;
@@ -341,6 +452,12 @@ class MuxConnection {
   int _sentBytes = 0;
   int _receivedBytes = 0;
   MuxLimits? _peerLimits;
+  // False until the peer's first frame (its LIMITS, normally) arrived, or
+  // the wait for it ended (MuxOptions.awaitPeerLimits).
+  bool _limitsKnown = true;
+  Timer? _limitsTimer;
+  // Channels opened before then; their DATA waits.
+  final List<MuxChannelLink> _awaitingLimits = [];
   Completer<void>? _idle;
   Future<void>? _closeFuture;
 
@@ -426,15 +543,23 @@ class MuxConnection {
   /// whose close confirmation timed out, are not counted.
   int get openChannelCount => _openCount;
 
+  /// The channel with [id] that is not mutually closed yet, if any: one
+  /// of [channels].
+  @internal
+  MuxChannel? channelWithId(int id) => _links[id]?.channel;
+
   /// The channels counted by [openChannelCount], as a snapshot.
   Iterable<MuxChannel> get channels => [
     for (final link in _links.values) link.channel,
   ];
 
-  /// Bytes buffered in the receive queues of all channels, counted as for
-  /// [MuxOptions.maxChannelBufferBytes], plus the OPEN payloads held for
-  /// the channels the peer opened until they are closed and delivered (see
-  /// [MuxOptions.maxOpenPayloadBytes]).
+  /// Bytes received and not delivered to a stream's listener yet over all
+  /// channels, at their flow-control cost (a subframe's length plus 16),
+  /// plus the OPEN payloads held for the channels the peer opened until
+  /// they are closed and delivered (see [MuxOptions.maxOpenPayloadBytes]).
+  /// Compared against [MuxOptions.receiveHighWaterMarkBytes]. What a
+  /// listener with [MuxChannel.manualCredit] holds is not counted (see
+  /// there); each channel's window bounds it.
   int get bufferedBytes => _bufferedBytes;
 
   /// Bytes of OPEN payloads held for the channels the peer opened that are
@@ -668,14 +793,24 @@ class MuxConnection {
   /// if no channel id is free or the peer's announced channel limit is
   /// reached; with [StatusCode.frameTooLarge] if the OPEN frame would
   /// exceed the peer's announced frame limit.
-  MuxChannel open(Uint8List openPayload) {
-    if (_closing || _goAwaySent) {
+  MuxChannel open(Uint8List openPayload) =>
+      _openLink(openPayload, openWritten: true).channel;
+
+  /// Opens a channel: sends its OPEN unless [openWritten] is false, when
+  /// the caller hands it to the output scheduler in its place
+  /// ([MuxChannel.openAfter]).
+  MuxChannelLink _openLink(Uint8List openPayload, {required bool openWritten}) {
+    // A channel opened after another one ([MuxChannel.openAfter]: a Talk
+    // bulk channel) continues work the connection admitted already: a
+    // GOAWAY, ours or the peer's, does not stop it.
+    final continuation = !openWritten;
+    if (_closing || (_goAwaySent && !continuation)) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'connection is closing',
       );
     }
-    if (_peerGoAway != null) {
+    if (_peerGoAway != null && !continuation) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'peer is going away',
@@ -704,14 +839,66 @@ class MuxConnection {
       id,
       isLocallyOpened: true,
       openPayload: payload,
+      sendWindow: _peerInitialWindow,
+      awaitingLimits: !_limitsKnown,
+      // The peer learns of the channel after our LIMITS.
+      receiveWindow: _localInitialWindow,
+      creditWindow: _localInitialWindow,
     );
+    if (!_limitsKnown) {
+      _awaitingLimits.add(link);
+    }
     _links[id] = link;
     _openCount++;
     if (_isOwnShortId(id)) {
       _shortIdsInUse++;
     }
-    _sendFrame(MuxFrame.open(id, payload));
-    return link.channel;
+    if (openWritten) {
+      _sendFrame(MuxFrame.open(id, payload));
+    } else {
+      link
+        ..openWritten = false
+        ..holdsFrames = true;
+    }
+    return link;
+  }
+
+  /// The OPEN of [link] will never be written: the channel ends locally
+  /// and its id is free again (the peer never heard of it).
+  void _openFailed(MuxChannelLink link, Status status) {
+    if (!identical(_links[link.id], link) || link.openWritten) {
+      return;
+    }
+    _links.remove(link.id);
+    _openCount--;
+    if (_isOwnShortId(link.id)) {
+      _shortIdsInUse--;
+    }
+    _awaitingLimits.remove(link);
+    final nested = [for (final (_, opens) in link.preOpen) ?opens];
+    link.neverOpened(status);
+    for (final opens in nested) {
+      _openFailed(opens, status);
+    }
+    scheduleMicrotask(_checkIdle);
+  }
+
+  /// Ends the wait for the peer's LIMITS: the channels opened meanwhile
+  /// get the window it announced (64 KiB without one) and send the DATA
+  /// that waited.
+  void _endLimitsWait() {
+    if (_limitsKnown) {
+      return;
+    }
+    _limitsKnown = true;
+    _limitsTimer?.cancel();
+    _limitsTimer = null;
+    final window = _peerInitialWindow;
+    final links = List.of(_awaitingLimits);
+    _awaitingLimits.clear();
+    for (final link in links) {
+      link.limitsKnown(window);
+    }
   }
 
   /// Most PINGs of [ping] awaiting their PONG. Beyond it, the oldest
@@ -866,7 +1053,7 @@ class MuxConnection {
       id += 2;
       if (MuxFrame.isReservedId(candidate) ||
           _links.containsKey(candidate) ||
-          _awaitingClose.contains(candidate)) {
+          _awaitingClose.containsKey(candidate)) {
         continue;
       }
       return candidate;
@@ -876,17 +1063,296 @@ class MuxConnection {
 
   // Sending -------------------------------------------------------------
 
+  /// Writes [frame] to the transport now, whatever is held: control
+  /// messages, OPEN, and CLOSE frames with nothing queued before them.
   void _sendFrame(MuxFrame frame) {
     if (!_writable) {
       return;
     }
+    _write(frame.encode());
+  }
+
+  void _write(Uint8List bytes) {
+    if (!_writable) {
+      return;
+    }
     try {
-      final bytes = frame.encode();
       _transport.sink.add(bytes);
       _sentBytes += bytes.length;
     } on Object catch (e) {
       _log.fine('$this: transport write failed: $e');
       _writable = false;
+    }
+  }
+
+  // Output scheduling ----------------------------------------------------
+  //
+  // DATA waits here, in one queue per channel id, while the transport is
+  // not ready (OutputReadyTransport); a CLOSE waits behind the DATA queued
+  // before it, so the order within a channel is kept. Control messages and
+  // the other frames go straight to the transport. Queues take turns: the
+  // ordinary ones first, one frame each, then the bulk ones, with a bulk
+  // turn after bulkZipper ordinary frames while bulk frames wait. Queues
+  // are keyed by id and an id is reused only once its CLOSE went out, so
+  // a new OPEN never overtakes an old CLOSE.
+
+  final Map<int, _OutQueue> _outQueues = {};
+  // Intrusive lists: taking the first turn, adding one and removing the
+  // turn of a closed channel (while the transport does not drain the
+  // lists) are constant time. A LinkedHashSet would not do: on the VM its
+  // first element is found by scanning past the ones removed before it.
+  final LinkedList<_OutQueue> _ordinaryTurns = LinkedList<_OutQueue>();
+  final LinkedList<_OutQueue> _bulkTurns = LinkedList<_OutQueue>();
+  int _ordinarySinceBulk = 0;
+  int _heldOutputFrames = 0;
+  int _heldOutputBytes = 0;
+  bool _awaitingOutput = false;
+  bool _pumping = false;
+
+  /// Bytes of the encoded frames the output scheduler holds because the
+  /// transport was not ready to take them (see [OutputReadyTransport]).
+  /// DATA is held only once its channel's send window took it, so this is
+  /// bounded by the windows the peer granted, plus a CLOSE per channel.
+  int get heldOutputBytes => _heldOutputBytes;
+
+  bool get _outputReady {
+    final transport = _transport;
+    return transport is! OutputReadyTransport ||
+        (transport as OutputReadyTransport).isOutputReady;
+  }
+
+  /// Hands [frame] of [link] to the output ([MuxChannelHost.sendChannelFrame]):
+  /// held with the channel while it holds frames, else scheduled.
+  void _sendChannelFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) {
+    if (!_writable) {
+      return;
+    }
+    if (link.holdsFrames) {
+      // The channel's own OPEN waits behind its parent's frames, or the
+      // frames that waited for it are going out: this one follows them.
+      // send has handed the payload over: the caller may reuse it now.
+      (link.preOpen = link.preOpen.isEmpty ? [] : link.preOpen).add((
+        MuxFrame(
+          frame.command,
+          frame.channelId,
+          Uint8List.fromList(frame.payload),
+        ),
+        opens,
+      ));
+      return;
+    }
+    _scheduleFrame(link, frame, opens: opens);
+  }
+
+  /// Writes [frame] of [link] now, or holds it in its channel's queue if
+  /// it is DATA and the transport is not ready (or other frames are held),
+  /// or anything behind DATA held for the channel.
+  void _scheduleFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) {
+    if (!_writable) {
+      return;
+    }
+    final id = link.id;
+    final isData = frame.command == MuxCommand.data;
+    var queue = _outQueues[id];
+    if (queue == null) {
+      if (!isData || (_heldOutputFrames == 0 && _outputReady)) {
+        if (isData) {
+          link.dataWritten(MuxCredit.costOf(frame.payload.length));
+        }
+        _writeOpening(frame.encode(), opens);
+        return;
+      }
+      queue = _outQueues[id] = _OutQueue(id);
+    }
+    final bytes = frame.encode();
+    queue.frames.add(_OutFrame(bytes, isData: isData, opens: opens));
+    _heldOutputFrames++;
+    _heldOutputBytes += bytes.length;
+    if (!queue.listed) {
+      _takeTurn(queue);
+    }
+    _pump();
+  }
+
+  /// Puts [queue] at the end of the turns of its channel's tier.
+  void _takeTurn(_OutQueue queue) {
+    final link = _links[queue.id];
+    if (link != null && link.channel.priority == MuxPriority.bulk) {
+      _bulkTurns.add(queue);
+    } else {
+      _ordinaryTurns.add(queue);
+    }
+  }
+
+  void _reprioritize(MuxChannelLink link) {
+    final queue = _outQueues[link.id];
+    if (queue == null || !queue.listed || !identical(_links[link.id], link)) {
+      return;
+    }
+    queue.unlink();
+    _takeTurn(queue);
+  }
+
+  /// The queue whose turn it is, or null when none holds a frame.
+  _OutQueue? _nextTurn() {
+    while (true) {
+      final bulkWaiting = _bulkTurns.isNotEmpty;
+      final _OutQueue queue;
+      if (_ordinaryTurns.isNotEmpty &&
+          (!bulkWaiting || _ordinarySinceBulk < options.bulkZipper)) {
+        queue = _ordinaryTurns.first..unlink();
+        if (bulkWaiting) {
+          _ordinarySinceBulk++;
+        }
+      } else if (bulkWaiting) {
+        queue = _bulkTurns.first..unlink();
+        _ordinarySinceBulk = 0;
+      } else {
+        return null;
+      }
+      if (queue.frames.isNotEmpty) {
+        return queue;
+      }
+    }
+  }
+
+  /// Writes held frames while the transport takes them.
+  void _pump() {
+    if (_pumping) {
+      return;
+    }
+    _pumping = true;
+    try {
+      while (_heldOutputFrames > 0 && _writable) {
+        if (!_outputReady) {
+          _awaitOutput();
+          return;
+        }
+        final queue = _nextTurn();
+        if (queue == null) {
+          return;
+        }
+        _writeHead(queue);
+      }
+    } finally {
+      _pumping = false;
+    }
+  }
+
+  /// Writes the first frame of [queue] and gives it its next turn.
+  void _writeHead(_OutQueue queue) {
+    final frame = queue.frames.removeFirst();
+    _heldOutputFrames--;
+    _heldOutputBytes -= frame.bytes.length;
+    if (queue.frames.isEmpty) {
+      _outQueues.remove(queue.id);
+    } else {
+      _takeTurn(queue);
+    }
+    if (frame.isData) {
+      _links[queue.id]?.dataWritten(
+        MuxCredit.costOf(frame.bytes.length - MuxFrame.headerSizeFor(queue.id)),
+      );
+    }
+    _writeOpening(frame.bytes, frame.opens);
+  }
+
+  /// Makes an OPEN visible before writing it: a synchronous peer may
+  /// respond during the write. Until this point its id is only reserved
+  /// locally, and DATA or CLOSE from the peer must be refused.
+  void _writeOpening(Uint8List bytes, MuxChannelLink? opens) {
+    if (opens != null) {
+      opens.openWritten = true;
+    }
+    _write(bytes);
+    if (opens != null) {
+      _openWritten(opens);
+    }
+  }
+
+  /// The OPEN of [link] ([MuxChannel.openAfter]) was written: what the
+  /// channel sent meanwhile follows it.
+  void _openWritten(MuxChannelLink link) {
+    link.openWritten = true;
+    link.openWrittenAfterClose();
+    try {
+      // Read as it grows: what a synchronous peer's answer makes the
+      // channel hand over meanwhile is added behind.
+      for (var i = 0; i < link.preOpen.length; i++) {
+        final (frame, opens) = link.preOpen[i];
+        if (link.closeReceived && frame.command == MuxCommand.data) {
+          // The peer closed the channel meanwhile (a synchronous
+          // transport): DATA would land on an id it considers closed.
+          continue;
+        }
+        _scheduleFrame(link, frame, opens: opens);
+      }
+    } finally {
+      link
+        ..preOpen = const []
+        ..holdsFrames = false;
+    }
+  }
+
+  void _awaitOutput() {
+    if (_awaitingOutput) {
+      return;
+    }
+    _awaitingOutput = true;
+    (_transport as OutputReadyTransport).outputReady.then(
+      (_) {
+        _awaitingOutput = false;
+        _pump();
+      },
+      onError: (Object _) {
+        _awaitingOutput = false;
+      },
+    );
+  }
+
+  /// Drops the DATA queued for [id], whose CLOSE the peer sent, and writes
+  /// what follows it (our CLOSE) at once, so that nothing stays queued for
+  /// an id that is about to be free.
+  void _dropQueuedData(int id) {
+    final queue = _outQueues.remove(id);
+    if (queue == null) {
+      return;
+    }
+    final rest = <_OutFrame>[];
+    for (final frame in queue.frames) {
+      _heldOutputFrames--;
+      _heldOutputBytes -= frame.bytes.length;
+      if (!frame.isData) {
+        rest.add(frame);
+      }
+    }
+    if (queue.listed) {
+      queue.unlink();
+    }
+    queue.frames.clear();
+    for (final frame in rest) {
+      _writeOpening(frame.bytes, frame.opens);
+    }
+  }
+
+  /// Writes everything held, in the order of the turns, whether or not
+  /// the transport is ready: the connection is closing, and the transport
+  /// writes what it was given before it closes.
+  void _flushHeld() {
+    while (_heldOutputFrames > 0 && _writable) {
+      final queue = _nextTurn();
+      if (queue == null) {
+        break;
+      }
+      _writeHead(queue);
     }
   }
 
@@ -899,6 +1365,17 @@ class MuxConnection {
   }
 
   int get _peerMaxFrameSize => _peerLimits?.maxFrameSize ?? 0;
+
+  /// The send window of a channel opened now: the initial window of the
+  /// peer's last LIMITS, 64 KiB before any.
+  int get _peerInitialWindow =>
+      _peerLimits?.initialWindow ?? MuxLimits.defaultInitialWindow;
+
+  /// The window this side grants: the one announced in LIMITS, or the
+  /// 64 KiB the peer assumes without it.
+  int get _localInitialWindow => options.announceLimits
+      ? options.initialWindow
+      : MuxLimits.defaultInitialWindow;
 
   Uint8List _nextPingPayload() {
     final n = _pingCounter;
@@ -955,6 +1432,13 @@ class MuxConnection {
       );
     }
     final id = frame.channelId;
+    if (!_limitsKnown &&
+        (id != MuxFrame.controlChannelId ||
+            frame.payload.isEmpty ||
+            frame.payload[0] != MuxControlType.limits.code)) {
+      // A peer that announces sends LIMITS first: this one does not.
+      _endLimitsWait();
+    }
     if (id == MuxFrame.controlChannelId) {
       _handleControl(frame.payload);
       return;
@@ -964,10 +1448,20 @@ class MuxConnection {
         _handleOpen(id, frame.payload);
       case MuxCommand.data:
         final link = _links[id];
-        if (link != null && !link.closeReceived) {
+        if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveData(frame.payload);
-        } else if (link == null && _awaitingClose.contains(id)) {
-          // In flight before the peer saw our CLOSE: dropped.
+        } else if (link == null && _awaitingClose.containsKey(id)) {
+          // In flight before the peer saw our CLOSE: dropped, but still
+          // charged against the credit it had when the channel ended.
+          final window = _awaitingClose[id]!;
+          final cost = MuxCredit.costOf(frame.payload.length);
+          if (cost > window) {
+            throw ProtocolException(
+              'DATA costing $cost bytes on closing channel $id, '
+              'beyond the window of $window granted',
+            );
+          }
+          _awaitingClose[id] = window - cost;
         } else {
           throw ProtocolException('DATA on channel $id which is not open');
         }
@@ -976,11 +1470,14 @@ class MuxConnection {
           decodeStatusPayload(frame.payload, 'CLOSE'),
         );
         final link = _links[id];
-        if (link != null && !link.closeReceived) {
+        if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveClose(status);
-        } else if (link == null && _awaitingClose.remove(id)) {
+        } else if (link == null && _awaitingClose.remove(id) != null) {
           // The confirmation of a CLOSE we sent without a channel: the id
-          // is mutually closed and free again.
+          // is mutually closed and free again. A channel whose close
+          // confirmation timed out may still have DATA queued, and the
+          // CLOSE behind it, if the peer's CLOSE crossed ours.
+          _dropQueuedData(id);
           if (_isOwnShortId(id)) {
             _shortIdsInUse--;
           }
@@ -995,12 +1492,12 @@ class MuxConnection {
     if (id.isOdd != isInitiator) {
       throw ProtocolException('OPEN on channel $id with the wrong parity');
     }
-    if (_links.containsKey(id) || _awaitingClose.contains(id)) {
+    if (_links.containsKey(id) || _awaitingClose.containsKey(id)) {
       throw ProtocolException('OPEN on channel $id which is in use');
     }
     Status? rejection;
     final payloadBudget = _openPayloadBudget;
-    if (_goAwaySent) {
+    if (_goAwaySent && !_continuesOpenChannel(payload)) {
       rejection = Status.of(StatusCode.goingAway);
     } else if (_incomingCancelled) {
       rejection = Status.of(StatusCode.unavailable, 'not accepting channels');
@@ -1028,6 +1525,17 @@ class MuxConnection {
       id,
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
+      sendWindow: _peerInitialWindow,
+      // The peer may have opened it before our LIMITS reached it, with the
+      // 64 KiB it assumes until then: accept the larger of the two, and
+      // return credit against the smaller, so that a sender holding either
+      // window never waits for credit we would not send.
+      receiveWindow: _localInitialWindow > MuxLimits.defaultInitialWindow
+          ? _localInitialWindow
+          : MuxLimits.defaultInitialWindow,
+      creditWindow: _localInitialWindow < MuxLimits.defaultInitialWindow
+          ? _localInitialWindow
+          : MuxLimits.defaultInitialWindow,
     )..incomingPending = true;
     _links[id] = link;
     _openCount++;
@@ -1036,6 +1544,26 @@ class MuxConnection {
     _undelivered.add(link);
     _scheduleIncomingDrain();
   }
+
+  /// Whether [openPayload] opens a Talk bulk channel (the reserved type
+  /// `_bulk`) for a channel open on this connection: it carries the
+  /// payload of a message of that channel, work admitted before our GOAWAY,
+  /// so the GOAWAY does not refuse it (wiki "Talk", "Bulk payloads").
+  bool _continuesOpenChannel(Uint8List openPayload) {
+    try {
+      final address = ChannelAddress.decode(openPayload);
+      if (address.type != _bulkType || address.payload.length < 10) {
+        return false;
+      }
+      final parent = ByteReader(address.payload).u48();
+      final link = _links[parent];
+      return link != null && !link.closeReceived;
+    } on ProtocolException {
+      return false;
+    }
+  }
+
+  static final Name _bulkType = Name('_bulk');
 
   /// [MuxOptions.maxOpenPayloadBytes], or half of
   /// [MuxOptions.receiveHighWaterMarkBytes] if that is smaller; null for
@@ -1061,8 +1589,8 @@ class MuxConnection {
     _noteBuffered(-size);
   }
 
-  /// Rejects a peer OPEN with CLOSE carrying [status], remembering only
-  /// the id until the peer confirms.
+  /// Rejects a peer OPEN with CLOSE carrying [status], remembering
+  /// its id and remaining receive window until the peer confirms.
   void _reject(int id, Status status) {
     final cap = options.maxPendingRejections;
     if (cap > 0 && _awaitingClose.length >= cap) {
@@ -1072,7 +1600,9 @@ class MuxConnection {
       );
     }
     _log.fine('$this: rejecting channel $id: $status');
-    _awaitingClose.add(id);
+    _awaitingClose[id] = _localInitialWindow > MuxLimits.defaultInitialWindow
+        ? _localInitialWindow
+        : MuxLimits.defaultInitialWindow;
     _sendFrame(
       MuxFrame.close(
         id,
@@ -1103,12 +1633,25 @@ class MuxConnection {
       case MuxControlType.limits:
         _peerLimits = MuxLimits.decode(message.payload);
         _log.fine('$this: peer limits $_peerLimits');
+        _endLimitsWait();
       case MuxControlType.nonce:
         _onPeerNonce(message.payload);
       case MuxControlType.ident:
         _onIdent(message.payload);
+      case MuxControlType.credit:
+        _onCredit(MuxCredit.decode(message.payload));
       case null:
         _log.fine('$this: ignoring control type ${message.type}');
+    }
+  }
+
+  /// Flow-control credit from the peer: ignored for a channel that is not
+  /// open here (it raced a CLOSE), and for an id whose OPEN we have not
+  /// written yet ([MuxChannel.openAfter]), which the peer cannot know.
+  void _onCredit(MuxCredit credit) {
+    final link = _links[credit.channelId];
+    if (link != null && link.openWritten) {
+      link.receiveCredit(credit.bytes);
     }
   }
 
@@ -1393,7 +1936,7 @@ class MuxConnection {
     _links.remove(link.id);
     _openCount--;
     _releaseOpenPayload(link);
-    _awaitingClose.add(link.id);
+    _awaitingClose[link.id] = link.channel.receiveWindow;
     link.abandoned();
     scheduleMicrotask(_checkIdle);
     final cap = options.maxPendingRejections;
@@ -1496,8 +2039,9 @@ class MuxConnection {
     _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
   }
 
-  /// Whether the transport is throttled by its output and the peer has
-  /// read some of it since the last check.
+  /// Whether our output is backed up (the transport throttles its input
+  /// because of it, or the output scheduler holds frames the transport
+  /// has not taken) and the peer has read some of it since the last check.
   bool _outputProgressed() {
     final transport = _transport;
     if (transport is! OutputBufferedTransport) {
@@ -1506,7 +2050,8 @@ class MuxConnection {
     final output = transport as OutputBufferedTransport;
     final accepted = output.acceptedOutputBytes;
     final progressed =
-        output.isInputThrottled && accepted != _lastAcceptedOutput;
+        (output.isInputThrottled || _heldOutputFrames > 0) &&
+        accepted != _lastAcceptedOutput;
     _lastAcceptedOutput = accepted;
     return progressed;
   }
@@ -1545,6 +2090,7 @@ class MuxConnection {
 
   Future<void> _doShutdown(Status status, Status channelStatus) async {
     _closing = true;
+    _flushHeld();
     _finish(status, channelStatus);
     _writable = false;
     try {
@@ -1566,8 +2112,16 @@ class MuxConnection {
   }
 
   void _finish(Status status, Status channelStatus) {
+    _outQueues.clear();
+    _ordinaryTurns.clear();
+    _bulkTurns.clear();
+    _heldOutputFrames = 0;
+    _heldOutputBytes = 0;
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;
+    _limitsTimer?.cancel();
+    _limitsTimer = null;
+    _awaitingLimits.clear();
     final links = _links.values.toList();
     _links.clear();
     _awaitingClose.clear();
@@ -1611,10 +2165,32 @@ class _Host implements MuxChannelHost {
   final MuxConnection _connection;
 
   @override
+  void reprioritize(MuxChannelLink link) => _connection._reprioritize(link);
+
+  @override
   MuxOptions get options => _connection.options;
 
   @override
   void sendFrame(MuxFrame frame) => _connection._sendFrame(frame);
+
+  @override
+  void sendChannelFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) => _connection._sendChannelFrame(link, frame, opens: opens);
+
+  @override
+  MuxChannelLink openAfter(MuxChannelLink parent, Uint8List openPayload) =>
+      _connection._openLink(openPayload, openWritten: false);
+
+  @override
+  void openFailed(MuxChannelLink link, Status status) =>
+      _connection._openFailed(link, status);
+
+  @override
+  void dropQueuedData(MuxChannelLink link) =>
+      _connection._dropQueuedData(link.id);
 
   @override
   void release(MuxChannelLink link) => _connection._release(link);
@@ -1627,6 +2203,29 @@ class _Host implements MuxChannelHost {
 
   @override
   int get peerMaxFrameSize => _connection._peerMaxFrameSize;
+}
+
+/// The frames of one channel id waiting for the transport; an entry of a
+/// turn list while it has frames and it is not being written from.
+final class _OutQueue extends LinkedListEntry<_OutQueue> {
+  _OutQueue(this.id);
+
+  final int id;
+  final Queue<_OutFrame> frames = Queue<_OutFrame>();
+
+  /// Whether the queue is in a turn list.
+  bool get listed => list != null;
+}
+
+/// An encoded frame waiting for the transport.
+class _OutFrame {
+  _OutFrame(this.bytes, {required this.isData, this.opens});
+
+  final Uint8List bytes;
+  final bool isData;
+
+  /// For an OPEN of [MuxChannel.openAfter], the channel it opens.
+  final MuxChannelLink? opens;
 }
 
 class _PendingPing {

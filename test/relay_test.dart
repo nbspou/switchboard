@@ -470,6 +470,38 @@ void main() {
       await channel.close();
     });
 
+    test('bulk payloads through the relay, both ways', () async {
+      final mesh = await startMesh();
+      await Relay.start(mesh);
+      final worker = await Worker.start(mesh);
+      final c = await consumer(mesh);
+      final mux = await c
+          .openChannel(worker.address, payload: bytes('token'))
+          .timeout(limit);
+      final channel = TalkChannel(mux);
+      // 100 kB each way: too large for a frame, so a bulk payload through
+      // the relay's pipes, toward the worker and back.
+      final job = 'x' * 100000;
+      final reply = await channel.request('RUN', bytes(job)).timeout(limit);
+      expect(reply.isBulk, isTrue);
+      expect(
+        text(reply.payload),
+        '$job by ${worker.id} for relay-1 with "token"',
+      );
+      final streamed = await channel
+          .request(
+            'RUN',
+            Uint8List(0),
+            bulk: Stream.fromIterable([bytes('a' * 40000), bytes('b' * 40000)]),
+          )
+          .timeout(limit);
+      expect(
+        text(streamed.payload),
+        startsWith('${'a' * 40000}${'b' * 40000} by'),
+      );
+      await channel.close();
+    });
+
     test('the relay record carries the relay\'s identity; the consumer names '
         'it', () async {
       final mesh = await startMesh();

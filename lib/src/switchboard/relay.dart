@@ -303,7 +303,7 @@ class RelayService {
         'relay: $incoming for $who piped to ${target.header.address} on '
         'channel ${channel.id} of ${channel.connection}',
       );
-      await pipeChannels(incoming.channel, channel);
+      await pipeChannelsWithin(incoming.channel, channel, _bound);
     } finally {
       _bound.exit(connection);
     }

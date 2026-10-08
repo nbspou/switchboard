@@ -36,6 +36,11 @@ import '../status.dart';
 /// identifies, for at most the node's `identityTimeout`, and evaluates the
 /// policy again then.
 ///
+/// A policy never sees bulk channels (the reserved type `_bulk`): they
+/// carry the payload of a message of a channel the policy admitted
+/// already, and are routed to that channel's Talk layer before any policy
+/// (`TalkChannel.adoptBulk`), or refused `FAILED_PRECONDITION` without one.
+///
 /// The peer's identity is [MuxConnection.peerIdentity] of [connection].
 /// See the wiki pages "Switchboard Addressing and Dispatch", sections
 /// "Dispatch of incoming channels" and "Connections and identity", and

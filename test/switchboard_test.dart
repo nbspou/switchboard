@@ -245,7 +245,12 @@ void main() {
   group('WebSocket binding', () {
     test('the mux frame limit reaches both ends', () async {
       const limit = 4 * 1024 * 1024;
-      final options = fast.copyWith(maxFrameSize: limit);
+      // A window of 8 MiB, so that a subframe of 3 MiB (at most half the
+      // window) can be sent.
+      final options = fast.copyWith(
+        maxFrameSize: limit,
+        initialWindow: 2 * limit,
+      );
       final server = Switchboard(muxOptions: options);
       addTearDown(server.close);
       server.registerService(Name('echo'), (incoming) {
@@ -272,7 +277,7 @@ void main() {
         uri,
         ChannelAddress(type: Name('echo')),
       );
-      echo.send(big);
+      unawaited(echo.send(big));
       expect(await echo.stream.first, big);
       await echo.close();
     });
@@ -654,6 +659,128 @@ void main() {
     });
   });
 
+  group('bulk channels', () {
+    late Switchboard server;
+    late Switchboard client;
+
+    setUp(() {
+      server = node();
+      client = node();
+    });
+
+    /// A Talk service answering every request with its payload's length
+    /// (as text), after [delay].
+    ChannelHandler sizes({Duration? delay}) => (incoming) async {
+      if (delay != null) {
+        await Future<void>.delayed(delay);
+      }
+      incoming.talk().messages.listen((m) {
+        m.reply(bytes('${m.payload.length} ${m.isBulk}'));
+      });
+    };
+
+    test('are routed to their parent before the listener policy', () async {
+      server.registerService(svc, sizes());
+      final seen = <ChannelAddress>[];
+      final uri = await server.listenTcp(
+        '127.0.0.1',
+        0,
+        policy: (address, connection) {
+          seen.add(address);
+          return ChannelPolicies.denyReserved(address, connection) &&
+              ChannelPolicies.allowTypes({svc})(address, connection);
+        },
+      );
+      final talk = await client.openTalkAt(uri, svcAddress());
+      final answer = await talk.request('PUT', Uint8List(200000));
+      expect(utf8.decode(answer.payload), '200000 true');
+      final streamed = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(Uint8List(5)),
+      );
+      expect(utf8.decode(streamed.payload), '5 true');
+      // The policy saw the parent only.
+      expect(seen, hasLength(1));
+      expect(seen.single.type, svc);
+    });
+
+    test('naming no open channel are refused FAILED_PRECONDITION', () async {
+      final uri = await server.listenTcp('127.0.0.1', 0);
+      final connection = await client.connect(uri);
+      final stray = connection.open(TalkBulkOpen(4242, 1).encode());
+      expect(await stray.done, hasCode(StatusCode.failedPrecondition));
+      // Malformed: a protocol error for that channel only.
+      final malformed = connection.open(
+        ChannelAddress(type: Services.bulk, payload: Uint8List(3)).encode(),
+      );
+      expect(await malformed.done, hasCode(StatusCode.protocolError));
+      expect(connection.isOpen, isTrue);
+    });
+
+    test(
+      'for a channel read without Talk are refused FAILED_PRECONDITION',
+      () async {
+        final read = Completer<void>();
+        server.registerService(svc, (incoming) {
+          incoming.channel.stream.listen((_) {
+            if (!read.isCompleted) {
+              read.complete();
+            }
+          });
+        });
+        final uri = await server.listenTcp('127.0.0.1', 0);
+        final parent = await client.openChannelAt(uri, svcAddress());
+        await parent.send(Uint8List(1));
+        await read.future;
+        final bulk = parent.openAfter(TalkBulkOpen(parent.id, 1).encode());
+        expect(await bulk.done, hasCode(StatusCode.failedPrecondition));
+      },
+    );
+
+    test('wait for a Talk layer created after the channel arrived', () async {
+      server.registerService(
+        svc,
+        sizes(delay: const Duration(milliseconds: 50)),
+      );
+      final uri = await server.listenTcp('127.0.0.1', 0);
+      final talk = await client.openTalkAt(uri, svcAddress());
+      final answer = await talk.request(
+        'PUT',
+        Uint8List(0),
+        bulk: Stream.value(Uint8List(70000)),
+        bulkLength: 70000,
+      );
+      expect(utf8.decode(answer.payload), '70000 true');
+    });
+
+    test('flow both ways over a symmetric connection', () async {
+      // The server pushes a channel to the client, which answers with a
+      // bulk response.
+      client.registerService(svc, (incoming) {
+        incoming.talk().messages.listen((m) {
+          m.reply(Uint8List(100000));
+        });
+      });
+      final uri = await server.listenTcp('127.0.0.1', 0);
+      final pushed = Completer<MuxConnection>();
+      server.registerService(Name('hello'), (incoming) {
+        pushed.complete(incoming.connection);
+        unawaited(incoming.channel.close());
+      });
+      await (await client.openChannelAt(
+        uri,
+        ChannelAddress(type: Name('hello')),
+      )).done;
+      final back = TalkChannel(
+        server.openChannelOn(await pushed.future, svcAddress()),
+      );
+      final answer = await back.request('GET', Uint8List(0));
+      expect(answer.isBulk, isTrue);
+      expect(answer.payload, hasLength(100000));
+    });
+  });
+
   group('symmetric dispatch', () {
     test('the server opens a channel back to a client service', () async {
       final server = node();
@@ -786,7 +913,7 @@ void main() {
       expect(channel.connection, isNot(same(first)));
       expect(await tagOf(channel), 'svc');
       // The held channel still works on the old connection.
-      serverSide.channel.send(bytes('still here'));
+      unawaited(serverSide.channel.send(bytes('still here')));
       expect(await held.stream.first, bytes('still here'));
       await held.close();
       await goingAway;

@@ -200,19 +200,34 @@ class DelayedResolver extends StaticResolver {
   }
 }
 
-/// A peer linked to the gate's dispatch over memory.
+/// A peer linked to the gate's dispatch over memory; bulk channels go to
+/// their parent's Talk layer, as a Switchboard routes them.
 class Peer {
   Peer(this.gate) {
     final (a, b) = MemoryTransport.pair();
     client = MuxConnection(a, isInitiator: true, options: quiet);
     server = MuxConnection(b, isInitiator: false, options: quiet);
     server.incoming.listen((channel) {
+      if (_isBulk(channel)) {
+        TalkChannel.adoptBulk(channel);
+        return;
+      }
       final result = gate.handler(IncomingChannel(channel));
       if (result is Future<void>) {
         result.ignore();
       }
     });
+    client.incoming.listen((channel) {
+      if (_isBulk(channel)) {
+        TalkChannel.adoptBulk(channel);
+      } else {
+        unawaited(channel.close(Status.of(StatusCode.notFound)));
+      }
+    });
   }
+
+  static bool _isBulk(MuxChannel channel) =>
+      TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload));
 
   final SlotGate gate;
   late final MuxConnection client;
@@ -237,7 +252,7 @@ class Peer {
 /// Sends [message] and returns the first answer.
 Future<String> ask(MuxChannel channel, String message) async {
   final answer = channel.stream.first;
-  channel.send(bytes(message));
+  unawaited(channel.send(bytes(message)));
   return text(await answer.timeout(limit));
 }
 
@@ -350,7 +365,7 @@ void main() {
       expect(gate.stateOf(1), SlotGateState.loading);
       final a = peer.open(shard: 1, payload: 'a');
       final b = peer.open(shard: 1, payload: 'b');
-      a.send(bytes('x'));
+      unawaited(a.send(bytes('x')));
       await settle();
       expect(lifecycle.served, isEmpty);
       lifecycle.loadGate!.complete();
@@ -603,7 +618,7 @@ void main() {
       expect(lifecycle.log, isNot(contains('drain 1 e2 to2')));
       // New channels are queued meanwhile, unread.
       final late = peer.open(shard: 1, payload: 'late');
-      late.send(bytes('queued'));
+      unawaited(late.send(bytes('queued')));
       await settle();
       expect(lifecycle.served[1], hasLength(1));
       await busy.close();
@@ -655,7 +670,7 @@ void main() {
       await gate.onAssign(assign(1));
       final busy = peer.open(shard: 1, payload: 'busy');
       final answers = StreamQueue(busy.stream.map(text));
-      busy.send(bytes('x'));
+      unawaited(busy.send(bytes('x')));
       expect(await answers.next.timeout(limit), '1:x');
       final draining = RecordingContext(kv, 1, 2);
       final drained = expectLater(
@@ -670,7 +685,7 @@ void main() {
       expect(busy.canSend, isTrue);
       expect(gate.stateOf(1), SlotGateState.locked);
       await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
-      busy.send(bytes('y'));
+      unawaited(busy.send(bytes('y')));
       expect(await answers.next.timeout(limit), '1:y');
       await answers.cancel(immediate: true);
     });
@@ -719,14 +734,14 @@ void main() {
       await gate.onAssign(assign(1));
       final stuck = peer.open(shard: 1, payload: 'stuck');
       final answers = StreamQueue(stuck.stream.map(text));
-      stuck.send(bytes('before'));
+      unawaited(stuck.send(bytes('before')));
       expect(await answers.next.timeout(limit), '1:before');
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
       expect(gate.stateOf(1), SlotGateState.forwarding);
       expect(await stuck.done.timeout(limit), isRelocated(2, 2));
       if (stuck.canSend) {
-        stuck.send(bytes('after-forward'));
+        unawaited(stuck.send(bytes('after-forward')));
       }
       expect(await answers.hasNext.timeout(limit), isFalse);
       await settle();
@@ -741,14 +756,14 @@ void main() {
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       final first = peer.open(shard: 1, payload: 'first');
       final second = peer.open(shard: 1, payload: 'second');
-      first.send(bytes('a'));
-      second.send(bytes('b'));
+      unawaited(first.send(bytes('a')));
+      unawaited(second.send(bytes('b')));
       await settle();
       await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
       expect(gate.stateOf(1), SlotGateState.forwarding);
       expect(text(await first.stream.first.timeout(limit)), 'to:a');
       final answers = StreamQueue(second.stream.map(text));
-      second.send(bytes('c'));
+      unawaited(second.send(bytes('c')));
       expect(await answers.take(2).timeout(limit), ['to:b', 'to:c']);
       // In arrival order, with the open payload except the instance.
       expect(
@@ -822,7 +837,7 @@ void main() {
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       final queued = peer.open(shard: 1);
       final answers = StreamQueue(queued.stream.map(text));
-      queued.send(bytes('a'));
+      unawaited(queued.send(bytes('a')));
       await settle();
       await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
       await until(() => gate.stateOf(1) == null);
@@ -831,7 +846,7 @@ void main() {
       expect(await peer.open(shard: 1).done, isMoved());
       // A forwarded channel keeps working after the grace period.
       expect(await answers.next.timeout(limit), 'to:a');
-      queued.send(bytes('b'));
+      unawaited(queued.send(bytes('b')));
       expect(await answers.next.timeout(limit), 'to:b');
     });
 
@@ -883,7 +898,7 @@ void main() {
       await gate.onAssign(assign(1, holder: 1));
       await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
       final queued = peer.open(shard: 1, payload: 'queued');
-      queued.send(bytes('a'));
+      unawaited(queued.send(bytes('a')));
       await settle();
       expect(lifecycle.served, isEmpty);
       // The migration to 2 failed, its RESUME (epoch 1) never arrived, and
@@ -975,7 +990,7 @@ void main() {
       await gate.onAssign(assign(1));
       final served = peer.open(shard: 1);
       final answers = StreamQueue(served.stream.map(text));
-      served.send(bytes('x'));
+      unawaited(served.send(bytes('x')));
       expect(await answers.next.timeout(limit), '1:x');
       for (final to in [0, 1]) {
         await expectLater(
@@ -984,7 +999,7 @@ void main() {
         );
       }
       expect(gate.serves(1), isTrue);
-      served.send(bytes('y'));
+      unawaited(served.send(bytes('y')));
       expect(await answers.next.timeout(limit), '1:y');
       expect(lifecycle.log, isNot(contains(startsWith('drain'))));
       expect(warnings, [contains('DRAIN'), contains('DRAIN')]);
@@ -1240,6 +1255,26 @@ void main() {
       expect(arrived, hasLength(1));
       expect(arrived.single.address.shard, 1);
       expect(arrived.single.address.instance, 2);
+      await talk.close();
+    });
+
+    test('a forwarded request and its answer carry bulk payloads', () async {
+      newGate(trackChannels: false);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      target.registerService(kv, (incoming) {
+        incoming.talk().messages.listen((m) {
+          expect(m.isBulk, isTrue);
+          m.reply(Uint8List.fromList([...m.payload, ...m.payload]));
+        });
+      }, instance: 2);
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      final big = Uint8List.fromList(List.generate(100000, (i) => i % 251));
+      final answer = await talk.request('PUT', big).timeout(limit);
+      expect(answer.isBulk, isTrue);
+      expect(answer.payload, [...big, ...big]);
       await talk.close();
     });
 

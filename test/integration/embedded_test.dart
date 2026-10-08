@@ -75,6 +75,72 @@ void main() {
     expect(await input.hasNext, isFalse);
   });
 
+  test('a device announcing a 256 byte window is held to it from the first '
+      'channel on', () async {
+    // The device listens; the node connects and talks at once, before the
+    // device's LIMITS can have arrived.
+    final device = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(device.close);
+    final node = Switchboard(
+      muxOptions: const MuxOptions(keepAliveInterval: null),
+    );
+    addTearDown(node.close);
+    final accepted = device.first;
+    final connection = await node.connect(
+      Uri.parse('tcp://127.0.0.1:${device.port}'),
+    );
+    final talk = TalkChannel(
+      connection.open(hexBytes('01 64 65 76 00 00 00 00 00')),
+    );
+    for (var i = 0; i < 3; i++) {
+      talk.send('PUT', Uint8List(100));
+    }
+    final peer = await accepted;
+    addTearDown(peer.destroy);
+    final bytes = StreamQueue(peer.expand((chunk) => chunk));
+    addTearDown(() => bytes.cancel(immediate: true));
+    Future<List<int>> frame() async {
+      final prefix = await bytes.take(4);
+      final length =
+          prefix[0] | (prefix[1] << 8) | (prefix[2] << 16) | (prefix[3] << 24);
+      return bytes.take(length);
+    }
+
+    expect(hexString(await bytes.take(8)), preamble);
+    // The node's LIMITS, then the OPEN; no DATA yet.
+    expect(hexString(await frame()), startsWith('02 00 00 04'));
+    expect(hexString(await frame()), startsWith('12 02 00'));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    // The device announces: no frame limit, 4 channels, a 256 byte window.
+    peer.add(
+      hexBytes(
+        '$preamble 10 00 00 00 02 00 00 04 00 00 00 00 04 00 00 00 '
+        '00 01 00 00',
+      ),
+    );
+    // Each message costs 109 + 16 bytes: two fit the window, the third
+    // waits for the device's credit.
+    var used = 0;
+    for (var i = 0; i < 2; i++) {
+      final data = await frame();
+      expect(data.sublist(0, 3), [0x02, 0x02, 0x00]);
+      used += data.length - 3 + 16;
+    }
+    expect(used, lessThanOrEqualTo(256));
+    final third = bytes.hasNext.timeout(const Duration(milliseconds: 100));
+    await expectLater(third, throwsA(isA<TimeoutException>()));
+    // CREDIT for channel 2: the third message goes.
+    peer.add(
+      hexBytes(
+        '0E 00 00 00 02 00 00 07 02 00 00 00 00 00 '
+        '${hexString([used & 0xFF, used >> 8, 0, 0])}',
+      ),
+    );
+    final last = await frame();
+    expect(last.sublist(0, 3), [0x02, 0x02, 0x00]);
+    expect(last.length - 3, 109);
+  });
+
   test('a device skipping the LIMITS control frame', () async {
     await start(const MuxOptions(keepAliveInterval: null));
     // Bytes may arrive split anywhere.
@@ -83,8 +149,8 @@ void main() {
     }
     expect(await read(8), preamble);
     var frame = await readFrame();
-    // LIMITS on the control channel: 02 00 00 | 04 | u32 | u32.
-    expect(frame, startsWith('0C 00 00 00 02 00 00 04'));
+    // LIMITS on the control channel: 02 00 00 | 04 | u32 | u32 | u32.
+    expect(frame, startsWith('10 00 00 00 02 00 00 04'));
     frame = await readFrame();
     expect(frame, reply);
     await socket.close();

@@ -133,10 +133,10 @@ void main() {
 
       final raData = StreamQueue(ra.stream);
       final caData = StreamQueue(ca.stream);
-      ca.send(hexBytes('01'));
+      unawaited(ca.send(hexBytes('01')));
       ca.sink.add(hexBytes('02 03'));
-      ca.send(empty);
-      ra.send(hexBytes('04'));
+      unawaited(ca.send(empty));
+      unawaited(ra.send(hexBytes('04')));
       expect(hexString(await raData.next), '01');
       expect(hexString(await raData.next), '02 03');
       expect(await raData.next, isEmpty);
@@ -216,8 +216,8 @@ void main() {
       final ca = a.open(empty);
       final ra = await bIncoming.next;
       final caData = ca.stream.map(hexString).toList();
-      ra.send(hexBytes('05'));
-      ra.send(hexBytes('06'));
+      unawaited(ra.send(hexBytes('05')));
+      unawaited(ra.send(hexBytes('06')));
       await ca.close();
       expect(await caData, ['05', '06']);
       await a.close();
@@ -302,7 +302,7 @@ void main() {
 
       final channel = mux.open(hexBytes('AA'));
       expect(await raw.nextHex(), '12 03 00 AA');
-      channel.send(hexBytes('01 02 03'));
+      unawaited(channel.send(hexBytes('01 02 03')));
       expect(await raw.nextHex(), '02 03 00 01 02 03');
       final closed = channel.close(Status.of(StatusCode.notFound, 'x'));
       expect(await raw.nextHex(), '22 03 00 05 00 78');
@@ -340,7 +340,7 @@ void main() {
         final c1 = a.open(empty);
         final c2 = a.open(empty);
         // DATA racing the rejection is not an error.
-        c2.send(hexBytes('01'));
+        unawaited(c2.send(hexBytes('01')));
         final c2Data = c2.stream.toList();
         expect(await c2.done, hasCode(StatusCode.resourceExhausted));
         expect(await c2Data, isEmpty);
@@ -383,7 +383,10 @@ void main() {
           maxChannels: 7,
         ),
       );
-      expect(await raw.nextHex(), '02 00 00 04 00 10 00 00 07 00 00 00');
+      expect(
+        await raw.nextHex(),
+        '02 00 00 04 00 10 00 00 07 00 00 00 00 00 01 00',
+      );
       await mux.close();
     });
 
@@ -411,7 +414,7 @@ void main() {
 
       final channel = mux.open(empty);
       expect(await raw.nextHex(), '12 02 00');
-      channel.send(Uint8List(200));
+      unawaited(channel.send(Uint8List(200)));
       expect((await raw.next()).payload, hasLength(200));
 
       announce(64, 1);
@@ -421,7 +424,7 @@ void main() {
         () => channel.send(Uint8List(62)),
         throwsStatus(StatusCode.frameTooLarge),
       );
-      channel.send(Uint8List(61));
+      unawaited(channel.send(Uint8List(61)));
       expect((await raw.next()).encode(), hasLength(64));
       expect(() => mux.open(empty), throwsStatus(StatusCode.resourceExhausted));
       // The CLOSE reason is cut to the new limit.
@@ -441,7 +444,7 @@ void main() {
       await settle();
       final second = mux.open(Uint8List(1000));
       expect((await raw.next()).payload, hasLength(1000));
-      second.send(Uint8List(4000));
+      unawaited(second.send(Uint8List(4000)));
       expect((await raw.next()).payload, hasLength(4000));
       unawaited(second.close());
       expect(await raw.nextHex(), '22 04 00');
@@ -476,7 +479,7 @@ void main() {
       final (a, b) = muxPair(acceptor: quiet.copyWith(maxFrameSize: 16));
       await a.ping();
       final channel = a.open(Uint8List(13));
-      channel.send(Uint8List(13));
+      unawaited(channel.send(Uint8List(13)));
       expect(
         () => channel.send(Uint8List(14)),
         throwsStatus(StatusCode.frameTooLarge),
@@ -788,8 +791,8 @@ void main() {
         r1.stream.listen((_) => throw StateError('application bug'));
       }, (error, _) => errors.add(error));
       final r2Data = StreamQueue(r2.stream);
-      c1.send(hexBytes('01'));
-      c2.send(hexBytes('02'));
+      unawaited(c1.send(hexBytes('01')));
+      unawaited(c2.send(hexBytes('02')));
       expect(hexString(await r2Data.next), '02');
       await a.ping();
       expect(errors, [isStateError]);
@@ -983,9 +986,9 @@ void main() {
           throwsStatus(StatusCode.failedPrecondition),
         );
 
-        ca.send(hexBytes('01'));
+        unawaited(ca.send(hexBytes('01')));
         expect(hexString(await rbData.next), '01');
-        rb.send(hexBytes('02'));
+        unawaited(rb.send(hexBytes('02')));
         expect(hexString(await caData.next), '02');
 
         await ca.close();
@@ -1098,7 +1101,7 @@ void main() {
       expect(a.receivedBytes, 0);
       final bIncoming = StreamQueue(b.incoming);
       final ca = a.open(hexBytes('AA BB'));
-      ca.send(Uint8List(100));
+      unawaited(ca.send(Uint8List(100)));
       final rb = await bIncoming.next;
       final data = StreamQueue(rb.stream);
       expect(await data.next, hasLength(100));
@@ -1107,7 +1110,7 @@ void main() {
           MuxFrame.data(2, Uint8List(100)).encode().length;
       expect(a.sentBytes, sent);
       expect(b.receivedBytes, sent);
-      rb.send(Uint8List(10));
+      unawaited(rb.send(Uint8List(10)));
       await ca.stream.first;
       expect(a.receivedBytes, MuxFrame.data(2, Uint8List(10)).encode().length);
       expect(b.sentBytes, a.receivedBytes);
@@ -1282,7 +1285,9 @@ void main() {
     test('incoming channels are buffered until listened to', () async {
       final (a, b) = muxPair();
       for (var i = 0; i < 3; i++) {
-        a.open(Uint8List.fromList([i])).send(Uint8List.fromList([i + 10]));
+        unawaited(
+          a.open(Uint8List.fromList([i])).send(Uint8List.fromList([i + 10])),
+        );
       }
       await a.ping();
       final channels = await b.incoming.take(3).toList();
@@ -1303,7 +1308,7 @@ void main() {
           unawaited(b.close().then((_) => done.complete()));
         });
       });
-      channel.send(hexBytes('01'));
+      unawaited(channel.send(hexBytes('01')));
       await done.future;
       expect(await channel.done, isA<Status>());
       expect(await a.done, hasCode(StatusCode.connectionLost));
@@ -1456,7 +1461,14 @@ void main() {
   });
 
   group('real transports', () {
+    // Windows of 256 KiB, so that a subframe of 100000 bytes (at most half
+    // the window) can be sent.
+    final wide = quiet.copyWith(initialWindow: 256 * 1024);
+
     Future<void> exercise(MuxConnection client, MuxConnection server) async {
+      // Channels opened before the peer's LIMITS arrived keep 64 KiB.
+      await client.ping();
+      await server.ping();
       final serverIncoming = StreamQueue(server.incoming);
       final channel = client.open(hexBytes('AA'));
       final accepted = await serverIncoming.next;
@@ -1465,12 +1477,23 @@ void main() {
       final echo = accepted.stream.listen(accepted.send);
       final replies = StreamQueue(channel.stream);
       final big = Uint8List(100000)..fillRange(0, 100000, 7);
-      channel.send(hexBytes('01 02'));
-      channel.send(big);
+      unawaited(channel.send(hexBytes('01 02')));
+      unawaited(channel.send(big));
       expect(hexString(await replies.next), '01 02');
       expect(await replies.next, big);
-      final back = server.open(hexBytes('BB'));
+      // A bulk payload of 1 MB, in chunks, paced by the window.
+      final back = server.open(hexBytes('BB'))..priority = MuxPriority.bulk;
       expect(back.id, 3);
+      final backAtClient = await StreamQueue(client.incoming).next;
+      final bulk = Uint8List.fromList(
+        List.generate(1000000, (i) => i * 13 & 0xFF),
+      );
+      final received = backAtClient.stream
+          .expand((d) => d)
+          .take(bulk.length)
+          .toList();
+      await back.send(bulk);
+      expect(await received, bulk);
       await channel.close(Status.of(StatusCode.cancelled));
       expect(await accepted.done, hasCode(StatusCode.cancelled));
       await echo.cancel();
@@ -1487,12 +1510,12 @@ void main() {
       final client = MuxConnection(
         await StreamTransport.connectTcp('127.0.0.1', listener.port),
         isInitiator: true,
-        options: quiet,
+        options: wide,
       );
       final server = MuxConnection(
         StreamTransport.fromSocket(await accepted),
         isInitiator: false,
-        options: quiet,
+        options: wide,
       );
       await exercise(client, server);
       await listener.close();
@@ -1514,33 +1537,35 @@ void main() {
       final client = MuxConnection(
         clientTransport,
         isInitiator: true,
-        options: quiet,
+        options: wide,
       );
       final server = MuxConnection(
         StreamTransport.fromSocket(await accepted),
         isInitiator: false,
-        options: quiet,
+        options: wide,
       );
       await listener.close();
       final channel = client.open(empty);
       final chunk = Uint8List(64 * 1024);
-      // At most 1 MiB queued: the socket stays full, memory bounded.
-      final flood = Timer.periodic(const Duration(milliseconds: 1), (_) {
-        for (var i = 0; i < 32; i++) {
-          if (!channel.canSend ||
-              clientTransport.bufferedOutputBytes > 1 << 20) {
-            return;
+      // Each subframe awaited: the window bounds what waits, and the client
+      // sends as fast as the server reads, so the socket stays full.
+      var flooding = true;
+      addTearDown(() => flooding = false);
+      unawaited(() async {
+        while (flooding && channel.canSend) {
+          try {
+            await channel.send(chunk);
+          } on SwitchboardException {
+            break;
           }
-          channel.send(chunk);
         }
-      });
-      addTearDown(flood.cancel);
+      }());
       final fromServer = channel.stream.drain<void>();
       final serverSide = await server.incoming.first;
       final toServer = serverSide.stream.drain<void>();
       await Future<void>.delayed(const Duration(milliseconds: 50));
       for (var i = 0; i < 64; i++) {
-        serverSide.send(chunk);
+        unawaited(serverSide.send(chunk));
       }
       final goingAway = server.goAway();
       await server.close();
@@ -1565,7 +1590,7 @@ void main() {
           MuxConnection(
             WebSocketTransport.wrap(IOWebSocketChannel(ws)),
             isInitiator: false,
-            options: quiet,
+            options: wide,
           ),
         );
       });
@@ -1574,7 +1599,7 @@ void main() {
           Uri.parse('ws://127.0.0.1:${http.port}/'),
         ),
         isInitiator: true,
-        options: quiet,
+        options: wide,
       );
       final server = await servers.stream.first;
       await servers.close();
