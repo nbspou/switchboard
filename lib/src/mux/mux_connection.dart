@@ -53,6 +53,7 @@ class MuxOptions {
     this.initialWindow = defaultInitialWindow,
     this.bulkZipper = defaultBulkZipper,
     this.bulkChunkSize = defaultBulkChunkSize,
+    this.awaitPeerLimits = true,
   });
 
   /// Default [maxFrameSize]: 1 MiB.
@@ -221,6 +222,21 @@ class MuxOptions {
   /// default 64 KiB.
   final int bulkChunkSize;
 
+  /// Whether DATA waits for the peer's LIMITS: on a channel opened before
+  /// the peer's first frame arrived, OPEN and CLOSE go at once but DATA
+  /// waits until that frame is here, so that the window and the frame
+  /// limit the peer announces apply to it (a peer announcing a small
+  /// window, an embedded device say, may treat DATA beyond it as a
+  /// protocol error). The wait ends with the peer's LIMITS, or with any
+  /// other first frame (a peer that announces sends LIMITS first, so one
+  /// that sends something else first does not announce), or after
+  /// [keepAliveTimeout]; then the window is the one announced, or the
+  /// 64 KiB a sender assumes without LIMITS. Default true; false sends at
+  /// once against the 64 KiB assumption, the window of a channel opened
+  /// before the LIMITS staying at it. See the wiki page "Polyverse
+  /// Switchboard Mux", section "Flow control".
+  final bool awaitPeerLimits;
+
   /// A copy with the given fields replaced. Pass [disableKeepAlive] to set
   /// [keepAliveInterval] to null.
   MuxOptions copyWith({
@@ -242,6 +258,7 @@ class MuxOptions {
     int? initialWindow,
     int? bulkZipper,
     int? bulkChunkSize,
+    bool? awaitPeerLimits,
   }) => MuxOptions(
     maxFrameSize: maxFrameSize ?? this.maxFrameSize,
     maxChannels: maxChannels ?? this.maxChannels,
@@ -263,6 +280,7 @@ class MuxOptions {
     initialWindow: initialWindow ?? this.initialWindow,
     bulkZipper: bulkZipper ?? this.bulkZipper,
     bulkChunkSize: bulkChunkSize ?? this.bulkChunkSize,
+    awaitPeerLimits: awaitPeerLimits ?? this.awaitPeerLimits,
   );
 }
 
@@ -367,6 +385,22 @@ class MuxConnection {
         ).toFrame(),
       );
     }
+    if (options.awaitPeerLimits &&
+        options.keepAliveTimeout > Duration.zero &&
+        !_closing) {
+      _limitsKnown = false;
+      _limitsTimer = Timer(options.keepAliveTimeout, () {
+        _limitsTimer = null;
+        if (!_limitsKnown) {
+          _log.fine(
+            '$this: no frame from the peer within '
+            '${options.keepAliveTimeout}; sending against the 64 KiB '
+            'window assumed without LIMITS',
+          );
+        }
+        _endLimitsWait();
+      });
+    }
     _startKeepAlive();
   }
 
@@ -410,6 +444,12 @@ class MuxConnection {
   int _sentBytes = 0;
   int _receivedBytes = 0;
   MuxLimits? _peerLimits;
+  // False until the peer's first frame (its LIMITS, normally) arrived, or
+  // the wait for it ended (MuxOptions.awaitPeerLimits).
+  bool _limitsKnown = true;
+  Timer? _limitsTimer;
+  // Channels opened before then; their DATA waits.
+  final List<MuxChannelLink> _awaitingLimits = [];
   Completer<void>? _idle;
   Future<void>? _closeFuture;
 
@@ -777,10 +817,14 @@ class MuxConnection {
       isLocallyOpened: true,
       openPayload: payload,
       sendWindow: _peerInitialWindow,
+      awaitingLimits: !_limitsKnown,
       // The peer learns of the channel after our LIMITS.
       receiveWindow: _localInitialWindow,
       creditWindow: _localInitialWindow,
     );
+    if (!_limitsKnown) {
+      _awaitingLimits.add(link);
+    }
     _links[id] = link;
     _openCount++;
     if (_isOwnShortId(id)) {
@@ -788,6 +832,24 @@ class MuxConnection {
     }
     _sendFrame(MuxFrame.open(id, payload));
     return link.channel;
+  }
+
+  /// Ends the wait for the peer's LIMITS: the channels opened meanwhile
+  /// get the window it announced (64 KiB without one) and send the DATA
+  /// that waited.
+  void _endLimitsWait() {
+    if (_limitsKnown) {
+      return;
+    }
+    _limitsKnown = true;
+    _limitsTimer?.cancel();
+    _limitsTimer = null;
+    final window = _peerInitialWindow;
+    final links = List.of(_awaitingLimits);
+    _awaitingLimits.clear();
+    for (final link in links) {
+      link.limitsKnown(window);
+    }
   }
 
   /// Most PINGs of [ping] awaiting their PONG. Beyond it, the oldest
@@ -1229,6 +1291,13 @@ class MuxConnection {
       );
     }
     final id = frame.channelId;
+    if (!_limitsKnown &&
+        (id != MuxFrame.controlChannelId ||
+            frame.payload.isEmpty ||
+            frame.payload[0] != MuxControlType.limits.code)) {
+      // A peer that announces sends LIMITS first: this one does not.
+      _endLimitsWait();
+    }
     if (id == MuxFrame.controlChannelId) {
       _handleControl(frame.payload);
       return;
@@ -1391,6 +1460,7 @@ class MuxConnection {
       case MuxControlType.limits:
         _peerLimits = MuxLimits.decode(message.payload);
         _log.fine('$this: peer limits $_peerLimits');
+        _endLimitsWait();
       case MuxControlType.nonce:
         _onPeerNonce(message.payload);
       case MuxControlType.ident:
@@ -1867,6 +1937,9 @@ class MuxConnection {
   void _finish(Status status, Status channelStatus) {
     _keepAliveTimer?.cancel();
     _keepAliveTimer = null;
+    _limitsTimer?.cancel();
+    _limitsTimer = null;
+    _awaitingLimits.clear();
     final links = _links.values.toList();
     _links.clear();
     _awaitingClose.clear();

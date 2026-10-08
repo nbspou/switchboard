@@ -95,8 +95,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     this.openPayload,
     this._initialSendWindow,
     this._receiveWindow,
-    this._creditWindow,
-  ) : _sendWindow = _initialSendWindow {
+    this._creditWindow, {
+    required bool awaitingLimits,
+  }) : _sendWindow = awaitingLimits ? 0 : _initialSendWindow,
+       _awaitingLimits = awaitingLimits {
     // Synchronous, fed from [_queue] only while the listener is active, so
     // that every buffered byte is in [_queue] and accounted for.
     _incoming = StreamController<Uint8List>(
@@ -144,9 +146,11 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
 
   // Flow control, sending side: the window the peer granted, the
   // subframes waiting for it (in order), and our CLOSE waiting behind
-  // them.
-  final int _initialSendWindow;
+  // them. While the peer's LIMITS is awaited the window is 0 and the
+  // initial window the 64 KiB assumed without LIMITS.
+  int _initialSendWindow;
   int _sendWindow;
+  bool _awaitingLimits;
   final Queue<_PendingSend> _pendingSends = Queue<_PendingSend>();
   Status? _pendingClose;
   bool _closeQueued = false;
@@ -343,10 +347,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// side may still send on the channel before the peer returns credit.
   ///
   /// Starts at the initial window the peer announced in LIMITS before the
-  /// channel was opened (64 KiB if none had arrived), grows with every
-  /// CREDIT the peer sends for the channel and shrinks with every DATA
-  /// frame sent on it. See the wiki page "Polyverse Switchboard Mux",
-  /// section "Flow control".
+  /// channel was opened, grows with every CREDIT the peer sends for the
+  /// channel and shrinks with every DATA frame sent on it. On a channel
+  /// opened before the peer's LIMITS arrived it is 0 until then, so that
+  /// DATA waits for it (see [MuxOptions.awaitPeerLimits]); it then starts
+  /// at the window announced, or at 64 KiB if the wait ended without one.
+  /// See the wiki page "Polyverse Switchboard Mux", section "Flow
+  /// control".
   int get sendWindow => _sendWindow;
 
   /// The largest subframe [send] takes on this channel, in bytes, or a
@@ -359,6 +366,11 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// frame must also fit the frame limit the peer announced with LIMITS
   /// (its 3 or 7 byte header included). Larger payloads go on a channel
   /// whose [priority] is [MuxPriority.bulk], where [send] splits them.
+  ///
+  /// While the peer's LIMITS is awaited (see [sendWindow]) this reflects
+  /// the 64 KiB window assumed without one; a subframe taken meanwhile
+  /// that the window or frame limit then announced does not fit fails its
+  /// [send] future with [StatusCode.frameTooLarge].
   int get maxSubframeLength {
     var max = _frameCostLimit - MuxCredit.frameOverhead;
     final peerMax = _link.host.peerMaxFrameSize;
@@ -562,11 +574,13 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
             }
             _pendingSends.removeFirst();
           } else {
+            // Checked first: a subframe the window never takes would wait
+            // for ever.
+            _checkSize(head.subframe.length);
             final cost = MuxCredit.costOf(head.subframe.length);
             if (cost > _sendWindow) {
               break;
             }
-            _checkSize(head.subframe.length);
             _sendWindow -= cost;
             _pendingSends.removeFirst();
             _link.host.sendChannelFrame(
@@ -604,6 +618,20 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
     _pendingSends.clear();
     for (final send in pending) {
       send.completer.completeError(error);
+    }
+  }
+
+  /// The wait for the peer's LIMITS ended: the window starts at [window],
+  /// and what waited for it goes.
+  void _limitsKnown(int window) {
+    if (!_awaitingLimits) {
+      return;
+    }
+    _awaitingLimits = false;
+    _initialSendWindow = window;
+    _sendWindow += window;
+    if (_state != MuxChannelState.closed) {
+      _admitPending();
     }
   }
 
@@ -877,6 +905,7 @@ class MuxChannelLink {
     required int sendWindow,
     required int receiveWindow,
     required int creditWindow,
+    bool awaitingLimits = false,
   }) {
     channel = MuxChannel._(
       this,
@@ -884,9 +913,10 @@ class MuxChannelLink {
       id,
       isLocallyOpened,
       openPayload,
-      sendWindow,
+      awaitingLimits ? MuxLimits.defaultInitialWindow : sendWindow,
       receiveWindow,
       creditWindow,
+      awaitingLimits: awaitingLimits,
     );
   }
 
@@ -914,6 +944,10 @@ class MuxChannelLink {
   /// Applies the peer's CREDIT of [bytes] for this channel. Throws
   /// [ProtocolException] if the window would exceed `2^32 - 1`.
   void receiveCredit(int bytes) => channel._receiveCredit(bytes);
+
+  /// The wait for the peer's LIMITS ended; [window] is the initial window
+  /// of a channel opened before it.
+  void limitsKnown(int window) => channel._limitsKnown(window);
 
   /// Handles the peer's CLOSE: frees the id, sends the confirming CLOSE if
   /// we have not sent ours (or ours if it still waited behind subframes,

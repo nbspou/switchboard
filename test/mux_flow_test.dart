@@ -314,6 +314,140 @@ void main() {
     });
   });
 
+  group('DATA waits for the peer LIMITS', () {
+    final waiting = rawOptions.copyWith(awaitPeerLimits: true);
+
+    test('OPEN goes at once, DATA once the LIMITS arrived, within the window '
+        'it announced', () async {
+      final (mux, raw) = rawPair(options: waiting);
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      expect(await raw.nextHex(), '12 02 00');
+      expect(channel.sendWindow, 0);
+      final sent = <int>[];
+      for (var i = 0; i < 3; i++) {
+        unawaited(
+          channel.send(Uint8List(100)..[0] = i).then((_) => sent.add(i)),
+        );
+      }
+      await pumpEventQueue();
+      expect(sent, isEmpty);
+      // An embedded device: a window of 256, so frames of at most 128.
+      raw.send(limitsHex(256));
+      // Two frames of 116 fit; the third waits for credit.
+      var used = 0;
+      for (var i = 0; i < 2; i++) {
+        final frame = await raw.next();
+        expect(frame.command, MuxCommand.data);
+        expect(frame.payload[0], i);
+        used += MuxCredit.costOf(frame.payload.length);
+      }
+      expect(used, lessThanOrEqualTo(256));
+      await settle(raw);
+      expect(sent, [0, 1]);
+      expect(channel.sendWindow, 256 - used);
+      expect(channel.maxSubframeLength, 112);
+      raw.send(creditHex(2, used));
+      expect((await raw.next()).payload[0], 2);
+      await pumpEventQueue();
+      expect(sent, [0, 1, 2]);
+    });
+
+    test(
+      'a subframe the announced window does not take fails its send',
+      () async {
+        final (mux, raw) = rawPair(options: waiting);
+        addTearDown(mux.close);
+        final channel = mux.open(empty);
+        await raw.next();
+        // Taken against the 64 KiB assumption.
+        expect(channel.maxSubframeLength, 32752);
+        final big = channel.send(Uint8List(1000));
+        final small = channel.send(Uint8List(10));
+        raw.send(limitsHex(256));
+        await expectLater(big, throwsStatus(StatusCode.frameTooLarge));
+        await small;
+        final frame = await raw.next();
+        expect(frame.payload, hasLength(10));
+      },
+    );
+
+    test('a peer whose first frame is not LIMITS ends the wait', () async {
+      final (mux, raw) = rawPair(options: waiting);
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      final sent = channel.send(Uint8List(5));
+      raw.send('02 00 00 01 5E');
+      await sent;
+      expect(channel.sendWindow, 65536 - 21);
+      // The wait ends before the PING is handled: the DATA, then the PONG.
+      expect((await raw.next()).payload, hasLength(5));
+      await raw.nextControl(MuxControlType.pong);
+      // A LIMITS arriving later applies to channels opened after it.
+      raw.send(limitsHex(1000));
+      await settle(raw);
+      expect(mux.open(empty).sendWindow, 1000);
+      expect(channel.sendWindow, 65536 - 21);
+    });
+
+    test('the wait ends after the keep-alive timeout', () async {
+      final (mux, raw) = rawPair(
+        options: waiting.copyWith(
+          keepAliveTimeout: const Duration(milliseconds: 50),
+        ),
+      );
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      final watch = Stopwatch()..start();
+      await channel.send(Uint8List(5));
+      expect(
+        watch.elapsed,
+        greaterThanOrEqualTo(const Duration(milliseconds: 40)),
+      );
+      expect(channel.sendWindow, 65536 - 21);
+      expect((await raw.next()).payload, hasLength(5));
+    });
+
+    test('a close waits behind the DATA that waits', () async {
+      final (mux, raw) = rawPair(options: waiting);
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      unawaited(channel.send(Uint8List(5)));
+      unawaited(channel.close());
+      raw.send(limitsHex(1000));
+      expect((await raw.next()).command, MuxCommand.data);
+      expect(await raw.nextHex(), '22 02 00');
+    });
+
+    test(
+      'between two connections nothing waits longer than a round trip',
+      () async {
+        final (a, b) = muxPair(
+          initiator: quiet.copyWith(initialWindow: 256),
+          acceptor: quiet.copyWith(initialWindow: 256),
+        );
+        addTearDown(a.close);
+        addTearDown(b.close);
+        // Opened before either LIMITS arrived: the window is still the 256
+        // each side announces.
+        final ca = a.open(empty);
+        final received = <int>[];
+        b.incoming.listen(
+          (c) => c.stream.listen((d) => received.add(d.length)),
+        );
+        for (var i = 0; i < 10; i++) {
+          unawaited(ca.send(Uint8List(100)));
+        }
+        await pumpEventQueue();
+        expect(ca.maxSubframeLength, 112);
+        expect(received, hasLength(10));
+      },
+    );
+  });
+
   group('receive window', () {
     /// A channel the mux opened over [raw], after the mux's LIMITS of
     /// [window].

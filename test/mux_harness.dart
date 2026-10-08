@@ -28,8 +28,13 @@ const quiet = MuxOptions(
   goAwayGrace: Duration(seconds: 2),
 );
 
-/// Additionally no LIMITS, for byte exact raw peer tests.
-const rawOptions = MuxOptions(keepAliveInterval: null, announceLimits: false);
+/// Additionally no LIMITS, for byte exact raw peer tests, and DATA sent
+/// without waiting for the raw peer's LIMITS (which it may never send).
+const rawOptions = MuxOptions(
+  keepAliveInterval: null,
+  announceLimits: false,
+  awaitPeerLimits: false,
+);
 
 final empty = Uint8List(0);
 
