@@ -21,6 +21,7 @@ import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../status.dart';
 import '../switchboard/incoming_channel.dart';
+import '../talk/talk_bulk.dart';
 import '../talk/talk_channel.dart';
 import 'backoff.dart';
 
@@ -777,6 +778,11 @@ class ReconnectingClient {
     } on ProtocolException catch (e) {
       _log.warning('channel ${channel.id} from the endpoint: ${e.status}');
       unawaited(channel.close(e.status));
+      return;
+    }
+    if (TalkBulkOpen.isBulk(address)) {
+      // The payload of a Talk message of one of our channels.
+      TalkChannel.routeBulk(channel, address);
       return;
     }
     if (_incomingCancelled || _incoming.isClosed) {

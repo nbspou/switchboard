@@ -484,9 +484,11 @@ class _BulkIn {
         if (!_ended) {
           close(Status.of(StatusCode.cancelled, 'bulk payload not wanted'));
         }
-        final s = subscription;
+        // Not returned: the cancel of an ended mux stream is a future of
+        // the root zone, which would deliver this stream's end outside the
+        // listener's zone (and outside fake_async's control).
+        subscription?.cancel().ignore();
         subscription = null;
-        return s?.cancel();
       },
     );
     return _BulkStream(controller.stream, this);

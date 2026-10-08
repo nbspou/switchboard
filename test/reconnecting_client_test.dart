@@ -85,6 +85,11 @@ class FakeEndpoint {
     connections.add(connection);
     connection.incoming.listen((channel) {
       final incoming = IncomingChannel(channel);
+      if (TalkBulkOpen.isBulk(incoming.address)) {
+        // As a Switchboard routes them.
+        TalkChannel.adoptBulk(channel);
+        return;
+      }
       channels.add(incoming);
       onChannel?.call(incoming);
     });
@@ -512,6 +517,35 @@ void main() {
         async.flushMicrotasks();
         expect(reply.value?.procedureName, 'PONG');
         expect(reply.value?.payload, [1, 2]);
+        closeAndCheck(async, client, appChannels: true);
+      });
+    });
+  });
+
+  group('bulk payloads', () {
+    test('both ways through openTalk', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async)
+          ..onChannel = (incoming) {
+            incoming.talk().messages.listen((message) {
+              message.reply(
+                Uint8List.fromList([...message.payload, ...message.payload]),
+              );
+            });
+          };
+        final client = clientFor(endpoint);
+        final big = Uint8List.fromList(List.generate(70000, (i) => i % 251));
+        final reply = Outcome(
+          client.openTalk(events).then((talk) => talk.request('PUT', big)),
+        );
+        async
+          ..flushMicrotasks()
+          ..elapse(const Duration(milliseconds: 10));
+        expect(reply.error, isNull);
+        expect(reply.value?.isBulk, isTrue);
+        expect(reply.value?.payload, [...big, ...big]);
+        // The endpoint's bulk channel never reached the application.
+        expect(endpoint.channels, hasLength(1));
         closeAndCheck(async, client, appChannels: true);
       });
     });
