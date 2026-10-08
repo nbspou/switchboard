@@ -497,6 +497,303 @@ void main() {
     });
   });
 
+  group('idle timeout', () {
+    /// A Talk channel and its far end over [muxPair], in fake time, the
+    /// bulk channels of both sides routed; then a function closing both.
+    (TalkChannel, TalkChannel, void Function()) fakeTalk(
+      FakeAsync async, {
+      TalkOptions near = const TalkOptions(),
+      TalkOptions far = const TalkOptions(),
+    }) {
+      final (client, server) = muxPair();
+      TalkChannel? accepted;
+      void route(MuxChannel channel) {
+        if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+          TalkChannel.adoptBulk(channel);
+        } else {
+          accepted = TalkChannel(channel, options: far);
+        }
+      }
+
+      client.incoming.listen(route);
+      server.incoming.listen(route);
+      final talk = TalkChannel(client.open(Uint8List(0)), options: near);
+      async.elapse(Duration.zero);
+      return (
+        talk,
+        accepted!,
+        () {
+          client.close();
+          server.close();
+          async.elapse(quiet.keepAliveTimeout);
+        },
+      );
+    }
+
+    /// What [future] completed with, as it completes.
+    (Object? Function(), bool Function()) watch(Future<Object?> future) {
+      Object? outcome;
+      var done = false;
+      future.then(
+        (value) {
+          outcome = value;
+          done = true;
+        },
+        onError: (Object error) {
+          outcome = error;
+          done = true;
+        },
+      );
+      return (() => outcome, () => done);
+    }
+
+    final Matcher deadlineExceeded = isA<SwitchboardException>().having(
+      (e) => e.code,
+      'code',
+      StatusCode.deadlineExceeded,
+    );
+
+    test('a request whose bulk payload stalls is answered DEADLINE_EXCEEDED '
+        'once no byte came for the timeout', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkChunkSize: 500),
+        );
+        server.messages.listen((_) => fail('not delivered'));
+        final source = StreamController<List<int>>();
+        final (outcome, done) = watch(
+          talk.request(
+            'PUT',
+            Uint8List(0),
+            bulk: source.stream,
+            timeout: Duration.zero,
+          ),
+        );
+        source.add(pattern(500));
+        async.elapse(const Duration(seconds: 20));
+        // A chunk restarts the timeout.
+        source.add(pattern(500));
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        expect(
+          outcome(),
+          isA<TalkAbortException>().having(
+            (e) => e.code,
+            'code',
+            StatusCode.deadlineExceeded,
+          ),
+        );
+        // The sender's transfer ended with its bulk channel.
+        expect(source.hasListener, isFalse);
+        expect(server.incomingRequestCount, 0);
+        source.close();
+        close();
+      });
+    });
+
+    test('a final response whose payload stalls fails its request', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(async);
+        final source = StreamController<List<int>>();
+        late Future<void> sent;
+        server.messages.listen((m) => sent = m.replyBulk(source.stream));
+        final (outcome, done) = watch(talk.request('GET', Uint8List(0)));
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        // This side's own failure, not an abort from the peer.
+        expect(
+          outcome(),
+          allOf(deadlineExceeded, isNot(isA<TalkAbortException>())),
+        );
+        final (sendOutcome, _) = watch(sent);
+        async.elapse(Duration.zero);
+        expect(sendOutcome(), deadlineExceeded);
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('an item whose payload stalls ends its stream', () {
+      fakeAsync((async) {
+        // The responder's own timeout would end the request first.
+        final (talk, server, close) = fakeTalk(
+          async,
+          far: const TalkOptions(replyTimeout: Duration.zero),
+        );
+        final source = StreamController<List<int>>();
+        server.messages.listen((m) => m.replyItemBulk(source.stream).ignore());
+        final stream = talk.streamRequest(
+          'LIST',
+          Uint8List(0),
+          timeout: Duration.zero,
+        );
+        final errors = <Object>[];
+        stream.items.listen((_) => fail('not delivered'), onError: errors.add);
+        final (outcome, done) = watch(stream.done);
+        async.elapse(const Duration(seconds: 29));
+        expect(done(), isFalse);
+        async.elapse(const Duration(seconds: 2));
+        expect(outcome(), deadlineExceeded);
+        expect(errors.single, deadlineExceeded);
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('a plain message whose payload stalls is dropped', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(async);
+        final seen = <TalkMessage>[];
+        talk.messages.listen(seen.add);
+        final source = StreamController<List<int>>();
+        server
+          ..send('NOTE', Uint8List(0), bulk: source.stream)
+          ..send('AFTER', Uint8List.fromList([7]));
+        async.elapse(const Duration(seconds: 29));
+        expect(seen, isEmpty);
+        async.elapse(const Duration(seconds: 2));
+        expect(seen.single.procedureName, 'AFTER');
+        expect(source.hasListener, isFalse);
+        source.close();
+        close();
+      });
+    });
+
+    test('a streamed payload the application reads errors', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: TalkOptions(streamBulk: (_) => true),
+        );
+        final errors = <Object>[];
+        final chunks = <Uint8List>[];
+        talk.messages.listen(
+          (m) => m.bulk.listen(chunks.add, onError: errors.add),
+        );
+        final source = StreamController<List<int>>();
+        server.send('NOTE', Uint8List(0), bulk: source.stream);
+        source.add(pattern(100));
+        async.elapse(const Duration(seconds: 29));
+        expect(errors, isEmpty);
+        async.elapse(const Duration(seconds: 2));
+        expect(errors.single, deadlineExceeded);
+        source.close();
+        close();
+      });
+    });
+
+    test('a payload waiting for its reader here does not time out', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: TalkOptions(streamBulk: (_) => true),
+        );
+        final received = BytesBuilder();
+        var ended = false;
+        StreamSubscription<Uint8List>? reading;
+        talk.messages.listen((m) {
+          reading = m.bulk.listen(
+            received.add,
+            onError: (Object e) => fail('$e'),
+            onDone: () => ended = true,
+          )..pause();
+        });
+        server.send(
+          'NOTE',
+          Uint8List(0),
+          bulk: Stream.value(pattern(200000)),
+          bulkLength: 200000,
+        );
+        // The window is used up: the sender waits for this side.
+        async.elapse(const Duration(minutes: 2));
+        expect(ended, isFalse);
+        reading!.resume();
+        async.elapse(Duration.zero);
+        expect(ended, isTrue);
+        expect(received.takeBytes(), pattern(200000));
+        // Nothing is in transfer: no timer is left.
+        expect(async.pendingTimers, isEmpty);
+        reading!.cancel();
+        close();
+      });
+    });
+
+    test('an unclaimed bulk channel goes idle too', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkOpenTimeout: Duration(minutes: 1)),
+        );
+        final seen = <TalkMessage>[];
+        talk.messages.listen(seen.add);
+        final raw = server.raw as MuxChannel;
+        final bulk = raw.openAfter(TalkBulkOpen(raw.id, 1).encode());
+        Status? end;
+        bulk.done.then((status) => end = status);
+        async.elapse(const Duration(seconds: 29));
+        expect(end, isNull);
+        async.elapse(const Duration(seconds: 2));
+        expect(end?.known, StatusCode.deadlineExceeded);
+        // Its message fails when it comes: refused, the next one delivered.
+        raw.sink
+          ..add(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('PUT'),
+              requestId: 1,
+              bulk: true,
+              payload: TalkBulkReference(1).encode(),
+            ).encode(),
+          )
+          ..add(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('AFTER'),
+              payload: Uint8List(0),
+            ).encode(),
+          );
+        async.elapse(Duration.zero);
+        expect(seen.single.procedureName, 'AFTER');
+        expect(talk.incomingRequestCount, 0);
+        close();
+      });
+    });
+
+    test('Duration.zero sets no idle timeout', () {
+      fakeAsync((async) {
+        final (talk, server, close) = fakeTalk(
+          async,
+          near: const TalkOptions(bulkChunkSize: 500),
+          far: const TalkOptions(bulkIdleTimeout: Duration.zero),
+        );
+        server.messages.listen((m) => m.reply(m.payload.sublist(0, 1)));
+        final source = StreamController<List<int>>();
+        final (outcome, done) = watch(
+          talk.request(
+            'PUT',
+            Uint8List(0),
+            bulk: source.stream,
+            timeout: Duration.zero,
+          ),
+        );
+        source.add(pattern(500));
+        async.elapse(const Duration(minutes: 10));
+        expect(done(), isFalse);
+        source.add(pattern(500, 500));
+        source.close();
+        async.elapse(Duration.zero);
+        expect((outcome() as TalkMessage?)?.payload, [0]);
+        expect(async.pendingTimers, isEmpty);
+        close();
+      });
+    });
+  });
+
   for (final tcp in [false, true]) {
     group(tcp ? 'over TCP' : 'over memory', () {
       test('a request with a bulk payload of known length', () async {

@@ -372,6 +372,11 @@ class _BulkIn {
     // Never paused nor cancelled: it ends with the bulk channel, and what
     // arrives for nobody is dropped (and consumed) here.
     channel.stream.listen(_onChunk, onDone: _onEnd);
+    final timeout = talk.options.bulkIdleTimeout;
+    if (timeout > Duration.zero) {
+      _lastProgress = monotonicNow();
+      _armIdle(timeout);
+    }
   }
 
   final TalkChannel talk;
@@ -409,8 +414,70 @@ class _BulkIn {
   /// Called each time the reader took a chunk: the transfer progresses.
   void Function()? onProgress;
 
+  // The idle timeout ([TalkOptions.bulkIdleTimeout]): one timer while the
+  // channel is open and read, checking the last progress when it fires.
+  Timer? _idleTimer;
+  Duration _lastProgress = Duration.zero;
+
+  /// Why the transfer failed on this side (it went idle), for a reader
+  /// that attaches later.
+  Status? _failed;
+
+  void _armIdle(Duration delay) {
+    _idleTimer = Timer(
+      delay > _maxTimerDelay ? _maxTimerDelay : delay,
+      _checkIdle,
+    );
+  }
+
+  void _stopIdle() {
+    _idleTimer?.cancel();
+    _idleTimer = null;
+  }
+
+  /// A chunk arrived or was consumed: the idle timeout restarts.
+  void _progressed() {
+    if (_idleTimer != null) {
+      _lastProgress = monotonicNow();
+    }
+  }
+
+  void _checkIdle() {
+    _idleTimer = null;
+    if (_dropping || channel.state != MuxChannelState.open) {
+      return;
+    }
+    final timeout = talk.options.bulkIdleTimeout;
+    final now = monotonicNow();
+    if (channel.heldBytes > 0 || channel.bufferedBytes > 0) {
+      // What arrived waits to be consumed here: the peer may be waiting
+      // for this side's credit.
+      _lastProgress = now;
+    }
+    final idle = now - _lastProgress;
+    if (idle < timeout) {
+      _armIdle(timeout - idle);
+      return;
+    }
+    final status = Status.of(
+      StatusCode.deadlineExceeded,
+      'no byte of bulk payload $number within $timeout',
+    );
+    _log.fine('bulk channel ${channel.id} went idle: $status');
+    _failed = status;
+    close(status);
+    final onDone = _onDone;
+    if (onDone != null) {
+      // The reader learns of it now, not once the peer confirmed the
+      // CLOSE; what still arrives is dropped.
+      _detach();
+      onDone(status);
+    }
+  }
+
   void _onChunk(Uint8List data) {
-    if (_dropping) {
+    _progressed();
+    if (_dropping || _failed != null) {
       _consume(data.length);
       return;
     }
@@ -423,6 +490,7 @@ class _BulkIn {
   }
 
   void _onEnd() {
+    _stopIdle();
     unawaited(
       channel.done.then((status) {
         _endStatus = status;
@@ -441,6 +509,13 @@ class _BulkIn {
     void Function(Status status) onDone,
   ) {
     _read = true;
+    final failed = _failed;
+    if (failed != null) {
+      // Went idle before it was read.
+      _detach();
+      onDone(failed);
+      return;
+    }
     _onData = onData;
     _onDone = onDone;
     while (_buffer.isNotEmpty && identical(_onData, onData)) {
@@ -454,6 +529,7 @@ class _BulkIn {
 
   /// The reader went away: what arrives from now on is dropped.
   void _detach() {
+    _stopIdle();
     _dropping = true;
     _onData = null;
     _onDone = null;
@@ -481,6 +557,7 @@ class _BulkIn {
   /// to ended.
   void close(Status status) {
     if (channel.state == MuxChannelState.open) {
+      _stopIdle();
       unawaited(channel.close(_bulkCloseStatus(status)));
     }
   }
@@ -597,6 +674,7 @@ class _BulkIn {
   }
 
   void _consume(int length) {
+    _progressed();
     try {
       channel.consumed(length);
     } on StateError catch (e) {

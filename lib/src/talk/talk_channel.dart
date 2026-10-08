@@ -57,6 +57,7 @@ class TalkOptions {
     this.bulkWindow = defaultBulkWindow,
     this.maxUnclaimedBulk = defaultMaxUnclaimedBulk,
     this.bulkOpenTimeout = const Duration(seconds: 10),
+    this.bulkIdleTimeout = const Duration(seconds: 30),
     this.streamBulk,
   });
 
@@ -167,6 +168,24 @@ class TalkOptions {
   /// references to be dispatched (its OPEN precedes it on the wire, but
   /// dispatch may lag). Expiry is a channel protocol error. Default 10 s.
   final Duration bulkOpenTimeout;
+
+  /// Receiving: how long a bulk channel the peer opened may go without a
+  /// byte while this side waits for one; then it is closed
+  /// `DEADLINE_EXCEEDED`, and its payload fails with that status as a
+  /// failed transfer does: reassembled, the message fails (a request is
+  /// answered `ABORT DEADLINE_EXCEEDED`, a final response fails its
+  /// request, an item ends its stream, a plain message is dropped);
+  /// streamed, its [TalkMessage.bulk] stream ends with that error;
+  /// forwarded, the bulk channel it is piped into is closed with it.
+  /// Restarted by every chunk that arrives, and by every chunk this side
+  /// consumes; it does not run while what arrived waits to be consumed
+  /// here (a reader that is paused, or a forwarded payload waiting for
+  /// the far side's window), since then the silence is this side's. The
+  /// request and reply timeouts do not cover a final response's payload,
+  /// nor a request's once delivered: this bounds a peer that keeps its
+  /// connection alive but stalls a transfer. [Duration.zero]: none.
+  /// Default 30 s.
+  final Duration bulkIdleTimeout;
 
   /// Receiving: which bulk messages are delivered as soon as they arrive,
   /// with the payload still arriving as a stream ([TalkMessage.bulk]),
@@ -644,8 +663,9 @@ class TalkChannel {
   /// restarts each time a chunk of the payload goes out (as it does for a
   /// stream item), and as the bulk payloads of stream items arrive; it
   /// stops when the final response arrives, and the transfer of a bulk
-  /// payload in that response is not timed (the connection's keep-alive
-  /// bounds a peer gone silent; [TalkRequest.cancel] stops it).
+  /// payload in that response is bounded by [TalkOptions.bulkIdleTimeout]
+  /// instead (a peer that stops sending it; [TalkRequest.cancel] stops it
+  /// too).
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
