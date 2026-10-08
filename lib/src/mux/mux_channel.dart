@@ -73,6 +73,12 @@ abstract interface class MuxChannelCarrier {
 
   /// As [MuxChannel.consumed], on the current channel.
   void consumed(int bytes, {int subframes = 1});
+
+  /// As [MuxChannel.send]: the future completes when the subframe was
+  /// handed to the connection, on the current channel or on the
+  /// replacement it waits for, so that a layer forwarding what it reads
+  /// can return the credit of what it forwards once it went out.
+  Future<void> send(Uint8List subframe);
 }
 
 /// One channel of a [MuxConnection].
