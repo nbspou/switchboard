@@ -756,6 +756,8 @@ class MuxConnection {
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the GOAWAY payload stays within 1024 bytes and the
   /// frame fits the peer's announced frame limit.
+  /// The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`, while
+  /// the local end status retains the given code.
   ///
   /// Throws [ArgumentError] synchronously for application status codes.
   Future<void> goAway([Status status = const Status(33)]) {

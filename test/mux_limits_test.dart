@@ -704,6 +704,36 @@ void main() {
     });
   });
 
+  group('CONNECTION_LOST stays local', () {
+    test('CLOSE sends UNAVAILABLE and retains the local status', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      final status = Status.of(StatusCode.connectionLost, 'upstream gone');
+      unawaited(channel.close(status));
+      expect(
+        closeStatus(await raw.next()),
+        Status.of(StatusCode.unavailable, 'upstream gone'),
+      );
+      raw.send('22 02 00');
+      expect(await channel.done, status);
+    });
+
+    test('GOAWAY sends UNAVAILABLE and retains the local status', () async {
+      final (mux, raw) = rawPair();
+      final status = Status.of(StatusCode.connectionLost, 'upstream gone');
+      await mux.goAway(status);
+      final frames = await raw.rest();
+      expect(frames, hasLength(1));
+      expect(
+        MuxControlMessage.decode(frames.single.payload).goAwayStatus,
+        Status.of(StatusCode.unavailable, 'upstream gone'),
+      );
+      expect(await mux.done, status);
+    });
+  });
+
   group('application codes from the peer', () {
     test('CLOSE: reported as UNKNOWN and relayable', () async {
       final (mux, raw) = rawPair();

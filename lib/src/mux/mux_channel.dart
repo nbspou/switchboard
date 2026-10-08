@@ -177,7 +177,7 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the frame fits the peer's announced frame limit and
   /// the status payload stays within 1024 bytes; [done] reports [status]
-  /// as given.
+  /// as given. The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`.
   ///
   /// Completes when the channel is mutually closed or the connection is
   /// lost, whichever comes first; completes at once if the channel is
