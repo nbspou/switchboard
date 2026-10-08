@@ -495,6 +495,36 @@ void main() {
   });
 
   group('receive window', () {
+    for (final rejected in [false, true]) {
+      test(
+        'DATA beyond the remaining window after CLOSE is refused (rejected: $rejected)',
+        () async {
+          final (mux, raw) = rawPair(
+            options: rawOptions.copyWith(
+              maxChannels: 1,
+              closeConfirmTimeout: const Duration(milliseconds: 20),
+            ),
+          );
+          addTearDown(mux.close);
+          final channel = mux.open(empty);
+          final id = rejected ? 3 : channel.id;
+          if (rejected) {
+            raw.send(hexString(MuxFrame.open(id, empty).encode()));
+          } else {
+            await channel.close();
+          }
+          raw.send(hexString(MuxFrame.data(id, Uint8List(32752)).encode()));
+          raw.send(hexString(MuxFrame.data(id, Uint8List(32752)).encode()));
+          await pumpEventQueue();
+          expect(mux.isOpen, isTrue);
+          raw.send(hexString(MuxFrame.data(id, empty).encode()));
+          await pumpEventQueue();
+          expect(mux.isOpen, isFalse);
+          expect(await mux.done, hasCode(StatusCode.protocolError));
+        },
+      );
+    }
+
     test(
       'grant inside an automatic listener counts the delivered frame',
       () async {

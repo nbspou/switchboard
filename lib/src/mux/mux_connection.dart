@@ -133,7 +133,7 @@ class MuxOptions {
   /// a channel and still wait for the peer's CLOSE: peer OPENs we rejected
   /// (beyond [maxChannels], after GOAWAY, or with nobody listening to
   /// [MuxConnection.incoming]) and channels whose close confirmation timed
-  /// out ([closeConfirmTimeout]). Each costs only its id; beyond the cap
+  /// out ([closeConfirmTimeout]). Each costs its id and remaining receive window; beyond the cap
   /// the connection ends with GOAWAY `RESOURCE_EXHAUSTED`. 0 means
   /// unlimited.
   final int maxPendingRejections;
@@ -421,7 +421,8 @@ class MuxConnection {
   final Queue<MuxChannelLink> _undelivered = Queue<MuxChannelLink>();
   final Map<int, MuxChannelLink> _links = {};
   // Ids we sent CLOSE for, without a channel, awaiting the peer's CLOSE.
-  final Set<int> _awaitingClose = {};
+  // Remaining receive credit is kept even after channel state is released.
+  final Map<int, int> _awaitingClose = {};
   final Completer<Status> _done = Completer<Status>();
   final List<_PendingPing> _pings = [];
   final int _firstId;
@@ -1047,7 +1048,7 @@ class MuxConnection {
       id += 2;
       if (MuxFrame.isReservedId(candidate) ||
           _links.containsKey(candidate) ||
-          _awaitingClose.contains(candidate)) {
+          _awaitingClose.containsKey(candidate)) {
         continue;
       }
       return candidate;
@@ -1414,8 +1415,18 @@ class MuxConnection {
         final link = _links[id];
         if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveData(frame.payload);
-        } else if (link == null && _awaitingClose.contains(id)) {
-          // In flight before the peer saw our CLOSE: dropped.
+        } else if (link == null && _awaitingClose.containsKey(id)) {
+          // In flight before the peer saw our CLOSE: dropped, but still
+          // charged against the credit it had when the channel ended.
+          final window = _awaitingClose[id]!;
+          final cost = MuxCredit.costOf(frame.payload.length);
+          if (cost > window) {
+            throw ProtocolException(
+              'DATA costing $cost bytes on closing channel $id, '
+              'beyond the window of $window granted',
+            );
+          }
+          _awaitingClose[id] = window - cost;
         } else {
           throw ProtocolException('DATA on channel $id which is not open');
         }
@@ -1426,7 +1437,7 @@ class MuxConnection {
         final link = _links[id];
         if (link != null && link.openWritten && !link.closeReceived) {
           link.receiveClose(status);
-        } else if (link == null && _awaitingClose.remove(id)) {
+        } else if (link == null && _awaitingClose.remove(id) != null) {
           // The confirmation of a CLOSE we sent without a channel: the id
           // is mutually closed and free again. A channel whose close
           // confirmation timed out may still have DATA queued, and the
@@ -1446,7 +1457,7 @@ class MuxConnection {
     if (id.isOdd != isInitiator) {
       throw ProtocolException('OPEN on channel $id with the wrong parity');
     }
-    if (_links.containsKey(id) || _awaitingClose.contains(id)) {
+    if (_links.containsKey(id) || _awaitingClose.containsKey(id)) {
       throw ProtocolException('OPEN on channel $id which is in use');
     }
     Status? rejection;
@@ -1543,8 +1554,8 @@ class MuxConnection {
     _noteBuffered(-size);
   }
 
-  /// Rejects a peer OPEN with CLOSE carrying [status], remembering only
-  /// the id until the peer confirms.
+  /// Rejects a peer OPEN with CLOSE carrying [status], remembering
+  /// its id and remaining receive window until the peer confirms.
   void _reject(int id, Status status) {
     final cap = options.maxPendingRejections;
     if (cap > 0 && _awaitingClose.length >= cap) {
@@ -1554,7 +1565,9 @@ class MuxConnection {
       );
     }
     _log.fine('$this: rejecting channel $id: $status');
-    _awaitingClose.add(id);
+    _awaitingClose[id] = _localInitialWindow > MuxLimits.defaultInitialWindow
+        ? _localInitialWindow
+        : MuxLimits.defaultInitialWindow;
     _sendFrame(
       MuxFrame.close(
         id,
@@ -1887,7 +1900,7 @@ class MuxConnection {
     _links.remove(link.id);
     _openCount--;
     _releaseOpenPayload(link);
-    _awaitingClose.add(link.id);
+    _awaitingClose[link.id] = link.channel.receiveWindow;
     link.abandoned();
     scheduleMicrotask(_checkIdle);
     final cap = options.maxPendingRejections;
