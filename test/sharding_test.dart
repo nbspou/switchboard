@@ -414,6 +414,38 @@ void main() {
       expect(log, ['1 ASSIGN 3 e1 h0']);
       expect(h.service.waitingRequestCount, 0);
     });
+
+    test('requests cancelled during the assignment hold are forgotten at '
+        'once', () async {
+      final h = Harness(assignmentHold: const Duration(seconds: 1));
+      addTearDown(h.close);
+      final a = instance(userq, 1, harness: h);
+      await a.start(space: SlotSpace(userq, count: 16, lazy: true));
+      final (router, _) = h.link();
+      for (var i = 0; i < 50; i++) {
+        for (final (channel, procedure, payload) in [
+          (router, 'LOCATE', LocateRequest(userq, 3).encode()),
+          (a.channel, 'CLAIM', ClaimRequest(userq, 3).encode()),
+          (a.channel, 'HOLDING', HoldingRequest(userq, [3]).encode()),
+        ]) {
+          final request = channel.startRequest(
+            procedure,
+            payload,
+            timeout: Duration.zero,
+          );
+          request.response.ignore();
+          await pump();
+          request.cancel();
+        }
+      }
+      await until(() => h.service.waitingRequestCount == 0);
+      expect(h.service.isHoldingAssignments, isTrue);
+      // Nothing of them is resolved when the hold ends.
+      await until(() => !h.service.isHoldingAssignments);
+      await Future<void>.delayed(ms50);
+      expect(h.service.slotTable(userq)!.entries, isEmpty);
+      expect(log, isEmpty);
+    });
   });
 
   group('allocator', () {

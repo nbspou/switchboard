@@ -47,6 +47,10 @@ class _SlotManager {
   final List<_HeldHolding> heldHoldings = [];
   int _claimSequence = 0;
   final Completer<void> _holdOver = Completer<void>();
+
+  /// What wakes each request waiting for the end of the assignment hold
+  /// ([_holdOverOrCancel]).
+  final Set<Completer<void>> _holdWaiters = {};
   bool closed = false;
 
   /// Deadlines of `LOCATE` requests waiting for a backoff to end, and of
@@ -65,8 +69,43 @@ class _SlotManager {
     for (final held in heldHoldings) held.message,
   }.length;
 
-  Future<void> get holdOver =>
-      holding && !_holdOver.isCompleted ? _holdOver.future : Future.value();
+  /// Completes when the assignment hold ends, or as soon as [message] is
+  /// cancelled: nothing then keeps it, or the code waiting for it, until
+  /// the hold ends.
+  Future<void> _holdOverOrCancel(TalkMessage message) {
+    if (!holding || _holdOver.isCompleted || !message.canReply) {
+      return Future.value();
+    }
+    final waker = Completer<void>();
+    _holdWaiters.add(waker);
+    _forgetOnCancel(message, () {
+      if (_holdWaiters.remove(waker)) {
+        waker.complete();
+      }
+    });
+    return waker.future;
+  }
+
+  void _wakeHoldWaiters() {
+    final wakers = _holdWaiters.toList();
+    _holdWaiters.clear();
+    for (final waker in wakers) {
+      waker.complete();
+    }
+  }
+
+  /// Requests held until the assignment hold ends ([heldClaims],
+  /// [heldHoldings], [_holdWaiters]) are forgotten as soon as their
+  /// requester cancels them: [forget] removes [message], which leaves
+  /// [waiting] too.
+  void _forgetOnCancel(TalkMessage message, void Function() forget) {
+    unawaited(
+      message.onCancel.then((_) {
+        forget();
+        unwait(message);
+      }),
+    );
+  }
 
   // ---------------------------------------------------------------------
   // Replies and declared deadlines
@@ -478,8 +517,10 @@ class _SlotManager {
       // Claims made during the hold are resolved first, so that a slot
       // someone was serving goes to its last owner rather than to a
       // holder of older storage.
-      heldHoldings.add(_HeldHolding(session, message, request));
+      final held = _HeldHolding(session, message, request);
+      heldHoldings.add(held);
       wait(message, service._holdLeft);
+      _forgetOnCancel(message, () => heldHoldings.remove(held));
       return;
     }
     _processHolding(session, message, request);
@@ -673,8 +714,10 @@ class _SlotManager {
     }
     settle(spaces[request.type]!);
     if (holding) {
-      heldClaims.add(_HeldClaim(session, message, request, _claimSequence++));
+      final held = _HeldClaim(session, message, request, _claimSequence++);
+      heldClaims.add(held);
       wait(message, service._holdLeft);
+      _forgetOnCancel(message, () => heldClaims.remove(held));
       return;
     }
     unawaited(_claim(session, message, request));
@@ -901,7 +944,7 @@ class _SlotManager {
         }
         if (holding) {
           wait(message, service._holdLeft);
-          await holdOver;
+          await _holdOverOrCancel(message);
           continue;
         }
         if (deadline != null && deadline.isCompleted) {
@@ -2041,6 +2084,7 @@ class _SlotManager {
     if (!_holdOver.isCompleted) {
       _holdOver.complete();
     }
+    _wakeHoldWaiters();
     final claims = List.of(heldClaims)
       ..sort((a, b) {
         final byEpoch = b.request.epoch.compareTo(a.request.epoch);
@@ -2100,6 +2144,7 @@ class _SlotManager {
     if (!_holdOver.isCompleted) {
       _holdOver.complete();
     }
+    _wakeHoldWaiters();
     for (final message in waiting.toList()) {
       abort(message, goingAway);
     }
