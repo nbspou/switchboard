@@ -367,6 +367,85 @@ void main() {
       await expectLater(a.locate(3), throwsStatus(StatusCode.unavailable));
       expect(h.service.slotTable(userq)![3], SlotEntry.unassigned);
     });
+
+    test('requests cancelled while an ASSIGN runs are forgotten at once; '
+        'the ASSIGN goes on', () async {
+      final a = instance(userq, 1);
+      final b = instance(userq, 2);
+      final space = SlotSpace(userq, count: 16, lazy: true);
+      await a.start(space: space, capacity: 1);
+      await b.start(space: space, capacity: 0);
+      final assigned = Completer<AssignResponse>();
+      a.onAssign = (_) => assigned.future;
+      final (router, _) = h.link();
+      final first = router.request(
+        'LOCATE',
+        LocateRequest(userq, 3).encode(),
+        timeout: Duration.zero,
+      );
+      await until(() => log.contains('1 ASSIGN 3 e1 h0'));
+      // Each waits for the ASSIGN of slot 3: a LOCATE, a CLAIM and a
+      // HOLDING by another instance, a RELEASE by the instance it goes to.
+      // The Talk channel forgets each request its requester cancels, so
+      // nothing but the naming service would bound how many it keeps.
+      for (var i = 0; i < 50; i++) {
+        for (final (channel, procedure, payload) in [
+          (router, 'LOCATE', LocateRequest(userq, 3).encode()),
+          (b.channel, 'CLAIM', ClaimRequest(userq, 3).encode()),
+          (b.channel, 'HOLDING', HoldingRequest(userq, [3]).encode()),
+          (a.channel, 'RELEASE', ReleaseRequest(userq, 3).encode()),
+        ]) {
+          final request = channel.startRequest(
+            procedure,
+            payload,
+            timeout: Duration.zero,
+          );
+          request.response.ignore();
+          await pump();
+          request.cancel();
+        }
+      }
+      await until(() => h.service.waitingRequestCount == 1);
+      assigned.complete(const AssignResponse());
+      expect(
+        LocateResponse.decode((await first).payload),
+        const LocateResponse(SlotState.owned, 1, 1),
+      );
+      expect(log, ['1 ASSIGN 3 e1 h0']);
+      expect(h.service.waitingRequestCount, 0);
+    });
+
+    test('requests cancelled during the assignment hold are forgotten at '
+        'once', () async {
+      final h = Harness(assignmentHold: const Duration(seconds: 1));
+      addTearDown(h.close);
+      final a = instance(userq, 1, harness: h);
+      await a.start(space: SlotSpace(userq, count: 16, lazy: true));
+      final (router, _) = h.link();
+      for (var i = 0; i < 50; i++) {
+        for (final (channel, procedure, payload) in [
+          (router, 'LOCATE', LocateRequest(userq, 3).encode()),
+          (a.channel, 'CLAIM', ClaimRequest(userq, 3).encode()),
+          (a.channel, 'HOLDING', HoldingRequest(userq, [3]).encode()),
+        ]) {
+          final request = channel.startRequest(
+            procedure,
+            payload,
+            timeout: Duration.zero,
+          );
+          request.response.ignore();
+          await pump();
+          request.cancel();
+        }
+      }
+      await until(() => h.service.waitingRequestCount == 0);
+      expect(h.service.isHoldingAssignments, isTrue);
+      // Nothing of them is resolved when the hold ends.
+      await until(() => !h.service.isHoldingAssignments);
+      await Future<void>.delayed(ms50);
+      expect(h.service.slotTable(userq)!.entries, isEmpty);
+      expect(log, isEmpty);
+    });
   });
 
   group('allocator', () {
@@ -590,6 +669,60 @@ void main() {
       expect(table[0], const SlotEntry.free(holder: 1));
       expect(table[1], const SlotEntry.owned(2, holder: 2, epoch: 1));
     });
+
+    test('the holder declared during a failed fresh ASSIGN is the holder '
+        'before a LOCATE tries the next instance', () async {
+      final space = SlotSpace(userq, count: 16, lazy: true);
+      final a = instance(userq, 1);
+      final b = instance(userq, 2);
+      // Up and taking no slots: a holder others fetch from.
+      final holder = instance(userq, 3);
+      await a.start(space: space, capacity: 1);
+      await b.start(space: space, capacity: 1);
+      await holder.start(space: space, capacity: 0);
+      final refuse = Completer<void>();
+      a.onAssign = (_) async {
+        await refuse.future;
+        throw SwitchboardException.of(StatusCode.unavailable, 'not ready');
+      };
+      final (router, _) = h.link();
+      final r = Instance(h, userq, 0, log)..channel = router;
+      final located = r.locate(5);
+      await until(() => log.contains('1 ASSIGN 5 e1 h0'));
+      List<int>? discard;
+      unawaited(holder.holding([5]).then((d) => discard = d));
+      await Future<void>.delayed(ms50);
+      expect(discard, isNull, reason: 'waits for the ASSIGN to 1');
+      refuse.complete();
+      expect(await located, const LocateResponse(SlotState.owned, 2, 1));
+      await until(() => discard != null);
+      // The ASSIGN to 1 failed: 3 holds the slot, which 2 fetches from it.
+      expect(log, ['1 ASSIGN 5 e1 h0', '2 ASSIGN 5 e1 h3']);
+      expect(discard, isEmpty);
+    });
+
+    test('a slot being assigned fresh to the declaring instance keeps it as '
+        'holder when that ASSIGN fails', () async {
+      final space = SlotSpace(userq, count: 16, lazy: true);
+      final a = instance(userq, 1);
+      final b = instance(userq, 2);
+      await a.start(space: space, capacity: 1);
+      await b.start(space: space, capacity: 1);
+      final refuse = Completer<void>();
+      a.onAssign = (_) async {
+        await refuse.future;
+        throw SwitchboardException.of(StatusCode.unavailable, 'not ready');
+      };
+      final (router, _) = h.link();
+      final r = Instance(h, userq, 0, log)..channel = router;
+      final located = r.locate(5);
+      await until(() => log.contains('1 ASSIGN 5 e1 h0'));
+      // Answered at once: the slot is being assigned to a itself.
+      expect(await a.holding([5]), isEmpty);
+      refuse.complete();
+      expect(await located, const LocateResponse(SlotState.owned, 2, 1));
+      expect(log, ['1 ASSIGN 5 e1 h0', '2 ASSIGN 5 e1 h1']);
+    });
   });
 
   group('WATCH and LOOKUP', () {
@@ -763,6 +896,42 @@ void main() {
       );
     });
 
+    test(
+      'queued MIGRATEs their requesters cancel are forgotten at once',
+      () async {
+        // The old owner declares nothing while it drains, so that nothing
+        // but the cancellation tells the service the requests are gone.
+        final h = Harness(handoverTimeout: const Duration(seconds: 5));
+        addTearDown(h.close);
+        final a = instance(zone, 1, harness: h)..heartbeat = false;
+        final b = instance(zone, 2, harness: h);
+        await a.start(space: staticSpace(zone, 4), capacity: 0);
+        await b.start(space: staticSpace(zone, 4), capacity: 0);
+        await a.claim(1);
+        await a.claim(2);
+        final (router, _) = h.link();
+        log.clear();
+        final gate = Completer<void>();
+        a.onDrain = (r) => r.slot == 1 ? gate.future : Future.value();
+        final first = Migration(router, zone, 1, to: 2);
+        await until(() => log.contains('1 DRAIN 1 e2 to2'));
+        for (var i = 0; i < 50; i++) {
+          final cancelled = Migration(router, zone, 2, to: 2);
+          await pump();
+          cancelled.stream.cancel();
+        }
+        await until(() => h.service.waitingRequestCount == 1);
+        gate.complete();
+        expect(await first.done, Status.ok);
+        expect(log, [
+          '1 DRAIN 1 e2 to2',
+          '2 ASSIGN 1 e2 h1',
+          '1 FORWARD 1 e2 to2',
+        ]);
+        expect(h.service.waitingRequestCount, 0);
+      },
+    );
+
     test('a queued MIGRATE its requester cancels leaves the queue; the '
         'next one starts', () async {
       await a.claim(3);
@@ -886,6 +1055,46 @@ void main() {
       async.elapse(ms50 * 2);
       expect(async.pendingTimers, isEmpty);
     }
+
+    test('a FORWARD is not bounded: what it declares reaches the MIGRATE '
+        'as declared', () {
+      fakeAsync((async) {
+        final h = Harness(handoverMaxDuration: const Duration(seconds: 1));
+        final log = <String>[];
+        final (a, _, router) = zones(async, h, log);
+        a.heartbeat = false;
+        a.declare = (procedure) =>
+            procedure == 'FORWARD' ? const Duration(seconds: 30) : null;
+        a.onForward = (_) => Future<void>.delayed(const Duration(seconds: 10));
+        final declared = <Duration?>[];
+        final m = router.channel.streamRequest(
+          'MIGRATE',
+          MigrateRequest(zone, 1, to: 2).encode(),
+          onExtend: (deadline, renew) => declared.add(deadline),
+        );
+        m.items.listen(null, onError: (Object _) {});
+        Object? outcome;
+        m.done.then<void>(
+          (_) => outcome = Status.ok,
+          onError: (Object e) => outcome = e,
+        );
+        async.elapse(const Duration(seconds: 11));
+        expect(log, [
+          '1 DRAIN 1 e2 to2',
+          '2 ASSIGN 1 e2 h1',
+          '1 FORWARD 1 e2 to2',
+        ]);
+        // As declared, plus the buffer each side adds to what it declares.
+        expect(
+          declared.last,
+          const Duration(seconds: 30) +
+              clientOptions.extendBuffer +
+              serverOptions.extendBuffer,
+        );
+        expect(outcome, Status.ok);
+        closeWithoutTimers(async, h);
+      });
+    });
 
     test('a DRAIN running longer is cancelled and the migration rolled '
         'back', () {

@@ -47,6 +47,10 @@ class _SlotManager {
   final List<_HeldHolding> heldHoldings = [];
   int _claimSequence = 0;
   final Completer<void> _holdOver = Completer<void>();
+
+  /// What wakes each request waiting for the end of the assignment hold
+  /// ([_holdOverOrCancel]).
+  final Set<Completer<void>> _holdWaiters = {};
   bool closed = false;
 
   /// Deadlines of `LOCATE` requests waiting for a backoff to end, and of
@@ -55,8 +59,53 @@ class _SlotManager {
 
   bool get holding => service.isHoldingAssignments;
 
-  Future<void> get holdOver =>
-      holding && !_holdOver.isCompleted ? _holdOver.future : Future.value();
+  /// The distinct requests in [waiting], waiting for an operation in
+  /// progress ([_Busy.waiters]), or held until the assignment hold ends.
+  int get waitingCount => {
+    ...waiting,
+    for (final space in spaces.values)
+      for (final busy in space.busy.values) ...busy.waiters.keys,
+    for (final held in heldClaims) held.message,
+    for (final held in heldHoldings) held.message,
+  }.length;
+
+  /// Completes when the assignment hold ends, or as soon as [message] is
+  /// cancelled: nothing then keeps it, or the code waiting for it, until
+  /// the hold ends.
+  Future<void> _holdOverOrCancel(TalkMessage message) {
+    if (!holding || _holdOver.isCompleted || !message.canReply) {
+      return Future.value();
+    }
+    final waker = Completer<void>();
+    _holdWaiters.add(waker);
+    _forgetOnCancel(message, () {
+      if (_holdWaiters.remove(waker)) {
+        waker.complete();
+      }
+    });
+    return waker.future;
+  }
+
+  void _wakeHoldWaiters() {
+    final wakers = _holdWaiters.toList();
+    _holdWaiters.clear();
+    for (final waker in wakers) {
+      waker.complete();
+    }
+  }
+
+  /// Requests held until the assignment hold ends ([heldClaims],
+  /// [heldHoldings], [_holdWaiters]) are forgotten as soon as their
+  /// requester cancels them: [forget] removes [message], which leaves
+  /// [waiting] too.
+  void _forgetOnCancel(TalkMessage message, void Function() forget) {
+    unawaited(
+      message.onCancel.then((_) {
+        forget();
+        unwait(message);
+      }),
+    );
+  }
 
   // ---------------------------------------------------------------------
   // Replies and declared deadlines
@@ -120,14 +169,33 @@ class _SlotManager {
     waiting.remove(message);
   }
 
+  /// Joins [message] to [busy] ([join]) and completes when [busy] ends, or
+  /// as soon as [message] is cancelled or cannot be answered: nothing then
+  /// keeps it, or the code waiting for it, until [busy] ends.
+  Future<void> waitFor(TalkMessage message, _Busy busy) {
+    join(message, busy);
+    return busy.waiters[message]?.future ?? Future.value();
+  }
+
   /// [message] waits for [busy] to end: it is told the bound of the step
-  /// in progress now, and every later one ([stepStarted], [relay]).
+  /// in progress now, and every later one ([stepStarted], [relay]). If its
+  /// requester cancels it meanwhile, it is forgotten at once ([waiting],
+  /// [_Busy.waiters]) and woken ([waitFor]); the operation goes on for
+  /// whoever else needs it.
   void join(TalkMessage message, _Busy busy) {
-    if (!message.canReply || closed) {
+    if (!message.canReply || closed || busy.released) {
       return;
     }
     waiting.add(message);
-    busy.waiters.add(message);
+    if (!busy.waiters.containsKey(message)) {
+      busy.waiters[message] = Completer<void>();
+      unawaited(
+        message.onCancel.then((_) {
+          busy.leave(message);
+          unwait(message);
+        }),
+      );
+    }
     final until = busy.until;
     if (until != null) {
       final left = until - monotonicNow();
@@ -137,29 +205,32 @@ class _SlotManager {
 
   /// The longest a hand-over request to an instance waits for its answer
   /// until the instance declares otherwise: [NamingService.handoverTimeout],
-  /// else [NamingService.handoverMaxDuration]; null when neither bounds it.
-  Duration? get _stepBound {
+  /// else, for a request [bounded] overall (`ASSIGN`, `DRAIN`),
+  /// [NamingService.handoverMaxDuration]; null when neither bounds it.
+  Duration? _stepBound(bool bounded) {
     if (service.handoverTimeout > Duration.zero) {
       return service.handoverTimeout;
     }
-    if (service.handoverMaxDuration > Duration.zero) {
+    if (bounded && service.handoverMaxDuration > Duration.zero) {
       return service.handoverMaxDuration;
     }
     return null;
   }
 
-  /// [value] lowered to [NamingService.handoverMaxDuration].
-  Duration? _clampHandover(Duration? value) {
+  /// [value] lowered to [NamingService.handoverMaxDuration] for a request
+  /// [bounded] by it; as it is for another (`FORWARD`).
+  Duration? _clampHandover(Duration? value, bool bounded) {
     final bound = service.handoverMaxDuration;
-    return value != null && bound > Duration.zero && value > bound
+    return bounded && value != null && bound > Duration.zero && value > bound
         ? bound
         : value;
   }
 
-  /// A hand-over request for [busy] was sent to an instance: its waiters
-  /// are told how long the service waits for the answer.
-  void stepStarted(_Busy busy) {
-    final bound = _stepBound;
+  /// A hand-over request for [busy] was sent to an instance ([bounded] as
+  /// in [ask]): its waiters are told how long the service waits for the
+  /// answer.
+  void stepStarted(_Busy busy, {required bool bounded}) {
+    final bound = _stepBound(bounded);
     busy.until = bound == null ? null : monotonicNow() + bound;
     if (bound != null) {
       _tell(busy, bound, null);
@@ -169,12 +240,18 @@ class _SlotManager {
   /// The instance working on [busy] sent `EXTEND` declaring [deadline] and
   /// [renew] (both null: it restarted the service's default timeout):
   /// passed on to the waiters, the migration request it serves with the
-  /// same values.
-  void relay(_Busy busy, Duration? deadline, Duration? renew) {
-    deadline = _clampHandover(deadline);
-    renew = _clampHandover(renew);
+  /// same values. Only a request [bounded] by
+  /// [NamingService.handoverMaxDuration] has them lowered to it.
+  void relay(
+    _Busy busy,
+    Duration? deadline,
+    Duration? renew, {
+    required bool bounded,
+  }) {
+    deadline = _clampHandover(deadline, bounded);
+    renew = _clampHandover(renew, bounded);
     if (deadline == null && renew == null) {
-      deadline = _stepBound;
+      deadline = _stepBound(bounded);
       if (deadline == null) {
         return;
       }
@@ -193,9 +270,10 @@ class _SlotManager {
       declare(owner, deadline, renew: renew, exact: true);
     }
     final longest = _longest(deadline, renew);
-    busy.waiters.removeWhere((m) => !m.canReply);
-    for (final message in busy.waiters) {
-      if (!identical(message, owner)) {
+    for (final message in busy.waiters.keys.toList()) {
+      if (!message.canReply) {
+        busy.leave(message);
+      } else if (!identical(message, owner)) {
         declare(message, longest);
       }
     }
@@ -448,8 +526,10 @@ class _SlotManager {
       // Claims made during the hold are resolved first, so that a slot
       // someone was serving goes to its last owner rather than to a
       // holder of older storage.
-      heldHoldings.add(_HeldHolding(session, message, request));
+      final held = _HeldHolding(session, message, request);
+      heldHoldings.add(held);
       wait(message, service._holdLeft);
+      _forgetOnCancel(message, () => heldHoldings.remove(held));
       return;
     }
     _processHolding(session, message, request);
@@ -528,9 +608,10 @@ class _SlotManager {
   }
 
   /// Applies a `HOLDING` declaration of [slot] by instance [me]: a free
-  /// slot without holder gets [me] as holder; one being assigned to [me]
-  /// is fine; one being assigned fresh (holder 0) to another instance goes
-  /// to [waiting]; any other slot held elsewhere goes to [discard].
+  /// slot without holder gets [me] as holder; one being assigned fresh
+  /// (holder 0) gets [me] as holder if that `ASSIGN` fails
+  /// ([_Space.declared]), and goes to [waiting] when it is assigned to
+  /// another instance; any other slot held elsewhere goes to [discard].
   void _declareHeld(
     _Space space,
     int slot,
@@ -550,6 +631,10 @@ class _SlotManager {
         setEntry(space, slot, SlotEntry.free(holder: me, epoch: entry.epoch));
         return;
       }
+      // Decided by that ASSIGN: should it fail, the first instance that
+      // declared the slot meanwhile holds it, before anything else (a
+      // LOCATE trying the next instance) can assign the slot fresh again.
+      space.declared.putIfAbsent(slot, () => me);
       if (target != me) {
         waiting.add(slot);
       }
@@ -573,11 +658,10 @@ class _SlotManager {
     var slots = waiting;
     while (true) {
       final space = spaces[type]!;
-      final operations = [for (final slot in slots) ?space.busy[slot]];
-      for (final busy in operations) {
-        join(message, busy);
-      }
-      await Future.wait([for (final busy in operations) busy.future]);
+      await Future.wait([
+        for (final slot in slots)
+          if (space.busy[slot] case final busy?) waitFor(message, busy),
+      ]);
       if (closed || !message.canReply || !session.active) {
         unwait(message);
         return;
@@ -639,8 +723,10 @@ class _SlotManager {
     }
     settle(spaces[request.type]!);
     if (holding) {
-      heldClaims.add(_HeldClaim(session, message, request, _claimSequence++));
+      final held = _HeldClaim(session, message, request, _claimSequence++);
+      heldClaims.add(held);
       wait(message, service._holdLeft);
+      _forgetOnCancel(message, () => heldClaims.remove(held));
       return;
     }
     unawaited(_claim(session, message, request));
@@ -706,8 +792,7 @@ class _SlotManager {
         case SlotState.free:
           final busy = space.busy[slot];
           if (busy != null) {
-            join(message, busy);
-            await busy.future;
+            await waitFor(message, busy);
             continue;
           }
           final holder = entry.holder != 0
@@ -754,6 +839,10 @@ class _SlotManager {
         unwait(message);
         return;
       }
+      if (closed) {
+        abortCode(message, StatusCode.goingAway, 'naming service closed');
+        return;
+      }
       final space = lookup(message, type, slot);
       if (space == null) {
         return;
@@ -796,8 +885,7 @@ class _SlotManager {
           caller != null &&
           space.assigning[slot] == caller.instance) {
         // Being assigned to the caller: release once that is decided.
-        join(message, busy);
-        await busy.future;
+        await waitFor(message, busy);
         continue;
       }
       abortCode(
@@ -860,13 +948,12 @@ class _SlotManager {
         }
         final busy = space.busy[slot];
         if (busy != null) {
-          join(message, busy);
-          await busy.future;
+          await waitFor(message, busy);
           continue;
         }
         if (holding) {
           wait(message, service._holdLeft);
-          await holdOver;
+          await _holdOverOrCancel(message);
           continue;
         }
         if (deadline != null && deadline.isCompleted) {
@@ -1388,13 +1475,14 @@ class _SlotManager {
         timeout: service.handoverTimeout,
         onExtend: busy == null
             ? null
-            : (deadline, renew) => relay(busy, deadline, renew),
+            : (deadline, renew) =>
+                  relay(busy, deadline, renew, bounded: bounded),
       );
     } on SwitchboardException catch (e) {
       return Future.error(e);
     }
     if (busy != null) {
-      stepStarted(busy);
+      stepStarted(busy, bounded: bounded);
     }
     final completer = Completer<TalkMessage>();
     void onGone() {
@@ -1531,6 +1619,21 @@ class _SlotManager {
         space.pendingFor.remove(target.instance);
       } else {
         space.pendingFor[target.instance] = n;
+      }
+      final declarer = space.declared.remove(slot);
+      final now = space.entry(slot);
+      if (declarer != null &&
+          !closed &&
+          now.isFree &&
+          now.holder == 0 &&
+          live(type, declarer) != null) {
+        // Failed: the instance that declared holding the slot meanwhile is
+        // its holder, before the waiters wake.
+        setEntry(
+          space,
+          slot,
+          SlotEntry.free(holder: declarer, epoch: now.epoch),
+        );
       }
       busy.release();
       scheduleBalance(space);
@@ -1991,6 +2094,7 @@ class _SlotManager {
     if (!_holdOver.isCompleted) {
       _holdOver.complete();
     }
+    _wakeHoldWaiters();
     final claims = List.of(heldClaims)
       ..sort((a, b) {
         final byEpoch = b.request.epoch.compareTo(a.request.epoch);
@@ -2050,6 +2154,7 @@ class _SlotManager {
     if (!_holdOver.isCompleted) {
       _holdOver.complete();
     }
+    _wakeHoldWaiters();
     for (final message in waiting.toList()) {
       abort(message, goingAway);
     }
@@ -2073,6 +2178,11 @@ class _Space {
   /// `ASSIGN`s in flight: slot to target instance, and count per target.
   final Map<int, int> assigning = {};
   final Map<int, int> pendingFor = {};
+
+  /// The first instance that declared `HOLDING` of a slot while it was
+  /// being assigned fresh (holder 0), by slot: its holder if that `ASSIGN`
+  /// fails.
+  final Map<int, int> declared = {};
 
   /// Slots with an operation in progress (an `ASSIGN` or a migration).
   final Map<int, _Busy> busy = {};
@@ -2134,6 +2244,7 @@ class _Space {
     space = definition;
     clearBackoffs();
     entries.clear();
+    declared.clear();
     load.clear();
     grace.clear();
     parked.clear();
@@ -2231,16 +2342,12 @@ class _Space {
 /// An operation in progress on a slot (an `ASSIGN` or a migration), and
 /// the requests waiting for it to end.
 class _Busy {
-  final Completer<void> _done = Completer<void>();
-
-  /// Completes when the operation ends.
-  Future<void> get future => _done.future;
-
   /// Takes the operation off its slot.
   void Function()? onRelease;
 
-  /// Requests waiting for the operation, told the bound of each step.
-  final Set<TalkMessage> waiters = {};
+  /// Requests waiting for the operation, told the bound of each step, each
+  /// with what wakes it when the operation ends.
+  final Map<TalkMessage, Completer<void>> waiters = {};
 
   /// The `MIGRATE` request the operation serves, told the same values the
   /// instances declare.
@@ -2250,14 +2357,26 @@ class _Busy {
   /// ([monotonicNow]); null when nothing bounds it.
   Duration? until;
 
-  /// Ends the operation.
+  /// The operation ended.
+  bool released = false;
+
+  /// Ends the operation and wakes its waiters.
   void release() {
     onRelease?.call();
     onRelease = null;
-    if (!_done.isCompleted) {
-      _done.complete();
+    if (released) {
+      return;
+    }
+    released = true;
+    final wakers = waiters.values.toList();
+    waiters.clear();
+    for (final waker in wakers) {
+      waker.complete();
     }
   }
+
+  /// Forgets [message] and wakes it, if it waits for the operation.
+  void leave(TalkMessage message) => waiters.remove(message)?.complete();
 }
 
 /// The `ASSIGN` backoff of one instance for one slot.

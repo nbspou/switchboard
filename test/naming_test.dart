@@ -16,6 +16,8 @@ import 'package:fake_async/fake_async.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/address/service_address.dart';
 import 'package:switchboard/src/bytes.dart';
+import 'package:switchboard/src/identity/peer_identity.dart';
+import 'package:switchboard/src/mux/mux_connection.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_client.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
@@ -171,6 +173,39 @@ void main() {
         1,
       );
       expect(h.service.table.values.single.metadata, hasLength(4096));
+    });
+
+    test('close completes while a listener of events is paused', () async {
+      final service = NamingService(assignmentHold: Duration.zero);
+      final events = service.events.listen((_) {});
+      final slots = service.slotEvents.listen((_) {});
+      events.pause();
+      slots.pause();
+      service.registerLocal(Name('npc'), [uriA]);
+      await service.close().timeout(timeout);
+      await events.cancel();
+      await slots.cancel();
+    });
+
+    test('follows the IDENTs of a connection with one listener, however '
+        'many channels it carried', () async {
+      final connection = _IdentityEvents();
+      for (var i = 0; i < 20; i++) {
+        final link = StreamChannelController<Uint8List>();
+        h.service.serve(
+          TalkChannel(link.local, options: serverOptions),
+          connection: connection,
+        );
+        final client = TalkChannel(link.foreign, options: clientOptions);
+        await register(client, 'npc');
+        await client.close();
+      }
+      await until(() => h.service.channelCount == 0);
+      expect(connection.waiting, 1);
+      // An IDENT once no channel is left: the service stops listening.
+      connection.changeIdentity();
+      await pump();
+      expect(connection.waiting, 0);
     });
 
     test('a REGISTER without the metadata field has empty metadata', () async {
@@ -1427,6 +1462,41 @@ void main() {
       expect(assigned, [1]);
     });
 
+    test(
+      'a relayed CONNECT whose dial-back fails is answered UNAVAILABLE',
+      () async {
+        final scripted = ScriptedConnector((m) {});
+        addTearDown(scripted.close);
+        final client = NamingClient(
+          scripted.call,
+          reconnectDelay: reconnectDelay,
+        );
+        clients.add(client);
+        final failures = <Object>[
+          SwitchboardException.of(StatusCode.failedPrecondition, 'left mesh'),
+          SwitchboardException.of(StatusCode.deadlineExceeded, 'no answer'),
+          SwitchboardException.of(StatusCode.unauthenticated, 'refused'),
+          StateError('bug'),
+        ];
+        var calls = 0;
+        client.connectHandler = (request) async => throw failures[calls++];
+        await client.start();
+        await client.synced.timeout(timeout);
+        final server = scripted.servers.single;
+        for (var i = 0; i < failures.length; i++) {
+          await expectLater(
+            server.request(
+              'CONNECT',
+              DialBackRequest('consumer', uriA).encode(),
+              name: Procedures.connect,
+            ),
+            throwsStatus(StatusCode.unavailable),
+          );
+        }
+        expect(calls, failures.length);
+      },
+    );
+
     test('a refused UNREGSTR drops the channel', () async {
       final registered = <String>[];
       final scripted = ScriptedConnector((m) {
@@ -1570,6 +1640,264 @@ void main() {
       expect(h.service.table, isEmpty);
     });
 
+    test('a replacement refused before sending drops the old record', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(maxOutgoingRequests: 1),
+      );
+      final client = newClient(limited);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      await client.register(type, [uriA], instance: 1);
+      // This request holds the only outgoing request slot while a
+      // replacement of the already registered record is attempted.
+      final other = client.register(type, [uriA], instance: 2);
+      await expectLater(
+        client.register(type, [uriB], instance: 1),
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await other.timeout(timeout);
+      await until(() => !h.service.table.containsKey(ServiceAddress(type, 1)));
+      await until(() => limited.calls == 2 && client.isSynced);
+      expect(h.service.table.keys, [ServiceAddress(type, 2)]);
+    });
+
+    test('a refused replacement also retires an in-flight REGISTER', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(maxOutgoingRequests: 1),
+      );
+      final client = newClient(limited);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final first = client.register(type, [uriA], instance: 1);
+      final failed = expectLater(
+        first,
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await expectLater(
+        client.register(type, [uriB], instance: 1),
+        throwsStatus(StatusCode.resourceExhausted),
+      );
+      await failed;
+      await until(() => limited.calls == 2 && client.isSynced);
+      expect(h.service.table, isEmpty);
+    });
+
+    test('a refused replacement of a registration never made keeps the '
+        'channel', () async {
+      final other = h.link().$1;
+      expect(await register(other, 'npc', instance: 5), 5);
+      final client = newClient(connector);
+      connector.down = true;
+      unawaited(client.start());
+      await until(() => connector.calls >= 2);
+      // Neither is sent before the next connect.
+      final first = client.register(Name('npc'), [uriA], instance: 5);
+      final firstFailed = expectLater(
+        first,
+        throwsStatus(StatusCode.alreadyExists),
+      );
+      final replacement = client.register(Name('npc'), [uriB], instance: 5);
+      final failedCalls = connector.calls;
+      connector.down = false;
+      await expectLater(replacement, throwsStatus(StatusCode.alreadyExists));
+      await firstFailed;
+      await client.synced.timeout(timeout);
+      // Nothing of this client's was published: the channel stays.
+      await Future<void>.delayed(reconnectDelay * 5);
+      expect(connector.calls, failedCalls + 1);
+      expect(client.isSynced, isTrue);
+    });
+
+    test('a replacement unregistered in flight, then refused, drops the '
+        'old record', () async {
+      final h = Harness(assignmentHold: const Duration(seconds: 1));
+      addTearDown(h.close);
+      // On the first channel, the naming service takes one request at a
+      // time from this client.
+      var calls = 0;
+      final client = NamingClient(() async {
+        calls++;
+        final link = StreamChannelController<Uint8List>();
+        h.service.serve(
+          TalkChannel(
+            link.local,
+            options: calls == 1
+                ? const TalkOptions(
+                    replyTimeout: Duration(milliseconds: 200),
+                    maxIncomingRequests: 1,
+                  )
+                : serverOptions,
+          ),
+        );
+        return TalkChannel(link.foreign, options: clientOptions);
+      }, reconnectDelay: reconnectDelay);
+      clients.add(client);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      await client.register(type, [uriA], instance: 1);
+      // Held until the assignment hold ends: the service refuses what
+      // follows on the channel meanwhile.
+      final held = client.register(Name('api'), [uriA]);
+      await pump();
+      final replacement = client.register(type, [uriB], instance: 1);
+      await client.unregister(type, 1);
+      await expectLater(replacement, throwsStatus(StatusCode.cancelled));
+      await until(() => !h.service.table.containsKey(ServiceAddress(type, 1)));
+      // The held registration is made again on the next channel.
+      await held.timeout(const Duration(seconds: 3));
+      expect(calls, 2);
+      expect(h.service.table.keys.map((a) => a.type), [Name('api')]);
+    });
+
+    test('register, unregister and register again of one id while the '
+        'first REGISTER is in flight keeps the second record', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final published = <String>[];
+      h.service.events.listen((e) => published.add(describeEvent(e)));
+      final type = Name('npc');
+      final first = client.register(type, [uriA], instance: 7);
+      final cancelled = expectLater(first, throwsStatus(StatusCode.cancelled));
+      await client.unregister(type, 7);
+      expect(await client.register(type, [uriB], instance: 7), 7);
+      await cancelled;
+      await Future<void>.delayed(ms50);
+      // The first REGISTER's late answer sends no UNREGSTR: the second
+      // REGISTER, after it on the channel, replaced its record.
+      expect(published, ['UP npc/7 $uriA', 'UP npc/7 $uriB']);
+      expect(h.service.table.values.single.endpoints, [uriB]);
+      expect(connector.calls, 1);
+      await client.unregister(type, 7);
+      expect(h.service.table, isEmpty);
+    });
+
+    test('a superseded registration given a new id does not stay '
+        'published', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final assigned = <int>[];
+      expect(
+        await client.register(
+          type,
+          [uriA],
+          instance: 5,
+          onAssigned: assigned.add,
+        ),
+        5,
+      );
+      // The naming service restarts; meanwhile another channel takes 5.
+      connector.down = true;
+      final h2 = Harness(assignmentHold: const Duration(milliseconds: 300));
+      addTearDown(h2.close);
+      connector.harness = h2;
+      await h.service.close();
+      await until(() => !client.isConnected);
+      final other = h2.link().$1;
+      expect(await register(other, 'npc', instance: 5), 5);
+      connector.down = false;
+      // REGISTER 5 is refused, the REGISTER for any id that follows is held.
+      await until(() => client.isConnected);
+      await Future<void>.delayed(ms50);
+      // 5 is free again and the application registers it again: the held
+      // registration is superseded, and its answer comes with another id.
+      await unregister(other, 'npc', 5);
+      expect(await client.register(type, [uriB], instance: 5), 5);
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(h2.service.table.keys, [ServiceAddress(type, 5)]);
+      expect(h2.service.table.values.single.endpoints, [uriB]);
+      expect(assigned, [5]);
+    });
+
+    test('a remembered registration waiting to be made again keeps its '
+        'endpoints when its id goes to a new registration', () async {
+      final limited = Connector(
+        h,
+        options: const TalkOptions(
+          replyTimeout: Duration(milliseconds: 200),
+          requestTimeout: Duration(milliseconds: 300),
+          maxOutgoingRequests: 2,
+        ),
+      );
+      final client = NamingClient(
+        limited.call,
+        reconnectDelay: const Duration(milliseconds: 300),
+      );
+      clients.add(client);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final type = Name('npc');
+      final uris = [
+        for (var i = 1; i <= 3; i++) Uri.parse('tcp://10.0.0.$i:9000'),
+      ];
+      final third = <int>[];
+      expect(await client.register(type, [uris[0]]), 1);
+      expect(await client.register(type, [uris[1]]), 2);
+      expect(await client.register(type, [uris[2]], onAssigned: third.add), 3);
+      // A fresh naming service: 1 and 2 are registered again, 3 waits for
+      // its retry (the channel sends two requests at a time).
+      final h2 = Harness();
+      addTearDown(h2.close);
+      limited.harness = h2;
+      await h.service.close();
+      await until(() => h2.service.table.length == 2);
+      expect(await client.register(type, [uriB]), 3);
+      await until(() => h2.service.table.length == 4);
+      final published = {
+        for (final r in h2.service.table.values)
+          r.address.instance: r.endpoints,
+      };
+      expect(published, {
+        1: [uris[0]],
+        2: [uris[1]],
+        3: [uriB],
+        4: [uris[2]],
+      });
+      expect(third, [3, 4]);
+    });
+
+    test('close and unregister of superseded registrations whose futures '
+        'were dropped report no error', () async {
+      final client = newClient(connector);
+      connector.down = true;
+      unawaited(client.start());
+      await until(() => connector.calls >= 1);
+      final type = Name('npc');
+      for (final instance in [8, 9]) {
+        // Superseded: its future fails like the next one's, cancelled.
+        unawaited(client.register(type, [uriA], instance: instance));
+        client.register(type, [uriB], instance: instance).ignore();
+      }
+      await client.unregister(type, 8);
+      await client.close();
+      await pump();
+    });
+
+    test('close completes while a listener of events is paused', () async {
+      final client = newClient(connector);
+      await client.start();
+      await client.synced.timeout(timeout);
+      final closed = Completer<void>();
+      final listening = () async {
+        await for (final _ in client.events) {
+          // The subscription is paused while this runs.
+          await client.close().timeout(timeout);
+          closed.complete();
+        }
+      }();
+      // Its UP comes first, and closing cancels the REGISTER.
+      client.register(Name('npc'), [uriA]).ignore();
+      await closed.future.timeout(timeout);
+      await listening.timeout(timeout);
+    });
+
     test('unregister while the REGISTER is in flight', () async {
       final client = newClient(connector);
       await client.start();
@@ -1682,3 +2010,55 @@ class ScriptedConnector {
 
 /// [value] as UTF-8 bytes.
 Uint8List text(String value) => Uint8List.fromList(utf8.encode(value));
+
+/// A connection that never identifies until [changeIdentity], and counts the
+/// listeners waiting for its next `IDENT`.
+class _IdentityEvents implements MuxConnection {
+  Completer<void> _event = Completer<void>();
+
+  /// Listeners on the current [identityChanged].
+  int waiting = 0;
+
+  /// A valid `IDENT` (of nobody, as far as [peerIdentity] goes).
+  void changeIdentity() {
+    final event = _event;
+    _event = Completer<void>();
+    waiting = 0;
+    event.complete();
+  }
+
+  @override
+  bool get isOpen => true;
+
+  @override
+  PeerIdentity? get peerIdentity => null;
+
+  @override
+  Future<void> get identityChanged => _Counted(_event.future, () => waiting++);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
+
+/// [inner], calling [onListen] for every listener.
+class _Counted implements Future<void> {
+  _Counted(this.inner, this.onListen);
+
+  final Future<void> inner;
+  final void Function() onListen;
+
+  @override
+  Future<R> then<R>(
+    FutureOr<R> Function(void value) onValue, {
+    Function? onError,
+  }) {
+    onListen();
+    return inner.then(onValue, onError: onError);
+  }
+
+  @override
+  Stream<void> asStream() => Stream.fromFuture(this);
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}

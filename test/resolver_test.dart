@@ -10,11 +10,53 @@ Authors:
 import 'package:switchboard/src/address/service_address.dart';
 import 'package:switchboard/src/name.dart';
 import 'package:switchboard/src/naming/naming_protocol.dart';
+import 'package:switchboard/src/status.dart';
 import 'package:switchboard/src/switchboard/resolver.dart';
 import 'package:test/test.dart';
 
 void main() {
+  final closed = isA<SwitchboardException>().having(
+    (e) => e.code,
+    'code',
+    StatusCode.failedPrecondition,
+  );
+
   group('StaticResolver', () {
+    test('close ends resolution and refuses changes before mutating', () async {
+      final type = Name('npc');
+      final record = ServiceRecord(ServiceAddress(type, 1));
+      final r = StaticResolver([record]);
+      r.defineSlots(SlotSpace(type, count: 2));
+      r.setSlot(type, 0, const SlotEntry.owned(1, epoch: 1));
+      await r.close();
+      await r.close();
+      await expectLater(r.resolve(type), throwsA(closed));
+      await expectLater(r.locateSlot(type, 0), throwsA(closed));
+      expect(
+        () => r.add(ServiceRecord(ServiceAddress(type, 2))),
+        throwsA(closed),
+      );
+      expect(() => r.remove(record.address), throwsA(closed));
+      expect(() => r.defineSlots(SlotSpace(type, count: 3)), throwsA(closed));
+      expect(() => r.removeSlots(type), throwsA(closed));
+      expect(() => r.setSlot(type, 0, SlotEntry.unassigned), throwsA(closed));
+      expect(r.table.values, [record]);
+      expect(r.slotTable(type)!.count, 2);
+      expect(r.slotOwner(type, 0)!.owner, 1);
+    });
+
+    test('close completes while a listener of events is paused', () async {
+      final r = StaticResolver();
+      final events = r.events.listen((_) {});
+      final slots = r.slotEvents.listen((_) {});
+      events.pause();
+      slots.pause();
+      r.add(ServiceRecord(ServiceAddress(Name('npc'), 1)));
+      await r.close().timeout(const Duration(seconds: 2));
+      await events.cancel();
+      await slots.cancel();
+    });
+
     test('resolves by type and emits events', () async {
       final r = StaticResolver([
         ServiceRecord(
@@ -54,5 +96,7 @@ void main() {
     expect(records.single.address, ServiceAddress(Name('x')));
     expect(records.single.endpoints, [Uri.parse('ws://ep/ws')]);
     await r.close();
+    await r.close();
+    await expectLater(r.resolve(Name('x')), throwsA(closed));
   });
 }

@@ -99,6 +99,10 @@ class Instance {
   /// Receives the one-way messages (subscription events) of [channel].
   void Function(TalkMessage event)? onEvent;
 
+  /// The deadline to declare with one `EXTEND` when a request arrives
+  /// (null: none), by its procedure.
+  Duration? Function(String procedure)? declare;
+
   Future<void> start({SlotSpace? space, int capacity = 1}) async {
     final (client, server) = harness.link();
     channel = client;
@@ -119,6 +123,10 @@ class Instance {
       return;
     }
     m.setReplyTimeout(Duration.zero);
+    final deadline = declare?.call(m.procedureName);
+    if (deadline != null) {
+      m.extend(deadline: deadline);
+    }
     final extend = Timer.periodic(ms50, (t) {
       if (m.canReply && heartbeat) {
         m.extend();
