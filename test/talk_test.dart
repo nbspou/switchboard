@@ -1609,14 +1609,17 @@ void main() {
     test('items listeners without onError survive aborts, cancels and '
         'timeouts', () async {
       final errors = await uncaughtErrors(() async {
-        final peer = RawPeer(
-          options: const TalkOptions(requestTimeout: Duration(milliseconds: 5)),
-        );
+        final peer = RawPeer();
         final aborted = peer.talk.streamRequest('A', Uint8List(0));
         aborted.items.listen((_) {});
         final cancelled = peer.talk.streamRequest('C', Uint8List(0));
         cancelled.items.listen((_) {});
-        final expired = peer.talk.streamRequest('T', Uint8List(0));
+        // Only this request should expire while the event queue is pumped.
+        final expired = peer.talk.streamRequest(
+          'T',
+          Uint8List(0),
+          timeout: const Duration(milliseconds: 5),
+        );
         expired.items.listen((_) {});
         await pumpEventQueue();
         peer.send(
