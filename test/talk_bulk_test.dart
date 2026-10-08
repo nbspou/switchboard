@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // Talk bulk payloads (wiki page "Polyverse Switchboard Talk", section
@@ -16,6 +17,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:switchboard/core.dart';
 import 'package:switchboard/src/transport/stream_transport.dart';
 import 'package:test/test.dart';
@@ -148,6 +150,40 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 }
 
 void main() {
+  test('references without bulk OPENs have a bounded dispatch wait', () {
+    fakeAsync((async) {
+      final (client, server) = muxPair();
+      final talks = <TalkChannel>[];
+      server.incoming.listen((raw) => talks.add(TalkChannel(raw)));
+      final raw = client.open(Uint8List(0));
+      async.elapse(Duration.zero);
+      final baseline = async.nonPeriodicTimerCount;
+      for (var number = 1; number <= 100; number++) {
+        raw.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            responseId: 1, // Unknown: consumed by Talk immediately.
+            bulk: true,
+            payload: TalkBulkReference(number).encode(),
+          ).encode(),
+        );
+      }
+      async.elapse(Duration.zero);
+      expect(
+        async.nonPeriodicTimerCount - baseline,
+        lessThanOrEqualTo(TalkOptions.defaultMaxUnclaimedBulk),
+      );
+      Status? end;
+      talks.single.done.then((status) => end = status);
+      async.elapse(Duration.zero);
+      expect(end?.known, StatusCode.protocolError);
+      expect(async.pendingTimers, isEmpty);
+      client.close();
+      server.close();
+      async.elapse(quiet.keepAliveTimeout);
+    });
+  });
+
   for (final tcp in [false, true]) {
     group(tcp ? 'over TCP' : 'over memory', () {
       test('a request with a bulk payload of known length', () async {

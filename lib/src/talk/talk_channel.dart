@@ -147,7 +147,9 @@ class TalkOptions {
 
   /// Receiving: bulk channels the peer may open for this channel before
   /// the messages that reference them arrive; beyond, a bulk OPEN is closed
-  /// `RESOURCE_EXHAUSTED`. Default 16, the wiki's reference.
+  /// `RESOURCE_EXHAUSTED`. Also bounds references waiting for their bulk
+  /// OPEN to be dispatched; beyond, a channel protocol error. Default 16,
+  /// the wiki's reference.
   final int maxUnclaimedBulk;
 
   /// Receiving: how long a message waits for the bulk channel it
@@ -1436,11 +1438,7 @@ class TalkChannel {
       );
       return false;
     }
-    _bulkAwaited[number] = _Awaited(
-      message,
-      Timer(options.bulkOpenTimeout, () => _bulkNeverOpened(number)),
-    );
-    return true;
+    return _awaitBulk(number, message);
   }
 
   /// The bulk payload of [frame], a message dropped on arrival, is not
@@ -1463,10 +1461,21 @@ class TalkChannel {
       );
       return;
     }
+    _awaitBulk(number, null);
+  }
+
+  /// Dispatch may lag, but ignored responses must not buy unbounded
+  /// timers with the credit returned on arrival.
+  bool _awaitBulk(int number, _Message? message) {
+    if (_bulkAwaited.length >= options.maxUnclaimedBulk) {
+      _protocolError('too many BULK references waiting for their channels');
+      return false;
+    }
     _bulkAwaited[number] = _Awaited(
-      null,
+      message,
       Timer(options.bulkOpenTimeout, () => _bulkNeverOpened(number)),
     );
+    return true;
   }
 
   void _bulkNeverOpened(int number) {
