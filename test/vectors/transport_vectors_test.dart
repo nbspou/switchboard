@@ -117,6 +117,21 @@ void main() {
       );
     });
 
+    test('maxFrameSize zero means no limit', () {
+      expect(
+        decodeStream(
+          hexBytes('$preamble 04 00 00 00 02 02 00 AA'),
+          maxFrameSize: 0,
+        ).map(hexString),
+        ['02 02 00 AA'],
+      );
+      // Unlimited frame size does not permit an empty transport frame.
+      expect(
+        () => decodeStream(hexBytes('$preamble 00 00 00 00'), maxFrameSize: 0),
+        throwsA(isA<ProtocolException>()),
+      );
+    });
+
     test('lengths with the top bit set are not negative', () {
       // 0x80000000: bitwise operations are 32-bit signed on JavaScript.
       expect(

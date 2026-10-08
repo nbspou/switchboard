@@ -160,6 +160,112 @@ void main() {
   });
 
   group('undelivered incoming channels', () {
+    test(
+      'closed channels still count toward the incoming backlog cap',
+      () async {
+        final (mux, raw) = rawPair(
+          options: rawOptions.copyWith(maxChannels: 2),
+        );
+        addTearDown(mux.close);
+        for (var i = 0; i < 2; i++) {
+          raw.send(openHex(3));
+          raw.send('22 03 00');
+          expect(closeStatus(await raw.next()), Status.ok);
+        }
+        expect(mux.openChannelCount, 0);
+        raw.send(openHex(3));
+        raw.send('22 03 00');
+        expect(
+          closeStatus(await raw.next()).known,
+          StatusCode.resourceExhausted,
+        );
+        final incoming = StreamQueue(mux.incoming);
+        addTearDown(() => incoming.cancel(immediate: true));
+        expect((await incoming.next).state, MuxChannelState.closed);
+        expect((await incoming.next).state, MuxChannelState.closed);
+        // Delivering the backlog frees capacity, including a reused id.
+        raw.send(openHex(3));
+        expect((await incoming.next).state, MuxChannelState.open);
+      },
+    );
+
+    test('closed undelivered OPEN payloads retain their budget', () async {
+      final (mux, raw) = rawPair(
+        options: rawOptions.copyWith(maxOpenPayloadBytes: 100),
+      );
+      addTearDown(mux.close);
+      raw.send(openHex(3, 100));
+      raw.send('02 03 00 AA');
+      raw.send('22 03 00');
+      expect(closeStatus(await raw.next()), Status.ok);
+      expect(mux.openPayloadBytes, 100);
+      expect(mux.bufferedBytes, 133);
+      raw.send(openHex(3, 1));
+      raw.send('22 03 00');
+      expect(closeStatus(await raw.next()).known, StatusCode.resourceExhausted);
+      final incoming = StreamQueue(mux.incoming);
+      addTearDown(() => incoming.cancel(immediate: true));
+      final channel = await incoming.next;
+      expect(channel.openPayload, hasLength(100));
+      expect((await channel.stream.toList()).map(hexString), ['AA']);
+      expect(mux.openPayloadBytes, 0);
+      expect(mux.bufferedBytes, 0);
+      raw.send(openHex(3, 100));
+      expect((await incoming.next).openPayload, hasLength(100));
+    });
+
+    test(
+      'cancelling or ending a closed backlog releases accounting once',
+      () async {
+        for (final closeConnection in [false, true]) {
+          final (mux, raw) = rawPair();
+          addTearDown(mux.close);
+          raw.send(openHex(3, 100));
+          raw.send('02 03 00 AA');
+          raw.send('22 03 00');
+          expect(closeStatus(await raw.next()), Status.ok);
+          expect(mux.openPayloadBytes, 100);
+          if (closeConnection) {
+            await mux.close();
+          }
+          final subscription = mux.incoming.listen((_) => fail('paused'))
+            ..pause();
+          await subscription.cancel();
+          expect(mux.openPayloadBytes, 0);
+          expect(mux.bufferedBytes, 0);
+        }
+      },
+    );
+
+    test('a paused listener holds at most maxChannels of them', () async {
+      final (mux, raw) = rawPair(options: rawOptions.copyWith(maxChannels: 2));
+      addTearDown(mux.close);
+      final received = <MuxChannel>[];
+      final subscription = mux.incoming.listen(received.add)..pause();
+      addTearDown(subscription.cancel);
+      for (var i = 0; i < 2; i++) {
+        raw.send(openHex(3, 10));
+        raw.send('02 03 00 AA');
+        raw.send('22 03 00');
+        expect(closeStatus(await raw.next()), Status.ok);
+      }
+      // Its CLOSE confirms the rejection.
+      raw.send(openHex(3, 10));
+      raw.send('22 03 00');
+      expect(closeStatus(await raw.next()).known, StatusCode.resourceExhausted);
+      expect(mux.openPayloadBytes, 20);
+      expect(received, isEmpty);
+      subscription.resume();
+      await pumpEventQueue();
+      expect(received, hasLength(2));
+      expect(mux.openPayloadBytes, 0);
+      for (final channel in received) {
+        expect(channel.state, MuxChannelState.closed);
+        expect((await channel.stream.toList()).map(hexString), ['AA']);
+      }
+      expect(mux.bufferedBytes, 0);
+    });
+
     test('cancelling incoming closes them with UNAVAILABLE', () async {
       final (a, b) = muxPair(
         acceptor: quiet.copyWith(goAwayGrace: const Duration(seconds: 5)),
@@ -624,6 +730,49 @@ void main() {
       await a.ping();
       expect(b.isOpen, isTrue);
       await a.close();
+    });
+  });
+
+  group('CONNECTION_LOST stays local', () {
+    test('CLOSE sends UNAVAILABLE and retains the local status', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      final status = Status.of(StatusCode.connectionLost, 'upstream gone');
+      unawaited(channel.close(status));
+      expect(
+        closeStatus(await raw.next()),
+        Status.of(StatusCode.unavailable, 'upstream gone'),
+      );
+      raw.send('22 02 00');
+      expect(await channel.done, status);
+    });
+
+    test('GOAWAY sends UNAVAILABLE and retains the local status', () async {
+      final (mux, raw) = rawPair();
+      final status = Status.of(StatusCode.connectionLost, 'upstream gone');
+      await mux.goAway(status);
+      final frames = await raw.rest();
+      expect(frames, hasLength(1));
+      expect(
+        MuxControlMessage.decode(frames.single.payload).goAwayStatus,
+        Status.of(StatusCode.unavailable, 'upstream gone'),
+      );
+      expect(await mux.done, status);
+    });
+
+    test('only the code changes: the bytes after it are relayed', () async {
+      final (mux, raw) = rawPair();
+      addTearDown(mux.close);
+      final channel = mux.open(empty);
+      await raw.next();
+      // As a peer that broke the rule sent it, the reason not even UTF-8.
+      final status = Status.decode(hexBytes('22 00 FF 41'));
+      unawaited(channel.close(status));
+      expect(hexString((await raw.next()).payload), '0E 00 FF 41');
+      raw.send('22 02 00');
+      expect(await channel.done, status);
     });
   });
 

@@ -528,6 +528,21 @@ void main() {
       );
     });
 
+    test('a continuation length cannot overflow the message limit', () async {
+      final (client, server) = await h.pair();
+      final received = eager(server.stream);
+      client
+        ..send(clientFrame(opBinary, [1], fin: false))
+        ..send(clientHeader(opContinuation, 0x7FFFFFFFFFFFFFFF));
+      // Only send the header: the cumulative size must be refused before
+      // buffering any of the claimed continuation payload.
+      await expectLater(
+        received.next.timeout(const Duration(seconds: 1)),
+        throwsA(isStatusError(StatusCode.frameTooLarge)),
+      );
+      expect((await client.next()).closeCode, 1009);
+    });
+
     test('the limit counts every fragment of a message', () async {
       final (client, server) = await h.pair();
       final received = eager(server.stream);

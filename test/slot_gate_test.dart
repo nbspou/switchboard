@@ -88,6 +88,7 @@ class TestLifecycle extends SlotLifecycle {
   final List<String> log = [];
   Completer<void>? loadGate;
   Completer<void>? drainGate;
+  Completer<void>? unloadGate;
   Object? loadError;
   AssignResult result = AssignResult.holding;
 
@@ -133,7 +134,10 @@ class TestLifecycle extends SlotLifecycle {
   }
 
   @override
-  Future<void> unload(int slot) async => log.add('unload $slot');
+  Future<void> unload(int slot) async {
+    log.add('unload $slot');
+    await unloadGate?.future;
+  }
 
   @override
   FutureOr<void> serve(IncomingChannel channel, int slot) {
@@ -163,16 +167,36 @@ class RecordingContext implements SlotRequestContext {
   final int epoch;
 
   final List<(Duration?, Duration?)> declared = [];
+  final Completer<void> cancelled = Completer<void>();
 
   @override
-  bool get isCancelled => false;
+  bool get isCancelled => cancelled.isCompleted;
 
   @override
-  Future<void> get onCancel => Completer<void>().future;
+  Future<void> get onCancel => cancelled.future;
 
   @override
   void extend({Duration? deadline, Duration? renew}) =>
       declared.add((deadline, renew));
+}
+
+/// Holds forwarding opens so their queue and cancellation can be inspected,
+/// or fails them before returning a future.
+class DelayedResolver extends StaticResolver {
+  DelayedResolver(super.records);
+
+  final Completer<void> proceed = Completer<void>();
+
+  /// [resolve] throws at once instead of returning a future.
+  bool throwAtOnce = false;
+
+  @override
+  Future<List<ServiceRecord>> resolve(Name type) {
+    if (throwAtOnce) {
+      throw SwitchboardException.of(StatusCode.unavailable, 'resolver down');
+    }
+    return proceed.future.then((_) => super.resolve(type));
+  }
 }
 
 /// A peer linked to the gate's dispatch over memory.
@@ -335,6 +359,132 @@ void main() {
       expect(lifecycle.log, ['load 1 e1 h0', 'serve 1 a', 'serve 1 b']);
     });
 
+    test(
+      'revocation from serve refuses the rest of the released queue',
+      () async {
+        newGate();
+        lifecycle.loadGate = Completer<void>();
+        final assigned = gate.onAssign(assign(1));
+        final a = peer.open(shard: 1, payload: 'a');
+        final b = peer.open(shard: 1, payload: 'b');
+        await settle();
+        lifecycle.onServe = (_, slot) => gate.onRevoke(kv, slot);
+        lifecycle.loadGate!.complete();
+        await assigned;
+        expect(lifecycle.served[1], hasLength(1));
+        expect(await a.done.timeout(limit), isRelocated());
+        expect(await b.done.timeout(limit), isMoved());
+      },
+    );
+
+    test('a revoked load must finish cleanup before another ASSIGN', () async {
+      newGate();
+      final hold = lifecycle.loadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1));
+      loading.ignore();
+      await gate.onRevoke(kv, 1);
+      lifecycle.loadGate = null;
+      await expectLater(
+        gate.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      await gate.onAssign(assign(1, epoch: 2));
+      expect(lifecycle.log, ['load 1 e1 h0', 'unload 1', 'load 1 e2 h0']);
+      expect(await ask(peer.open(shard: 1), 'x'), '1:x');
+    });
+
+    test('a new gate on the lifecycle refuses the slots its closed gate is '
+        'still loading, and only those', () async {
+      newGate();
+      final hold = lifecycle.loadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1));
+      loading.ignore();
+      await gate.close();
+      // A failed publishSharded can be repeated with the same lifecycle.
+      final next = SlotGate(node, client, kv, lifecycle: lifecycle);
+      addTearDown(next.close);
+      expect(lifecycle.gate, same(next));
+      lifecycle.loadGate = null;
+      await expectLater(
+        next.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      await next.onAssign(assign(2));
+      expect(next.serves(2), isTrue);
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      await next.onAssign(assign(1, epoch: 2));
+      expect(next.serves(1), isTrue);
+      expect(lifecycle.log, [
+        'load 1 e1 h0',
+        'load 2 e1 h0',
+        'unload 1',
+        'load 1 e2 h0',
+      ]);
+    });
+
+    test('an unload must finish before another ASSIGN', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final hold = lifecycle.unloadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final revoking = gate.onRevoke(kv, 1);
+      await expectLater(
+        gate.onAssign(assign(1, epoch: 2)),
+        throwsCode(StatusCode.unavailable),
+      );
+      hold.complete();
+      await revoking;
+      await gate.onAssign(assign(1, epoch: 2));
+      expect(gate.serves(1), isTrue);
+    });
+
+    test('closing during reassignment unload prevents the new load', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      final hold = lifecycle.unloadGate = Completer<void>();
+      addTearDown(() {
+        if (!hold.isCompleted) hold.complete();
+      });
+      final loading = gate.onAssign(assign(1, epoch: 3));
+      loading.ignore();
+      await gate.close();
+      hold.complete();
+      await expectLater(loading, throwsCode(StatusCode.unavailable));
+      expect(lifecycle.log, ['load 1 e1 h0', 'unload 1']);
+    });
+
+    test(
+      'a cancelled ASSIGN cannot serve its queue when load completes',
+      () async {
+        newGate();
+        final context = RecordingContext(kv, 1, 1);
+        final hold = lifecycle.loadGate = Completer<void>();
+        final loading = gate.onAssign(assign(1), context);
+        loading.ignore();
+        final queued = peer.open(shard: 1);
+        await settle();
+        context.cancelled.complete();
+        hold.complete();
+        await expectLater(loading, throwsCode(StatusCode.cancelled));
+        expect(await queued.done.timeout(limit), isMoved());
+        expect(lifecycle.served, isEmpty);
+        expect(gate.serves(1), isFalse);
+        expect(lifecycle.log, ['load 1 e1 h0', 'unload 1']);
+      },
+    );
+
     test('a failed load refuses the queue and fails ASSIGN', () async {
       newGate();
       lifecycle
@@ -465,8 +615,9 @@ void main() {
       expect(lifecycle.log.last, 'serve 1 late');
     });
 
-    test('DRAIN declares drainTimeout once when it waits for work in '
-        'flight; load and drain get the context', () async {
+    test('DRAIN declares its wait for work in flight, a second longer, '
+        'then restarts the default timeout; load and drain get the '
+        'context', () async {
       newGate();
       final loading = RecordingContext(kv, 1, 1);
       await gate.onAssign(assign(1), loading);
@@ -480,11 +631,13 @@ void main() {
         draining,
       );
       await settle();
-      expect(draining.declared, [(limit, null)]);
+      final declared = limit + const Duration(seconds: 1);
+      expect(draining.declared, [(declared, null)]);
       await busy.close();
       await drained.timeout(limit);
       expect(lifecycle.drainContext, same(draining));
-      expect(draining.declared, hasLength(1));
+      // The drain gets the naming service's default timeout again.
+      expect(draining.declared, [(declared, null), (null, null)]);
       // Nothing in flight: nothing to declare.
       await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
       final idle = RecordingContext(kv, 1, 3);
@@ -493,6 +646,32 @@ void main() {
           .timeout(limit);
       expect(idle.declared, isEmpty);
       expect(lifecycle.drainContext, same(idle));
+    });
+
+    test('a DRAIN cancelled while it waits for work in flight stops '
+        'waiting, closes nothing and does not drain', () async {
+      newGate();
+      await gate.onAssign(assign(1));
+      final busy = peer.open(shard: 1, payload: 'busy');
+      final answers = StreamQueue(busy.stream.map(text));
+      busy.send(bytes('x'));
+      expect(await answers.next.timeout(limit), '1:x');
+      final draining = RecordingContext(kv, 1, 2);
+      final drained = expectLater(
+        gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2), draining),
+        throwsCode(StatusCode.cancelled),
+      );
+      await settle();
+      draining.cancelled.complete();
+      // Well before drainTimeout (5 s).
+      await drained.timeout(const Duration(seconds: 2));
+      expect(lifecycle.log, isNot(contains('drain 1 e2 to2')));
+      expect(busy.canSend, isTrue);
+      expect(gate.stateOf(1), SlotGateState.locked);
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      busy.send(bytes('y'));
+      expect(await answers.next.timeout(limit), '1:y');
+      await answers.cancel(immediate: true);
     });
 
     test('detached channels do not hold DRAIN', () async {
@@ -582,6 +761,58 @@ void main() {
       expect(gate.movedStatus(1), isMoved(2, 2));
       expect(gate.servedSlots, isEmpty);
       expect(lifecycle.log, isNot(contains('unload 1')));
+    });
+
+    test(
+      'forwarding opens remain bounded while resolution is stalled',
+      () async {
+        final resolver = DelayedResolver([
+          ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+        ]);
+        node.resolver = resolver;
+        addTearDown(resolver.close);
+        addTearDown(() {
+          if (!resolver.proceed.isCompleted) resolver.proceed.complete();
+        });
+        newGate(maxQueuedChannels: 1);
+        await gate.onAssign(assign(1));
+        await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+        final first = peer.open(shard: 1);
+        await settle();
+        await first.close();
+        // Closing and opening again cannot accumulate unbounded pending
+        // resolver calls or continuations outside the mux channel limit.
+        final excess = peer.open(shard: 1);
+        expect(
+          await excess.done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+        resolver.proceed.complete();
+        await node.connect(targetUri);
+        await settle();
+        expect(await ask(peer.open(shard: 1), 'new'), 'to:new');
+      },
+    );
+
+    test('a forwarding open that fails at once gives its place back', () async {
+      final resolver = DelayedResolver([
+        ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+      ])..throwAtOnce = true;
+      resolver.proceed.complete();
+      node.resolver = resolver;
+      addTearDown(resolver.close);
+      newGate(maxQueuedChannels: 1);
+      await gate.onAssign(assign(1));
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      for (var i = 0; i < 3; i++) {
+        expect(
+          await peer.open(shard: 1).done.timeout(limit),
+          hasCode(StatusCode.unavailable),
+        );
+      }
+      // Refused by the bound if a failed open had kept its place.
+      resolver.throwAtOnce = false;
+      expect(await ask(peer.open(shard: 1), 'new'), 'to:new');
     });
 
     test('after the grace period: unload, then MOVED', () async {
@@ -865,6 +1096,40 @@ void main() {
   group('requests', () {
     late List<String> answered;
 
+    test(
+      'revocation from a request refuses the rest of the released queue',
+      () async {
+        newGate(trackChannels: false);
+        final handled = <String>[];
+        lifecycle.onServe = (channel, slot) {
+          channel.talk().messages.listen((message) {
+            unawaited(
+              gate.serveRequest(message, slot, (m) {
+                handled.add(text(m.payload));
+                m.reply(m.payload);
+                unawaited(gate.onRevoke(kv, slot));
+              }),
+            );
+          });
+        };
+        await gate.onAssign(assign(1));
+        final talk = TalkChannel(peer.open(shard: 1));
+        await settle();
+        await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+        final first = talk.request('GET', bytes('a'));
+        final second = expectLater(
+          talk.request('GET', bytes('b')),
+          throwsCode(StatusCode.moved),
+        );
+        await settle();
+        await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+        expect(text((await first).payload), 'a');
+        await second;
+        expect(handled, ['a']);
+        await talk.close();
+      },
+    );
+
     /// Serves Talk on every channel; requests go through [serveRequest]
     /// and are answered `slot:payload` after [hold] completes.
     void talkLifecycle({Completer<void>? hold}) {
@@ -880,6 +1145,75 @@ void main() {
         );
       };
     }
+
+    test(
+      'forwarded requests remain bounded while resolution is stalled',
+      () async {
+        final resolver = DelayedResolver([
+          ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+        ]);
+        node.resolver = resolver;
+        addTearDown(resolver.close);
+        addTearDown(() {
+          if (!resolver.proceed.isCompleted) resolver.proceed.complete();
+        });
+        newGate(maxQueuedRequests: 1, trackChannels: false);
+        talkLifecycle();
+        await gate.onAssign(assign(1));
+        final talk = TalkChannel(peer.open(shard: 1));
+        await settle();
+        await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+        target.registerService(kv, (incoming) {
+          incoming.talk().messages.listen((m) => m.reply(m.payload));
+        }, instance: 2);
+        final first = talk.startRequest('GET', bytes('first'));
+        final cancelled = expectLater(
+          first.response,
+          throwsCode(StatusCode.cancelled),
+        );
+        await settle();
+        first.cancel();
+        await cancelled;
+        await expectLater(
+          talk.request('GET', bytes('excess'), timeout: limit),
+          throwsCode(StatusCode.unavailable),
+        );
+        resolver.proceed.complete();
+        await node.connect(targetUri);
+        await settle();
+        expect(text((await talk.request('GET', bytes('new'))).payload), 'new');
+        await talk.close();
+      },
+    );
+
+    test('a forwarding channel that fails at once gives the request\'s '
+        'place back', () async {
+      final resolver = DelayedResolver([
+        ServiceRecord(ServiceAddress(kv, 2), endpoints: [targetUri]),
+      ])..throwAtOnce = true;
+      resolver.proceed.complete();
+      node.resolver = resolver;
+      addTearDown(resolver.close);
+      newGate(maxQueuedRequests: 1, trackChannels: false);
+      talkLifecycle();
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      target.registerService(kv, (incoming) {
+        incoming.talk().messages.listen((m) => m.reply(m.payload));
+      }, instance: 2);
+      for (var i = 0; i < 3; i++) {
+        await expectLater(
+          talk.request('GET', bytes('x$i'), timeout: limit),
+          throwsCode(StatusCode.unavailable),
+        );
+      }
+      // Refused by the bound if a failed open had kept its place.
+      resolver.throwAtOnce = false;
+      expect(text((await talk.request('GET', bytes('new'))).payload), 'new');
+      await talk.close();
+    });
 
     test('served, queued while locked, forwarded after FORWARD', () async {
       newGate(trackChannels: false);

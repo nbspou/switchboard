@@ -165,6 +165,19 @@ class RawProxy {
 
 class _ForeignMessage extends Fake implements TalkMessage {}
 
+/// A frontend sink whose frame limit refuses a large streamed reply.
+class _LimitedSink extends DelegatingStreamSink<Uint8List> {
+  _LimitedSink(super.sink);
+
+  @override
+  void add(Uint8List data) {
+    if (data.length > 64) {
+      throw SwitchboardException.of(StatusCode.frameTooLarge);
+    }
+    super.add(data);
+  }
+}
+
 void main() {
   for (final sync in [false, true]) {
     for (final hops in [1, 2]) {
@@ -563,6 +576,122 @@ void main() {
     final odd = Name.fromBytes([0xFF, 0x41, 0, 0, 0, 0, 0, 0]);
     final odd2 = Name.fromBytes([0xC3, 0x28, 0x80, 0, 0, 0, 0, 0]);
 
+    test('an undeliverable synchronous item cancels the forwarded request', () {
+      fakeAsync((async) {
+        final toClient = StreamChannelController<Uint8List>(sync: true);
+        final toBackend = StreamChannelController<Uint8List>(sync: true);
+        final proxy = Proxy(
+          TalkChannel(
+            StreamChannel(
+              toClient.local.stream,
+              _LimitedSink(toClient.local.sink),
+            ),
+          ),
+          TalkChannel(toBackend.local),
+        );
+        final atClient = <TalkFrame>[];
+        final atBackend = <TalkFrame>[];
+        toClient.foreign.stream.listen(
+          (d) => atClient.add(TalkFrame.decode(d)),
+        );
+        toBackend.foreign.stream.listen((data) {
+          final frame = TalkFrame.decode(data);
+          atBackend.add(frame);
+          if (frame.kind == TalkKind.message) {
+            // Respond inside the proxy's send, before it has the handle.
+            toBackend.foreign.sink.add(
+              TalkFrame(
+                kind: TalkKind.streamItem,
+                responseId: frame.requestId,
+                payload: Uint8List(100),
+              ).encode(),
+            );
+          } else if (frame.kind == TalkKind.abort && frame.hasRequest) {
+            toBackend.foreign.sink.add(
+              TalkFrame(
+                kind: TalkKind.abort,
+                responseId: frame.requestId,
+                payload: Status.of(StatusCode.cancelled).encode(),
+              ).encode(),
+            );
+          }
+        });
+        toClient.foreign.sink.add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('LIST'),
+            requestId: 7,
+            stream: true,
+          ).encode(),
+        );
+        async.flushMicrotasks();
+        expect(atClient.single.status.known, StatusCode.unavailable);
+        expect(atBackend.map((f) => f.kind), [
+          TalkKind.message,
+          TalkKind.abort,
+        ]);
+        expect(proxy.front.incomingRequestCount, 0);
+        expect(proxy.back.outgoingRequestCount, 0);
+        final forwarded = Outcome(proxy.forwards.single);
+        async.flushMicrotasks();
+        expect(forwarded.isDone, isTrue);
+        proxy.close();
+        async.flushMicrotasks();
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    test('a listener that throws after forwarding cancels the forwarded '
+        'request', () async {
+      final toClient = StreamChannelController<Uint8List>();
+      final toBackend = StreamChannelController<Uint8List>();
+      final front = TalkChannel(toClient.local);
+      final back = TalkChannel(toBackend.local);
+      final forwards = <Future<void>>[];
+      front.messages.listen((m) {
+        forwards.add(forwardMessage(m, back));
+        throw StateError('handler bug');
+      });
+      final atClient = <TalkFrame>[];
+      final atBackend = <TalkFrame>[];
+      toClient.foreign.stream.listen((d) => atClient.add(TalkFrame.decode(d)));
+      toBackend.foreign.stream.listen((data) {
+        final frame = TalkFrame.decode(data);
+        atBackend.add(frame);
+        if (frame.kind == TalkKind.abort && frame.hasRequest) {
+          toBackend.foreign.sink.add(
+            TalkFrame(
+              kind: TalkKind.abort,
+              responseId: frame.requestId,
+              payload: Status.of(StatusCode.cancelled).encode(),
+            ).encode(),
+          );
+        }
+      });
+      toClient.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('LIST'),
+          requestId: 7,
+          stream: true,
+        ).encode(),
+      );
+      await pumpEventQueue();
+      final forwarded = Outcome(forwards.single);
+      await pumpEventQueue();
+      expect(forwarded.isDone, isTrue, reason: 'forwarding ended');
+      expect(atClient.single.kind, TalkKind.abort);
+      expect(atClient.single.responseId, 7);
+      expect(atClient.single.status.known, StatusCode.internal);
+      expect(atBackend.map((f) => (f.kind, f.requestId)), [
+        (TalkKind.message, 1),
+        (TalkKind.abort, 1),
+      ], reason: 'the backend is told to stop');
+      expect(front.incomingRequestCount, 0);
+      expect(back.outgoingRequestCount, 0);
+      await Future.wait([front.close(), back.close()]);
+    });
+
     test('non-UTF-8 procedure names pass through byte for byte', () async {
       final p = RawProxy();
       p.fromClient(
@@ -655,6 +784,62 @@ void main() {
       ]);
       await p.proxy.close();
     });
+
+    for (final code in [StatusCode.moved, StatusCode.relocated]) {
+      test(
+        '${code.name} abort fields and reason pass through byte for byte',
+        () async {
+          final p = RawProxy();
+          p.fromClient(
+            TalkFrame(
+              kind: TalkKind.message,
+              procedure: Name('Q'),
+              requestId: 7,
+            ),
+          );
+          await pumpEventQueue();
+          // The owner bytes and malformed UTF-8 reason must survive status
+          // decoding. Rebuilding the status from its reason would corrupt it.
+          final payload = bytes([
+            code.code,
+            0,
+            0xFF,
+            0xEE,
+            0xDD,
+            0xCC,
+            0xBB,
+            0xAA,
+            0x78,
+            0x56,
+            0x34,
+            0x12,
+            0xFF,
+            0x80,
+          ]);
+          p.fromBackend(
+            TalkFrame(
+              kind: TalkKind.abort,
+              responseId: p.atBackend.single.requestId,
+              payload: payload,
+            ),
+          );
+          await Future.wait(p.proxy.forwards);
+          await pumpEventQueue();
+          final response = p.atClient.single;
+          expect(response.kind, TalkKind.abort);
+          expect(response.responseId, 7);
+          expect(response.payload, payload);
+          expect(
+            p.atBackend,
+            hasLength(1),
+            reason: 'neither status is retried',
+          );
+          expect(p.proxy.front.incomingRequestCount, 0);
+          expect(p.proxy.back.outgoingRequestCount, 0);
+          await p.proxy.close();
+        },
+      );
+    }
 
     test('a chained request from the backend gets its own id toward the '
         'client', () async {

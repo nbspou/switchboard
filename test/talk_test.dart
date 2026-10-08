@@ -723,6 +723,32 @@ void main() {
       await p.close();
     });
 
+    test('a request whose handler threw is marked cancelled', () async {
+      final p = Pair();
+      final seen = <String, TalkMessage>{};
+      p.b.messages.listen((m) {
+        seen[m.procedureName] = m;
+        if (m.procedureName == 'LATE') {
+          m.reply(bytes([1]));
+        }
+        throw StateError('handler bug');
+      });
+      await expectLater(
+        p.a.request('BOOM', Uint8List(0)),
+        throwsStatus(StatusCode.internal),
+      );
+      expect((await p.a.request('LATE', Uint8List(0))).payload, [1]);
+      final boom = seen['BOOM']!;
+      final onCancel = Outcome(boom.onCancel);
+      await pumpEventQueue();
+      expect(boom.isCancelled, isTrue, reason: 'work should stop');
+      expect(onCancel.isDone, isTrue);
+      expect(boom.canReply, isFalse);
+      expect(seen['LATE']!.isCancelled, isFalse, reason: 'it was answered');
+      expect(p.bToA.where((f) => f.kind == TalkKind.abort), hasLength(1));
+      await p.close();
+    });
+
     test('item listener exceptions abort the item request', () async {
       final p = Pair();
       serve(p.b, (m) async {
@@ -892,6 +918,141 @@ void main() {
   });
 
   group('timeouts', () {
+    /// The longest delay a JavaScript timer takes, a signed 32-bit number
+    /// of milliseconds (about 24.8 days); a longer one fires at once.
+    const maxTimerDelay = Duration(milliseconds: 0x7FFFFFFF);
+
+    void expectTimersInRange(FakeAsync async) => expect(
+      async.pendingTimers.map((t) => t.duration),
+      everyElement(lessThanOrEqualTo(maxTimerDelay)),
+      reason: 'longer timers fire at once on JavaScript',
+    );
+
+    test('long requester timeouts are armed in steps a JavaScript timer '
+        'takes, and expire on time', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(
+            requestTimeout: Duration(days: 30),
+            maxExtension: Duration.zero,
+          ),
+        );
+        final gap = Outcome(peer.talk.request('Q', Uint8List(0)));
+        final declared = Outcome(peer.talk.request('Q', Uint8List(0)));
+        async.flushMicrotasks();
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.extend,
+            responseId: 2,
+            payload: TalkFrame.extendPayload(
+              deadline: const Duration(days: 40),
+            ),
+          ),
+        );
+        async.flushMicrotasks();
+        expectTimersInRange(async);
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
+        expect(gap.isDone, isFalse);
+        async.elapse(const Duration(days: 1));
+        expect(gap.error, isStatus(StatusCode.deadlineExceeded));
+        async.elapse(const Duration(days: 9));
+        expectTimersInRange(async);
+        expect(declared.isDone, isFalse);
+        async.elapse(const Duration(days: 1));
+        expect(declared.error, isStatus(StatusCode.deadlineExceeded));
+        expect(peer.talk.outgoingRequestCount, 0);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('long cancelled-id timeouts rearm until their deadline', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(days: 30)),
+        );
+        peer.talk.startRequest('Q', Uint8List(0)).cancel();
+        expectTimersInRange(async);
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
+        expect(peer.talk.outgoingRequestCount, 1);
+        async.elapse(const Duration(days: 1));
+        expect(peer.talk.outgoingRequestCount, 0);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('long responder deadlines are armed in steps a JavaScript timer '
+        'takes, and expire on time', () {
+      fakeAsync((async) {
+        final peer = RawPeer();
+        TalkMessage? held;
+        peer.talk.messages.listen((m) => held = m);
+        peer.send(
+          TalkFrame(kind: TalkKind.message, procedure: Name('Q'), requestId: 1),
+        );
+        async.flushMicrotasks();
+        held!.extend(deadline: const Duration(days: 30));
+        expectTimersInRange(async);
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange(async);
+        expect(held!.canReply, isTrue);
+        async.elapse(const Duration(days: 1));
+        expect(held!.canReply, isFalse);
+        expect(peer.received.last.kind, TalkKind.abort);
+        expect(peer.received.last.status.known, StatusCode.deadlineExceeded);
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test(
+      'long requester timeouts do not overflow the platform timer',
+      () async {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(days: 30)),
+        );
+        addTearDown(peer.talk.close);
+        final request = peer.talk.startRequest('Q', Uint8List(0));
+        final result = Outcome(request.response);
+        await Future<void>.delayed(ms30);
+        expect(result.isDone, isFalse);
+        request.cancel();
+        await Future<void>.delayed(ms30);
+        expect(
+          peer.talk.outgoingRequestCount,
+          1,
+          reason: 'the cancelled id keeps its long release timeout',
+        );
+        await peer.talk.close();
+      },
+    );
+
+    test(
+      'long declared deadlines do not overflow the platform timer',
+      () async {
+        final p = Pair(a: const TalkOptions(maxExtension: Duration.zero));
+        addTearDown(p.close);
+        final held = <TalkMessage>[];
+        serve(p.b, (m) {
+          held.add(m);
+          m.extend(deadline: const Duration(days: 30));
+        });
+        final response = Outcome(p.a.request('Q', Uint8List(0)));
+        await pumpEventQueue();
+        await Future<void>.delayed(ms30);
+        expect(held, hasLength(1));
+        expect(held.single.canReply, isTrue);
+        expect(response.isDone, isFalse);
+        await p.close();
+      },
+    );
+
     test('responder side: ABORT DEADLINE_EXCEEDED, later replies throw', () {
       fakeAsync((async) {
         final p = Pair(b: const TalkOptions(replyTimeout: ms30));
@@ -1551,14 +1712,17 @@ void main() {
     test('items listeners without onError survive aborts, cancels and '
         'timeouts', () async {
       final errors = await uncaughtErrors(() async {
-        final peer = RawPeer(
-          options: const TalkOptions(requestTimeout: Duration(milliseconds: 5)),
-        );
+        final peer = RawPeer();
         final aborted = peer.talk.streamRequest('A', Uint8List(0));
         aborted.items.listen((_) {});
         final cancelled = peer.talk.streamRequest('C', Uint8List(0));
         cancelled.items.listen((_) {});
-        final expired = peer.talk.streamRequest('T', Uint8List(0));
+        // Only this request should expire while the event queue is pumped.
+        final expired = peer.talk.streamRequest(
+          'T',
+          Uint8List(0),
+          timeout: const Duration(milliseconds: 5),
+        );
         expired.items.listen((_) {});
         await pumpEventQueue();
         peer.send(
@@ -2575,6 +2739,22 @@ void main() {
       });
     });
 
+    test('a cancel during an automatic timeout abort gets no second final', () {
+      fakeAsync((async) {
+        final r = SyncResponder();
+        async.flushMicrotasks();
+        r.cancelDuring(isFinal);
+        async.elapse(const Duration(seconds: 10));
+        async.flushMicrotasks();
+        expect(r.finals, hasLength(1));
+        expect(r.finals.single.status.known, StatusCode.deadlineExceeded);
+        expect(r.request.canReply, isFalse);
+        expect(r.request.isCancelled, isTrue);
+        expect(r.talk.incomingRequestCount, 0);
+        finish(async, r);
+      });
+    });
+
     test('a cancel during a chained reply leaves the chained request as '
         'the final', () {
       fakeAsync((async) {
@@ -2822,6 +3002,112 @@ void main() {
       await third;
       await talk.close();
     });
+
+    for (final end in [
+      'a channel abort',
+      'a protocol error',
+      'close',
+      'the peer closing',
+    ]) {
+      test('an answer that arrived before $end keeps its place', () async {
+        final (talk, peer) = syncLink();
+        final seen = <String>[];
+        talk.messages.listen(
+          (m) => seen.add(m.procedureName),
+          onError: (Object e) => seen.add('error'),
+        );
+        final response = talk
+            .request('Q', Uint8List(0), ordered: true)
+            .then((_) => seen.add('answer'));
+        peer
+          ..add(plain('M1'))
+          ..add(plain('M2'))
+          ..add(answer(1));
+        switch (end) {
+          case 'a channel abort':
+            peer.add(
+              TalkFrame(
+                kind: TalkKind.abort,
+                payload: Status.of(StatusCode.unavailable).encode(),
+              ).encode(),
+            );
+          case 'a protocol error':
+            peer.add(bytes([0xC0]));
+          case 'close':
+            unawaited(talk.close());
+          default:
+            unawaited(peer.close());
+        }
+        await response;
+        await talk.done;
+        await pumpEventQueue();
+        expect(seen, [
+          'M1',
+          'M2',
+          'answer',
+          if (end == 'a channel abort') 'error',
+        ]);
+      });
+    }
+
+    for (final abort in [false, true]) {
+      test('a paused listener holds an ${abort ? 'abort' : 'answer'} that '
+          'arrived before the channel ended; resuming or cancelling '
+          'delivers it', () {
+        fakeAsync((async) {
+          for (final resume in [true, false]) {
+            final (talk, peer) = syncLink();
+            final seen = <String>[];
+            final sub = talk.messages.listen((m) => seen.add(m.procedureName))
+              ..pause();
+            final response = Outcome(
+              talk
+                  .request('Q', Uint8List(0), ordered: true)
+                  .whenComplete(() => seen.add('answer')),
+            );
+            peer
+              ..add(plain('M1'))
+              ..add(
+                abort
+                    ? TalkFrame(
+                        kind: TalkKind.abort,
+                        responseId: 1,
+                        payload: Status.of(StatusCode.notFound).encode(),
+                      ).encode()
+                    : answer(1),
+              );
+            async.flushMicrotasks();
+            expect(talk.outgoingRequestCount, 0);
+            final closed = Outcome(
+              talk.close(Status.of(StatusCode.unavailable)),
+            );
+            async.flushMicrotasks();
+            expect(closed.isDone, isTrue);
+            expect(response.isDone, isFalse);
+            if (resume) {
+              sub.resume();
+              async.flushMicrotasks();
+              expect(seen, ['M1', 'answer']);
+            } else {
+              sub.cancel();
+              async.flushMicrotasks();
+              expect(seen, ['answer']);
+            }
+            expect(response.isDone, isTrue);
+            if (abort) {
+              expect(response.error, isA<TalkAbortException>());
+              expect(response.error, isStatus(StatusCode.notFound));
+            } else {
+              expect(response.error, isNull);
+              expect(response.value!.responseId, 1);
+            }
+            sub.cancel();
+            async.flushMicrotasks();
+            expect(async.pendingTimers, isEmpty);
+          }
+        });
+      });
+    }
   });
 
   group('subscriptions', () {
@@ -3282,6 +3568,50 @@ void main() {
       await source.close();
       await p.close();
     });
+
+    for (final sourceFails in [false, true]) {
+      test(
+        'replyStream: cleanup errors after ${sourceFails ? 'a source error' : 'a peer cancel'} '
+        'are handled',
+        () async {
+          final errors = await uncaughtErrors(() async {
+            final p = Pair();
+            var cancellations = 0;
+            final source = StreamController<Uint8List>(
+              onCancel: () {
+                cancellations++;
+                return Future<void>.error(StateError('cleanup failed'));
+              },
+            );
+            late Outcome<void> finished;
+            serve(p.b, (m) => finished = Outcome(m.replyStream(source.stream)));
+            final stream = p.a.streamRequest('X', Uint8List(0));
+            final answer = Outcome(stream.done);
+            stream.items.listen((_) {});
+            await pumpEventQueue();
+            if (sourceFails) {
+              source.addError(StateError('source failed'));
+            } else {
+              stream.cancel();
+            }
+            await pumpEventQueue();
+            expect(finished.isDone, isTrue);
+            expect(finished.error, isNull);
+            expect(cancellations, 1);
+            expect(
+              answer.error,
+              isStatus(
+                sourceFails ? StatusCode.internal : StatusCode.cancelled,
+              ),
+            );
+            expect(p.bToA.where((f) => f.kind == TalkKind.abort), hasLength(1));
+            await source.close();
+            await p.close();
+          });
+          expect(errors, isEmpty);
+        },
+      );
+    }
 
     test(
       'replyStream: the channel closing stops consuming the source',

@@ -75,8 +75,9 @@ abstract final class StreamTransport {
   /// A wrong magic or a zero length fails the stream with a
   /// [ProtocolException]; an unsupported preamble version fails it with a
   /// [SwitchboardException] carrying [StatusCode.unsupported]. A length
-  /// above [maxFrameSize] fails it with a [SwitchboardException] carrying
-  /// [StatusCode.frameTooLarge], without reading the body. After such an
+  /// above [maxFrameSize] (0 means no limit) fails it with a
+  /// [SwitchboardException] carrying [StatusCode.frameTooLarge], without
+  /// reading the body. After such an
   /// error the stream closes, and [output] is closed once the listener has
   /// seen the error and the end of the stream, so a mux layer can still
   /// send GOAWAY from its error handler.
@@ -94,6 +95,9 @@ abstract final class StreamTransport {
   /// closing [output] (which first writes the buffered bytes) takes longer
   /// than [closeTimeout], the transport gives up: it calls [abort], if
   /// given, which should destroy the underlying connection.
+  /// Cancelling the stream subscription, even while paused, leaves the
+  /// sink writable and keeps reading to observe the peer closing; input
+  /// paused for output throttling stays paused until the output drains.
   static StreamTransportChannel wrap(
     Stream<List<int>> input,
     StreamSink<List<int>> output, {

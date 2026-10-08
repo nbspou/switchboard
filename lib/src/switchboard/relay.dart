@@ -19,6 +19,7 @@ import '../naming/naming_protocol.dart';
 import '../status.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
+import 'identity_wait.dart';
 import 'incoming_channel.dart';
 import 'proxy.dart';
 import 'resolver.dart';
@@ -58,10 +59,11 @@ final Logger _log = Logger('Switchboard.Relay');
 ///    to the instance is being opened (steps 4 to 7) is checked again
 ///    under its new identity: if that may not open the type, the channel
 ///    to the instance is closed (`CANCELLED`) and the consumer's refused
-///    with `PERMISSION_DENIED`. If a required identity expires meanwhile,
-///    the consumer is refused with `UNAUTHENTICATED` and the channel to
-///    the instance is closed. An identity that arrives once the two
-///    channels are piped does not affect them.
+///    with `PERMISSION_DENIED`. With [requireIdentity], a credential that
+///    expires meanwhile likewise closes the channel to the instance and
+///    refuses the consumer's with `UNAUTHENTICATED`. An identity that
+///    arrives (or expires) once the two channels are piped does not affect
+///    them.
 /// 4. Bounds the channels it relays per consumer connection to
 ///    [maxChannelsPerConnection] (0: no bound): `RESOURCE_EXHAUSTED`
 ///    beyond, since every consumer shares the relay's connection to each
@@ -276,9 +278,10 @@ class RelayService {
       final channel = target.channel;
       // The consumer may have identified (again) while the channel to the
       // instance was being opened: the identity it has now is the one held
-      // to its scopes. A required identity can also have expired meanwhile.
+      // to its scopes. It may also have expired during that wait.
       final now = connection.peerIdentity;
-      if (requireIdentity && now == null) {
+      if (now == null && requireIdentity) {
+        _log.info('relay: $incoming refused, the consumer identity expired');
         unawaited(channel.close(genericStatus(StatusCode.cancelled)));
         await incoming.reject(genericStatus(StatusCode.unauthenticated));
         return;
@@ -307,7 +310,8 @@ class RelayService {
 
   /// The identity the consumer of [incoming] presents once it identifies,
   /// within the node's [Switchboard.identityTimeout] (zero: not waited
-  /// for); null when it did not, or the channel ended meanwhile.
+  /// for); null when it did not, or the channel ended meanwhile. Closed
+  /// channels leave no per-channel listener on the pending identity event.
   Future<PeerIdentity?> _identified(IncomingChannel incoming) async {
     final connection = incoming.connection;
     final channel = incoming.channel;
@@ -321,8 +325,7 @@ class RelayService {
       if (left <= Duration.zero || channel.state != MuxChannelState.open) {
         return null;
       }
-      await Future.any<void>([connection.identityChanged, channel.done])
-          .timeout(left, onTimeout: () {});
+      await waitForIdentityChange(channel, left);
     }
     return connection.peerIdentity;
   }

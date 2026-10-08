@@ -177,13 +177,14 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the frame fits the peer's announced frame limit and
   /// the status payload stays within 1024 bytes; [done] reports [status]
-  /// as given.
+  /// as given. The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`.
   ///
   /// Completes when the channel is mutually closed or the connection is
   /// lost, whichever comes first; completes at once if the channel is
   /// already closed. If the peer does not confirm within
   /// [MuxOptions.closeConfirmTimeout], the channel is considered closed
-  /// locally and this completes then; see that option. Never completes
+  /// locally and this completes then; see that option. Completion cancels
+  /// the confirmation timer even on synchronous transports. Never completes
   /// with an error. Throws [ArgumentError] synchronously for application
   /// status codes (256 and above), which must not be used in CLOSE.
   @override
@@ -193,8 +194,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       _closeSent = true;
       _state = MuxChannelState.halfClosedLocal;
       _noteStatus(status);
-      _link.host.sendFrame(_closeFrame(status));
+      // A synchronous transport can confirm during sendFrame; install
+      // the timer first so that completion cancels it.
       _link._startConfirmTimer();
+      _link.host.sendFrame(_closeFrame(status));
     }
     return _done.future;
   }
@@ -342,6 +345,10 @@ class MuxChannelLink {
 
   /// Channel id.
   int get id => channel.id;
+
+  /// Whether the connection still holds this channel for incoming delivery.
+  /// Kept separately so queue removal and membership checks stay constant time.
+  bool incomingPending = false;
 
   /// Whether the peer's CLOSE has been received.
   bool get closeReceived => channel._closeReceived;

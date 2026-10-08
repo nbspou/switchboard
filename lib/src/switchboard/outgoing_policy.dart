@@ -122,9 +122,13 @@ typedef EndpointCredential = FutureOr<Uint8List?> Function(
 /// );
 /// ```
 ///
-/// A hook that throws fails identification with `UNAUTHENTICATED` before
-/// sending an IDENT (the error is logged). Return null explicitly when an
-/// unnamed identification is intended.
+/// A hook that throws fails closed rather than naming nobody: the error is
+/// logged at WARNING, the new connection is sent GOAWAY, and the attempt
+/// fails with `SwitchboardException` `StatusCode.internal`, whose reason
+/// names the hook, not the error. The resolving opens, the relay path
+/// and `PeerSet` count it as a failure to connect: the next endpoint or
+/// relay is tried, and a `PeerSet` peer again after its backoff.
+/// `Switchboard.identifyOn` fails the same way without sending `IDENT`.
 typedef ExpectedIdentity = String? Function(
   Uri endpoint,
   ServiceRecord? record,

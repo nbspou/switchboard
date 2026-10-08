@@ -451,6 +451,39 @@ void main() {
     );
   });
 
+  test(
+    'credentials pending during an endpoint change stay at their destination',
+    () async {
+      final a = await worker(1);
+      final b = await worker(1);
+      final credential = Completer<Uint8List?>();
+      final requested = Completer<void>();
+      consumer = Switchboard(
+        muxOptions: fast,
+        credentialFor: (endpoint, record) {
+          requested.complete();
+          expect(endpoint, a.uri);
+          return credential.future;
+        },
+      );
+      addTearDown(consumer.close);
+      resolver.add(a.record());
+      final set = watch();
+      await until(() => set.online.length == 1);
+      final opening = set.openChannel(1);
+      final refused = expectLater(
+        opening,
+        throwsCode(StatusCode.failedPrecondition),
+      );
+      await requested.future;
+      resolver.add(b.record());
+      await until(() => set.peers[1]!.endpoint == b.uri);
+      credential.complete(bytes('only-for-a'));
+      await refused;
+      expect(b.payloads, isEmpty);
+    },
+  );
+
   test('credentials: each worker sees its own key, never the mesh '
       'credential', () async {
     final ws = [for (var id = 1; id <= 4; id++) await worker(id)];
@@ -931,6 +964,82 @@ void main() {
   });
 
   group('timing (fake_async)', () {
+    test('a hanging credential fails setup within connectTimeout', () {
+      fakeAsync((async) {
+        final resolver = StaticResolver();
+        final credential = Completer<Uint8List?>();
+        final consumer = Switchboard(
+          muxOptions: fast,
+          credentialFor: (_, _) => credential.future,
+        );
+        final w = Worker(1);
+        unawaited(w.start());
+        async.flushMicrotasks();
+        resolver.add(w.record());
+        final set = PeerSet.watch(
+          consumer,
+          gpu,
+          resolver: resolver,
+          channel: ChannelAddress(type: gpu),
+          connectTimeout: ms(300),
+          initialBackoff: ms(500),
+          jitter: 0,
+        );
+        async.elapse(ms(299));
+        final peer = set.peers[1]!;
+        expect(peer.state, PeerState.connecting);
+        async.elapse(ms(2));
+        expect(peer.state, PeerState.offline);
+        expect(peer.lastStatus, hasCode(StatusCode.internal));
+        expect(peer.connection, isNull);
+        // A credential delivered after its bound cannot open a channel.
+        credential.complete(bytes('late'));
+        async.flushMicrotasks();
+        expect(w.raw, isEmpty);
+        unawaited(set.close());
+        unawaited(w.stop());
+        unawaited(consumer.close());
+        unawaited(resolver.close());
+        async.elapse(const Duration(seconds: 1));
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
+    for (final hook in ['onConnect', 'onOpen']) {
+      test('$hook closing the set leaves no hook timeout behind', () {
+        fakeAsync((async) {
+          final resolver = StaticResolver();
+          final consumer = Switchboard(muxOptions: fast);
+          final w = Worker(1);
+          unawaited(w.start());
+          async.flushMicrotasks();
+          resolver.add(w.record());
+          late PeerSet set;
+          Future<void> closeInHook() {
+            unawaited(set.close());
+            return Completer<void>().future;
+          }
+
+          set = PeerSet.watch(
+            consumer,
+            gpu,
+            resolver: resolver,
+            connectTimeout: const Duration(seconds: 10),
+            onConnect: hook == 'onConnect' ? (_) => closeInHook() : null,
+            channel: hook == 'onOpen' ? ChannelAddress(type: gpu) : null,
+            onOpen: hook == 'onOpen' ? (_, _) => closeInHook() : null,
+          );
+          async.elapse(const Duration(seconds: 1));
+          expect(set.isClosed, isTrue);
+          unawaited(w.stop());
+          unawaited(consumer.close());
+          unawaited(resolver.close());
+          async.elapse(const Duration(seconds: 1));
+          expect(async.pendingTimers, isEmpty);
+        });
+      });
+    }
+
     test('the backoff schedule, a lasting connection resets it, close '
         'leaves no timer', () {
       fakeAsync((async) {

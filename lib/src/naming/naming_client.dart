@@ -36,9 +36,10 @@ typedef TalkConnector = Future<TalkChannel> Function();
 /// client's channel: dial [DialBackRequest.endpoint], identify there with
 /// [DialBackRequest.intent] naming [DialBackRequest.requester] as the
 /// receiver, and complete once that identification is confirmed. A
-/// failure is answered `ABORT` (with the status of a
-/// [SwitchboardException], else `UNAVAILABLE`). `MeshNode` installs one
-/// (see [NamingClient.connectHandler]).
+/// failure, whatever it is, is answered `ABORT UNAVAILABLE` (wiki page
+/// "Switchboard Identity and Credentials", "Reverse connections"); its
+/// cause goes to the log. `MeshNode` installs one (see
+/// [NamingClient.connectHandler]).
 typedef ConnectHandler = Future<void> Function(DialBackRequest request);
 
 /// A client of the naming service: registers this process's services and
@@ -344,15 +345,15 @@ class NamingClient {
     try {
       await handler(request);
     } on Object catch (e, st) {
-      final status = e is SwitchboardException
-          ? e.status
-          : Status.of(StatusCode.unavailable, 'dial back failed');
       if (e is! SwitchboardException) {
         _log.warning('CONNECT handler failed', e, st);
       } else {
-        _log.info('CONNECT to ${request.endpoint} failed: $status');
+        _log.info('CONNECT to ${request.endpoint} failed: ${e.status}');
       }
-      _abortRequest(message, status);
+      _abortRequest(
+        message,
+        Status.of(StatusCode.unavailable, 'dial back failed'),
+      );
       return;
     }
     if (message.canReply) {
@@ -612,6 +613,10 @@ class NamingClient {
   /// endpoints and metadata (publishing `UP` if either changed), only the
   /// newest registration is remembered, and the earlier call's future
   /// completes (or fails) like this one.
+  /// If the replacement is refused while the earlier registration may be
+  /// published on the channel (it was made, or was in flight, on it), the
+  /// client drops the channel, so that the record it no longer tracks
+  /// goes away with it.
   ///
   /// [onAssigned], if given, is called synchronously with the instance id
   /// whenever the registration gets an id different from the one it had:
@@ -703,7 +708,9 @@ class NamingClient {
   /// Removes the registration of `type/instance` made through this client
   /// and stops re-registering it. A [register] of it still in flight fails
   /// with [StatusCode.cancelled]; if the naming service registers it anyway,
-  /// the client unregisters it as soon as the answer arrives.
+  /// the client unregisters it as soon as the answer arrives, and if one
+  /// that replaced a registration on the channel is refused, the client
+  /// drops the channel, which takes the replaced record with it.
   ///
   /// While disconnected it completes immediately: the naming service already
   /// dropped the record with the channel. Fails with [StatusCode.notFound]
@@ -796,7 +803,9 @@ class NamingClient {
     if (!_firstSynced.isCompleted) {
       _firstSynced.completeError(cancelled);
     }
-    await _events.close();
+    // Not awaited: a listener that is paused (an `await for` body calling
+    // close, an idle StreamQueue) would hold it for ever.
+    unawaited(_events.close());
     await _slots.close();
   }
 
@@ -956,7 +965,7 @@ class NamingClient {
       return;
     }
     entry.pending = session;
-    final requested = instance ?? entry.instance;
+    final requested = entry.pendingInstance = instance ?? entry.instance;
     final int assigned;
     try {
       // Ordered: the UP of the record, which the naming service sends
@@ -996,13 +1005,21 @@ class NamingClient {
     _Entry entry,
     int assigned,
   ) async {
-    if (entry.superseded) {
-      // A newer registration of the same id took over; it registers the
-      // endpoints and metadata it wants on its own.
-      return;
-    }
-    if (!_entries.contains(entry)) {
-      // Unregistered while the request was in flight.
+    if (entry.superseded || !_entries.contains(entry)) {
+      // Superseded by a newer registration, or unregistered, while the
+      // request was in flight. The record is the newer registration's if
+      // that one registers the same id on this channel: its REGISTER
+      // follows this one, and replaces the record. Otherwise nothing
+      // tracks the record any more (this one may have been given another
+      // id than the newer one asked for), and it is removed.
+      final successor = _successorOn(session, entry, assigned);
+      if (successor != null) {
+        if (!identical(successor.session, session)) {
+          // Should its REGISTER be refused, the record would stay.
+          successor.replacesOn = session;
+        }
+        return;
+      }
       if (session.usable) {
         try {
           await _sendUnregister(session, entry.type, assigned);
@@ -1012,7 +1029,9 @@ class NamingClient {
       }
       return;
     }
-    if (entry.completer.isCompleted && assigned != entry.instance) {
+    if (entry.completer.isCompleted &&
+        entry.instance != 0 &&
+        assigned != entry.instance) {
       _log.warning(
         're-registered ${ServiceAddress(entry.type, entry.instance)} as '
         '${ServiceAddress(entry.type, assigned)}',
@@ -1023,18 +1042,32 @@ class NamingClient {
     entry.session = session;
     entry.refusals = 0;
     // At most one remembered registration per address: an older one that
-    // ended up with the same id (it asked for any id and was given the one
-    // this entry asked for) is superseded by this, the later answer.
-    for (final older in [
+    // ended up with the same id on this channel (it asked for any id and
+    // was given the one this entry asked for) is superseded by this, the
+    // later answer. A remembered one that is not registered on this channel
+    // (it waits to be registered again) has lost its id to this entry, and
+    // asks for a new one when it is.
+    for (final other in [
       for (final e in _entries)
         if (!identical(e, entry) &&
             e.type == entry.type &&
             e.instance == assigned &&
-            e.completer.isCompleted)
+            e.completer.isCompleted &&
+            !identical(e.pending, session))
           e,
     ]) {
-      _supersede(older, entry);
+      if (identical(other.session, session)) {
+        _supersede(other, entry);
+      } else {
+        _log.warning(
+          '${ServiceAddress(entry.type, assigned)} went to another '
+          'registration of this client; asking for a new id',
+        );
+        other.instance = 0;
+      }
     }
+    // Whatever it replaced, it replaced.
+    entry.replacesOn = null;
     _log.fine('registered ${ServiceAddress(entry.type, assigned)}');
     if (changed) {
       _notifyAssigned(entry, assigned);
@@ -1066,12 +1099,18 @@ class NamingClient {
     final indeterminate = _isIndeterminate(error);
     if (!_entries.contains(entry)) {
       // Unregistered while the request was in flight. If the naming service
-      // may have registered it after all, the record must not outlive the
-      // channel unnoticed.
+      // may have registered it after all, or still publishes the record it
+      // was to replace, the record must not outlive the channel unnoticed.
       if (indeterminate) {
         session.lose(
           Status.of(StatusCode.aborted, 'REGISTER outcome unknown'),
           'REGISTER $address has no clear outcome ($error)',
+        );
+      } else if (identical(entry.replacesOn, session)) {
+        session.lose(
+          Status.of(StatusCode.aborted, 'replacement REGISTER failed'),
+          'replacement REGISTER $address failed after unregister; dropping '
+          'the old record',
         );
       }
       return;
@@ -1123,6 +1162,27 @@ class NamingClient {
     }
     _entries.remove(entry);
     entry.completer.completeError(error, stackTrace);
+    if (identical(entry.replacesOn, session)) {
+      session.lose(
+        Status.of(StatusCode.aborted, 'replacement REGISTER failed'),
+        'replacement REGISTER $address failed; dropping the old record',
+      );
+    }
+  }
+
+  /// The registration other than [entry] that holds `type/assigned` on
+  /// [session], or whose `REGISTER` of it is in flight there; null if none.
+  _Entry? _successorOn(_Session session, _Entry entry, int assigned) {
+    for (final e in _entries) {
+      if (!identical(e, entry) &&
+          e.type == entry.type &&
+          ((identical(e.session, session) && e.instance == assigned) ||
+              (identical(e.pending, session) &&
+                  e.pendingInstance == assigned))) {
+        return e;
+      }
+    }
+    return null;
   }
 
   /// Whether a failed request may still have taken effect: the naming
@@ -1139,10 +1199,25 @@ class NamingClient {
   void _supersede(_Entry older, _Entry newer) {
     _entries.remove(older);
     older.superseded = true;
+    final live = _session;
+    if (live != null &&
+        (identical(older.session, live) ||
+            identical(older.pending, live) ||
+            identical(older.replacesOn, live))) {
+      newer.replacesOn = live;
+    }
     if (!older.completer.isCompleted) {
       newer.completer.future.then(
         older.completer.complete,
-        onError: older.completer.completeError,
+        onError: (Object error, StackTrace stackTrace) {
+          if (error is SwitchboardException &&
+              error.code == StatusCode.cancelled) {
+            // By [close] or [unregister], which do not report it as an
+            // unhandled error to a caller that dropped the future.
+            older.completer.future.ignore();
+          }
+          older.completer.completeError(error, stackTrace);
+        },
       );
     }
   }
@@ -1349,8 +1424,16 @@ class _Entry {
   /// The session a REGISTER for this entry is in flight on.
   _Session? pending;
 
+  /// The id that REGISTER asks for (0: any).
+  int pendingInstance = 0;
+
   /// Replaced by a newer registration of the same address.
   bool superseded = false;
+
+  /// The session on which a registration this entry superseded may still
+  /// be published (registered, or in flight, there): if this entry is
+  /// refused on it, the channel is dropped. Null once registered.
+  _Session? replacesOn;
 
   /// Refusals of re-registration in a row.
   int refusals = 0;

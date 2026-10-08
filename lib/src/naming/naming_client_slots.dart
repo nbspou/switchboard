@@ -1007,7 +1007,8 @@ class _ClientSlots {
       declared.pending.clear();
     }
     draining.clear();
-    await events.close();
+    // Not awaited, as for [NamingClient.events].
+    unawaited(events.close());
   }
 }
 

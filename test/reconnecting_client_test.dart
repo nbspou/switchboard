@@ -779,6 +779,25 @@ void main() {
   });
 
   group('stop and close', () {
+    test('a connector that closes the client leaves no timeout behind', () {
+      fakeAsync((async) {
+        final endpoint = FakeEndpoint(async);
+        late ReconnectingClient client;
+        client = clientFor(
+          endpoint,
+          autoStart: false,
+          connect: () {
+            unawaited(client.close());
+            return Completer<StreamChannel<Uint8List>>().future;
+          },
+        );
+        client.start();
+        async.flushMicrotasks();
+        expect(client.isClosed, isTrue);
+        expect(async.pendingTimers, isEmpty);
+      });
+    });
+
     test('stop() sends GOAWAY and stops reconnecting; start() resumes', () {
       fakeAsync((async) {
         final endpoint = FakeEndpoint(async);

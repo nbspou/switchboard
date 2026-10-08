@@ -276,8 +276,10 @@ class FramedByteTransport {
   void _onCancel() {
     // The StreamChannel contract: cancelling the subscription has no
     // effect on the sink, and the channel must still notice the peer
-    // closing. Keep reading and drop frames.
+    // closing. Release the listener's pause, keeping any output throttle,
+    // then keep reading and drop frames.
     _listenerGone = true;
+    _onListenerResume();
   }
 
   void _onChunk(List<int> chunk) {

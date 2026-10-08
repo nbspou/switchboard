@@ -361,6 +361,14 @@ class NamingService {
 
   final List<_Held> _held = [];
 
+  /// The sessions served over each connection, whose `IDENT`s are followed
+  /// by one listener per connection ([_awaitIdentity]) however many
+  /// channels it carries and has carried: a listener per channel would
+  /// stay attached to the connection after its channel ended, until the
+  /// next `IDENT`. An entry stays, without sessions, while its listener
+  /// waits.
+  final Map<MuxConnection, Set<_Session>> _connections = {};
+
   /// Read-only live view of the table: every registered record by address.
   late final Map<ServiceAddress, ServiceRecord> table = UnmodifiableMapView(
     _table,
@@ -395,6 +403,13 @@ class NamingService {
 
   /// Number of channels currently served.
   int get channelCount => _sessions.length;
+
+  /// Number of requests kept while they wait for something slow: an
+  /// `ASSIGN` or a migration in progress, the assignment hold, a brokered
+  /// `CONNECT`. A request its requester cancels while it waits for an
+  /// operation in progress is forgotten at once.
+  @visibleForTesting
+  int get waitingRequestCount => _slots.waitingCount;
 
   /// True while `REGISTER` requests for any id are held; see
   /// [assignmentHold].
@@ -446,6 +461,9 @@ class NamingService {
   /// channel in its payload: a credential that names a holder key proves
   /// nothing without the `IDENT` proof, and is ignored there, as are bytes
   /// that are not a valid credential (the channel is then unidentified).
+  /// Once the connection identifies, its credential remains authoritative:
+  /// expiry ends the session rather than falling back to the payload.
+  /// Every later `IDENT` updates the expiry, even without another request.
   /// [handler] passes both.
   ///
   /// Takes over [TalkChannel.messages], so each channel can be served only
@@ -475,15 +493,14 @@ class NamingService {
     );
     _sessions.add(session);
     unawaited(channel.done.then((_) => _drop(session)));
-    session.identitySubscription = connection?.identityChanges.listen(
-      (_) => _watchIdentity(session),
-    );
+    _followIdentity(session);
+    // Observe the connection before waiting for the payload verifier: its
+    // credential can expire while that check is still in flight.
+    _watchIdentity(session);
     if (credential != null && credential.isNotEmpty && verifier != null) {
       // Requests wait until the credential is checked.
       session.subscription!.pause();
       unawaited(_checkPayload(session, Uint8List.fromList(credential)));
-    } else {
-      _watchIdentity(session);
     }
   }
 
@@ -571,11 +588,14 @@ class NamingService {
     for (final session in sessions) {
       _drop(session);
     }
+    _connections.clear();
     await Future.wait([
       for (final session in sessions) session.channel.close(goingAway),
     ]);
-    await _events.close();
-    await _slots.events.close();
+    // Not awaited: a listener that is paused (an `await for` body calling
+    // close, an idle StreamQueue) would hold it for ever.
+    unawaited(_events.close());
+    unawaited(_slots.events.close());
   }
 
   // ---------------------------------------------------------------------
@@ -881,11 +901,16 @@ class NamingService {
   static final Name _everything = Name('*');
 
   /// The valid credential identifying [session] now: its connection's peer
-  /// identity, else its payload credential, else null.
+  /// identity, else its payload credential only until the connection first
+  /// identifies, else null.
   static Credential? _identityOf(_Session session) {
     final connection = session.connection?.peerIdentity?.credential;
     if (connection != null) {
+      session.byConnection = true;
       return connection;
+    }
+    if (session.byConnection) {
+      return null;
     }
     final payload = session.payloadCredential;
     return payload != null && !payload.isExpired() ? payload : null;
@@ -915,15 +940,13 @@ class NamingService {
   }
 
   /// Notes that [session] is identified, if it is, and ends it when its
-  /// identity expires without being renewed. Called on every valid IDENT
-  /// too, so an idle session follows a newly established or earlier expiry.
+  /// identity expires without being renewed.
   void _watchIdentity(_Session session) {
     final credential = _identityOf(session);
     if (credential == null || !session.active) {
       return;
     }
     session.wasIdentified = true;
-    session.identityByConnection = session.connection?.peerIdentity != null;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
     final expires = credential.expiresAtTime;
@@ -937,6 +960,43 @@ class NamingService {
     });
   }
 
+  /// Follows the later `IDENT`s of the connection of [session], not only
+  /// its requests: a replacement credential may expire sooner, or identify
+  /// a connection that was anonymous.
+  void _followIdentity(_Session session) {
+    final connection = session.connection;
+    if (connection == null || !connection.isOpen) {
+      return;
+    }
+    final sessions = _connections[connection];
+    if (sessions != null) {
+      sessions.add(session);
+      return;
+    }
+    _connections[connection] = {session};
+    _awaitIdentity(connection);
+  }
+
+  /// Waits for the next `IDENT` of [connection], or its end, and has every
+  /// session it carries look at its identity again. Stops, forgetting the
+  /// connection, once it carries no session or has ended.
+  void _awaitIdentity(MuxConnection connection) {
+    connection.identityChanged.then((_) {
+      final sessions = _connections[connection];
+      if (sessions == null) {
+        return;
+      }
+      if (sessions.isEmpty || !connection.isOpen) {
+        _connections.remove(connection);
+        return;
+      }
+      for (final session in sessions.toList()) {
+        _watchIdentity(session);
+      }
+      _awaitIdentity(connection);
+    }).ignore();
+  }
+
   void _onExpiry(_Session session) {
     if (!session.active) {
       return;
@@ -948,7 +1008,7 @@ class NamingService {
       return;
     }
     final connection = session.connection;
-    final byConnection = session.identityByConnection;
+    final byConnection = session.byConnection;
     _log.info(
       'naming channel ${byConnection ? 'and connection ' : ''}ended: the '
       'credential expired',
@@ -1043,9 +1103,8 @@ class NamingService {
   /// Answers `RENEW` with a credential re-issued by [issuer]: the
   /// channel's own (an empty payload, or its bytes), or the one in the
   /// payload, which must be valid ([verifier]) and, on an identified
-  /// channel, carry its identity. Only renewing the channel's own bearer
-  /// credential replaces its payload identity; renewing another credential
-  /// does not prove possession of that credential's holder key.
+  /// channel, carry its identity. The renewal of the channel's own payload
+  /// credential replaces it; that of another credential does not.
   Future<void> _renew(
     _Session session,
     TalkMessage message,
@@ -1079,6 +1138,10 @@ class NamingService {
       _abort(message, _unauthenticated);
       return;
     }
+    // Only the channel's own payload credential is renewed in place: one
+    // sent in the request may name a holder key, which the payload cannot
+    // prove, or carry other scopes.
+    final ownPayload = identical(current, session.payloadCredential);
     final hook = renewable;
     if (hook != null) {
       var allowed = false;
@@ -1109,8 +1172,7 @@ class NamingService {
       _abort(message, Status.of(StatusCode.failedPrecondition, 'cannot renew'));
       return;
     }
-    final payload = session.payloadCredential;
-    if (session.active && payload != null && payload == current) {
+    if (session.active && ownPayload) {
       // The channel is identified by its payload: the renewal is its
       // identity from now on.
       session.payloadCredential = renewed;
@@ -1464,6 +1526,8 @@ class NamingService {
     session.active = false;
     session.expiryTimer?.cancel();
     session.expiryTimer = null;
+    // The entry stays while its listener waits (see [_connections]).
+    _connections[session.connection]?.remove(session);
     _held.removeWhere((h) => identical(h.session, session));
     _endWatches(session);
     final owned = session.owned.toList();
@@ -1525,15 +1589,11 @@ class _Session {
   /// ends it, rather than leaving it unidentified.
   bool wasIdentified = false;
 
-  /// The source of the identity whose expiry the timer tracks. A payload
-  /// credential can coexist with it, but does not suppress its GOAWAY.
-  bool identityByConnection = false;
+  /// A connection identity has taken precedence over any OPEN credential.
+  bool byConnection = false;
 
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
-
-  /// Tracks IDENT changes even when no naming request arrives.
-  StreamSubscription<void>? identitySubscription;
 
   final Set<_Registration> owned = {};
 
@@ -1558,10 +1618,8 @@ class _Session {
     }
   }
 
-  /// Stops listening to the channel and its connection's identity.
+  /// Stops listening to the channel.
   void cancel() {
-    identitySubscription?.cancel().ignore();
-    identitySubscription = null;
     subscription?.cancel().ignore();
     subscription = null;
   }

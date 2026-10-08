@@ -83,6 +83,8 @@ class MuxOptions {
 
   /// Largest number of simultaneously open channels (in both directions)
   /// before peer OPENs are rejected with CLOSE `RESOURCE_EXHAUSTED`.
+  /// Also caps channels waiting for delivery on [MuxConnection.incoming],
+  /// including ones the peer already closed, independently of the open cap.
   /// Announced with LIMITS. 0 means unlimited.
   final int maxChannels;
 
@@ -97,6 +99,8 @@ class MuxOptions {
   /// connection is closed with `CONNECTION_LOST`. Also bounds how long
   /// [MuxConnection.close] waits for the transport to close; after that
   /// the transport is aborted if it implements [AbortableTransport].
+  /// A reply or connection close cancels the probe timer even when the
+  /// transport delivers it synchronously during the PING write.
   ///
   /// While a transport implementing [OutputBufferedTransport] has stopped
   /// reading because of our unsent output, the peer reading that output
@@ -147,7 +151,8 @@ class MuxOptions {
 
   /// Largest number of bytes of OPEN payloads held for the channels the
   /// peer opened and that are not closed yet (mutually, or by
-  /// [closeConfirmTimeout]). A channel keeps its open payload for its
+  /// [closeConfirmTimeout]), or still await delivery on
+  /// [MuxConnection.incoming]. A channel keeps its open payload for its
   /// whole life, so without this budget a peer could open [maxChannels]
   /// channels with frame-sized OPEN payloads and never send DATA while a
   /// handler holds them. A peer OPEN that would exceed it is rejected with
@@ -320,7 +325,7 @@ class MuxConnection {
   int _openCount = 0;
   int _pingCounter = 0;
   int _bufferedBytes = 0;
-  // OPEN payload bytes of the peer's channels that are not closed yet.
+  // OPEN payload bytes of the peer's channels still open or undelivered.
   int _openPayloadBytes = 0;
   bool _incomingCancelled = false;
   bool _incomingEndRequested = false;
@@ -345,8 +350,6 @@ class MuxConnection {
   PeerIdentity? _peerIdentity;
   final Completer<PeerIdentity> _peerIdentified = Completer<PeerIdentity>();
   Completer<void>? _identityEvent;
-  final StreamController<void> _identityChanges =
-      StreamController<void>.broadcast();
   // Frames that arrived while an IDENT was being verified; handled after
   // it, in order, so that they see its outcome.
   final Queue<Uint8List> _heldFrames = Queue<Uint8List>();
@@ -361,6 +364,8 @@ class MuxConnection {
 
   /// Channels opened by the peer, single subscription. Buffered until
   /// listened to; ends when the connection ends.
+  /// The backlog, including closed channels, is capped by
+  /// [MuxOptions.maxChannels]; further OPENs receive `RESOURCE_EXHAUSTED`.
   ///
   /// Cancelling the subscription makes the connection reject further peer
   /// OPENs with CLOSE `UNAVAILABLE`, and closes the channels it had
@@ -422,12 +427,12 @@ class MuxConnection {
 
   /// Bytes buffered in the receive queues of all channels, counted as for
   /// [MuxOptions.maxChannelBufferBytes], plus the OPEN payloads held for
-  /// the channels the peer opened until they are closed (see
+  /// the channels the peer opened until they are closed and delivered (see
   /// [MuxOptions.maxOpenPayloadBytes]).
   int get bufferedBytes => _bufferedBytes;
 
   /// Bytes of OPEN payloads held for the channels the peer opened that are
-  /// not closed yet; bounded by [MuxOptions.maxOpenPayloadBytes].
+  /// still open or awaiting delivery; bounded by [MuxOptions.maxOpenPayloadBytes].
   int get openPayloadBytes => _openPayloadBytes;
 
   /// Whether reading the transport is paused because more than
@@ -490,12 +495,6 @@ class MuxConnection {
   @internal
   Future<void> get identityChanged =>
       (_identityEvent ??= Completer<void>()).future;
-
-  /// Each valid `IDENT` of the peer. Ends with the connection. Subscribers
-  /// can cancel when a naming session ends without retaining that session
-  /// until the peer identifies again.
-  @internal
-  Stream<void> get identityChanges => _identityChanges.stream;
 
   /// Identifies this side to the peer with [credential] (wiki page
   /// "Switchboard Identity and Credentials", section "Connection
@@ -757,6 +756,8 @@ class MuxConnection {
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the GOAWAY payload stays within 1024 bytes and the
   /// frame fits the peer's announced frame limit.
+  /// The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`, while
+  /// the local end status retains the given code.
   ///
   /// Throws [ArgumentError] synchronously for application status codes.
   Future<void> goAway([Status status = const Status(33)]) {
@@ -997,7 +998,9 @@ class MuxConnection {
       rejection = Status.of(StatusCode.goingAway);
     } else if (_incomingCancelled) {
       rejection = Status.of(StatusCode.unavailable, 'not accepting channels');
-    } else if (options.maxChannels > 0 && _openCount >= options.maxChannels) {
+    } else if (options.maxChannels > 0 &&
+        (_openCount >= options.maxChannels ||
+            _undelivered.length >= options.maxChannels)) {
       rejection = Status.of(
         StatusCode.resourceExhausted,
         'at most ${options.maxChannels} channels',
@@ -1019,7 +1022,7 @@ class MuxConnection {
       id,
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
-    );
+    )..incomingPending = true;
     _links[id] = link;
     _openCount++;
     _openPayloadBytes += payload.length;
@@ -1042,9 +1045,9 @@ class MuxConnection {
   }
 
   /// Releases the accounting of the OPEN payload of a channel the peer
-  /// opened, once it no longer counts as open.
+  /// opened, once it is both closed and no longer awaiting delivery.
   void _releaseOpenPayload(MuxChannelLink link) {
-    if (link.channel.isLocallyOpened) {
+    if (link.channel.isLocallyOpened || _closing || link.incomingPending) {
       return;
     }
     final size = link.channel.openPayload.length;
@@ -1226,7 +1229,6 @@ class MuxConnection {
       _peerIdentified.complete(identity);
     }
     _signalIdentity();
-    _identityChanges.add(null);
     while (_heldFrames.isNotEmpty && !_verifyingIdent && !_closing) {
       _processFrame(_heldFrames.removeFirst());
     }
@@ -1318,7 +1320,11 @@ class MuxConnection {
     while (_undelivered.isNotEmpty &&
         _incoming.hasListener &&
         !_incoming.isPaused) {
-      _incoming.add(_undelivered.removeFirst().channel);
+      final link = _undelivered.removeFirst()..incomingPending = false;
+      if (link.channel.state == MuxChannelState.closed) {
+        _releaseOpenPayload(link);
+      }
+      _incoming.add(link.channel);
     }
     if (_incomingEndRequested && _undelivered.isEmpty && !_incoming.isClosed) {
       unawaited(_incoming.close());
@@ -1338,6 +1344,10 @@ class MuxConnection {
     );
     final status = Status.of(StatusCode.unavailable, 'not accepting channels');
     for (final link in links) {
+      link.incomingPending = false;
+      if (link.channel.state == MuxChannelState.closed) {
+        _releaseOpenPayload(link);
+      }
       link.closeUndelivered(status);
     }
   }
@@ -1426,7 +1436,9 @@ class MuxConnection {
 
   void _startKeepAlive() {
     final interval = options.keepAliveInterval;
-    if (interval == null) {
+    // A synchronous transport can end the connection while the constructor
+    // sends LIMITS, before the first timer is armed.
+    if (interval == null || _closing) {
       return;
     }
     _keepAliveTimer = Timer(interval, _onKeepAliveTimer);
@@ -1466,8 +1478,9 @@ class MuxConnection {
       return;
     }
     _keepAliveProbing = true;
-    _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
+    // Arm before sending: a synchronous reply (or close) cancels it.
     _keepAliveTimer = Timer(options.keepAliveTimeout, _onKeepAliveTimer);
+    _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
   }
 
   /// Whether the transport is throttled by its output and the peer has
@@ -1566,7 +1579,6 @@ class MuxConnection {
     _peerNonceWaiter = null;
     nonceWaiter?.completeError(SwitchboardException(status));
     _signalIdentity();
-    unawaited(_identityChanges.close());
     final idle = _idle;
     _idle = null;
     if (idle != null && !idle.isCompleted) {
