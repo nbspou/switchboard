@@ -342,6 +342,7 @@ class _BulkOut {
       },
       onDone: () {
         from._ended = true;
+        from.talk._bulkIns.remove(from);
         unawaited(
           from.channel.done.then((status) {
             final declared = from.length;
@@ -409,6 +410,7 @@ class _BulkIn {
       return;
     }
     _read = true;
+    talk._bulkIns.remove(this);
     close(Status.of(StatusCode.cancelled, 'bulk payload not read'));
     // Dropping a stream's buffer takes a listener that cancels.
     channel.stream.listen(null).cancel().ignore();
@@ -483,6 +485,7 @@ class _BulkIn {
           },
           onDone: () {
             _ended = true;
+            talk._bulkIns.remove(this);
             unawaited(
               channel.done.then((status) {
                 if (controller.isClosed) {

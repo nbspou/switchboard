@@ -1368,14 +1368,8 @@ class TalkChannel {
     b
       ..length = message._bulkRef!.length
       ..onProgress = message._onBulkProgress;
+    // Until its bytes were all read, or it was abandoned.
     _bulkIns.add(b);
-    unawaited(
-      b.channel.done.then((_) {
-        if (b._read) {
-          _bulkIns.remove(b);
-        }
-      }),
-    );
     var stream = message._forSink;
     final predicate = options.streamBulk;
     if (!stream && predicate != null) {
