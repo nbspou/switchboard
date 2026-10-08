@@ -123,12 +123,13 @@ class Mesh {
     CredentialVerifier? payloadVerifier,
     bool Function(Credential credential)? renewable,
     Duration brokerTimeout = const Duration(seconds: 5),
+    Duration assignmentHold = Duration.zero,
     bool close = true,
     String? name,
   }) async {
     final host = await node(close: close);
     final service = NamingService(
-      assignmentHold: Duration.zero,
+      assignmentHold: assignmentHold,
       holdingSettle: Duration.zero,
       verifier: payloadVerifier ?? await verifier(),
       requireCredential: requireCredential,
@@ -255,6 +256,16 @@ Future<Map<String, StatusCode?>> survey(
 
 const ok = null;
 const denied = StatusCode.permissionDenied;
+
+String describeEvent(ServiceEvent e) =>
+    '${e.up ? 'UP' : 'DOWN'} ${e.record.address}';
+
+/// An event or other message a naming channel received, for comparison.
+String describe(TalkMessage m) => switch (m.procedureName) {
+  'UP' => describeEvent(ServiceEvent.decodeUp(m.payload)),
+  'DOWN' => describeEvent(ServiceEvent.decodeDown(m.payload)),
+  _ => m.procedureName,
+};
 
 /// A slot lifecycle with nothing to load or serve.
 class Idle extends SlotLifecycle {
@@ -626,6 +637,291 @@ void main() {
         unnamed.connect(uri),
         throwsCode(StatusCode.unauthenticated),
       );
+    });
+  });
+
+  group('a replacement credential', () {
+    final watcherScopes = [
+      Scope.of(Right.register, 'worker-*'),
+      Scope.of(Right.watch, '*'),
+    ];
+    final otherType = Name('worker-h');
+
+    test('of another identity ends the naming channel as an expiry would, '
+        'without GOAWAY', () async {
+      final mesh = await Mesh.start();
+      final changes = <String>[];
+      mesh.service.events.listen((e) => changes.add(describeEvent(e)));
+      final worker = await node(
+        credential: await issue('worker-a1', watcherScopes),
+      );
+      final connection = await worker.connect(mesh.uri);
+      Status? goAway;
+      unawaited(connection.peerGoAwayStatus.then((s) => goAway = s));
+      final c = await channelTo(worker, mesh);
+      expect(await call(c, Procedures.watch, Uint8List(0)), ok);
+      expect(
+        await call(c, Procedures.register, registerPayload(workerType)),
+        ok,
+      );
+      final id = mesh.service.table.keys.single.instance;
+      // The same holder, presenting another identity it holds.
+      await worker.updateCredential(await issue('worker-b2', watcherScopes));
+      final ended = await c.done.timeout(limit);
+      expect(ended, hasCode(StatusCode.unauthenticated));
+      expect(ended.reason, 'identity changed');
+      expect(mesh.service.table, isEmpty);
+      expect(mesh.service.watchCount, 0);
+      expect(changes, ['UP worker-g/$id', 'DOWN worker-g/$id']);
+      // The connection is validly identified: it stays, and serves a new
+      // naming channel under the new identity.
+      expect(connection.isOpen, isTrue);
+      expect(connection.peerIdentity, isNull);
+      final again = await channelTo(worker, mesh);
+      expect(
+        await call(again, Procedures.register, registerPayload(workerType)),
+        ok,
+      );
+      expect(goAway, isNull);
+      expect(connection.isOpen, isTrue);
+    });
+
+    test('of another identity: a MeshNode registers again under it', () async {
+      final mesh = await Mesh.start();
+      final changes = <String>[];
+      mesh.service.events.listen((e) => changes.add(describeEvent(e)));
+      final worker = await node(
+        credential: await issue('worker-a1', workerScopes),
+      );
+      final joined = MeshNode.join(
+        worker,
+        mesh.uri,
+        watch: false,
+        renewCredential: false,
+        reconnectDelay: const Duration(milliseconds: 20),
+      );
+      addTearDown(joined.leave);
+      final id = await joined
+          .publish(workerType, (incoming) {}, endpoints: const [])
+          .timeout(limit);
+      await worker.updateCredential(await issue('worker-b2', workerScopes));
+      await until(() => changes.length == 3);
+      expect(changes, [
+        'UP worker-g/$id',
+        'DOWN worker-g/$id',
+        'UP worker-g/$id',
+      ]);
+      expect(mesh.service.channelCount, 1);
+    });
+
+    test(
+      'of another identity also ends a channel its payload identified',
+      () async {
+        final mesh = await Mesh.start();
+        final client = await node(verify: false);
+        final connection = await client.connect(mesh.uri);
+        final bearer = await issue('consumer-2', consumerScopes, bearer: true);
+        final c = await channelTo(client, mesh, payload: bearer.encode());
+        expect(await call(c, Procedures.watch, Uint8List(0)), ok);
+        expect(mesh.service.watchCount, 1);
+        await connection.identify(
+          await issue('worker-a1', watcherScopes),
+          holderKey: key,
+        );
+        expect(
+          await c.done.timeout(limit),
+          hasCode(StatusCode.unauthenticated),
+        );
+        expect(mesh.service.watchCount, 0);
+        expect(connection.isOpen, isTrue);
+      },
+    );
+
+    test('of the same identity with narrower scopes ends the subscriptions '
+        'and records they do not grant, silently', () async {
+      final mesh = await Mesh.start();
+      final changes = <String>[];
+      mesh.service.events.listen((e) => changes.add(describeEvent(e)));
+      final worker = await node(
+        credential: await issue('worker-a1', watcherScopes),
+      );
+      final c = await channelTo(worker, mesh);
+      final received = <String>[];
+      c.messages.listen((m) => received.add(describe(m)));
+      expect(await call(c, Procedures.watch, Uint8List(0)), ok);
+      expect(
+        await call(c, Procedures.watch, WatchRequest(workerType).encode()),
+        ok,
+      );
+      expect(
+        await call(c, Procedures.watch, WatchRequest(otherType).encode()),
+        ok,
+      );
+      expect(
+        await call(c, Procedures.register, registerPayload(workerType)),
+        ok,
+      );
+      expect(
+        await call(c, Procedures.register, registerPayload(otherType)),
+        ok,
+      );
+      ServiceAddress addressOf(Name type) =>
+          mesh.service.table.keys.singleWhere((a) => a.type == type);
+      final kept = addressOf(workerType);
+      final lost = addressOf(otherType);
+      await until(() => received.length == 2);
+      expect(received, ['UP $kept', 'UP $lost']);
+      expect(mesh.service.watchCount, 3);
+      // Still worker-a1, now only for worker-g.
+      await worker.updateCredential(
+        await issue('worker-a1', [
+          Scope.of(Right.register, workerType.toString()),
+          Scope.of(Right.watch, workerType.toString()),
+        ]),
+      );
+      await until(() => mesh.service.table.length == 1);
+      expect(mesh.service.table.keys, [kept]);
+      expect(changes, ['UP $kept', 'UP $lost', 'DOWN $lost']);
+      // WATCH * and WATCH worker-h are gone, without an event; the DOWN of
+      // the record was published after they ended.
+      expect(mesh.service.watchCount, 1);
+      expect(c.isOpen, isTrue);
+      // Under the new scopes: worker-g events still arrive, others not.
+      final admin = await node(credential: await issue('root', adminScopes));
+      final a = await channelTo(admin, mesh);
+      expect(
+        await call(a, Procedures.register, registerPayload(otherType)),
+        ok,
+      );
+      expect(
+        await call(a, Procedures.register, registerPayload(workerType)),
+        ok,
+      );
+      final added = mesh.service.table.keys.singleWhere(
+        (x) => x.type == workerType && x != kept,
+      );
+      await until(() => received.length == 3);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(received, ['UP $kept', 'UP $lost', 'UP $added']);
+      expect(await call(c, Procedures.watch, Uint8List(0)), denied);
+      expect(
+        await call(c, Procedures.register, registerPayload(otherType)),
+        denied,
+      );
+      // The same scopes again change nothing.
+      await worker.updateCredential(
+        await issue('worker-a1', [
+          Scope.of(Right.register, workerType.toString()),
+          Scope.of(Right.watch, workerType.toString()),
+        ]),
+      );
+      expect(
+        await call(c, Procedures.unwatch, WatchRequest(workerType).encode()),
+        ok,
+      );
+      expect(mesh.service.table.keys, containsAll([kept, added]));
+    });
+
+    test('a record that keeps register keeps its slots; one that loses it '
+        'goes DOWN and frees them as a lost channel would', () async {
+      final mesh = await Mesh.start();
+      final both = [...workerScopes, Scope.of(Right.claim, 'worker-*')];
+      final worker = await node(credential: await issue('worker-a1', both));
+      final joined = MeshNode.join(
+        worker,
+        mesh.uri,
+        watch: false,
+        renewCredential: false,
+      );
+      addTearDown(joined.leave);
+      await joined
+          .publishSharded(
+            workerType,
+            Idle(),
+            count: 4,
+            mode: SlotMode.static,
+            capacity: 0,
+            endpoints: const [],
+          )
+          .timeout(limit);
+      await joined.claimSlot(workerType, 2).timeout(limit);
+      final id = mesh.service.table.keys.single.instance;
+      SlotTable table() => mesh.service.slotTable(workerType)!;
+      expect(table()[2].owner, id);
+      // claim gone, register kept: SLOTS is still granted, nothing moves.
+      await worker.updateCredential(await issue('worker-a1', workerScopes));
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(mesh.service.table.keys.single.instance, id);
+      expect(table()[2].owner, id);
+      // register gone: the record goes DOWN and its slot is free, the
+      // space stays.
+      await worker.updateCredential(
+        await issue('worker-a1', [Scope.of(Right.claim, 'worker-*')]),
+      );
+      await until(() => mesh.service.table.isEmpty);
+      expect(table()[2].owner, 0);
+      expect(table()[2].state, SlotState.free);
+      expect(table().space.count, 4);
+    });
+
+    test('a REGISTER held for the assignment hold is refused once its '
+        'type is no longer granted', () {
+      fakeAsync((async) {
+        late Mesh mesh;
+        late Switchboard worker;
+        StatusCode? held;
+        StatusCode? allowed = StatusCode.unknown;
+        Future<void> setUp() async {
+          mesh = await Mesh.start(
+            assignmentHold: const Duration(minutes: 1),
+            close: false,
+          );
+          worker = await node(
+            credential: await issue('worker-a1', workerScopes),
+            close: false,
+          );
+          final c = await worker.openTalkAt(
+            mesh.uri,
+            ChannelAddress(type: naming),
+          );
+          // Without the helper's timeout: the hold outlasts it.
+          Future<StatusCode?> register(Name type) => c
+              .request(
+                Procedures.register.toString(),
+                registerPayload(type),
+                name: Procedures.register,
+              )
+              .then<StatusCode?>(
+                (_) => null,
+                onError: (Object e) =>
+                    e is SwitchboardException ? e.code : StatusCode.unknown,
+              );
+          unawaited(register(otherType).then((code) => held = code));
+          unawaited(register(workerType).then((code) => allowed = code));
+        }
+
+        unawaited(setUp());
+        async.elapse(const Duration(seconds: 1));
+        expect(mesh.service.table, isEmpty);
+        expect(held, isNull);
+        unawaited(
+          issue('worker-a1', [
+            Scope.of(Right.register, workerType.toString()),
+          ]).then(worker.updateCredential),
+        );
+        async.elapse(const Duration(seconds: 1));
+        // At once, not when the hold ends.
+        expect(held, denied);
+        expect(allowed, StatusCode.unknown);
+        expect(mesh.service.table, isEmpty);
+        async.elapse(const Duration(minutes: 1));
+        expect(allowed, ok);
+        expect(mesh.service.table.keys.single.type, workerType);
+        unawaited(worker.close());
+        unawaited(mesh.close());
+        async.elapse(const Duration(seconds: 30));
+        expect(async.pendingTimers, isEmpty);
+      });
     });
   });
 

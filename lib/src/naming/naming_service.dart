@@ -466,6 +466,22 @@ class NamingService {
   /// Every later `IDENT` updates the expiry, even without another request.
   /// [handler] passes both.
   ///
+  /// A credential that replaces the one an identified channel had (a later
+  /// `IDENT`, or the connection identifying a channel its payload
+  /// identified) holds what the channel set up to the new credential. One
+  /// of another identity ends the channel as its expiry would: its records
+  /// go `DOWN` and it is closed with `UNAUTHENTICATED`, but the
+  /// connection, validly identified, is not sent `GOAWAY`. One of the same
+  /// identity with other scopes ends, without an event, as `UNWATCH` would,
+  /// every subscription it does not grant `watch` for (for every type: a
+  /// `watch` scope with the pattern `*`); takes `DOWN` and removes every
+  /// record of a type it does not grant `register` for, which releases that
+  /// instance's slots as the loss of its channel would; and refuses with
+  /// `PERMISSION_DENIED` a `REGISTER` of such a type waiting for the
+  /// assignment hold. A slot space and the slots of a record that stays
+  /// are left alone: `register` for the type still grants `SLOTS`. Requests
+  /// already in progress are not affected.
+  ///
   /// Takes over [TalkChannel.messages], so each channel can be served only
   /// once: throws [StateError] if its messages are already listened to, in
   /// which case the service keeps nothing of it. The channel keeps its own
@@ -620,8 +636,16 @@ class NamingService {
         _abort(message, _unauthenticated);
         return;
       }
-    } else if (!session.wasIdentified || session.expiryTimer == null) {
+    } else if (!session.wasIdentified ||
+        session.expiryTimer == null ||
+        !identical(identity, session.credential)) {
+      // Not watched yet, or replaced (a request can overtake the listener
+      // of the connection's IDENTs): checked before the request is.
       _watchIdentity(session);
+      if (!session.active) {
+        _abort(message, _unauthenticated);
+        return;
+      }
     }
     if (procedure == Procedures.register) {
       _onRegister(session, message);
@@ -897,6 +921,11 @@ class NamingService {
     'permission denied',
   );
 
+  static final Status _identityChanged = Status.of(
+    StatusCode.unauthenticated,
+    'identity changed',
+  );
+
   /// The pattern that matches every name.
   static final Name _everything = Name('*');
 
@@ -940,11 +969,20 @@ class NamingService {
   }
 
   /// Notes that [session] is identified, if it is, and ends it when its
-  /// identity expires without being renewed.
+  /// identity expires without being renewed. A credential that replaced
+  /// the one the session had is checked first ([_replaced]), which may end
+  /// the session.
   void _watchIdentity(_Session session) {
     final credential = _identityOf(session);
     if (credential == null || !session.active) {
       return;
+    }
+    final previous = session.credential;
+    if (!identical(credential, previous)) {
+      session.credential = credential;
+      if (previous != null && !_replaced(session, previous, credential)) {
+        return;
+      }
     }
     session.wasIdentified = true;
     session.expiryTimer?.cancel();
@@ -958,6 +996,68 @@ class NamingService {
       session.expiryTimer = null;
       _onExpiry(session);
     });
+  }
+
+  /// Holds [session], identified by [previous], to [credential], which
+  /// replaced it (see [serve]). Returns false when that ended the session:
+  /// [credential] names another identity.
+  bool _replaced(_Session session, Credential previous, Credential credential) {
+    if (credential.identity != previous.identity) {
+      _log.info(
+        'naming channel ended: its identity changed from '
+        '"${previous.identity}" to "${credential.identity}"',
+      );
+      _drop(session);
+      unawaited(session.channel.close(_identityChanged));
+      return false;
+    }
+    _narrow(session, credential);
+    return true;
+  }
+
+  /// Ends what [session] set up that [credential], of the same identity as
+  /// the credential it replaced, does not grant: subscriptions without
+  /// `watch` (silently, as `UNWATCH` would), records without `register`
+  /// (`DOWN`, which releases their slots as the loss of the channel would),
+  /// and `REGISTER`s held for the assignment hold without `register`
+  /// (`PERMISSION_DENIED`).
+  void _narrow(_Session session, Credential credential) {
+    final watches = [
+      for (final type in session.watches.keys)
+        if (!(type == null
+            ? _grantsEvery(credential, Right.watch)
+            : credential.allows(Right.watch, type)))
+          type,
+    ];
+    for (final type in watches) {
+      session.watches.remove(type);
+      _log.info(
+        'subscription to ${type ?? 'every type'} ended: '
+        '"${credential.identity}" no longer has the watch scope',
+      );
+    }
+    if (watches.isNotEmpty && session.watches.isEmpty) {
+      _watching.remove(session);
+    }
+    final held = [
+      for (final h in _held)
+        if (identical(h.session, session) &&
+            !credential.allows(Right.register, h.request.type))
+          h,
+    ];
+    for (final h in held) {
+      _held.remove(h);
+      _abort(h.message, _permissionDenied);
+    }
+    for (final registration in session.owned.toList()) {
+      if (!credential.allows(Right.register, registration.address.type)) {
+        _log.info(
+          '${registration.address} removed: "${credential.identity}" no '
+          'longer has the register scope',
+        );
+        _remove(registration);
+      }
+    }
   }
 
   /// Follows the later `IDENT`s of the connection of [session], not only
@@ -1050,17 +1150,26 @@ class NamingService {
     if (credential == null) {
       return _permits(session, message, right, Name.empty);
     }
-    for (final scope in credential.scopes) {
-      if (scope.right == Right.admin ||
-          (scope.right == right && scope.pattern == _everything)) {
-        return true;
-      }
+    if (_grantsEvery(credential, right)) {
+      return true;
     }
     _log.info(
       '${message.procedureName} refused: "${credential.identity}" has no '
       '${right.name} scope for every type',
     );
     _abort(message, _permissionDenied);
+    return false;
+  }
+
+  /// Whether [credential] grants [right] on every type: a scope with the
+  /// pattern `*`, or `admin`.
+  static bool _grantsEvery(Credential credential, Right right) {
+    for (final scope in credential.scopes) {
+      if (scope.right == Right.admin ||
+          (scope.right == right && scope.pattern == _everything)) {
+        return true;
+      }
+    }
     return false;
   }
 
@@ -1591,6 +1700,11 @@ class _Session {
 
   /// A connection identity has taken precedence over any OPEN credential.
   bool byConnection = false;
+
+  /// The credential that identified the channel when last looked at
+  /// ([NamingService._watchIdentity]); one that replaces it is held to
+  /// what the channel set up.
+  Credential? credential;
 
   /// Ends the channel when its identity expires.
   Timer? expiryTimer;
