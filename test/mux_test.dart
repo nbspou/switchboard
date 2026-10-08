@@ -13,7 +13,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
+import 'package:fake_async/fake_async.dart';
 import 'package:logging/logging.dart';
+import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/src/bytes.dart';
 import 'package:switchboard/src/mux/mux_channel.dart';
 import 'package:switchboard/src/mux/mux_connection.dart';
@@ -29,7 +31,81 @@ import 'package:web_socket_channel/io.dart';
 import 'mux_harness.dart';
 
 void main() {
+  test('a synchronous keep-alive reply and close leave no timer', () async {
+    final timers = <Timer>[];
+    addTearDown(() {
+      for (final timer in timers) {
+        timer.cancel();
+      }
+    });
+    await runZoned(
+      () async {
+        final input = StreamController<Uint8List>(sync: true);
+        // Closed through the mux transport's sink.
+        // ignore: close_sinks
+        final output = StreamController<Uint8List>(sync: true);
+        final mux = MuxConnection(
+          StreamChannel(input.stream, output.sink),
+          isInitiator: true,
+          options: rawOptions.copyWith(
+            keepAliveInterval: const Duration(milliseconds: 5),
+          ),
+        );
+        final closed = Completer<void>();
+        final peer = output.stream.listen((bytes) {
+          final message = MuxControlMessage.decode(
+            MuxFrame.decode(bytes).payload,
+          );
+          if (message.knownType == MuxControlType.ping) {
+            input.add(
+              MuxControlMessage.pong(message.payload).toFrame().encode(),
+            );
+            closed.complete(mux.close());
+          }
+        });
+        await closed.future;
+        await peer.cancel();
+        await input.close();
+      },
+      zoneSpecification: ZoneSpecification(
+        createTimer: (self, parent, zone, duration, callback) {
+          final timer = parent.createTimer(zone, duration, callback);
+          timers.add(timer);
+          return timer;
+        },
+      ),
+    );
+    expect(timers.where((timer) => timer.isActive), isEmpty);
+  });
+
   group('channels', () {
+    test('a synchronous CLOSE confirmation leaves no timer', () {
+      fakeAsync((async) {
+        final transport = StreamChannelController<Uint8List>(sync: true);
+        final mux = MuxConnection(
+          transport.local,
+          isInitiator: true,
+          options: rawOptions,
+        );
+        final peer = transport.foreign.stream.listen((bytes) {
+          final frame = MuxFrame.decode(bytes);
+          if (frame.command == MuxCommand.close) {
+            transport.foreign.sink.add(
+              MuxFrame.close(frame.channelId).encode(),
+            );
+          }
+        });
+        final channel = mux.open(empty);
+        unawaited(channel.close());
+        expect(channel.state, MuxChannelState.closed);
+        async.flushMicrotasks();
+        expect(async.nonPeriodicTimerCount, 0);
+        unawaited(mux.close());
+        unawaited(peer.cancel());
+        async.flushMicrotasks();
+      });
+    });
+
     test('open from both sides, payloads and data both ways', () async {
       final (a, b) = muxPair();
       final aIncoming = StreamQueue(a.incoming);

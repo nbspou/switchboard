@@ -183,7 +183,8 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
   /// lost, whichever comes first; completes at once if the channel is
   /// already closed. If the peer does not confirm within
   /// [MuxOptions.closeConfirmTimeout], the channel is considered closed
-  /// locally and this completes then; see that option. Never completes
+  /// locally and this completes then; see that option. Completion cancels
+  /// the confirmation timer even on synchronous transports. Never completes
   /// with an error. Throws [ArgumentError] synchronously for application
   /// status codes (256 and above), which must not be used in CLOSE.
   @override
@@ -193,8 +194,10 @@ class MuxChannel with StreamChannelMixin<Uint8List> implements StatusClosable {
       _closeSent = true;
       _state = MuxChannelState.halfClosedLocal;
       _noteStatus(status);
-      _link.host.sendFrame(_closeFrame(status));
+      // A synchronous transport can confirm during sendFrame; install
+      // the timer first so that completion cancels it.
       _link._startConfirmTimer();
+      _link.host.sendFrame(_closeFrame(status));
     }
     return _done.future;
   }

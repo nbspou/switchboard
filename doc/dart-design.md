@@ -283,6 +283,7 @@ Behaviour notes:
 * Reasons sent in CLOSE and GOAWAY are shortened on a UTF-8 boundary so the status payload is at most 1024 bytes and the frame fits the peer's announced frame limit; `done` reports the status as given. The cut is made in the encoded bytes, so fixed fields before a reason (`MOVED`) survive.
 * `Status.decode` keeps the bytes after the code as received (`reason` is their lossy UTF-8 decoding) and `encode` writes them back unchanged, so a status relayed by `pipeChannels` or `forwardMessage` (the `MOVED` and `RELOCATED` fields) reaches the far side byte for byte. `Status` itself does not interpret fields; `MovedStatus` does.
 * Channel streams and `incoming` are fed from queues the mux owns and only while the listener is active and not paused, so every buffered byte and channel is accounted for.
+* CLOSE confirmation and keep-alive probe timers are armed before writing their frames. A transport that delivers a confirmation, reply or connection close synchronously during the write cancels the timer, just as an asynchronous transport does; the write must not leave a new timer after completion.
 * NONCE and IDENT: see "Identity". While an IDENT is verified (asynchronous: Ed25519 is), the transport subscription is paused and frames the transport still delivers are queued; they are handled in order once the IDENT has taken effect, so policies see the identity on an OPEN sent right after it. Keep-alive counts that pause as local.
 
 ## Resource limits

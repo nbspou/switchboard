@@ -99,6 +99,8 @@ class MuxOptions {
   /// connection is closed with `CONNECTION_LOST`. Also bounds how long
   /// [MuxConnection.close] waits for the transport to close; after that
   /// the transport is aborted if it implements [AbortableTransport].
+  /// A reply or connection close cancels the probe timer even when the
+  /// transport delivers it synchronously during the PING write.
   ///
   /// While a transport implementing [OutputBufferedTransport] has stopped
   /// reading because of our unsent output, the peer reading that output
@@ -1472,8 +1474,9 @@ class MuxConnection {
       return;
     }
     _keepAliveProbing = true;
-    _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
+    // Arm before sending: a synchronous reply (or close) cancels it.
     _keepAliveTimer = Timer(options.keepAliveTimeout, _onKeepAliveTimer);
+    _sendFrame(MuxControlMessage.ping(_nextPingPayload()).toFrame());
   }
 
   /// Whether the transport is throttled by its output and the peer has
