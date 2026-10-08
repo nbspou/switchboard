@@ -60,9 +60,10 @@ final Logger _log = Logger('Switchboard.Relay');
 ///    under its new identity: if that may not open the type, the channel
 ///    to the instance is closed (`CANCELLED`) and the consumer's refused
 ///    with `PERMISSION_DENIED`. With [requireIdentity], a credential that
-///    expires meanwhile likewise closes the instance channel and refuses
-///    the consumer with `UNAUTHENTICATED`. An identity that arrives once the two
-///    channels are piped does not affect them.
+///    expires meanwhile likewise closes the channel to the instance and
+///    refuses the consumer's with `UNAUTHENTICATED`. An identity that
+///    arrives (or expires) once the two channels are piped does not affect
+///    them.
 /// 4. Bounds the channels it relays per consumer connection to
 ///    [maxChannelsPerConnection] (0: no bound): `RESOURCE_EXHAUSTED`
 ///    beyond, since every consumer shares the relay's connection to each

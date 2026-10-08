@@ -987,57 +987,61 @@ void main() {
       );
     });
 
-    test(
-      'a consumer expiring while its channel is opened is refused',
-      () async {
-        var now = DateTime.now().toUtc();
-        await withClock(Clock(() => now), () async {
-          final mesh = await startMesh();
-          final worker = await newNode();
-          final workerUri = await worker.listenMemory();
-          final opened = <MuxChannel>[];
-          worker.registerService(workerType, (incoming) {
-            opened.add(incoming.channel);
-            incoming.channel.send(bytes('private greeting'));
-            unawaited(incoming.channel.close());
-          }, instance: 1);
-          final gate = GatedResolver([
-            ServiceRecord(
-              ServiceAddress(workerType, 1),
-              endpoints: [workerUri],
-            ),
-          ]);
-          final relay = await Relay.start(
-            mesh,
-            allowEndpoints: true,
-            resolver: gate,
-          );
-          final credential = await authority.issue(
-            kind: CredentialKind.node,
-            identity: 'consumer-1',
-            scopes: consumerScopes,
-            holderKey: key.publicKey,
-            lifetime: const Duration(minutes: 1),
-          );
-          final c = await newNode(credential: credential);
-          final connection = await relayConnection(c, relay.uri);
-          final channel = openRelayed(
-            connection,
-            ChannelAddress(type: workerType, instance: 1).encode(),
-          );
-          await gate.asked.timeout(limit);
-          now = now.add(const Duration(minutes: 2));
-          gate.release();
-          expect(
-            await channel.done.timeout(limit),
-            hasCode(StatusCode.unauthenticated),
-          );
-          expect(await channel.stream.toList(), isEmpty);
-          await until(() => opened.isNotEmpty, 'opened at the worker');
-          await opened.single.done.timeout(limit);
-        });
-      },
-    );
+    test('a consumer expiring while its channel is opened is refused; the '
+        'channel to the instance is cancelled, the bound released', () async {
+      var now = DateTime.now().toUtc();
+      await withClock(Clock(() => now), () async {
+        final mesh = await startMesh();
+        final worker = await newNode();
+        final workerUri = await worker.listenMemory();
+        final opened = <MuxChannel>[];
+        worker.registerService(workerType, (incoming) {
+          opened.add(incoming.channel);
+          incoming.channel.send(bytes('private greeting'));
+        }, instance: 1);
+        final gate = GatedResolver([
+          ServiceRecord(ServiceAddress(workerType, 1), endpoints: [workerUri]),
+        ]);
+        final relay = await Relay.start(
+          mesh,
+          allowEndpoints: true,
+          resolver: gate,
+          maxChannelsPerConnection: 1,
+        );
+        Future<Credential> credential() => authority.issue(
+          kind: CredentialKind.node,
+          identity: 'consumer-1',
+          scopes: consumerScopes,
+          holderKey: key.publicKey,
+          lifetime: const Duration(minutes: 1),
+        );
+        final c = await newNode(credential: await credential());
+        final connection = await relayConnection(c, relay.uri);
+        final inner = ChannelAddress(type: workerType, instance: 1).encode();
+        final channel = openRelayed(connection, inner);
+        await gate.asked.timeout(limit);
+        now = now.add(const Duration(minutes: 2));
+        gate.release();
+        expect(
+          await channel.done.timeout(limit),
+          hasCode(StatusCode.unauthenticated),
+        );
+        expect(await channel.stream.toList(), isEmpty);
+        await until(() => opened.isNotEmpty, 'opened at the worker');
+        expect(
+          await opened.single.done.timeout(limit),
+          hasCode(StatusCode.cancelled),
+        );
+        // Renewed, the consumer has the one channel its bound allows.
+        await c.updateCredential(await credential());
+        final again = openRelayed(connection, inner);
+        expect(
+          text(await again.stream.first.timeout(limit)),
+          'private greeting',
+        );
+        await again.close();
+      });
+    });
 
     test('a consumer that identifies without naming the relay is refused by '
         'requireNamedIdent', () async {
