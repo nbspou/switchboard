@@ -1076,8 +1076,16 @@ class MuxChannelLink {
   bool incomingPending = false;
 
   /// False while the OPEN of a channel opened with [MuxChannel.openAfter]
-  /// waits behind its parent's frames; its own frames wait in [preOpen].
+  /// waits behind its parent's frames: the id is only reserved locally,
+  /// and the peer's frames on it are refused. Set just before the OPEN is
+  /// written, so that a synchronous peer may answer it.
   bool openWritten = true;
+
+  /// Whether the frames handed over for this channel wait in [preOpen]:
+  /// from [MuxChannel.openAfter] until its OPEN is written and the frames
+  /// that waited have followed it. Frames handed over meanwhile, while a
+  /// synchronous peer answers the OPEN or those frames, queue behind them.
+  bool holdsFrames = false;
 
   /// Frames of this channel handed to the connection before its OPEN was
   /// written, in order, each with the channel it opens if it is an OPEN

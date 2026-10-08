@@ -853,7 +853,9 @@ class MuxConnection {
     if (openWritten) {
       _sendFrame(MuxFrame.open(id, payload));
     } else {
-      link.openWritten = false;
+      link
+        ..openWritten = false
+        ..holdsFrames = true;
     }
     return link;
   }
@@ -1114,6 +1116,8 @@ class MuxConnection {
         (transport as OutputReadyTransport).isOutputReady;
   }
 
+  /// Hands [frame] of [link] to the output ([MuxChannelHost.sendChannelFrame]):
+  /// held with the channel while it holds frames, else scheduled.
   void _sendChannelFrame(
     MuxChannelLink link,
     MuxFrame frame, {
@@ -1122,8 +1126,9 @@ class MuxConnection {
     if (!_writable) {
       return;
     }
-    if (!link.openWritten) {
-      // The channel's own OPEN waits behind its parent's frames.
+    if (link.holdsFrames) {
+      // The channel's own OPEN waits behind its parent's frames, or the
+      // frames that waited for it are going out: this one follows them.
       // send has handed the payload over: the caller may reuse it now.
       (link.preOpen = link.preOpen.isEmpty ? [] : link.preOpen).add((
         MuxFrame(
@@ -1133,6 +1138,20 @@ class MuxConnection {
         ),
         opens,
       ));
+      return;
+    }
+    _scheduleFrame(link, frame, opens: opens);
+  }
+
+  /// Writes [frame] of [link] now, or holds it in its channel's queue if
+  /// it is DATA and the transport is not ready (or other frames are held),
+  /// or anything behind DATA held for the channel.
+  void _scheduleFrame(
+    MuxChannelLink link,
+    MuxFrame frame, {
+    MuxChannelLink? opens,
+  }) {
+    if (!_writable) {
       return;
     }
     final id = link.id;
@@ -1263,15 +1282,22 @@ class MuxConnection {
   void _openWritten(MuxChannelLink link) {
     link.openWritten = true;
     link.openWrittenAfterClose();
-    final frames = link.preOpen;
-    link.preOpen = const [];
-    for (final (frame, opens) in frames) {
-      if (link.closeReceived && frame.command == MuxCommand.data) {
-        // The peer refused the channel while its OPEN was being written
-        // (a synchronous transport): DATA would land on an unknown id.
-        continue;
+    try {
+      // Read as it grows: what a synchronous peer's answer makes the
+      // channel hand over meanwhile is added behind.
+      for (var i = 0; i < link.preOpen.length; i++) {
+        final (frame, opens) = link.preOpen[i];
+        if (link.closeReceived && frame.command == MuxCommand.data) {
+          // The peer closed the channel meanwhile (a synchronous
+          // transport): DATA would land on an id it considers closed.
+          continue;
+        }
+        _scheduleFrame(link, frame, opens: opens);
       }
-      _sendChannelFrame(link, frame, opens: opens);
+    } finally {
+      link
+        ..preOpen = const []
+        ..holdsFrames = false;
     }
   }
 

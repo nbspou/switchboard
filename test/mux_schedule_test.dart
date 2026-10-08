@@ -599,6 +599,34 @@ void main() {
       expect(mux.isOpen, isTrue);
     });
 
+    test('what a synchronous answer to the OPEN releases follows the frames '
+        'held for it', () async {
+      final (mux, gate) = syncPeer(
+        (frame) => [
+          if (frame.command == MuxCommand.open && frame.payload.isNotEmpty)
+            MuxControlMessage.credit(MuxCredit(frame.channelId, 100)).toFrame(),
+        ],
+      );
+      final parent = mux.open(empty);
+      await parent.send(Uint8List(1));
+      final child = parent.openAfter(Uint8List.fromList([9]));
+      // Held for the OPEN, using the whole window.
+      await child.send(Uint8List(32752));
+      await child.send(Uint8List(32752));
+      // Waits for the CREDIT the peer sends as the OPEN is written.
+      final last = child.send(Uint8List(3));
+      gate.allow(10);
+      await last;
+      await pumpEventQueue();
+      expect(
+        [
+          for (final frame in gate.on(child.id))
+            if (isData(frame)) frame.payload.length,
+        ],
+        [32752, 32752, 3],
+      );
+    });
+
     for (final command in [MuxCommand.data, MuxCommand.close]) {
       test(
         '${command.name} before the child OPEN is a protocol error',
