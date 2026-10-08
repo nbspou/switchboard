@@ -335,6 +335,24 @@ void main() {
       expect(lifecycle.log, ['load 1 e1 h0', 'serve 1 a', 'serve 1 b']);
     });
 
+    test(
+      'revocation from serve refuses the rest of the released queue',
+      () async {
+        newGate();
+        lifecycle.loadGate = Completer<void>();
+        final assigned = gate.onAssign(assign(1));
+        final a = peer.open(shard: 1, payload: 'a');
+        final b = peer.open(shard: 1, payload: 'b');
+        await settle();
+        lifecycle.onServe = (_, slot) => gate.onRevoke(kv, slot);
+        lifecycle.loadGate!.complete();
+        await assigned;
+        expect(lifecycle.served[1], hasLength(1));
+        expect(await a.done.timeout(limit), isRelocated());
+        expect(await b.done.timeout(limit), isMoved());
+      },
+    );
+
     test('a failed load refuses the queue and fails ASSIGN', () async {
       newGate();
       lifecycle
@@ -864,6 +882,40 @@ void main() {
 
   group('requests', () {
     late List<String> answered;
+
+    test(
+      'revocation from a request refuses the rest of the released queue',
+      () async {
+        newGate(trackChannels: false);
+        final handled = <String>[];
+        lifecycle.onServe = (channel, slot) {
+          channel.talk().messages.listen((message) {
+            unawaited(
+              gate.serveRequest(message, slot, (m) {
+                handled.add(text(m.payload));
+                m.reply(m.payload);
+                unawaited(gate.onRevoke(kv, slot));
+              }),
+            );
+          });
+        };
+        await gate.onAssign(assign(1));
+        final talk = TalkChannel(peer.open(shard: 1));
+        await settle();
+        await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+        final first = talk.request('GET', bytes('a'));
+        final second = expectLater(
+          talk.request('GET', bytes('b')),
+          throwsCode(StatusCode.moved),
+        );
+        await settle();
+        await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+        expect(text((await first).payload), 'a');
+        await second;
+        expect(handled, ['a']);
+        await talk.close();
+      },
+    );
 
     /// Serves Talk on every channel; requests go through [serveRequest]
     /// and are answered `slot:payload` after [hold] completes.

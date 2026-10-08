@@ -220,6 +220,8 @@ enum SlotGateState {
 /// [close]) it rejects the queue with `MOVED`, closes the slot's tracked
 /// channels with `RELOCATED` ([relocatedStatus]) and calls
 /// [SlotLifecycle.unload].
+/// A handler that locks or revokes the slot while its queue is being served
+/// leaves the remaining work subject to that new state.
 class SlotGate implements SlotHandler {
   /// Creates the gate of [type] on [switchboard], serving the slot
   /// requests [client] receives, with the application's [lifecycle] (which
@@ -1106,10 +1108,21 @@ class SlotGate implements SlotHandler {
 
   /// Serves what was queued while loading or locked.
   void _release(_GateSlot s, int slot) {
-    for (final incoming in _takeQueue(s)) {
-      _serve(s, incoming, slot);
+    bool serving() =>
+        identical(_slots[slot], s) && s.state == SlotGateState.serving;
+
+    // Remove one at a time: application handlers may lock or revoke the
+    // slot synchronously, and the remaining queue belongs to that state.
+    while (serving() && s.channels.isNotEmpty) {
+      final incoming = s.channels.removeFirst();
+      _queuedChannels--;
+      if (incoming.channel.canSend) {
+        _serve(s, incoming, slot);
+      }
     }
-    for (final parked in _takeRequests(s)) {
+    while (serving() && s.requests.isNotEmpty) {
+      final parked = s.requests.removeFirst();
+      _queuedRequests--;
       if (parked.message.expectsReply && !parked.message.canReply) {
         parked.finish();
         continue;
