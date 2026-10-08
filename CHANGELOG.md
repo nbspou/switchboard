@@ -17,7 +17,8 @@ The protocol specification lives in the project wiki (section
   messages (size and fragment count) before buffering them, buffers a
   fragmented message at about its size, and never negotiates compression; an
   in-memory pair; the optional capabilities `FrameLimited`,
-  `AbortableTransport` and `OutputBufferedTransport`.
+  `AbortableTransport`, `OutputBufferedTransport` and
+  `OutputReadyTransport`.
 - Mux: channels opened by either side, short and long ids reused after
   mutual close, reserved ids, a control channel with PING, PONG, GOAWAY and
   LIMITS (at most `MuxConnection.maxPendingPings` pings awaiting a PONG,
@@ -53,9 +54,8 @@ The protocol specification lives in the project wiki (section
   changes.
 - Proxying: `proxyHandler` and `pipeChannels` for frontend endpoints and
   host hint relays, routing by shard slot with a one-shot retry on `MOVED`
-  (what the client sends meanwhile is held up to the node's
-  `maxChannelBufferBytes`, beyond which the channel is closed with
-  `RESOURCE_EXHAUSTED`), an asynchronous `authorize` hook that may rewrite
+  (what the client sends meanwhile is held, its credit returned only once
+  the new owner's channel takes it), an asynchronous `authorize` hook that may rewrite
   the address, and refusal of slot-less channels to sharded types unless
   `allowNoSlot` admits the type. The slot tables are read once the
   resolver has answered, so a proxy whose naming client has not synced
@@ -173,6 +173,32 @@ The protocol specification lives in the project wiki (section
   `LOCATE` backoff wait), and the deadlines instances declare for `ASSIGN`
   and `DRAIN` are passed on to the requests waiting for them, the
   `MIGRATE` requester included. Adds a dependency on `package:clock`.
+- Protocol change, mux: per-channel credit flow control. `LIMITS` carries
+  a third field, the initial window (`MuxLimits.initialWindow`; 12 bytes,
+  a shorter payload or a zero window is a protocol error), which
+  `MuxOptions.initialWindow` (64 KiB) announces; the new control message
+  `CREDIT` (0x07, `MuxCredit`: `u48` channel id, `u32` bytes, exactly 10
+  bytes) returns or grants credit. A DATA frame costs its length plus 16
+  bytes of its channel's window; a peer sending beyond the window it was
+  granted ends the connection with GOAWAY `PROTOCOL_ERROR`, which
+  replaces the per-channel receive cap (`MuxOptions.maxChannelBufferBytes`
+  and its close with `RESOURCE_EXHAUSTED` are gone; the receive high-water
+  mark stays as the backstop, buffers now counted at the flow-control
+  cost). `MuxChannel.send` returns a future that waits for credit
+  (`sendWindow`; a subframe costing more than half the initial window is
+  refused, `maxSubframeLength`); `sink.addStream` waits for each subframe.
+  Credit goes back once half the window is consumed: by default when the
+  stream's listener takes a subframe, or, with `MuxChannel.manualCredit`,
+  when the layer reading for the application calls `consumed`;
+  `MuxChannel.grant` raises a window at once. An output scheduler holds
+  DATA while a transport implementing `OutputReadyTransport` (the stream
+  binding, `WebSocketServerChannel`) is not ready, and writes control
+  messages first, then ordinary channels in turn, then bulk channels
+  (`MuxChannel.priority`, `MuxPriority.bulk`) with a turn after
+  `MuxOptions.bulkZipper` (4) ordinary frames; `send` cuts a payload on a
+  bulk channel into chunks of `MuxOptions.bulkChunkSize` (64 KiB).
+  `pipeChannels` (the proxy, the relay, the slot gate's forwarding) passes
+  credit through hop by hop, and `SlotChannel.send` returns a future too.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row
@@ -189,7 +215,7 @@ The protocol specification lives in the project wiki (section
   `RELEASE`s and 64 hand-over migrations in flight.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
-  allocation, per-channel and per-connection receive buffers, a budget for
+  allocation, per-connection receive buffers, a budget for
   held OPEN payloads, a cap on unconfirmed CLOSEs, output high-water marks,
   a per-client limit on proxied channels, and host hint relaying only on
   request.

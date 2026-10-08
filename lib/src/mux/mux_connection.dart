@@ -994,10 +994,10 @@ class MuxConnection {
   bool _awaitingOutput = false;
   bool _pumping = false;
 
-  /// Bytes of the frames the output scheduler holds because the transport
-  /// was not ready to take them (see [OutputReadyTransport]): at most the
-  /// windows of the channels with something to send, plus one subframe
-  /// each.
+  /// Bytes of the encoded frames the output scheduler holds because the
+  /// transport was not ready to take them (see [OutputReadyTransport]).
+  /// DATA is held only once its channel's send window took it, so this is
+  /// bounded by the windows the peer granted, plus a CLOSE per channel.
   int get heldOutputBytes => _heldOutputBytes;
 
   bool get _outputReady {

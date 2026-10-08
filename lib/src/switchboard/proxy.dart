@@ -230,7 +230,7 @@ Status _closeStatusFor(Status status) {
 ///    its time, for example to verify the session credential in the
 ///    application payload with an authentication service; meanwhile the
 ///    channel is not read (the mux buffers what the client sends, within
-///    its limits). It returns the address to forward to: the channel's
+///    the window it grants the client). It returns the address to forward to: the channel's
 ///    own [IncomingChannel.address], or a rewritten one (the shard slot
 ///    set from the verified account, the payload replaced by a credential
 ///    the backends trust, and so on), which steps 4 and 5 use instead of
