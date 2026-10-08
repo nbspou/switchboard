@@ -318,8 +318,10 @@ class TalkChannel {
   /// the subscription is paused the answer waits, so the body of an
   /// `await for` loop over [messages] must not wait for an ordered
   /// request. Local failures (timeout, [TalkRequest.cancel], the end of
-  /// the channel) are reported at once. If the channel ends while an
-  /// answer is waiting for delivery, that request fails at once too.
+  /// the channel) are reported at once. An answer that arrived before
+  /// them has ended the request: it is still delivered in its place, also
+  /// after the channel ended ([messages] goes on delivering what it
+  /// holds), and while the subscription stays paused it waits.
   ///
   /// Throws synchronously, sending nothing, with
   /// [StatusCode.resourceExhausted] if [TalkOptions.maxOutgoingRequests] is
@@ -679,16 +681,11 @@ class TalkChannel {
   /// [marker] reaches the listener of [messages], after the messages that
   /// arrived before it; the listener never sees [marker]. At once when
   /// nobody listens, or nobody will.
-  void _deliverOrdered(
-    _Message marker,
-    _Outgoing pending,
-    void Function() outcome,
-  ) {
+  void _deliverOrdered(_Message marker, void Function() outcome) {
     if (_messagesCancelled || !_messages.hasListener || _messages.isClosed) {
       outcome();
       return;
     }
-    marker._orderedRequest = pending;
     marker._outcome = outcome;
     _orderedOutcomes.add(marker);
     _messages.add(marker);
@@ -750,7 +747,7 @@ class TalkChannel {
       _register(message);
     }
     if (pending.ordered) {
-      _deliverOrdered(message, pending, () => pending.complete(message));
+      _deliverOrdered(message, () => pending.complete(message));
     } else {
       pending.complete(message);
     }
@@ -796,11 +793,7 @@ class TalkChannel {
       }
       final error = TalkAbortException(_abortStatus(frame));
       if (pending.ordered) {
-        _deliverOrdered(
-          _Message(this, frame),
-          pending,
-          () => pending.fail(error),
-        );
+        _deliverOrdered(_Message(this, frame), () => pending.fail(error));
       } else {
         pending.fail(error);
       }
@@ -907,13 +900,8 @@ class TalkChannel {
         pending.fail(error);
       }
     }
-    // Their wire ids are already released, but a paused messages listener
-    // may still hold their answers. Channel failure must not wait for it.
-    final outcomes = _orderedOutcomes.toList();
-    _orderedOutcomes.clear();
-    for (final marker in outcomes) {
-      marker._runOutcome(error: error);
-    }
+    // Answers in [_orderedOutcomes] arrived before the end: they keep their
+    // place in [_messages], which still delivers what it holds once closed.
     final incoming = _incoming.values.toList();
     _incoming.clear();
     _undeliveredRequests.clear();
@@ -1383,21 +1371,11 @@ class _Message extends TalkMessage {
   /// in [TalkChannel.messages]: delivers that answer.
   void Function()? _outcome;
 
-  /// Also identifies a marker after shutdown has delivered its failure,
-  /// so resuming the messages listener cannot expose it as a message.
-  _Outgoing? _orderedRequest;
-
   /// Delivers the answer this message is the marker of, once.
-  void _runOutcome({SwitchboardException? error}) {
+  void _runOutcome() {
     final outcome = _outcome;
     _outcome = null;
-    if (outcome != null) {
-      if (error == null) {
-        outcome();
-      } else {
-        _orderedRequest!.fail(error);
-      }
-    }
+    outcome?.call();
   }
 
   /// [forwardMessage] took this request over.
@@ -1927,7 +1905,7 @@ class _GuardedSubscription extends DelegatingStreamSubscription<TalkMessage> {
   @override
   void onData(void Function(TalkMessage data)? handleData) {
     super.onData((message) {
-      if (message is _Message && message._orderedRequest != null) {
+      if (message is _Message && message._outcome != null) {
         // The answer to an ordered request, in its place among the
         // messages; never shown to the listener.
         final outcomes = message.channel._orderedOutcomes;

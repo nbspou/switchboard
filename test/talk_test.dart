@@ -2900,45 +2900,110 @@ void main() {
       await talk.close();
     });
 
-    for (final abort in [false, true]) {
-      test(
-        'closing releases a queued ordered ${abort ? 'abort' : 'answer'}',
-        () {
-          fakeAsync((async) {
-            final (talk, peer) = syncLink();
-            final seen = <TalkMessage>[];
-            final sub = talk.messages.listen(seen.add)..pause();
-            final response = Outcome(
-              talk.request('Q', Uint8List(0), ordered: true),
-            );
+    for (final end in [
+      'a channel abort',
+      'a protocol error',
+      'close',
+      'the peer closing',
+    ]) {
+      test('an answer that arrived before $end keeps its place', () async {
+        final (talk, peer) = syncLink();
+        final seen = <String>[];
+        talk.messages.listen(
+          (m) => seen.add(m.procedureName),
+          onError: (Object e) => seen.add('error'),
+        );
+        final response = talk
+            .request('Q', Uint8List(0), ordered: true)
+            .then((_) => seen.add('answer'));
+        peer
+          ..add(plain('M1'))
+          ..add(plain('M2'))
+          ..add(answer(1));
+        switch (end) {
+          case 'a channel abort':
             peer.add(
-              abort
-                  ? TalkFrame(
-                      kind: TalkKind.abort,
-                      responseId: 1,
-                      payload: Status.of(StatusCode.notFound).encode(),
-                    ).encode()
-                  : answer(1),
+              TalkFrame(
+                kind: TalkKind.abort,
+                payload: Status.of(StatusCode.unavailable).encode(),
+              ).encode(),
             );
+          case 'a protocol error':
+            peer.add(bytes([0xC0]));
+          case 'close':
+            unawaited(talk.close());
+          default:
+            unawaited(peer.close());
+        }
+        await response;
+        await talk.done;
+        await pumpEventQueue();
+        expect(seen, [
+          'M1',
+          'M2',
+          'answer',
+          if (end == 'a channel abort') 'error',
+        ]);
+      });
+    }
+
+    for (final abort in [false, true]) {
+      test('a paused listener holds an ${abort ? 'abort' : 'answer'} that '
+          'arrived before the channel ended; resuming or cancelling '
+          'delivers it', () {
+        fakeAsync((async) {
+          for (final resume in [true, false]) {
+            final (talk, peer) = syncLink();
+            final seen = <String>[];
+            final sub = talk.messages.listen((m) => seen.add(m.procedureName))
+              ..pause();
+            final response = Outcome(
+              talk
+                  .request('Q', Uint8List(0), ordered: true)
+                  .whenComplete(() => seen.add('answer')),
+            );
+            peer
+              ..add(plain('M1'))
+              ..add(
+                abort
+                    ? TalkFrame(
+                        kind: TalkKind.abort,
+                        responseId: 1,
+                        payload: Status.of(StatusCode.notFound).encode(),
+                      ).encode()
+                    : answer(1),
+              );
             async.flushMicrotasks();
-            expect(response.isDone, isFalse);
             expect(talk.outgoingRequestCount, 0);
             final closed = Outcome(
               talk.close(Status.of(StatusCode.unavailable)),
             );
             async.flushMicrotasks();
             expect(closed.isDone, isTrue);
+            expect(response.isDone, isFalse);
+            if (resume) {
+              sub.resume();
+              async.flushMicrotasks();
+              expect(seen, ['M1', 'answer']);
+            } else {
+              sub.cancel();
+              async.flushMicrotasks();
+              expect(seen, ['answer']);
+            }
             expect(response.isDone, isTrue);
-            expect(response.error, isStatus(StatusCode.unavailable));
-            sub.resume();
-            async.flushMicrotasks();
-            expect(seen, isEmpty, reason: 'outcome markers stay internal');
+            if (abort) {
+              expect(response.error, isA<TalkAbortException>());
+              expect(response.error, isStatus(StatusCode.notFound));
+            } else {
+              expect(response.error, isNull);
+              expect(response.value!.responseId, 1);
+            }
             sub.cancel();
             async.flushMicrotasks();
             expect(async.pendingTimers, isEmpty);
-          });
-        },
-      );
+          }
+        });
+      });
     }
   });
 
